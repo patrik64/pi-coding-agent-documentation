@@ -1,0 +1,112 @@
+---
+title: "log.ts"
+description: "Best-effort, multi-process-safe log file for MCP server notifications, with size-based rotation."
+source: "src/extensions/mcp/log.ts"
+full: true
+---
+
+MCP servers can send `notifications/message` to report what they are doing. This file turns those messages into lines in `mcp.log` inside the agent directory, so a user debugging a server has somewhere to look that is not the terminal UI.
+
+Several `pi` processes can run at once and share the file, so the design favors simple, synchronous appends and tolerates failure. The log is created by [runtime.ts](/docs/src/extensions/mcp/runtime.ts) connections and also by the offline command in [cli.ts](/docs/src/extensions/mcp/cli.ts). The extension entry is [index.ts](/docs/src/extensions/mcp/index.ts).
+
+<Scrollycoding>
+
+## !!steps Constants and data formatting
+
+The cap is 5 MB. `formatData` accepts any value: strings are used as is, other values are serialized as JSON, and if serialization throws (for example on a cycle) it falls back to `String`. `JSON.stringify` can return undefined, which the `??` also covers.
+
+```ts ! log.ts
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatData(data: unknown): string {
+	if (typeof data === "string") return data;
+	try {
+		// !mark
+		return JSON.stringify(data) ?? String(data);
+	} catch {
+		return String(data);
+	}
+}
+```
+
+## !!steps One message becomes one line
+
+`formatMcpLogMessage` builds `timestamp [server] level logger: text`. A missing level defaults to `info`, and a non-object payload is treated as plain data. Newlines inside the text are replaced with a newline plus four spaces, so a multi-line message stays visually attached to its header line.
+
+The `now` parameter exists so tests can pass a fixed date.
+
+```ts ! log.ts
+export function formatMcpLogMessage(server: string, params: unknown, now: Date = new Date()): string {
+	const message = isRecord(params) ? params : { data: params };
+	const level = typeof message.level === "string" ? message.level : "info";
+	const logger = typeof message.logger === "string" && message.logger ? ` ${message.logger}:` : "";
+	// !mark
+	const text = formatData(message.data).replace(/\r?\n/g, "\n    ");
+	return `${now.toISOString()} [${server}] ${level}${logger} ${text}\n`;
+}
+```
+
+## !!steps The log object
+
+`McpServerLog` stores only the path and a cached size. The size starts undefined and is read lazily on the first write, which is also when the directory is created, so constructing a log has no side effects.
+
+```ts ! log.ts
+/** Appends server log messages to one file. Write errors are ignored: logging must not break tools. */
+export class McpServerLog {
+	readonly path: string;
+	private size: number | undefined;
+
+	constructor(path: string) {
+		this.path = path;
+	}
+```
+
+## !!steps Writing with rotation
+
+Each write is one `appendFileSync`, which is small enough to avoid interleaving across processes. When the cached size passes the limit, the code re-reads the real size before renaming to `mcp.log.1`, because another process may already have rotated the file. After the append the cached size grows by the byte length of the line.
+
+The whole body sits in a `try` that swallows errors. A full disk or permission problem must never break a tool call.
+
+```ts ! log.ts
+	write(server: string, params: unknown): void {
+		const line = formatMcpLogMessage(server, params);
+		try {
+			if (this.size === undefined) {
+				mkdirSync(dirname(this.path), { recursive: true });
+				this.size = this.currentSize();
+			}
+			// !mark(1:4)
+			if (this.size > MAX_LOG_BYTES) {
+				// Another process may have rotated it already; check before renaming.
+				if (this.currentSize() > MAX_LOG_BYTES) renameSync(this.path, `${this.path}.1`);
+				this.size = this.currentSize();
+			}
+			appendFileSync(this.path, line);
+			this.size += Buffer.byteLength(line);
+		} catch {
+			// Ignore: the log is best effort.
+		}
+	}
+```
+
+## !!steps Reading the current size
+
+A missing file counts as size zero. This also handles the case where another process has just rotated the file away.
+
+```ts ! log.ts
+	private currentSize(): number {
+		try {
+			return statSync(this.path).size;
+		} catch {
+			return 0;
+		}
+	}
+```
+
+</Scrollycoding>
+
+Only one rotated generation is kept: each rotation overwrites `mcp.log.1`, so at most about 10 MB of history exists. The size check is against the cached value, so a process that has not written recently can briefly lag behind another's appends, which is acceptable for a best-effort log.

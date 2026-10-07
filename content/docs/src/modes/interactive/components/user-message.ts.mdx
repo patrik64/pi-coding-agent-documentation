@@ -1,0 +1,101 @@
+---
+title: "user-message.ts"
+description: "Transcript component that renders one user message as themed Markdown wrapped in terminal shell-integration zone markers"
+source: "src/modes/interactive/components/user-message.ts"
+full: true
+---
+
+Every prompt the user sent appears in the transcript as a block with its own background. This small component draws it: the text is rendered as Markdown with the user-message colors, and the first and last lines are tagged with OSC 133 escape sequences so terminals with shell integration can treat the message as a navigable zone.
+
+Colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) (the `userMessageText` and `userMessageBg` tokens defined in [dark.json](/docs/src/modes/interactive/theme/dark.json)). Extension-provided Markdown transformers are threaded through [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts).
+
+<Scrollycoding>
+
+## !!steps Constructor inputs
+
+The component stores the text, a Markdown theme (defaulting to `getMarkdownTheme()`), a horizontal padding and a list of `MarkdownTransformer`s that extensions can register (the type lives in [types.ts](/docs/src/core/extensions/types.ts)). It builds its child immediately.
+
+`setOutputPad` exists so the transcript can change padding later; it simply rebuilds.
+
+```ts ! user-message.ts
+export class UserMessageComponent extends Container {
+	private text: string;
+	private markdownTheme: MarkdownTheme;
+	private outputPad: number;
+	private markdownTransformers: readonly MarkdownTransformer[];
+
+	constructor(
+		text: string,
+		markdownTheme: MarkdownTheme = getMarkdownTheme(),
+		outputPad = 1,
+		markdownTransformers: readonly MarkdownTransformer[] = [],
+	) {
+		super();
+		this.text = text;
+		this.markdownTheme = markdownTheme;
+		this.outputPad = outputPad;
+		this.markdownTransformers = markdownTransformers;
+		// !mark
+		this.rebuild();
+	}
+```
+
+## !!steps One Markdown child does the coloring
+
+`rebuild` clears and adds a single `Markdown`. The comment explains a deliberate choice: no `Box` around it, because the Markdown can pad and paint its own background, and a Box would keep a second full-width copy of every line.
+
+The options matter for user text: ordered-list markers and backslash escapes are preserved, so what the user typed is shown as typed rather than renumbered or unescaped. The `transform` is built for the `"user"` role.
+
+```ts ! user-message.ts
+	private rebuild(): void {
+		this.clear();
+		// The Markdown pads and colors its own background: a Box around it would keep a second full-width copy of every
+		// line, with identical output.
+		this.addChild(
+			new Markdown(
+				this.text,
+				this.outputPad,
+				1,
+				this.markdownTheme,
+				{
+					// !mark(1:2)
+					color: (content: string) => theme.fg("userMessageText", content),
+					bgColor: (content: string) => theme.bg("userMessageBg", content),
+				},
+				{
+					preserveOrderedListMarkers: true,
+					preserveBackslashEscapes: true,
+					transform: createMarkdownTransform("user", false, this.markdownTransformers),
+				},
+			),
+		);
+	}
+```
+
+## !!steps OSC 133 zone markers
+
+OSC 133 is the semantic-prompt protocol: `A` starts a zone, `B` marks the end of the prompt, `C` the start of output. The component prepends `A` to the first rendered line and appends `B` and `C` together at the end of the last line, so terminals can jump between messages or select one whole.
+
+The markers are zero-width, and are added in `render` (after layout), so they never affect wrapping. Empty output is returned untouched.
+
+```ts ! user-message.ts
+const OSC133_ZONE_START = "\x1b]133;A\x07";
+const OSC133_ZONE_END = "\x1b]133;B\x07";
+const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+// ...
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		if (lines.length === 0) {
+			return lines;
+		}
+
+		// !mark(1:2)
+		lines[0] = OSC133_ZONE_START + lines[0];
+		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		return lines;
+	}
+```
+
+</Scrollycoding>
+
+The counterpart for model output is [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts); both are created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) while it replays or streams a session. Note that this fence joins two separate parts of the file (the constants at the top and the `render` method); there is no real adjacency between them.

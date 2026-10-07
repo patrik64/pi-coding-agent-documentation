@@ -1,0 +1,139 @@
+---
+title: "list-models.ts"
+description: "Implements the model listing command: fuzzy filter, sort, and print an aligned table of provider, model and capabilities"
+source: "src/cli/list-models.ts"
+full: true
+---
+
+This is the code behind listing models from the command line. It asks the
+[model-runtime.ts](/docs/src/core/model-runtime.ts) for models that are
+actually usable, optionally filters them with a fuzzy pattern, and prints a
+table with fixed-width columns.
+
+When nothing is available, it reuses the shared message from
+[auth-guidance.ts](/docs/src/core/auth-guidance.ts). The caller is
+[main.ts](/docs/src/main.ts).
+
+<Scrollycoding>
+
+## !!steps Human-readable token counts
+
+Context sizes are shortened to `200K` or `1M`. Whole numbers print without a
+decimal, others get one digit. Note the thresholds use decimal thousands, not
+1024, so a window of 131072 prints as `131.1K`.
+
+```ts ! list-models.ts
+function formatTokenCount(count: number): string {
+	if (count >= 1_000_000) {
+		const millions = count / 1_000_000;
+		return millions % 1 === 0 ? `${millions}M` : `${millions.toFixed(1)}M`;
+	}
+	if (count >= 1_000) {
+		const thousands = count / 1_000;
+		return thousands % 1 === 0 ? `${thousands}K` : `${thousands.toFixed(1)}K`;
+	}
+	return count.toString();
+}
+```
+
+## !!steps Loading and the early exits
+
+Errors from loading `models.json` are shown as a warning but do not stop the
+listing. Only available models are listed, meaning ones with working
+credentials. An empty list prints the login guidance and returns.
+
+```ts ! list-models.ts
+export async function listModels(
+	modelRuntime: ModelRuntime,
+	searchPattern?: string,
+	signal?: AbortSignal,
+): Promise<void> {
+	const loadError = modelRuntime.getError();
+	if (loadError) {
+		console.error(chalk.yellow(`Warning: errors loading models.json:\n${loadError}`));
+	}
+
+	const models = [...(await modelRuntime.getAvailable(undefined, { signal }))];
+
+	if (models.length === 0) {
+		console.log(formatNoModelsAvailableMessage());
+		return;
+	}
+```
+
+## !!steps Fuzzy filter and sort
+
+The pattern is matched against `provider id` as one string using the fuzzy
+matcher from the TUI package. The filtered array is then sorted in place by
+provider, then model id, with locale-aware comparison, so fuzzy match ranking
+is discarded.
+
+```ts ! list-models.ts
+	// Apply fuzzy filter if search pattern provided
+	let filteredModels: Model<Api>[] = models;
+	if (searchPattern) {
+		filteredModels = fuzzyFilter(models, searchPattern, (m) => `${m.provider} ${m.id}`);
+	}
+
+	if (filteredModels.length === 0) {
+		console.log(`No models matching "${searchPattern}"`);
+		return;
+	}
+
+	// Sort by provider, then by model id
+	filteredModels.sort((a, b) => {
+		const providerCmp = a.provider.localeCompare(b.provider);
+		if (providerCmp !== 0) return providerCmp;
+		return a.id.localeCompare(b.id);
+	});
+```
+
+## !!steps Turning models into rows
+
+Each model becomes a row of display strings: the context window and max output
+use the formatter, and two capabilities are flattened to `yes` or `no`. Images
+are supported when the model's input list includes `image`.
+
+```ts ! list-models.ts
+	const rows = filteredModels.map((m) => ({
+		provider: m.provider,
+		model: m.id,
+		context: formatTokenCount(m.contextWindow),
+		maxOut: formatTokenCount(m.maxTokens),
+		thinking: m.reasoning ? "yes" : "no",
+		images: m.input.includes("image") ? "yes" : "no",
+	}));
+```
+
+## !!steps Column widths and printing
+
+Each column is as wide as its longest cell, including the header. Lines are
+built by padding every cell and joining with two spaces. The header and rows
+repeat the same list of six `padEnd` calls; nothing shares that code.
+
+```ts ! list-models.ts
+	const widths = {
+		provider: Math.max(headers.provider.length, ...rows.map((r) => r.provider.length)),
+		model: Math.max(headers.model.length, ...rows.map((r) => r.model.length)),
+		context: Math.max(headers.context.length, ...rows.map((r) => r.context.length)),
+		maxOut: Math.max(headers.maxOut.length, ...rows.map((r) => r.maxOut.length)),
+		thinking: Math.max(headers.thinking.length, ...rows.map((r) => r.thinking.length)),
+		images: Math.max(headers.images.length, ...rows.map((r) => r.images.length)),
+	};
+
+	// Print header
+	const headerLine = [
+		headers.provider.padEnd(widths.provider),
+		headers.model.padEnd(widths.model),
+		headers.context.padEnd(widths.context),
+		headers.maxOut.padEnd(widths.maxOut),
+		headers.thinking.padEnd(widths.thinking),
+		headers.images.padEnd(widths.images),
+	].join("  ");
+	console.log(headerLine);
+```
+
+</Scrollycoding>
+
+The output goes straight to the console, so the function is meant for a
+one-shot CLI command, not for reuse inside the interactive UI.

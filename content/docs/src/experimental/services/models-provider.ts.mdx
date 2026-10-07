@@ -1,0 +1,235 @@
+---
+title: "models-provider.ts"
+description: "Implements the Models service over one conversation: replicated catalog, configuration that follows the agent document, and model selection (experimental)"
+source: "src/experimental/services/models-provider.ts"
+full: true
+---
+
+This is the implementation of the contract in [models.ts](/docs/src/experimental/services/models.ts). It connects three things: the model registry ([model-runtime.ts](/docs/src/core/model-runtime.ts)), the conversation's replicated agent document, and user settings ([settings-manager.ts](/docs/src/core/settings-manager.ts)).
+
+The core design choice is that the model and thinking level are not stored in the service. The agent document is the source of truth, and the replicated `configuration` slice is just a mirror that is updated whenever that document changes, including changes made by other clients.
+
+<Scrollycoding>
+
+## !!steps Building the initial state
+
+`createModelsService` takes the conversation, the agent document, the two optional core dependencies, and a state factory. Both dependencies are optional, so the service also works in tests or setups without a registry.
+
+`configurationOf` projects the document down to a provider and model id pair (or `null`) plus the thinking level, defaulting to `off`.
+
+```ts ! models-provider.ts
+export function createModelsService(
+	conversation: Conversation,
+	agent: DocumentState<AgentState>,
+	modelRuntime: ModelRuntime | undefined,
+	settingsManager: SettingsManager | undefined,
+	createState: (initial: ModelsState) => MutableReplicatedState<ModelsState>,
+): ModelsServiceRuntime {
+	let catalogRevision = 0;
+	// !mark(1:4)
+	const configurationOf = (value: Readonly<AgentState> | null): ModelsState["configuration"] => ({
+		model: value?.model === undefined ? null : { provider: value.model.provider, modelId: value.model.modelId },
+		thinkingLevel: value?.thinkingLevel ?? "off",
+	});
+	const state = createState({
+		catalog: { revision: 0, availableModels: [] },
+		configuration: configurationOf(agent.value),
+		refresh: { status: "idle" },
+	});
+```
+
+## !!steps Reading the selected model and its thinking levels
+
+The selected model is looked up in the registry from the document's reference. If there is none, the only valid thinking level is `off`; otherwise the levels are whatever the model supports, per the pi-ai helper.
+
+A model that disappeared from the registry also yields `off` only, because `selectedModel` returns `undefined` for it.
+
+```ts ! models-provider.ts
+	const selectedModel = () => {
+		const ref = agent.value?.model;
+		return ref === undefined ? undefined : modelRuntime?.getModel(ref.provider, ref.modelId);
+	};
+	// !mark(1:3)
+	const readThinkingLevels = (): ModelThinkingLevel[] => {
+		const selected = selectedModel();
+		return selected === undefined ? ["off"] : getSupportedThinkingLevels(selected);
+	};
+```
+
+## !!steps The catalog always contains the selected model
+
+`readCatalog` takes the available snapshot and, if the currently selected model is not in it (for example because credentials were removed), appends it. The UI therefore never shows a configuration pointing at a model that is missing from the list.
+
+Each call increments a local revision counter, so every published catalog is distinguishable.
+
+```ts ! models-provider.ts
+	const readCatalog = (): ModelsState["catalog"] => {
+		const selected = selectedModel();
+		const available = modelRuntime?.getAvailableSnapshot() ?? [];
+		// !mark(1:2)
+		const catalog =
+			selected === undefined || includesModel(available, selected) ? available : [...available, selected];
+		// !mark
+		catalogRevision += 1;
+		return {
+			revision: catalogRevision,
+			availableModels: catalog.map((model) => ({
+				provider: model.provider,
+				modelId: model.id,
+				name: model.name,
+				reasoning: model.reasoning,
+			})),
+		};
+	};
+```
+
+## !!steps Changing thinking level
+
+`cycleThinking` moves to the next supported level and wraps around, using `indexOf` on the list. `selectThinking` is strict: it throws with the list of valid levels when asked for an unsupported one.
+
+Neither writes to the replicated state directly. They call `conversation.configure`, which updates the agent document, and the mirror follows.
+
+```ts ! models-provider.ts
+		state,
+		async cycleThinking(context) {
+			const levels = readThinkingLevels();
+			const current = agent.value?.thinkingLevel ?? "off";
+			// !mark
+			const next = levels[(levels.indexOf(current) + 1) % levels.length] ?? "off";
+			await conversation.configure({ thinkingLevel: next }, context);
+		},
+		// ...
+		async selectThinking(level, context) {
+			const levels = readThinkingLevels();
+			// !mark(1:3)
+			if (!levels.includes(level)) {
+				throw new Error(`Thinking level ${level} is unavailable; choose one of: ${levels.join(", ")}`);
+			}
+			await conversation.configure({ thinkingLevel: level }, context);
+		},
+```
+
+## !!steps Refreshing the catalog
+
+`refresh` first publishes a status of refreshing, then asks the registry to refresh with the context's abort signal. Errors are collected into a plain object of id to message.
+
+After reading the new catalog it publishes in one change: the new catalog and either `done` or a `warning` with the errors. Providers that fail do not make the whole refresh throw.
+
+```ts ! models-provider.ts
+		async refresh(context) {
+			state.change(context, (draft) => {
+				draft.refresh = { status: "refreshing" };
+			});
+			// !mark
+			const refresh = modelRuntime?.refresh({ signal: context.abortSignal });
+			const errors =
+				refresh === undefined
+					? {}
+					: Object.fromEntries([...(await refresh).errors].map(([id, error]) => [id, error.message]));
+			const catalog = readCatalog();
+			state.change(context, (draft) => {
+				draft.catalog = catalog;
+				// !mark
+				draft.refresh = Object.keys(errors).length === 0 ? { status: "done" } : { status: "warning", errors };
+			});
+		},
+```
+
+## !!steps Selecting a model clamps and persists
+
+`select` fails fast for an unknown model. It clamps the current thinking level to what the new model supports, so switching from a reasoning model to a plain one does not leave an invalid level behind.
+
+After configuring the conversation it also stores the choice as the default in settings and flushes, so the next session starts with it.
+
+```ts ! models-provider.ts
+		async select(model, context) {
+			const selected = modelRuntime?.getModel(model.provider, model.modelId);
+			if (selected === undefined) throw new Error(`Unknown model: ${model.provider}/${model.modelId}`);
+			// !mark
+			const thinkingLevel = clampThinkingLevel(selected, agent.value?.thinkingLevel ?? "off");
+			await conversation.configure(
+				{ model: { provider: selected.provider, modelId: selected.id }, thinkingLevel },
+				context,
+			);
+			// !mark(1:2)
+			settingsManager?.setDefaultModelAndProvider(selected.provider, selected.id);
+			await settingsManager?.flush();
+		},
+```
+
+## !!steps Activation and syncing from the document
+
+`activate` publishes the first real catalog and resets refresh to idle. `syncConfiguration` compares the mirrored configuration with the document and returns early when nothing changed, so identical updates do not cause a replicated change.
+
+```ts ! models-provider.ts
+		service,
+		async activate(context) {
+			const catalog = readCatalog();
+			// !mark(1:2)
+			state.change(context, (draft) => {
+				draft.catalog = catalog;
+				draft.refresh = { status: "idle" };
+			});
+		},
+		syncConfiguration(context) {
+			const next = configurationOf(agent.value);
+			const current = state.value.configuration;
+			// !mark(1:6)
+			if (
+				current.model?.provider === next.model?.provider &&
+				current.model?.modelId === next.model?.modelId &&
+				current.thinkingLevel === next.thinkingLevel
+			) {
+				return;
+			}
+			state.change(context, (draft) => {
+				draft.configuration = next;
+			});
+		},
+	};
+}
+```
+
+## !!steps The facet that owns the document
+
+`createModelsServiceFacet` acquires the agent document first and throws if the conversation has none. Inside `setup` it registers disposal of the document, provides the service, and on activation subscribes to document changes.
+
+The subscription is created in `onActivate` and not in `setup`, after the first catalog is published, so the mirror cannot receive an update before it has initial state. The activation itself runs under the background context.
+
+```ts ! models-provider.ts
+export async function createModelsServiceFacet(options: {
+	readonly harness: Harness;
+	readonly conversation: Conversation;
+	readonly modelRuntime: ModelRuntime | undefined;
+	readonly settingsManager?: SettingsManager;
+	readonly context: Context;
+}): Promise<Facet> {
+	const agent = await options.harness.documentState(AgentDoc, options.conversation.id, options.context);
+	if (agent === undefined) throw new Error(`Conversation ${options.conversation.id} has no agent document`);
+	return defineFacet({
+		id: "@pi/models",
+		setup(env) {
+			// !mark
+			env.own(() => agent.dispose());
+			const runtime = createModelsService(
+				options.conversation,
+				agent,
+				options.modelRuntime,
+				options.settingsManager,
+				env.replicatedState,
+			);
+			// !mark
+			env.provide(Models, runtime.service);
+			// !mark(1:4)
+			env.onActivate(async () => {
+				await runtime.activate(BACKGROUND_CONTEXT);
+				env.own(agent.subscribe((_value, context) => runtime.syncConfiguration(context)));
+			});
+		},
+	});
+}
+```
+
+</Scrollycoding>
+
+The facet is installed in [worker.ts](/docs/src/experimental/services/worker.ts) with the session's model runtime and settings manager. The `includesModel` helper at the bottom is only used by the catalog reader.

@@ -1,0 +1,44 @@
+---
+title: "transcript.ts"
+description: "The Transcript service contract: a replicated view of the root conversation (experimental)"
+source: "src/experimental/services/transcript.ts"
+full: true
+---
+
+The smallest service in the folder. It exposes the root conversation's durable view as replicated state, so any attached client can render the transcript and follow it live.
+
+The state type `ConversationView` comes from the pi-durable package. This file only re-exposes it as a chord service. The provider is [transcript-provider.ts](/docs/src/experimental/services/transcript-provider.ts).
+
+<Scrollycoding>
+
+## !!steps One read-only state property
+
+The interface has a single `state` and no methods. The doc comment lists what the view contains: active entries plus the live, inbox, agent and usage documents. Writing to a conversation happens through other services, for example the agent controller in [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts).
+
+```ts ! transcript.ts
+import { defineService, type ReplicatedState } from "@earendil-works/chord";
+import type { ConversationView } from "@earendil-works/pi-durable";
+
+/** The root conversation's durable view: active entries and its live, inbox, agent, and usage documents. */
+// !mark(1:3)
+export interface Transcript {
+	readonly state: ReplicatedState<ConversationView>;
+}
+
+```
+
+## !!steps Registered under pi.transcript
+
+The token is created with `defineService` and named `pi.transcript`. As with the other services here, the type and the token share the identifier `Transcript`.
+
+```ts ! transcript.ts
+import { defineService, type ReplicatedState } from "@earendil-works/chord";
+import type { ConversationView } from "@earendil-works/pi-durable";
+// ...
+// !mark
+export const Transcript = defineService<Transcript>("pi.transcript");
+```
+
+</Scrollycoding>
+
+The session worker in [worker.ts](/docs/src/experimental/services/worker.ts) installs the provider, which gives every attached client the same view of the conversation.

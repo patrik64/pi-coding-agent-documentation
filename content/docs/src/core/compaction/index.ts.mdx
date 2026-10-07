@@ -1,0 +1,45 @@
+---
+title: "index.ts"
+description: "Barrel file that re-exports the compaction and branch-summarization modules as one import surface"
+source: "src/core/compaction/index.ts"
+full: true
+---
+
+This barrel gives the rest of the codebase a single import path for everything related to shrinking a conversation: deciding when to compact, summarizing a branch, and the helpers both share. It contains no logic of its own.
+
+Consumers such as [agent-session.ts](/docs/src/core/agent-session.ts) import from the folder instead of reaching into each module.
+
+<Scrollycoding>
+
+## !!steps Module doc comment
+
+The only prose in the file is a one-line description. It names the two jobs the folder covers, compaction and summarization.
+
+```ts ! index.ts
+/**
+ * Compaction and summarization utilities.
+ */
+```
+
+## !!steps Branch summarization export
+
+Everything exported by [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts) is forwarded. That is the code used when the user navigates to another branch of the session tree and the abandoned branch needs a summary.
+
+```ts ! index.ts
+// ...
+export * from "./branch-summarization.ts";
+```
+
+## !!steps Compaction and utils exports
+
+[compaction.ts](/docs/src/core/compaction/compaction.ts) holds the main compaction logic, and [utils.ts](/docs/src/core/compaction/utils.ts) holds file-operation tracking and conversation serialization used by both. Because `export *` is used for all three, a name collision between modules would be a compile error rather than a silent override.
+
+```ts ! index.ts
+// ...
+export * from "./compaction.ts";
+export * from "./utils.ts";
+```
+
+</Scrollycoding>
+
+The imports use explicit `.ts` extensions, matching the rest of the package. Compare the equivalent barrel for the HTML exporter in [index.ts](/docs/src/core/export-html/index.ts), which by contrast contains real logic.

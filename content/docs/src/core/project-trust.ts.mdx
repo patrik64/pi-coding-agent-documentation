@@ -1,0 +1,149 @@
+---
+title: "project-trust.ts"
+description: "Decides whether the current project folder is trusted, by consulting overrides, extensions, stored decisions, settings, and finally the user"
+source: "src/core/project-trust.ts"
+full: true
+---
+
+A project directory can carry its own settings, resources, packages and extensions, which means opening an untrusted folder could execute code. This file contains the single decision function, `resolveProjectTrusted`, that answers yes or no.
+
+The decision is a priority chain. Persistence and the option list live in [trust-manager.ts](/docs/src/core/trust-manager.ts), the default policy comes from [settings-manager.ts](/docs/src/core/settings-manager.ts), and the CLI front end that calls this is [project-trust.ts](/docs/src/cli/project-trust.ts).
+
+<Scrollycoding>
+
+## !!steps Inputs and the prompt text
+
+The options carry the working directory, the trust store, an optional hard override (from a CLI flag), the configured default policy, already loaded extensions, and a context for UI interaction.
+
+The prompt text spells out what trust grants: loading project settings and resources, installing missing project packages, and running project extensions.
+
+```ts ! project-trust.ts
+export type AppMode = "interactive" | "print" | "json" | "rpc";
+
+export interface ResolveProjectTrustedOptions {
+	cwd: string;
+	trustStore: ProjectTrustStore;
+	trustOverride?: boolean;
+	defaultProjectTrust?: DefaultProjectTrust;
+	extensionsResult?: LoadExtensionsResult;
+	projectTrustContext: ProjectTrustContext;
+	onExtensionError?: (message: string) => void;
+}
+
+function formatProjectTrustPrompt(cwd: string): string {
+// !mark
+	return `Trust project folder?\n${cwd}\n\nThis allows ${APP_NAME} to load ${CONFIG_DIR_NAME} settings and resources, install missing project packages, and execute project extensions.`;
+}
+```
+
+## !!steps Asking the user
+
+The options come from `getProjectTrustOptions` with session-only choices included. The UI shows labels only, so the chosen option is found by matching the label string back to the option. If the user cancels, the result is undefined.
+
+Option objects carry `updates` describing what to persist, and `setMany` applies them in one write.
+
+```ts ! project-trust.ts
+async function selectProjectTrustOption(
+	cwd: string,
+	ctx: ProjectTrustContext,
+): Promise<ProjectTrustOption | undefined> {
+// !mark
+	const options = getProjectTrustOptions(cwd, { includeSessionOnly: true });
+	const selected = await ctx.ui.select(
+		formatProjectTrustPrompt(cwd),
+		options.map((option) => option.label),
+	);
+	return options.find((option) => option.label === selected);
+}
+
+function saveProjectTrustPromptResult(trustStore: ProjectTrustStore, result: ProjectTrustOption): void {
+	if (result.updates.length > 0) {
+		trustStore.setMany(result.updates);
+	}
+}
+```
+
+## !!steps Short circuits first
+
+An explicit override wins over everything. Next, a folder with nothing that needs trust (no project settings, extensions or packages) is trusted without asking. That check is what keeps ordinary directories from ever prompting.
+
+```ts ! project-trust.ts
+export async function resolveProjectTrusted(options: ResolveProjectTrustedOptions): Promise<boolean> {
+// !mark(1:2)
+	if (options.trustOverride !== undefined) {
+		return options.trustOverride;
+	}
+// !mark(1:2)
+	if (!hasTrustRequiringProjectResources(options.cwd)) {
+		return true;
+	}
+```
+
+## !!steps Extensions can answer for the user
+
+If extensions are loaded, they get a `project_trust` event first, through `emitProjectTrustEvent` in [runner.ts](/docs/src/core/extensions/runner.ts). Extension errors are reported through `onExtensionError` but do not stop the chain.
+
+If a handler returns a result, it decides. Only the string `yes` means trusted, and `remember: true` writes the decision to the store. This lets enterprise policy extensions auto-answer.
+
+```ts ! project-trust.ts
+	if (options.extensionsResult) {
+// !mark(1:5)
+		const { result, errors } = await emitProjectTrustEvent(
+			options.extensionsResult,
+			{ type: "project_trust", cwd: options.cwd },
+			options.projectTrustContext,
+		);
+		for (const error of errors) {
+			options.onExtensionError?.(`Extension "${error.extensionPath}" project_trust error: ${error.error}`);
+		}
+		if (result) {
+			const trusted = result.trusted === "yes";
+// !mark(1:3)
+			if (result.remember === true) {
+				options.trustStore.set(options.cwd, trusted);
+			}
+			return trusted;
+		}
+	}
+```
+
+## !!steps Stored decision, default policy, then prompt
+
+A stored decision, trusted or not, ends the chain. Otherwise `defaultProjectTrust` applies: always and never decide immediately, and ask falls through.
+
+Without a UI (print or RPC modes), ask means no. With a UI, the user chooses, the result is saved, and cancelling yields false. Every unresolved path fails closed.
+
+```ts ! project-trust.ts
+// !mark(1:4)
+	const decision = options.trustStore.get(options.cwd);
+	if (decision !== null) {
+		return decision;
+	}
+
+// !mark(1:8)
+	switch (options.defaultProjectTrust ?? "ask") {
+		case "always":
+			return true;
+		case "never":
+			return false;
+		case "ask":
+			break;
+	}
+
+// !mark(1:3)
+	if (!options.projectTrustContext.hasUI) {
+		return false;
+	}
+
+	const selected = await selectProjectTrustOption(options.cwd, options.projectTrustContext);
+	if (selected !== undefined) {
+		saveProjectTrustPromptResult(options.trustStore, selected);
+		return selected.trusted;
+	}
+	return false;
+}
+```
+
+</Scrollycoding>
+
+The order is: override, nothing-to-trust, extension verdict, stored decision, default policy, interactive prompt. The function is async only because of extensions and the UI. The `AppMode` type exported at the top is not used in this file.

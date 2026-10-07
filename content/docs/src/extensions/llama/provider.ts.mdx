@@ -1,0 +1,336 @@
+---
+title: "provider.ts"
+description: "Builds the llama.cpp provider: turns a llama-server model catalog into chat and classifier models, with URL-based auth and cached refresh."
+source: "src/extensions/llama/provider.ts"
+full: true
+---
+
+This file adapts a local llama.cpp server to the provider interface of pi-ai. A llama.cpp server has no fixed model list, so the provider is a small controller: it holds the current catalog in memory and exposes it through `getModels` and `getAllModels`.
+
+Two kinds of models come out of one catalog. Normal models become `openai-completions` chat models. Decision models, which cannot generate text, and any other model usable for classification become classifier models. The catalog itself is fetched by the `LlamaClient` in [client.ts](/docs/src/extensions/llama/client.ts), and the extension entry point [index.ts](/docs/src/extensions/llama/index.ts) wires the provider into the session and the `/llama` UI in [ui.ts](/docs/src/extensions/llama/ui.ts).
+
+<Scrollycoding>
+
+## !!steps Finding the server URL
+
+The server URL is the whole "credential" for this provider. It is stored in the `env` of an API key credential as `LLAMA_BASE_URL`, and `resolveServerUrl` prefers it over the process environment variable of the same name.
+
+Everything goes through `normalizeLlamaServerUrl` from [client.ts](/docs/src/extensions/llama/client.ts), so a stored value and an environment value end up in the same shape. An empty or whitespace-only value counts as not configured.
+
+```ts ! provider.ts
+export const LLAMA_PROVIDER_ID = "llama.cpp";
+export const DEFAULT_LLAMA_SERVER_URL = "http://127.0.0.1:8080";
+function credentialServerUrl(credential: ApiKeyCredential | undefined): string | undefined {
+	const value = credential?.env?.LLAMA_BASE_URL;
+	// !mark
+	return typeof value === "string" && value.trim() ? normalizeLlamaServerUrl(value) : undefined;
+}
+
+async function resolveServerUrl(
+	ctx: AuthContext,
+	credential: ApiKeyCredential | undefined,
+): Promise<string | undefined> {
+	// !mark
+	const configured = credentialServerUrl(credential) ?? (await ctx.env("LLAMA_BASE_URL"))?.trim();
+	return configured ? normalizeLlamaServerUrl(configured) : undefined;
+}
+```
+
+## !!steps Which models can be selected
+
+llama.cpp can run in router mode where many models are listed but only some are in memory. A model is selectable when it is `loaded`, or `sleeping` (the server wakes it on the next request). An `unloaded` model counts only if it is a preset, has not failed to load, and the router reports autoload.
+
+`routerAutoloadEnabled` asks the server for its props, but only when the catalog actually contains an unloaded preset. Any error from the props call means "no autoload", so a failing probe never blocks the model list.
+
+```ts ! provider.ts
+function modelIsSelectable(model: LlamaModelInfo, routerAutoload: boolean): boolean {
+	if (model.status.value === "loaded") return true;
+	// llama.cpp reports idle-slept models as "sleeping"; requests wake them automatically.
+	if (model.status.value === "sleeping") return true;
+	// Unloaded presets are routable only when llama.cpp router autoload can load them on first use.
+	// !mark
+	return routerAutoload && model.status.value === "unloaded" && !model.status.failed && model.source === "preset";
+}
+
+async function routerAutoloadEnabled(
+	client: LlamaClient,
+	catalog: readonly LlamaModelInfo[],
+	signal: AbortSignal,
+): Promise<boolean> {
+	// !mark
+	if (!catalog.some((model) => model.status.value === "unloaded" && model.source === "preset")) return false;
+	try {
+		return (await client.props({ signal })).models_autoload === true;
+	} catch {
+		return false;
+	}
+}
+```
+
+## !!steps Context window fallbacks
+
+The context window is resolved from the most trustworthy source down: the runtime `n_ctx` the server reports, then a `--ctx-size` style flag found in the launch arguments of the model, then the value cached from a previous refresh, then the training context `n_ctx_train`, and finally 128000.
+
+The cached value matters because an unloaded model has no runtime metadata, so without the cache its window would jump back to the training size after a restart.
+
+```ts ! provider.ts
+function configuredContextWindow(model: LlamaModelInfo): number | undefined {
+	const args = model.status.args ?? [];
+	for (let index = 0; index < args.length - 1; index++) {
+		const flag = args[index];
+		if (flag !== "--ctx-size" && flag !== "-c" && flag !== "-ctx") continue;
+		const contextWindow = Number(args[index + 1]);
+		if (Number.isSafeInteger(contextWindow) && contextWindow > 0) return contextWindow;
+	}
+	return undefined;
+}
+
+function contextWindowOf(model: LlamaModelInfo, cachedContextWindow?: number): number {
+	const runtimeContextWindow = model.meta?.n_ctx;
+	// !mark(1:5)
+	if (runtimeContextWindow && runtimeContextWindow > 0) return runtimeContextWindow;
+	const configuredContext = configuredContextWindow(model);
+	if (configuredContext) return configuredContext;
+	if (cachedContextWindow && cachedContextWindow > 0) return cachedContextWindow;
+	const trainingContextWindow = model.meta?.n_ctx_train;
+	return trainingContextWindow && trainingContextWindow > 0 ? trainingContextWindow : 128000;
+}
+```
+
+## !!steps Decision models and classifiers
+
+A decision model advertises `decisions` among its output modalities. Such a model is shown only as a classifier. A model that lists both `decisions` and `text` appears in both lists.
+
+Older servers omit `architecture` or report only text, so everything they list is treated as a chat model. `toPiClassifierModel` picks the API: decision models use `typesafe-system-one` against the inference URL, other models fall back to `llama-cpp-classify` against the bare server URL.
+
+```ts ! provider.ts
+function isDecisionModel(model: LlamaModelInfo): boolean {
+	return model.architecture?.output_modalities?.includes("decisions") === true;
+}
+
+/** Decision-only models cannot generate text and are not listed for chat. */
+function isChatModel(model: LlamaModelInfo): boolean {
+	return !isDecisionModel(model) || model.architecture?.output_modalities?.includes("text") === true;
+}
+
+// ...
+): ClassifierModel<LlamaClassifierApi> {
+	const decision = isDecisionModel(model);
+	return {
+		type: "classifier",
+		id: model.id,
+		name: model.id,
+		// !mark(1:3)
+		api: decision ? "typesafe-system-one" : "llama-cpp-classify",
+		provider: LLAMA_PROVIDER_ID,
+		baseUrl: decision ? llamaInferenceUrl(serverUrl) : serverUrl,
+```
+
+## !!steps Describing a chat model
+
+`toPiModel` produces an OpenAI-compatible model. Costs are zero, images are accepted when the server lists image input, and `maxTokens` equals the context window.
+
+Reasoning support is detected from the chat template: if the template mentions `enable_thinking`, the model is marked as reasoning, only the `off` and `medium` levels are mapped, and the `qwen-chat-template` thinking format is used. The `compat` block switches off OpenAI-only features (store, developer role, strict mode) that llama-server does not implement.
+
+```ts ! provider.ts
+	const contextWindow = contextWindowOf(model, cachedContextWindow);
+	// !mark
+	const reasoning = props?.chat_template?.includes("enable_thinking") === true;
+	return {
+		id: model.id,
+		name: model.id,
+		api: "openai-completions",
+		provider: LLAMA_PROVIDER_ID,
+		baseUrl: llamaInferenceUrl(serverUrl),
+		reasoning,
+		...(reasoning && {
+			thinkingLevelMap: { off: "off", minimal: null, low: null, medium: "medium", high: null, xhigh: null },
+		}),
+		input: model.architecture?.input_modalities?.includes("image") ? ["text", "image"] : ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow,
+		maxTokens: contextWindow,
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			// !mark
+			supportsReasoningEffort: false,
+```
+
+## !!steps The controller and setCatalog
+
+`createLlamaProvider` returns a controller rather than a bare provider. The two arrays `models` and `classifiers` are closed-over state, and `setCatalog` replaces them from a fresh catalog. The extension calls it after the UI loads or unloads a model, so the model list updates without a full refresh.
+
+The two classifier backends are created once, lazily imported from pi-ai, and reused for every call.
+
+```ts ! provider.ts
+export interface LlamaProviderController {
+	provider: Provider<"openai-completions">;
+	setCatalog(models: readonly LlamaModelInfo[], serverUrl: string, options?: { routerAutoload?: boolean }): void;
+}
+
+export function createLlamaProvider(): LlamaProviderController {
+	let models: readonly Model<"openai-completions">[] = [];
+	let classifiers: readonly ClassifierModel<LlamaClassifierApi>[] = [];
+	const fallbackClassifier = llamaCppClassifyApi();
+	const decisionClassifier = typesafeSystemOneApi();
+
+	const setCatalog = (
+		catalog: readonly LlamaModelInfo[],
+		serverUrl: string,
+		options: { routerAutoload?: boolean } = {},
+	): void => {
+		// !mark(1:3)
+		const selectable = catalog.filter((model) => modelIsSelectable(model, options.routerAutoload === true));
+		models = selectable.filter(isChatModel).map((model) => toPiModel(model, serverUrl));
+		classifiers = selectable.map((model) => toPiClassifierModel(model, serverUrl));
+	};
+```
+
+## !!steps Login flow
+
+Login prompts for a server URL (defaulting to `LLAMA_BASE_URL` or the local default) and an optional API key. It then calls `list` on the server, so a wrong URL or key fails during login instead of later.
+
+The resulting credential stores the URL in `env` and the key (possibly undefined) in `key`. The prompt types and the interaction object come from pi-ai, not from [extensions/types.ts](/docs/src/core/extensions/types.ts).
+
+```ts ! provider.ts
+				login: async (interaction): Promise<ApiKeyCredential> => {
+					const enteredUrl = await interaction.prompt({
+						type: "text",
+						message: "llama.cpp server URL",
+						placeholder: process.env.LLAMA_BASE_URL ?? DEFAULT_LLAMA_SERVER_URL,
+					});
+					const serverUrl = normalizeLlamaServerUrl(
+						enteredUrl.trim() || process.env.LLAMA_BASE_URL || DEFAULT_LLAMA_SERVER_URL,
+					);
+					// !mark
+					const apiKey = (
+						await interaction.prompt({
+							type: "secret",
+							message: "API key (optional)",
+						})
+					).trim();
+					// !mark
+					await new LlamaClient(serverUrl, apiKey || undefined).list({ signal: interaction.signal });
+					return {
+						type: "api_key",
+						key: apiKey || undefined,
+						env: { LLAMA_BASE_URL: serverUrl },
+					};
+				},
+```
+
+## !!steps Check and resolve
+
+`check` only reports whether a server URL exists and where it came from. `resolve` produces the real auth: the key comes from the credential, then `LLAMA_API_KEY`, then the placeholder `"local"`, because the OpenAI client needs some non-empty key even when the server has none.
+
+The inference base URL is derived from the server URL, and the URL is passed back in `env` so later code sees the normalized value.
+
+```ts ! provider.ts
+				check: async ({ ctx, credential }) => {
+					const serverUrl = await resolveServerUrl(ctx, credential);
+					return serverUrl
+						? { type: "api_key", source: credential ? "stored credential" : "LLAMA_BASE_URL" }
+						: undefined;
+				},
+				resolve: async ({ ctx, credential }): Promise<AuthResult | undefined> => {
+					const serverUrl = await resolveServerUrl(ctx, credential);
+					if (!serverUrl) return undefined;
+					// !mark
+					const apiKey = credential?.key ?? (await ctx.env("LLAMA_API_KEY")) ?? "local";
+					return {
+						auth: { apiKey, baseUrl: llamaInferenceUrl(serverUrl) },
+						env: { ...credential?.env, LLAMA_BASE_URL: serverUrl },
+						source: credential ? "stored credential" : "LLAMA_BASE_URL",
+					};
+				},
+```
+
+## !!steps Restoring the cache first
+
+`refreshModels` works in two phases. First it restores previously persisted models for this provider and publishes them immediately, so the model list is usable offline and at startup. It also records each stored model's context window for later.
+
+If `publish` returns false, the refresh was superseded and the function stops.
+
+```ts ! provider.ts
+		refreshModels: async (context: RefreshModelsContext): Promise<void> => {
+			const cachedContextWindows = new Map<string, number>();
+			if (context.stored) {
+				const stored = context.stored.models.filter((model) => model.provider === LLAMA_PROVIDER_ID);
+				const restored = stored.filter(
+					(model): model is Model<"openai-completions"> =>
+						isModelType(model, "chat") && model.api === "openai-completions",
+				);
+				const restoredClassifiers = stored.filter(isLlamaClassifierModel);
+				for (const model of [...restored, ...restoredClassifiers]) {
+					cachedContextWindows.set(model.id, model.contextWindow);
+				}
+				// !mark(1:7)
+				if (
+					!(await context.publish({
+						update: () => {
+							models = restored;
+							classifiers = restoredClassifiers;
+						},
+					}))
+				) {
+					return;
+				}
+			}
+```
+
+## !!steps Refreshing from the network
+
+The network phase runs only when allowed, not aborted, and the credential is an API key with a server URL. It lists the catalog, probes router autoload, and re-checks the abort signal after each await.
+
+Only `loaded` models are asked for props, since querying an unloaded or sleeping model could load or wake it. Those models therefore get no thinking support until a later refresh sees them loaded. The final `publish` both persists the models with a timestamp and swaps the in-memory arrays.
+
+```ts ! provider.ts
+			if (!context.allowNetwork || context.signal.aborted || context.credential?.type !== "api_key") return;
+			const serverUrl = credentialServerUrl(context.credential);
+			if (!serverUrl) return;
+			const client = new LlamaClient(serverUrl, context.credential.key);
+			const catalog = await client.list({ signal: context.signal });
+			if (context.signal.aborted) return;
+			const routerAutoload = await routerAutoloadEnabled(client, catalog, context.signal);
+			if (context.signal.aborted) return;
+			const selectable = catalog.filter((model) => modelIsSelectable(model, routerAutoload));
+			// ...
+			const refreshed = await Promise.all(
+				selectable.filter(isChatModel).map(async (model) => {
+					const cachedContextWindow = cachedContextWindows.get(model.id);
+					// !mark(1:3)
+					if (model.status.value !== "loaded") return toPiModel(model, serverUrl, undefined, cachedContextWindow);
+					const props = await client.props({ model: model.id, signal: context.signal });
+					return toPiModel(model, serverUrl, props, cachedContextWindow);
+				}),
+			);
+```
+
+## !!steps Streaming and classification
+
+Chat requests are delegated to the generic `stream` and `streamSimple` from pi-ai's compat layer. Classification picks the backend from the model's own `api` field, which is why the classifier model records it.
+
+The function returns both the provider and `setCatalog`; the provider's `baseUrl` defaults to the local server until a credential supplies another.
+
+```ts ! provider.ts
+		stream: (model, context, options) => stream(model, context, options as ProviderStreamOptions | undefined),
+		streamSimple: (model, context, options) => streamSimple(model, context, options),
+		// !mark(1:6)
+		classify: (model, context, options) =>
+			(model.api === "typesafe-system-one" ? decisionClassifier : fallbackClassifier).classify(
+				model,
+				context,
+				options,
+			),
+	};
+
+	return { provider, setCatalog };
+}
+```
+
+</Scrollycoding>
+
+The pieces form a pipeline: the catalog from [client.ts](/docs/src/extensions/llama/client.ts) is filtered by `modelIsSelectable`, split into chat and classifier models, and cached through `publish`. [index.ts](/docs/src/extensions/llama/index.ts) owns the controller, and [huggingface.ts](/docs/src/extensions/llama/huggingface.ts) supplies the download search that the UI uses.
+
+Structurally the file is a set of pure helpers followed by one factory with mutable closure state. Note that `isLlamaClassifierModel` accepts only the two llama classifier APIs, so unrelated stored models are never restored into the llama lists.

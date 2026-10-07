@@ -1,0 +1,71 @@
+---
+title: "pi-manifest.ts"
+description: "Reads and validates the pi field of a package.json, listing the extensions, skills, prompts and themes a package contributes"
+source: "src/core/pi-manifest.ts"
+full: true
+---
+
+Pi packages advertise their resources in a `pi` object inside package.json. This tiny module reads that object and returns a normalized manifest, or null if the package does not declare one.
+
+It is used when installed packages are scanned for resources, notably by [package-manager.ts](/docs/src/core/package-manager.ts), and by the extension [loader.ts](/docs/src/core/extensions/loader.ts) when it discovers entry points. The reading is intentionally forgiving: malformed manifests are treated as absent rather than as errors.
+
+<Scrollycoding>
+
+## !!steps The manifest shape
+
+A manifest is up to four optional string arrays. The list of field names is a const tuple so the loop below stays type-safe, and `isObject` excludes arrays and null, since `typeof` alone would accept both.
+
+`stripBom` comes from [text.ts](/docs/src/utils/text.ts); package.json files saved by some Windows editors start with a byte order mark that `JSON.parse` rejects.
+
+```ts ! pi-manifest.ts
+import { readFileSync } from "node:fs";
+import { stripBom } from "../utils/text.ts";
+
+// !mark(1:5)
+export interface PiManifest {
+	extensions?: string[];
+	skills?: string[];
+	prompts?: string[];
+	themes?: string[];
+}
+
+const RESOURCE_FIELDS = ["extensions", "skills", "prompts", "themes"] as const;
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+```
+
+## !!steps Reading and filtering
+
+Any failure, whether a missing file, bad JSON or a non-object root, returns null. A `pi` key that is not an object also returns null.
+
+Each field is kept only if it is an array of strings. A field with a mixed array is dropped entirely, not filtered, and no diagnostic is produced. A package with `pi: {}` returns an empty manifest, which is distinct from null.
+
+```ts ! pi-manifest.ts
+export function readPiManifest(packageJsonPath: string): PiManifest | null {
+	try {
+		const pkg: unknown = JSON.parse(stripBom(readFileSync(packageJsonPath, "utf-8")));
+		if (!isObject(pkg) || !isObject(pkg.pi)) {
+			return null;
+		}
+
+		const manifest: PiManifest = {};
+		for (const field of RESOURCE_FIELDS) {
+			const entries = pkg.pi[field];
+// !mark(1:3)
+			if (Array.isArray(entries) && entries.every((entry) => typeof entry === "string")) {
+				manifest[field] = entries;
+			}
+		}
+		return manifest;
+// !mark(1:2)
+	} catch {
+		return null;
+	}
+}
+```
+
+</Scrollycoding>
+
+Note that the function reports nothing about why a manifest was rejected, so a typo like a number inside `skills` silently yields no skills. Callers get uniform behavior at the cost of discoverability.

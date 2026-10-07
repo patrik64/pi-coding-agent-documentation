@@ -1,0 +1,293 @@
+---
+title: "model-runtime.ts"
+description: "The configured pi-ai Models collection: provider composition, availability snapshots, request-time auth, credential operations and virtual-model routing"
+source: "src/core/model-runtime.ts"
+full: true
+---
+
+`ModelRuntime` is the object the rest of the coding agent asks about models. It wraps a pi-ai `Models` collection and layers pi-specific behavior on top: built-in providers from the bundled catalog, overlays from `models.json`, providers registered by extensions, virtual models, and credentials that may come from a file, an environment variable or a runtime override.
+
+The class keeps two kinds of answers. Synchronous getters (`getModels`, `hasConfiguredAuth`, `getAvailableSnapshot`) read a cached snapshot, so UI code can call them freely. The async methods refresh that snapshot or perform a real request. Most of the complexity is keeping the two consistent while credential changes, catalog refreshes and extension registrations interleave.
+
+<Scrollycoding>
+
+## !!steps Creation options and the snapshot
+
+The runtime stores one `ModelRuntimeSnapshot`: all models, the available ones, which providers have configured auth, which have a stored credential, and the per-provider auth check result. Everything synchronous reads from it.
+
+`CreateModelRuntimeOptions` shows the main dependencies: a `CredentialStore` (default [auth-storage.ts](/docs/src/core/auth-storage.ts)), the `models.json` path, a models store, and network flags. Network refresh is off unless `allowModelNetwork` is true.
+
+```ts ! model-runtime.ts
+interface ModelRuntimeSnapshot {
+	all: readonly Model<Api>[];
+	available: readonly Model<Api>[];
+	configuredProviders: ReadonlySet<string>;
+	storedProviders: ReadonlySet<string>;
+	auth: ReadonlyMap<string, AuthCheck | undefined>;
+}
+
+export interface CreateModelRuntimeOptions {
+	/** Credential storage. Defaults to the file at authPath. */
+	credentials?: CredentialStore;
+	authPath?: string;
+	modelsPath?: string | null;
+	modelsStore?: ModelsStore;
+	modelsStorePath?: string;
+	/** Allow create() to refresh model catalogs over the network. Defaults to false. */
+	allowModelNetwork?: boolean;
+```
+
+## !!steps Building the runtime in create
+
+`create` is the only public constructor. It wraps credentials in [runtime-credentials.ts](/docs/src/core/runtime-credentials.ts), loads [model-config.ts](/docs/src/core/model-config.ts) from `models.json`, picks a file-backed or in-memory models store from [models-store.ts](/docs/src/core/models-store.ts), and decorates every built-in provider (except radius) with [remote-catalog-provider.ts](/docs/src/core/remote-catalog-provider.ts).
+
+Network access is further gated by `PI_OFFLINE`: it is allowed only when that variable is undefined. A refresh timeout is built by combining the caller's signal with a timer-driven controller via `AbortSignal.any`.
+
+```ts ! model-runtime.ts
+		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
+		const providers = builtinProviderCatalog
+			.builtinProviders()
+			.map((provider) =>
+				provider.id === "radius"
+					? provider
+					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
+			);
+		const runtime = new ModelRuntime(
+			credentials,
+			config,
+			modelsPath,
+			modelsStore,
+			providers,
+			process.env.PI_OFFLINE === undefined,
+		);
+		runtime.configureRadiusProviders();
+		runtime.rebuildProviders();
+```
+
+## !!steps Composing providers from layers
+
+Providers come from five sources, merged in `providerIds`: built-ins, native extension providers, `models.json` providers, declarative extension providers and virtual-model providers. `composeProvider` picks a base (native extension first, then built-in) and, only if there is a `models.json` entry or extension config, calls `composeModelProvider` from [provider-composer.ts](/docs/src/core/provider-composer.ts).
+
+With no overlay the built-in is returned untouched so its auth and stream behavior stay exact. A composition error does not throw: it is recorded in `compositionErrors` and the base provider is used, so one bad config entry cannot take the provider offline.
+
+```ts ! model-runtime.ts
+	private composeProvider(providerId: string): Provider | undefined {
+		const base = this.nativeExtensionProviders.get(providerId) ?? this.builtins.get(providerId);
+		const extension = this.extensionProviders.get(providerId);
+		if (!this.config.getProvider(providerId) && !extension) {
+			// No overlays: use the builtin untouched so its auth/login/stream behavior is exact.
+			this.compositionErrors.delete(providerId);
+			return base;
+		}
+		try {
+			const provider = composeModelProvider(providerId, base, this.config, extension);
+			this.compositionErrors.delete(providerId);
+			return provider;
+		} catch (error) {
+			this.compositionErrors.set(providerId, error instanceof Error ? error.message : String(error));
+			return base;
+		}
+	}
+```
+
+## !!steps Virtual models wrap a composed provider
+
+`recomposeProvider` installs the result into the underlying `models` collection. If the provider has virtual models, they are layered over it with `withVirtualModels` from [virtual-models.ts](/docs/src/core/virtual-models.ts). If nothing defines the provider any more, it is deleted.
+
+`rebuildProviders` clears everything and recomposes all ids, used after `models.json` reloads. Single-provider changes call `recomposeProvider` directly, which is cheaper.
+
+```ts ! model-runtime.ts
+	private recomposeProvider(providerId: string): Provider | undefined {
+		const provider = this.composeProvider(providerId);
+		const virtualModels = [...(this.virtualModels.get(providerId)?.values() ?? [])].map((entry) => entry.model);
+		if (virtualModels.length > 0) this.models.setProvider(withVirtualModels(providerId, provider, virtualModels));
+		else if (provider) this.models.setProvider(provider);
+		else this.models.deleteProvider(providerId);
+		return provider;
+	}
+```
+
+## !!steps Availability refresh with sequence numbers
+
+Checking which providers have working credentials is async and can overlap with other changes, so results are guarded by counters. `queueAvailabilityRefresh` bumps `availabilityRefreshSeq`; when the slow pass finishes, it discards its result if the counter moved on.
+
+A full pass also bumps every per-provider counter, so a stale per-provider result cannot overwrite it. Errors are tracked with a separate sequence so only the latest operation can set or clear `availabilityError`.
+
+```ts ! model-runtime.ts
+	private async runAvailabilityRefresh(seq: number, errorSeq: number, signal: AbortSignal): Promise<void> {
+		const providers = this.models.getProviders();
+		const [available, checks, credentials] = await Promise.all([
+			this.models.getAvailable(undefined, { signal }),
+			Promise.all(
+				providers.map(
+					async (provider): Promise<[string, AuthCheck | undefined]> => [
+						provider.id,
+						await this.models.checkAuth(provider.id, { signal }),
+					],
+				),
+			),
+			this.credentials.list({ signal }),
+		]);
+		if (seq !== this.availabilityRefreshSeq) return;
+```
+
+## !!steps Per-provider refresh after a credential change
+
+After a login or logout only one provider changed, so `refreshProviderAvailability` patches the snapshot instead of redoing everything. It first increments the global counter to invalidate any full pass already in flight, then recomputes that one provider's auth, stored-credential flag and available models.
+
+The merge keys models by provider and id with a NUL separator and rebuilds `available` in catalog order, so the list stays stable.
+
+```ts ! model-runtime.ts
+		// Invalidate any full availability pass that started before this credential change.
+		++this.availabilityRefreshSeq;
+		const providerSeq = (this.providerAvailabilitySeq.get(providerId) ?? 0) + 1;
+		this.providerAvailabilitySeq.set(providerId, providerSeq);
+		const errorSeq = ++this.availabilityErrorSeq;
+		try {
+			const [available, auth, credential] = await Promise.all([
+				this.models.getAvailable(providerId, { signal }),
+				this.models.checkAuth(providerId, { signal }),
+				this.credentials.read(providerId, { signal }),
+			]);
+			signal.throwIfAborted();
+			if (this.providerAvailabilitySeq.get(providerId) !== providerSeq) return;
+```
+
+## !!steps Error reporting and auth status
+
+`getError` joins three sources into one string: `models.json` load errors, per-provider composition errors, and the last availability error. This is what [model-registry.ts](/docs/src/core/model-registry.ts) exposes to extensions.
+
+`getProviderAuthStatus` answers where a provider's credentials come from, in priority order: a runtime key, a stored credential, a key configured in `models.json` or an extension, and finally an environment check from the snapshot. The label field carries the source name for display.
+
+```ts ! model-runtime.ts
+	getProviderAuthStatus(providerId: string): AuthStatus {
+		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
+		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
+		const configured = configuredRequestAuthStatus(
+			this.config.getProvider(providerId),
+			this.extensionProviders.get(providerId),
+		);
+		if (configured) return configured;
+		const check = this.snapshot.auth.get(providerId);
+		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
+	}
+```
+
+## !!steps Serialized credential operations
+
+Login, logout and runtime key changes for the same provider are queued through `enqueueCredentialOperation`, a per-provider promise chain. A task starts only after the previous one finishes (its failure ignored), and the caller's promise resolves when its own task is done.
+
+After each change `synchronizeCredentialState` recomposes the provider, refreshes its models without network, and updates availability. If that local synchronization fails, it throws `CredentialSynchronizationError`, which carries the credential: the change itself was already committed, and callers need to know.
+
+```ts ! model-runtime.ts
+	private enqueueCredentialOperation<T>(providerId: string, signal: AbortSignal, task: () => Promise<T>): Promise<T> {
+		const previous = this.credentialOperations.get(providerId) ?? Promise.resolve();
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const operation = (async () => {
+			await previous.catch(() => {});
+			signal.throwIfAborted();
+			markStarted?.();
+			return task();
+		})();
+		const tail = operation.catch(() => {});
+		this.credentialOperations.set(providerId, tail);
+```
+
+## !!steps Preparing a request
+
+Every request path (`stream`, `streamSimple`, `streamDeferred`, `generateImages`, `classify`) goes through `prepareRequest`. It looks up the provider, resolves auth through `getAuth`, and merges headers in a fixed order: auth headers, then caller headers, then an optional `transformHeaders` hook.
+
+A caller-supplied `apiKey` beats the resolved one, and a resolved `baseUrl` is applied by cloning the model. Missing auth throws `ModelsError` with kind `auth`.
+
+```ts ! model-runtime.ts
+		const provider = this.models.getProvider(model.provider);
+		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+		const resolution = await this.getAuth(model, {
+			apiKey: options?.apiKey,
+			env: options?.env,
+			signal: options?.signal,
+		});
+		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+
+		const { transformHeaders, ...rawProviderOptions } = options ?? {};
+		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+```
+
+## !!steps Lazy streams and routed virtual models
+
+Streams are built with `lazyStream`, so a stream object is returned synchronously and auth resolution happens when it is first consumed. Callers like [agent-session.ts](/docs/src/core/agent-session.ts) can therefore treat failures as ordinary stream errors.
+
+For a virtual model, `streamSimple` first calls `resolveModel` to route the request, then recurses with the real model. The output budget is capped to the routed model's limit, and caller credentials are forwarded only when the routed model shares the virtual model's provider, so keys are not sent to the wrong vendor.
+
+```ts ! model-runtime.ts
+		if (isVirtualModel(model)) {
+			// Requests outside the agent loop are routed here. Callers sized them before routing, so
+			// cap the output budget to the routed model.
+			return lazyStream(model, async () => {
+				const route = await this.resolveModel(model, transcript.messages, {
+					reason: "direct",
+					thinkingLevel: options?.reasoning ?? "off",
+					signal: options?.signal,
+				});
+				const { maxTokens: limit } = route.model;
+				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+				// Caller credentials were resolved for the virtual model's provider. Another provider
+				// resolves its own, so they are not sent to the wrong vendor.
+				const { apiKey, headers, env, ...rest } = options ?? {};
+				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+```
+
+## !!steps Registering providers at runtime
+
+Extension registration mutates the maps, recomposes that provider, updates the snapshot and kicks off an offline `refresh`, deliberately not awaited. Because availability checks are async, `markProvisionallyConfigured` marks the provider configured immediately when it already has a stored credential or a configured key, so initial model selection (see [model-resolver.ts](/docs/src/core/model-resolver.ts)) does not miss it.
+
+Re-registering a name merges defined fields over the previous config and keeps the old values for undefined ones. Validation runs first, so a bad registration throws without changing state.
+
+```ts ! model-runtime.ts
+	registerProvider(providerId: string, config: ProviderConfigInput): void {
+		// Validate the incoming registration on its own, like the legacy registry:
+		// a broken re-registration must throw without touching the stored config.
+		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
+		this.nativeExtensionProviders.delete(providerId);
+		// Re-registration merges defined values over the previous registration and
+		// preserves undefined ones, matching the legacy ModelRegistry contract.
+		const previous = this.extensionProviders.get(providerId);
+		const effective: ProviderConfigInput = { ...previous };
+		for (const [key, value] of Object.entries(config)) {
+			if (value !== undefined) (effective as Record<string, unknown>)[key] = value;
+		}
+		this.extensionProviders.set(providerId, effective);
+```
+
+## !!steps Routing a virtual model request
+
+`resolveModel` asks the registered router function which real model and thinking level to use. It passes the latest successful response as `previous` and, on a retry, the failed one.
+
+The result is validated: the target must be a physical catalog model (not another virtual one) whose provider has credentials, and the thinking level is clamped with `clampThinkingLevel` to what that model supports. Any violation throws with a message naming the virtual model and the target.
+
+```ts ! model-runtime.ts
+		const target = this.getPhysicalModel(route.model.provider, route.model.id);
+		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
+		if (!target) throw new Error(`${routed}, which is not a physical model.`);
+		if (!this.hasConfiguredAuth(target.provider)) throw new Error(`${routed}, which has no credentials.`);
+		return { model: target, thinkingLevel: clampThinkingLevel(target, route.thinkingLevel), state: route.state };
+	}
+
+	/** A catalog chat model that is not virtual. */
+	getPhysicalModel(providerId: string, modelId: string): Model<Api> | undefined {
+		const model = this.models.getModel(providerId, modelId);
+		return model && !isVirtualModel(model) ? model : undefined;
+	}
+```
+
+</Scrollycoding>
+
+The class implements the pi-ai `Models` interface, so SDK consumers and the agent loop treat it as a normal models collection. [model-registry.ts](/docs/src/core/model-registry.ts) is the synchronous facade for extensions, [agent-session-services.ts](/docs/src/core/agent-session-services.ts) constructs and shares one runtime per session, and [model-resolver.ts](/docs/src/core/model-resolver.ts) reads its snapshot to choose models.
+
+Structurally the file moves from private state and snapshot bookkeeping, through read-only getters, to request methods, credential operations, and finally registration and virtual routing. Methods that mutate state call `refresh` without awaiting, so tests need to await the refresh explicitly before asserting on availability.

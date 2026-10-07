@@ -1,0 +1,224 @@
+---
+title: "client.ts"
+description: "HTTP client for a llama.cpp router-mode server: model catalog, load, unload, download, SSE events and progress parsing."
+source: "src/extensions/llama/client.ts"
+full: true
+---
+
+llama.cpp's server can run in router mode, where one server process manages several models that can be loaded, unloaded and downloaded on demand. This file is a thin client for that management API. It does not do inference; chat requests go through the provider in [provider.ts](/docs/src/extensions/llama/provider.ts), which uses the `/v1` URL this file computes.
+
+The command layer in [index.ts](/docs/src/extensions/llama/index.ts) and the dialogs in [ui.ts](/docs/src/extensions/llama/ui.ts) drive this client. Its interesting part is `loadAndWait` and `downloadAndWait`, which combine an SSE event stream with catalog polling to report progress.
+
+<Scrollycoding>
+
+## !!steps Model types
+
+`LlamaModelInfo` mirrors an entry of `/models`. The status value has five states, and the status object can carry the launch arguments, a failure flag, an exit code and per-file download progress. `LlamaProgress` is what the client reports to callers: a message, an optional ratio and an optional detail string.
+
+```ts ! client.ts
+export type LlamaModelStatus = "unloaded" | "loading" | "loaded" | "downloading" | "sleeping";
+
+export interface LlamaModelInfo {
+	id: string;
+	aliases?: string[];
+	status: {
+		value: LlamaModelStatus;
+		args?: string[];
+		failed?: boolean;
+		exit_code?: number;
+		progress?: Record<string, { done: number; total: number }>;
+	};
+// ...
+export interface LlamaProgress {
+	message: string;
+	ratio?: number;
+	detail?: string;
+}
+```
+
+## !!steps URL normalization
+
+Users type server URLs in many forms. `normalizeLlamaServerUrl` accepts only http and https, drops the hash and query, strips trailing slashes and a trailing `/v1`, and removes the final slash. The same server can then be addressed as the management base and, through `llamaInferenceUrl`, as the OpenAI-compatible `/v1` endpoint.
+
+```ts ! client.ts
+export function normalizeLlamaServerUrl(value: string): string {
+	const url = new URL(value.trim());
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error("Server URL must use http or https");
+	}
+	url.hash = "";
+	url.search = "";
+	url.pathname = url.pathname.replace(/\/+$/u, "").replace(/\/v1$/u, "") || "/";
+	return url.toString().replace(/\/$/u, "");
+}
+
+export function llamaInferenceUrl(serverUrl: string): string {
+	return `${normalizeLlamaServerUrl(serverUrl)}/v1`;
+}
+```
+
+## !!steps The request helper
+
+Every request adds JSON content type when there is a body and a bearer token when an API key is configured. A 15 second timeout is combined with the caller's signal using `AbortSignal.any`, so either can cancel the call.
+
+Error bodies are parsed leniently: the JSON error message is used if present, otherwise `llama.cpp returned HTTP` plus the status code.
+
+```ts ! client.ts
+	private async request(path: string, init: RequestInit = {}): Promise<unknown> {
+		const headers = new Headers(init.headers);
+		if (init.body !== undefined) headers.set("Content-Type", "application/json");
+		if (this.apiKey) headers.set("Authorization", `Bearer ${this.apiKey}`);
+		const timeout = AbortSignal.timeout(15_000);
+		const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+		const response = await fetch(`${this.serverUrl}${path}`, { ...init, headers, signal });
+		let payload: unknown;
+		try {
+			payload = await response.json();
+		} catch {
+			payload = undefined;
+		}
+		if (!response.ok) throw new Error(errorMessage(payload, `llama.cpp returned HTTP ${response.status}`));
+		return payload;
+	}
+```
+
+## !!steps Listing and router-mode detection
+
+`list` reads `/models` (with `?reload=1` to rescan). The check that every entry has an id and a status value doubles as router-mode detection: a plain single-model server returns entries without that shape, and the error says the server is not running in router mode.
+
+`props` fetches server properties, optionally for one model with `autoload=false` so asking does not start it, and keeps only the two fields it knows, with type checks.
+
+```ts ! client.ts
+	async list(options: { reload?: boolean; signal?: AbortSignal } = {}): Promise<LlamaModelInfo[]> {
+		const payload = await this.request(`/models${options.reload ? "?reload=1" : ""}`, { signal: options.signal });
+		if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { data?: unknown }).data)) {
+			throw new Error("llama.cpp returned an invalid model catalog");
+		}
+		const data = (payload as { data: unknown[] }).data;
+		if (!data.every(isModelInfo)) throw new Error("Server is not running in llama.cpp router mode");
+		return data;
+	}
+```
+
+## !!steps Load, unload and download
+
+The basic operations are thin POSTs. `unloadAndWait` adds polling: after asking the server to unload, it lists models every 100 ms until the model is gone or reports `unloaded`. The loop respects the abort signal through the local `sleep`.
+
+```ts ! client.ts
+	async load(model: string, signal?: AbortSignal): Promise<void> {
+		await this.request("/models/load", { method: "POST", body: JSON.stringify({ model }), signal });
+	}
+
+	async unload(model: string, signal?: AbortSignal): Promise<void> {
+		await this.request("/models/unload", { method: "POST", body: JSON.stringify({ model }), signal });
+	}
+
+	async unloadAndWait(model: string, signal?: AbortSignal): Promise<void> {
+		await this.unload(model, signal);
+		while (true) {
+			const entry = (await this.list({ signal })).find((candidate) => candidate.id === model);
+			if (!entry || entry.status.value === "unloaded") return;
+			await sleep(100, signal);
+		}
+	}
+```
+
+## !!steps Reading the SSE stream
+
+`watch` opens `/models/sse` and parses server-sent events by hand. It normalizes line endings, splits frames on blank lines, joins the `data:` lines of a frame and parses the JSON. Frames that are not valid events are ignored; the comment says catalog polling remains the authority, so a lost or malformed event can only delay progress, not change the outcome.
+
+```ts ! client.ts
+			buffer += decoder.decode(chunk.value, { stream: true }).replaceAll("\r\n", "\n");
+			let boundary = buffer.indexOf("\n\n");
+			while (boundary >= 0) {
+				const frame = buffer.slice(0, boundary);
+				buffer = buffer.slice(boundary + 2);
+				const data = frame
+					.split("\n")
+					.filter((line) => line.startsWith("data:"))
+					.map((line) => line.slice(5).trimStart())
+					.join("\n");
+				if (data) {
+					try {
+						const event = JSON.parse(data) as LlamaModelEvent;
+						if (event && typeof event.model === "string" && typeof event.event === "string") onEvent(event);
+					} catch {
+						// Ignore malformed events; catalog polling remains authoritative.
+					}
+				}
+				boundary = buffer.indexOf("\n\n");
+			}
+```
+
+## !!steps Loading with progress
+
+`loadAndWait` starts a watcher on a child abort controller linked to the caller's signal, issues the load, and then polls the catalog every 250 ms. Events only update progress and can set two flags. The poll decides the result: return when the entry says `loaded`, throw on `failed` (with the exit code if given) or on an `unloaded` event, and return a synthetic entry if an event said loaded but the entry is missing.
+
+The `finally` block unlinks the signal and aborts the watcher so the SSE connection never leaks. Failures of the SSE connection itself are swallowed, so progress bars degrade but loading still works.
+
+```ts ! client.ts
+		try {
+			await this.load(model, signal);
+			onProgress({ message: "Loading model" });
+			while (true) {
+				if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
+				const entry = (await this.list({ signal })).find((candidate) => candidate.id === model);
+				if (entry?.status.value === "loaded") return entry;
+				if (eventLoaded && !entry) return { id: model, status: { value: "loaded" } };
+				if (entry?.status.failed || eventError) {
+					throw new Error(
+						entry?.status.exit_code === undefined
+							? (eventError ?? "Model failed to load")
+							: `Model exited with code ${entry.status.exit_code}`,
+					);
+				}
+				await sleep(250, signal);
+			}
+		} finally {
+			unlink();
+			watcher.abort();
+		}
+```
+
+## !!steps Download completion heuristic
+
+Downloads have no single clear completion signal. `downloadAndWait` accepts a `download_finished` event, or an entry that appeared after a download was seen, or an entry present after two polls (a small or cached model might never show `downloading`). On success it re-lists with `reload: true` so the returned catalog includes the new model.
+
+```ts ! client.ts
+			while (true) {
+				if (signal?.aborted) throw signal.reason ?? new Error("Cancelled");
+				if (failure) throw new Error(failure);
+				const models = await this.list({ signal });
+				polls++;
+				const entry = models.find((candidate) => candidate.id === model);
+				if (entry?.status.value === "downloading") {
+					sawDownloading = true;
+					const progress = parseDownloadProgress(entry.status.progress);
+					if (progress) onProgress(progress);
+				} else if (finished || (entry && (sawDownloading || polls >= 2))) {
+					return this.list({ reload: true, signal });
+				}
+				await sleep(500, signal);
+			}
+```
+
+## !!steps Parsing progress payloads
+
+`parseLoadProgress` turns the server's staged progress into a single ratio: with a list of stages, the ratio is the stage index plus the stage's own fraction, divided by the stage count, and the message names the current stage with underscores replaced. `parseDownloadProgress` sums done and total bytes over all files, and `formatBytes` prints the detail text.
+
+```ts ! client.ts
+	const stageRatio = typeof value.value === "number" ? Math.max(0, Math.min(1, value.value)) : undefined;
+	let ratio = stageRatio;
+	if (stage && stages.length > 0) {
+		const index = stages.indexOf(stage);
+		if (index >= 0) ratio = (index + (stageRatio ?? 0)) / stages.length;
+	}
+	return {
+		message: stage ? `Loading ${stage.replaceAll("_", " ")}` : "Loading model",
+		ratio,
+	};
+```
+
+</Scrollycoding>
+
+The Hugging Face side of model discovery is in [huggingface.ts](/docs/src/extensions/llama/huggingface.ts). The extension entry point [index.ts](/docs/src/extensions/llama/index.ts) builds a `LlamaClient` from the stored provider credentials, and the catalog it returns feeds the provider's model list.

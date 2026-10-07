@@ -1,0 +1,98 @@
+---
+title: "session-export.ts"
+description: "Serializes the active branch of a session to a standalone JSONL file, re-linking parent ids into a straight chain"
+source: "src/core/session-export.ts"
+full: true
+---
+
+A session is stored as a tree: entries have parent ids and the user can fork
+or navigate between branches. Exporting a session to JSONL means flattening
+one root-to-leaf path into a file that can be imported again, without the other
+branches.
+
+The file has two functions: one builds the JSONL string, the other writes it to
+disk. Both take an optional callback that appends extra entries that exist
+only in the export. The session types and version constant come from
+[session-manager.ts](/docs/src/core/session-manager.ts), and path handling from
+[paths.ts](/docs/src/utils/paths.ts).
+
+<Scrollycoding>
+
+## !!steps Header first, then the branch re-parented into a chain
+
+The first line is a fresh session header with the current time, the same
+session id and cwd, and the current format version. The entries come from
+`getBranch()`, which returns only the active path.
+
+Each entry is copied with its `parentId` overwritten by the previous entry's id.
+The first entry gets `null`. This guarantees the exported file is a valid
+linear tree even if the original branch started from a point whose parent
+was not included.
+
+```ts ! session-export.ts
+export function serializeSessionBranch(
+	sessionManager: SessionManager,
+	createTrailingEntries?: TrailingEntries,
+): string {
+	const timestamp = new Date().toISOString();
+	const header: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: sessionManager.getSessionId(),
+		timestamp,
+		cwd: sessionManager.getCwd(),
+	};
+	const entries: object[] = [header];
+	let parentId: string | null = null;
+	// !mark(1:4)
+	for (const entry of sessionManager.getBranch()) {
+		entries.push({ ...entry, parentId });
+		parentId = entry.id;
+	}
+```
+
+## !!steps Trailing entries and the JSONL join
+
+After the loop, `parentId` holds the id of the last branch entry. The optional
+`createTrailingEntries` callback receives it together with the shared
+timestamp, so a caller can append entries that chain correctly onto the end.
+
+The output is one JSON object per line with a final newline.
+
+```ts ! session-export.ts
+	entries.push(...(createTrailingEntries?.(parentId, timestamp) ?? []));
+	return `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+}
+```
+
+## !!steps Writing the file
+
+With no path given, the file name is a timestamp with `:` and `.` replaced by
+dashes, so it is valid on every filesystem. The path is resolved against
+`process.cwd()`, not the session cwd, and missing parent directories are
+created. The function returns the final absolute path for display.
+
+```ts ! session-export.ts
+export function exportSessionToJsonl(
+	sessionManager: SessionManager,
+	outputPath?: string,
+	createTrailingEntries?: TrailingEntries,
+): string {
+	const filePath = resolvePath(
+		outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
+		process.cwd(),
+	);
+	const dir = dirname(filePath);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(filePath, serializeSessionBranch(sessionManager, createTrailingEntries));
+	return filePath;
+}
+```
+
+</Scrollycoding>
+
+This is the JSONL counterpart to the HTML exporter under
+`export-html`. The `/export` and `/import` entries in
+[slash-commands.ts](/docs/src/core/slash-commands.ts) are the user-facing
+side. The write is synchronous and not atomic, which is acceptable for a
+one-off user-triggered export.

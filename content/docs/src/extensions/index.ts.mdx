@@ -1,0 +1,45 @@
+---
+title: "index.ts"
+description: "The list of built-in extensions the CLI loads: llama.cpp, codemode, tool-search and mcp."
+source: "src/extensions/index.ts"
+full: true
+---
+
+Pi ships four features as extensions rather than as core code. This file collects them into `builtInExtensions`, an array of inline extensions that the runtime registers at startup alongside user and package extensions.
+
+The interesting field is `replaceable`. Three of the four can be taken over by a third-party extension that registers the same tool or command.
+
+<Scrollycoding>
+
+## !!steps Imports
+
+Each built-in is a default-exported extension factory from its own folder. The `InlineExtension` type comes from [types.ts](/docs/src/core/extensions/types.ts). The factories are [llama/index.ts](/docs/src/extensions/llama/index.ts), [codemode/index.ts](/docs/src/extensions/codemode/index.ts), [mcp/index.ts](/docs/src/extensions/mcp/index.ts) and [tool-search/index.ts](/docs/src/extensions/tool-search/index.ts).
+
+```ts ! index.ts
+import type { InlineExtension } from "../core/extensions/types.ts";
+import codemodeExtension from "./codemode/index.ts";
+import llamaExtension from "./llama/index.ts";
+import mcpExtension from "./mcp/index.ts";
+import toolSearchExtension from "./tool-search/index.ts";
+```
+
+## !!steps The array
+
+Every entry has `builtin: true`. The llama.cpp extension is not marked replaceable, because it registers a provider and a `/llama` command that nothing else is expected to duplicate.
+
+The comment explains the other three: an extension that registers `codemode`, `tool_search` or `/mcp` takes over, and the built-in does not run alongside it. That lets a third-party MCP extension replace the built-in one cleanly instead of colliding with it.
+
+```ts ! index.ts
+export const builtInExtensions: InlineExtension[] = [
+	{ name: "llama.cpp", factory: llamaExtension, builtin: true },
+	// Replaceable: an extension that registers `codemode`, `tool_search`, or `/mcp` (such as a third-party
+	// MCP extension) takes over instead of running alongside the built-in one.
+	{ name: "codemode", factory: codemodeExtension, replaceable: true, builtin: true },
+	{ name: "tool-search", factory: toolSearchExtension, replaceable: true, builtin: true },
+	{ name: "mcp", factory: mcpExtension, replaceable: true, builtin: true },
+];
+```
+
+</Scrollycoding>
+
+The only importer is [main.ts](/docs/src/main.ts), which spreads `builtInExtensions` in front of any extension factories passed in by SDK callers, so built-ins come first. The loader in [loader.ts](/docs/src/core/extensions/loader.ts) then turns the entries into live extensions.

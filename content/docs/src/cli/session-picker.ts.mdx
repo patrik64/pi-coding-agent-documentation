@@ -1,0 +1,101 @@
+---
+title: "session-picker.ts"
+description: "Standalone full-screen TUI that lets the user pick a past session for the --resume flag, before the main interface exists"
+source: "src/cli/session-picker.ts"
+full: true
+---
+
+With `--resume`, pi has to ask which session to continue before the normal
+interactive mode is running. This file builds a short-lived TUI around the
+existing session selector component and returns the chosen file path, or null
+if the user cancelled.
+
+The TUI scaffolding comes from [startup-ui.ts](/docs/src/cli/startup-ui.ts), and
+the list itself is
+[session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts).
+
+<Scrollycoding>
+
+## !!steps Inputs: two loaders
+
+The selector shows sessions for the current project and, on request, for all
+projects, so the function takes two async loaders rather than data. Loading can
+be slow, so the loader type supports progress reporting and cancellation. The
+session types come from [session-manager.ts](/docs/src/core/session-manager.ts).
+
+```ts ! session-picker.ts
+type SessionsLoader = (onProgress?: SessionListProgress, signal?: AbortSignal) => Promise<SessionInfo[]>;
+
+/** Show TUI session selector and return selected session path or null if cancelled */
+export async function selectSession(
+	currentSessionsLoader: SessionsLoader,
+	allSessionsLoader: SessionsLoader,
+	settingsManager: SettingsManager,
+): Promise<string | null> {
+	const ui = await createStartupTui(settingsManager);
+```
+
+## !!steps Keybindings and the resolve-once guard
+
+Keybindings are created and installed globally for the TUI. The `resolved`
+flag makes sure that select and cancel cannot both fire; the first one wins and
+stops the UI.
+
+```ts ! session-picker.ts
+	return new Promise((resolve) => {
+		const keybindings = KeybindingsManager.create();
+		setKeybindings(keybindings);
+		let resolved = false;
+```
+
+## !!steps Wiring the callbacks
+
+The component takes callbacks in order: select, cancel, exit, and render
+request. Select resolves with the path; cancel resolves with null. The third
+callback is different: it stops the UI and exits the whole process with code 0,
+without resolving. The rename hint is turned off since renaming makes no sense
+here.
+
+```ts ! session-picker.ts
+		const selector = new SessionSelectorComponent(
+			currentSessionsLoader,
+			allSessionsLoader,
+			(path: string) => {
+				if (!resolved) {
+					resolved = true;
+					ui.stop();
+					resolve(path);
+				}
+			},
+			() => {
+				if (!resolved) {
+					resolved = true;
+					ui.stop();
+					resolve(null);
+				}
+			},
+			() => {
+				ui.stop();
+				process.exit(0);
+			},
+			() => ui.requestRender(),
+			{ showRenameHint: false, keybindings },
+		);
+```
+
+## !!steps Mounting and starting
+
+The selector's inner list gets focus, since that is the part that handles keys.
+`startStartupTui` starts the terminal and also kicks off the terminal color
+query.
+
+```ts ! session-picker.ts
+		ui.addChild(selector);
+		ui.setFocus(selector.getSessionList());
+		startStartupTui(ui, settingsManager);
+```
+
+</Scrollycoding>
+
+Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts).
+The caller is [main.ts](/docs/src/main.ts).

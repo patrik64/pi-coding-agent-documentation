@@ -1,0 +1,21 @@
+{
+  "title": "src",
+  "pages": [
+    "bun",
+    "cli",
+    "client",
+    "core",
+    "experimental",
+    "extensions",
+    "modes",
+    "utils",
+    "cli.ts",
+    "config.ts",
+    "index.ts",
+    "main.ts",
+    "migrations.ts",
+    "package-manager-cli.ts",
+    "rpc-entry.ts"
+  ],
+  "defaultOpen": true
+}

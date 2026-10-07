@@ -1,0 +1,108 @@
+---
+title: "index.ts"
+description: "Barrel file for the extension system: loader, runner, the large event and API type surface, and tool helpers"
+source: "src/core/extensions/index.ts"
+full: true
+---
+
+This barrel is the single import point for everything extension-related inside the coding agent. It gathers the loader functions, the runner class, the very large list of event, context and registration types, a handful of type guards, and the tool wrappers.
+
+Most of the file is one long `export type` block re-exporting from [types.ts](/docs/src/core/extensions/types.ts). The runtime values are few, and they are the interesting part: loading, running, defining tools and narrowing tool events.
+
+<Scrollycoding>
+
+## !!steps Re-exports from outside the folder
+
+Two types from sibling modules, slash-command info from [slash-commands.ts](/docs/src/core/slash-commands.ts) and source info from [source-info.ts](/docs/src/core/source-info.ts), are surfaced here because extension APIs return them.
+
+```ts ! index.ts
+/**
+ * Extension system for lifecycle events and custom tools.
+ */
+
+// !mark(1:2)
+export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.ts";
+export type { SourceInfo } from "../source-info.ts";
+```
+
+## !!steps Loader functions
+
+The only functions pulled from [loader.ts](/docs/src/core/extensions/loader.ts) are the ones callers need: discovery, loading from paths, loading from an in-process factory, and creating the shared runtime object.
+
+```ts ! index.ts
+export {
+	// !mark(1:4)
+	createExtensionRuntime,
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "./loader.ts";
+```
+
+## !!steps Runner and its handler types
+
+The runner class is re-exported as a value from [runner.ts](/docs/src/core/extensions/runner.ts). Alongside it go the handler and listener types the session passes in to bind actions such as fork, new session and tree navigation.
+
+```ts ! index.ts
+export type {
+	ExtensionErrorListener,
+	ForkHandler,
+	NavigateTreeHandler,
+	NewSessionHandler,
+	ShutdownHandler,
+	SwitchSessionHandler,
+} from "./runner.ts";
+// !mark
+export { ExtensionRunner } from "./runner.ts";
+```
+
+## !!steps The big type block
+
+The `export type` block that follows re-exports well over a hundred names from [types.ts](/docs/src/core/extensions/types.ts): events, event results, contexts, tool-call and tool-result events per built-in tool, provider registration, UI contexts and loadout types. Inline comments group them (Events - Agent, Events - Session and so on).
+
+Keeping them in one block lets the package index pick a subset, as [core/index.ts](/docs/src/core/index.ts) does.
+
+```ts ! index.ts
+// !mark
+export type {
+	AfterProviderResponseEvent,
+	AgentActivityOutcome,
+	AgentBeforeSettleEvent,
+	AgentBeforeSettleEventResult,
+	AgentEndEvent,
+	AgentSettledEvent,
+	AgentStartEvent,
+	// Re-exports
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	AppendEntryHandler,
+	// App keybindings (for custom editors)
+	AppKeybinding,
+	AutocompleteProviderFactory,
+```
+
+## !!steps Type guards and tool wrappers
+
+The runtime helpers are separate from the type block: `defineTool`, per-tool result guards such as `isBashToolResult`, and `isToolCallEventType` for narrowing tool call events. The last line re-exports the two wrapping functions from [wrapper.ts](/docs/src/core/extensions/wrapper.ts).
+
+```ts ! index.ts
+// Type guards
+// !mark(1:11)
+export {
+	defineTool,
+	isBashToolResult,
+	isEditToolResult,
+	isFindToolResult,
+	isGrepToolResult,
+	isLsToolResult,
+	isPowerShellToolResult,
+	isReadToolResult,
+	isToolCallEventType,
+	isWriteToolResult,
+} from "./types.ts";
+export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.ts";
+```
+
+</Scrollycoding>
+
+Nothing here defines behavior. The file's role is to let [core/index.ts](/docs/src/core/index.ts) and the session code import from one folder path. Note that the jiti loader files and [virtual-modules.ts](/docs/src/core/extensions/virtual-modules.ts) are not re-exported, which is what keeps loader internals out of the public package surface.

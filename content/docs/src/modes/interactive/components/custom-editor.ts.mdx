@@ -1,0 +1,160 @@
+---
+title: "custom-editor.ts"
+description: "The prompt editor subclass that layers app-level keybindings, extension shortcuts and an embedded working-status border on the TUI editor"
+source: "src/modes/interactive/components/custom-editor.ts"
+full: true
+---
+
+`CustomEditor` extends the generic `Editor` from the TUI library with the behavior only the coding agent needs. It decides, for every raw key sequence, whether it belongs to an app action (interrupt, exit, paste image, cycle model, and so on), to an extension shortcut, or to ordinary text editing.
+
+Bindings are resolved through the [keybindings.ts](/docs/src/core/keybindings.ts) manager, so user remaps apply. The editor can also draw the agent's working status in its own top border, using [status-indicator.ts](/docs/src/modes/interactive/components/status-indicator.ts). [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) creates it and wires the handlers.
+
+<Scrollycoding>
+
+## !!steps Fields and handler hooks
+
+The editor holds the keybindings manager, an optional status indicator, and a map from app actions to handlers. A few special handlers (`onEscape`, `onCtrlD`, `onPasteImage`, `onExtensionShortcut`) are plain public properties, so the mode can change what Escape or Ctrl+D do at runtime.
+
+```ts ! custom-editor.ts
+export class CustomEditor extends Editor {
+	private keybindings: KeybindingsManager;
+	private workingStatusIndicator: StatusIndicator | undefined;
+	public readonly embedWorkingStatus: boolean;
+	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
+
+	// Special handlers that can be dynamically replaced
+	public onEscape?: () => void;
+	public onCtrlD?: () => void;
+	public onPasteImage?: () => void;
+	/** Handler for extension-registered shortcuts. Returns true if handled. */
+	public onExtensionShortcut?: (data: string) => boolean;
+```
+
+## !!steps Construction
+
+The constructor passes TUI, theme and options to the base class and records whether the working status should be embedded in the border (default off). The indicator itself is attached later with `setWorkingStatusIndicator`.
+
+```ts ! custom-editor.ts
+	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: CustomEditorOptions) {
+		super(tui, theme, options);
+		this.keybindings = keybindings;
+		this.embedWorkingStatus = options?.embedWorkingStatus ?? false;
+	}
+
+	setWorkingStatusIndicator(indicator: StatusIndicator | undefined): void {
+		this.workingStatusIndicator = indicator;
+	}
+```
+
+## !!steps Top border: status plus overflow label
+
+`renderTopBorder` falls back to the base border unless embedding is on, an indicator exists, the width is positive, and the status renders non-empty. When the editor is scrolled (`hiddenLineCount` above zero) it also wants a centered label like "N more" with an up arrow. `canFitOverflow` checks that the label fits and leaves at least one dash after the status.
+
+```ts ! custom-editor.ts
+	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
+		if (!this.embedWorkingStatus || !this.workingStatusIndicator || width <= 0) {
+			return super.renderTopBorder(width, hiddenLineCount);
+		}
+
+		let status = this.workingStatusIndicator.renderInBorder(Math.max(1, width - 5));
+		let statusWidth = visibleWidth(status);
+		if (statusWidth === 0) return super.renderTopBorder(width, hiddenLineCount);
+
+		const overflowLabel = hiddenLineCount > 0 ? ` ↑ ${hiddenLineCount} more ` : undefined;
+		const overflowLabelWidth = overflowLabel ? visibleWidth(overflowLabel) : 0;
+		const overflowStart = Math.floor((width - overflowLabelWidth) / 2);
+		// !mark(2:2)
+		const canFitOverflow = () =>
+			overflowLabel !== undefined && overflowLabelWidth + 2 <= width && overflowStart - (3 + statusWidth + 1) >= 1;
+```
+
+## !!steps Border layouts by available width
+
+There is a ladder of layouts. If the overflow label does not fit, the full status is downgraded to just a spinner. When it fits, the line is status, dashes, centered label, dashes. Otherwise, with enough room, it is the status followed by dashes. In the narrowest case only the spinner is drawn with a short dash prefix.
+
+```ts ! custom-editor.ts
+		if (overflowLabel && !canFitOverflow()) {
+			status = this.workingStatusIndicator.renderSpinnerInBorder(width);
+			statusWidth = visibleWidth(status);
+		}
+
+		if (canFitOverflow()) {
+			const leftBlockWidth = 3 + statusWidth + 1;
+			return (
+				this.borderColor("── ") +
+				status +
+				this.borderColor(
+					` ${"─".repeat(overflowStart - leftBlockWidth)}${overflowLabel}${"─".repeat(width - overflowStart - overflowLabelWidth)}`,
+				)
+			);
+		}
+```
+
+## !!steps Registering actions
+
+`onAction` stores a handler per app keybinding id. These live in a map rather than as fields so the interactive mode can register many actions uniformly.
+
+```ts ! custom-editor.ts
+	/**
+	 * Register a handler for an app action.
+	 */
+	onAction(action: AppKeybinding, handler: () => void): void {
+		this.actionHandlers.set(action, handler);
+	}
+```
+
+## !!steps Input priority, part one
+
+`handleInput` is an ordered chain. Extension shortcuts win first, then the clipboard image paste key. Interrupt is next, but only fires its handler when autocomplete is closed; otherwise the key falls through to the base editor so Escape cancels the autocomplete popup. A dynamic `onEscape` beats the registered action.
+
+```ts ! custom-editor.ts
+	handleInput(data: string): void {
+		// Check extension-registered shortcuts first
+		if (this.onExtensionShortcut?.(data)) {
+			return;
+		}
+
+		// Check for clipboard paste keybinding
+		if (this.keybindings.matches(data, "app.clipboard.pasteImage")) {
+			this.onPasteImage?.();
+			return;
+		}
+
+		// Check app keybindings first
+
+		// Escape/interrupt - only if autocomplete is NOT active
+		if (this.keybindings.matches(data, "app.interrupt")) {
+			if (!this.isShowingAutocomplete()) {
+```
+
+## !!steps Input priority, part two
+
+Ctrl+D exits only when the editor is empty; with text it falls through so it can act as delete-forward. Explicit history bindings are sent to the base editor before generic app actions, so a user can bind Ctrl+P to history even though it cycles models by default. Every remaining registered action is tried, skipping interrupt and exit, which were handled above, and anything unmatched becomes ordinary editing.
+
+```ts ! custom-editor.ts
+		// Exit (Ctrl+D) - only when editor is empty
+		if (this.keybindings.matches(data, "app.exit")) {
+			if (this.getText().length === 0) {
+				const handler = this.onCtrlD ?? this.actionHandlers.get("app.exit");
+				if (handler) handler();
+				return;
+			}
+			// Fall through to editor handling for delete-char-forward when not empty
+		}
+
+		// Check all other app actions
+		for (const [action, handler] of this.actionHandlers) {
+			// !mark
+			if (action !== "app.interrupt" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+				handler();
+				return;
+			}
+		}
+
+		// Pass to parent for editor handling
+		super.handleInput(data);
+```
+
+</Scrollycoding>
+
+The class sits between the TUI library editor and the application: the base class knows text editing, this one knows the agent's actions. Its priority order (extensions, paste, interrupt, exit, history, other actions) is the part most worth keeping in mind when adding a new keybinding. One quirk: if the interrupt key is pressed with no handler registered, the key is passed to the base editor rather than dropped.

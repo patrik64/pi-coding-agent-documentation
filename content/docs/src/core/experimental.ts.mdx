@@ -1,0 +1,26 @@
+---
+title: "experimental.ts"
+description: "Single environment-variable gate for experimental features"
+source: "src/core/experimental.ts"
+full: true
+---
+
+This is an experimental-feature switch, not experimental code itself. It is one function that reads `PI_EXPERIMENTAL` from the environment so that features still under development can be hidden by default and enabled with a single flag.
+
+Callers such as the experimental commands module, the startup UI in [startup-ui.ts](/docs/src/cli/startup-ui.ts) and the [footer.ts](/docs/src/modes/interactive/components/footer.ts) component call it instead of reading the variable directly, so the rule lives in one place.
+
+<Scrollycoding>
+
+## !!steps The gate
+
+Only the exact string `1` enables the features. Values such as `true` or `yes` do not. The variable is read on every call, so tests and tools can toggle it at runtime without restarting.
+
+```ts ! experimental.ts
+export function areExperimentalFeaturesEnabled(): boolean {
+	return process.env.PI_EXPERIMENTAL === "1";
+}
+```
+
+</Scrollycoding>
+
+Related configuration lives in [settings-manager.ts](/docs/src/core/settings-manager.ts), but this gate is deliberately environment-only and not persisted in settings.

@@ -1,0 +1,157 @@
+---
+title: "user-message-selector.ts"
+description: "The Fork from Message picker: a scrolling, wrapping list of past user messages used to branch a session at a chosen point"
+source: "src/modes/interactive/components/user-message-selector.ts"
+full: true
+---
+
+When the user forks a session, they pick which of their earlier messages to branch from. This file renders that picker. It consists of a private list component that does the scrolling and key handling, and an exported `Container` wrapper that adds the header, borders and an auto-cancel for the empty case.
+
+The component only deals with ids and text. Which entries count as user messages, and what forking actually does to the session, is handled elsewhere, in [session-manager.ts](/docs/src/core/session-manager.ts) and [agent-session.ts](/docs/src/core/agent-session.ts).
+
+<Scrollycoding>
+
+## !!steps The list item and initial selection
+
+Each item carries the session entry id, the message text and an optional timestamp (the timestamp is declared but never used in rendering). Messages are stored oldest to newest.
+
+The cursor starts on the id passed in, if it is found, and otherwise on the newest message, since the most likely fork point is the latest one.
+
+```ts ! user-message-selector.ts
+interface UserMessageItem {
+	id: string; // Entry ID in the session
+	text: string; // The message text
+	timestamp?: string; // Optional timestamp if available
+}
+
+class UserMessageList implements Component {
+	private messages: UserMessageItem[] = [];
+	private selectedIndex: number = 0;
+	public onSelect?: (entryId: string) => void;
+	public onCancel?: () => void;
+	private maxVisible: number = 10; // Max messages visible
+
+	constructor(messages: UserMessageItem[], initialSelectedId?: string) {
+		// Store messages in chronological order (oldest to newest)
+		this.messages = messages;
+		const initialIndex = initialSelectedId ? messages.findIndex((message) => message.id === initialSelectedId) : -1;
+		// !mark
+		this.selectedIndex = initialIndex >= 0 ? initialIndex : Math.max(0, messages.length - 1);
+	}
+```
+
+## !!steps A window centered on the selection
+
+`render` shows at most ten messages. The window start is the selection minus half the window, clamped so it never runs past the end. Because of that clamp, when fewer than ten messages exist the `Math.min` can go negative and `Math.max(0, ...)` fixes it.
+
+An empty list renders a single muted line and returns early.
+
+```ts ! user-message-selector.ts
+	render(width: number): string[] {
+		const lines: string[] = [];
+
+		if (this.messages.length === 0) {
+			lines.push(theme.fg("muted", "  No user messages found"));
+			return lines;
+		}
+
+		// Calculate visible range with scrolling
+		// !mark(1:4)
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.messages.length - this.maxVisible),
+		);
+		const endIndex = Math.min(startIndex + this.maxVisible, this.messages.length);
+```
+
+## !!steps Two lines per message
+
+Each message becomes a one-line preview (newlines flattened to spaces, truncated to the width minus the two-character cursor) and a muted "Message N of M" line, followed by a blank line. The selected row is bold with an accent cursor.
+
+A trailing `(selected/total)` indicator appears only when something is scrolled out of view.
+
+```ts ! user-message-selector.ts
+			// Normalize message to single line
+			const normalizedMessage = message.text.replace(/\n/g, " ").trim();
+
+			// First line: cursor + message
+			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+			const maxMsgWidth = width - 2; // Account for cursor (2 chars)
+			const truncatedMsg = truncateToWidth(normalizedMessage, maxMsgWidth);
+			const messageLine = cursor + (isSelected ? theme.bold(truncatedMsg) : truncatedMsg);
+
+			lines.push(messageLine);
+
+			// Second line: metadata (position in history)
+			const position = i + 1;
+			const metadata = `  Message ${position} of ${this.messages.length}`;
+			const metadataLine = theme.fg("muted", metadata);
+			lines.push(metadataLine);
+			lines.push(""); // Blank line between messages
+		}
+
+		// Add scroll indicator if needed
+		// !mark
+		if (startIndex > 0 || endIndex < this.messages.length) {
+```
+
+## !!steps Wrapping navigation
+
+Up and down wrap around, unlike the trust dialog. Enter reports the entry id, Escape cancels. Note that with an empty list, `this.messages.length - 1` would be -1 on an up press, but the wrapper cancels the empty picker, so this path is not normally reached.
+
+```ts ! user-message-selector.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+		// Up arrow - go to previous (older) message, wrap to bottom when at top
+		// !mark(1:6)
+		if (kb.matches(keyData, "tui.select.up")) {
+			this.selectedIndex = this.selectedIndex === 0 ? this.messages.length - 1 : this.selectedIndex - 1;
+		}
+		// Down arrow - go to next (newer) message, wrap to top when at bottom
+		else if (kb.matches(keyData, "tui.select.down")) {
+			this.selectedIndex = this.selectedIndex === this.messages.length - 1 ? 0 : this.selectedIndex + 1;
+		}
+		// Enter - select message and branch
+		else if (kb.matches(keyData, "tui.select.confirm")) {
+			const selected = this.messages[this.selectedIndex];
+			if (selected && this.onSelect) {
+				this.onSelect(selected.id);
+			}
+		}
+```
+
+## !!steps The exported wrapper and the empty case
+
+`UserMessageSelectorComponent` builds the header text (which states exactly what forking does: copy the active path up to that message into a new session), wraps the list in [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) rules, and forwards the callbacks.
+
+If there are no messages it schedules `onCancel` after 100 ms rather than calling it synchronously, so the caller has finished mounting the component before it is torn down again.
+
+```ts ! user-message-selector.ts
+		// Create message list
+		this.messageList = new UserMessageList(messages, initialSelectedId);
+		this.messageList.onSelect = onSelect;
+		this.messageList.onCancel = onCancel;
+
+		this.addChild(this.messageList);
+
+		// Add bottom border
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder());
+
+		// Auto-cancel if no messages
+		// !mark(1:3)
+		if (messages.length === 0) {
+			setTimeout(() => onCancel(), 100);
+		}
+	}
+
+	getMessageList(): UserMessageList {
+		return this.messageList;
+	}
+```
+
+</Scrollycoding>
+
+The selector is shown by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and focuses the whole container, which routes input to the inner list. Compare the sibling [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts), which handles the richer full-tree navigation case; this one is the flat, user-messages-only variant.
+
+One structural oddity: `getMessageList()` returns the private, unexported `UserMessageList` type, and `timestamp` on the item type is never read.

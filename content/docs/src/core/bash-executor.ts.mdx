@@ -1,0 +1,173 @@
+---
+title: "bash-executor.ts"
+description: "Runs a shell command through pluggable BashOperations, sanitizes and streams its output, and spills oversized output to a temp file"
+source: "src/core/bash-executor.ts"
+full: true
+---
+
+This module is the execution path for user-initiated bash, as opposed to bash calls made by the model. Its header comment names two callers, `AgentSession.executeBash()` for interactive and RPC modes (see [agent-session.ts](/docs/src/core/agent-session.ts)) and direct calls from modes that need to run a command.
+
+It does not spawn anything itself. It takes a `BashOperations` object, the same abstraction the model-facing bash tool uses in [bash.ts](/docs/src/core/tools/bash.ts), so the same code can drive a local shell, SSH or a container. Its own job is to turn raw bytes into clean text, keep memory bounded, and report a result object that says whether the command was cancelled or truncated.
+
+<Scrollycoding>
+
+## !!steps Options and result shape
+
+Callers can pass an `onChunk` callback to stream sanitized text as it arrives and an `AbortSignal` to cancel. The result distinguishes `exitCode` (undefined when killed) from `cancelled`, and carries `fullOutputPath` only when output was big enough to be written to disk.
+
+```ts ! bash-executor.ts
+export interface BashExecutorOptions {
+	/** Callback for streaming output chunks (already sanitized) */
+	onChunk?: (chunk: string) => void;
+	/** AbortSignal for cancellation */
+	signal?: AbortSignal;
+}
+
+export interface BashResult {
+	/** Combined stdout + stderr output (sanitized, possibly truncated) */
+	output: string;
+	/** Process exit code (undefined if killed/cancelled) */
+	exitCode: number | undefined;
+	/** Whether the command was cancelled via signal */
+	cancelled: boolean;
+	/** Whether the output was truncated */
+	truncated: boolean;
+	/** Path to temp file containing full output (if output exceeded truncation threshold) */
+	fullOutputPath?: string;
+}
+```
+
+## !!steps A rolling buffer with a lazy temp file
+
+Output is held in an array of chunks capped at twice the default byte limit. The temp file is created lazily by `ensureTempFile`, which uses `createOutputFileStream` from [output-files.ts](/docs/src/utils/output-files.ts) and replays whatever chunks are already buffered into it, so nothing is lost when the threshold is crossed mid-stream.
+
+```ts ! bash-executor.ts
+	const outputChunks: string[] = [];
+	let outputBytes = 0;
+	const maxOutputBytes = DEFAULT_MAX_BYTES * 2;
+
+	let tempFilePath: string | undefined;
+	let tempFileStream: WriteStream | undefined;
+	let totalBytes = 0;
+
+	const ensureTempFile = () => {
+		if (tempFilePath) {
+			return;
+		}
+		({ path: tempFilePath, stream: tempFileStream } = createOutputFileStream("pi-bash", ".log"));
+		for (const chunk of outputChunks) {
+			tempFileStream.write(chunk);
+		}
+	};
+```
+
+## !!steps Sanitizing each chunk
+
+Data arrives as Buffers. A single `TextDecoder` with `stream: true` is reused so a multi-byte character split across two chunks decodes correctly. The text then passes through `stripAnsi` ([ansi.ts](/docs/src/utils/ansi.ts)), `sanitizeBinaryOutput` ([shell.ts](/docs/src/utils/shell.ts)) and removal of carriage returns.
+
+The temp file starts once the raw byte count passes `DEFAULT_MAX_BYTES`, and from then on every sanitized chunk is written to it. The in-memory array drops its oldest chunks while it exceeds the cap, always keeping at least one. Finally the chunk goes to `onChunk`.
+
+```ts ! bash-executor.ts
+	const onData = (data: Buffer) => {
+		totalBytes += data.length;
+
+		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
+		const text = sanitizeBinaryOutput(stripAnsi(decoder.decode(data, { stream: true }))).replace(/\r/g, "");
+
+		// Start writing to temp file if exceeds threshold
+		if (totalBytes > DEFAULT_MAX_BYTES) {
+			ensureTempFile();
+		}
+
+		if (tempFileStream) {
+			tempFileStream.write(text);
+		}
+
+		// Keep rolling buffer
+		outputChunks.push(text);
+		outputBytes += text.length;
+		while (outputBytes > maxOutputBytes && outputChunks.length > 1) {
+			const removed = outputChunks.shift()!;
+			outputBytes -= removed.length;
+		}
+
+		// Stream to callback
+		if (options?.onChunk) {
+			options.onChunk(text);
+		}
+	};
+```
+
+## !!steps Normal completion
+
+After `exec` resolves, the buffered text is passed through `truncateTail` from [truncate.ts](/docs/src/core/tools/truncate.ts). If truncation happened, the temp file is forced into existence, so the full output is always recoverable when the returned text is shortened. The stream is closed in every branch.
+
+`cancelled` is read from the signal rather than from the process, and a cancelled run reports `exitCode` as undefined even if the process produced one.
+
+```ts ! bash-executor.ts
+	// !mark(1:5)
+	try {
+		const result = await operations.exec(command, cwd, {
+			onData,
+			signal: options?.signal,
+		});
+
+		const fullOutput = outputChunks.join("");
+		const truncationResult = truncateTail(fullOutput);
+		if (truncationResult.truncated) {
+			ensureTempFile();
+		}
+		if (tempFileStream) {
+			tempFileStream.end();
+		}
+		const cancelled = options?.signal?.aborted ?? false;
+
+		return {
+			output: truncationResult.truncated ? truncationResult.content : fullOutput,
+			exitCode: cancelled ? undefined : (result.exitCode ?? undefined),
+			cancelled,
+			truncated: truncationResult.truncated,
+			fullOutputPath: tempFilePath,
+		};
+```
+
+## !!steps Abort and error handling
+
+Aborting a run makes the underlying operations throw, so the catch block checks the signal first. If it was an abort, the function builds the same kind of result as the success path, with `cancelled: true`, instead of rethrowing. Output captured before the abort is therefore still returned to the user.
+
+Any other error closes the temp file stream and propagates.
+
+```ts ! bash-executor.ts
+	} catch (err) {
+		// Check if it was an abort
+		if (options?.signal?.aborted) {
+			const fullOutput = outputChunks.join("");
+			const truncationResult = truncateTail(fullOutput);
+			if (truncationResult.truncated) {
+				ensureTempFile();
+			}
+			if (tempFileStream) {
+				tempFileStream.end();
+			}
+			return {
+				output: truncationResult.truncated ? truncationResult.content : fullOutput,
+				exitCode: undefined,
+				cancelled: true,
+				truncated: truncationResult.truncated,
+				fullOutputPath: tempFilePath,
+			};
+		}
+
+		if (tempFileStream) {
+			tempFileStream.end();
+		}
+
+		throw err;
+	}
+```
+
+</Scrollycoding>
+
+The only consumer of the result is the session layer, which stores it as a bash message (see [messages.ts](/docs/src/core/messages.ts)). Because the function takes `BashOperations` rather than a shell path, extensions that replace local execution plug in without any change here.
+
+Structurally, the success and abort paths repeat the same six lines of truncation and cleanup. The buffer limit variable is named `maxOutputBytes` but is compared against `text.length`, which counts UTF-16 units, so for non-ASCII output the cap is looser than its name suggests. The `timeout` option that `BashOperations.exec` supports is also not exposed by `BashExecutorOptions`.

@@ -1,0 +1,93 @@
+---
+title: "bundled.ts"
+description: "Creates chord facet loaders for plugin bundles, on the session side from manifests and on the UI side from server-sent artifacts"
+source: "src/experimental/plugins/bundled.ts"
+full: true
+---
+
+Experimental plugins are built into facet bundles with two entries: `session` runs next to the agent and `tui` runs in the UI. This file creates the loaders that turn those bundles into running facets.
+
+The session side loads from manifest files on disk. The presentation side never reads disk. It only accepts artifacts that the connected server selected and sent, which is a deliberate trust boundary. Bundles are produced by [package.ts](/docs/src/experimental/plugins/package.ts).
+
+<Scrollycoding>
+
+## !!steps Session loaders from manifests
+
+With no manifests there is no loader. Otherwise one optional loader per manifest is combined into a single `FacetLoader`.
+
+```ts ! bundled.ts
+const PRESENTATION_FACET_BUNDLES_KEY = "presentationFacetBundles";
+const PI_PLUGIN_API = "@earendil-works/pi-coding-agent/experimental/plugin";
+
+export function createSessionPluginFacetLoader(manifestPaths: readonly string[]): FacetLoader | undefined {
+	if (manifestPaths.length === 0) return undefined;
+	return combineFacetLoaders(manifestPaths.map(createOptionalSessionFacetLoader));
+}
+```
+
+## !!steps Tolerating a missing session entry
+
+A plugin may ship only a UI entry. The wrapper reads the manifest at load time and, if there is no `session` entry, returns an empty facet list with a no-op dispose instead of failing.
+
+```ts ! bundled.ts
+function createOptionalSessionFacetLoader(manifestPath: string): FacetLoader {
+	const loader = createFacetBundleLoader({
+		manifestPath,
+		entry: "session",
+		resolveExternal: resolvePluginExternal,
+	});
+	return {
+		async load() {
+			const manifest = await readFacetBundleManifest(manifestPath);
+			// !mark(1:2)
+			if (manifest.entries.session !== undefined) return loader.load();
+			return { facets: Object.freeze([]), async dispose() {} };
+		},
+	};
+}
+```
+
+## !!steps Sending bundles to the UI
+
+`createPresentationFacetData` packs artifacts into one JSON object under a fixed key. `createPresentationFacetLoaders` validates that data and builds one artifact loader per entry, throwing on malformed input.
+
+```ts ! bundled.ts
+export function createPresentationFacetData(artifacts: readonly FacetBundleArtifact[]): JsonValue {
+	return {
+		[PRESENTATION_FACET_BUNDLES_KEY]: artifacts.map((artifact) => artifact as unknown as JsonValue),
+	};
+}
+
+/** Create local loaders only from artifacts selected and sent by the connected server. */
+export function createPresentationFacetLoaders(data: JsonValue): readonly FacetLoader[] {
+	// !mark(1:2)
+	if (data === null || Array.isArray(data) || typeof data !== "object") {
+		throw new Error("Invalid presentation plugin data");
+	}
+	const artifacts = data[PRESENTATION_FACET_BUNDLES_KEY];
+	if (artifacts === undefined) return [];
+	// !mark
+	if (!Array.isArray(artifacts)) throw new Error("Invalid presentation plugin bundle list");
+	return artifacts.map((artifact) =>
+		createFacetBundleArtifactLoader({ artifact, resolveExternal: resolvePluginExternal }),
+	);
+}
+```
+
+## !!steps Resolving the plugin API import
+
+Plugins import the plugin API by package name, which cannot be resolved from a bundle. `resolvePluginExternal` maps exactly that specifier to a file URL of [plugin.ts](/docs/src/experimental/plugin.ts) next to this module, choosing the extension from how this module itself was loaded, so it works from source and from compiled output. Any other specifier is left alone.
+
+```ts ! bundled.ts
+function resolvePluginExternal(specifier: string): string | undefined {
+	// !mark
+	if (specifier !== PI_PLUGIN_API) return undefined;
+	// !mark(1:2)
+	const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+	return new URL(`../plugin.${extension}`, import.meta.url).href;
+}
+```
+
+</Scrollycoding>
+
+The session loaders are used where the server starts a session worker (see [session-worker.ts](/docs/src/experimental/session-worker.ts)), and the presentation loaders by the UI client that receives the artifacts. The file keeps no state.

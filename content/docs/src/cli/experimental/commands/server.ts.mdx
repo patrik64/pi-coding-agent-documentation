@@ -1,0 +1,139 @@
+---
+title: "server.ts"
+description: "Experimental CLI definition of the `server` subcommand: its flags, validation rules, and the context hook that actually starts the server"
+source: "src/cli/experimental/commands/server.ts"
+full: true
+---
+
+This file is part of the experimental command-line layer. It is only the
+declarative half of the `server` subcommand: it says which flags exist, how
+their values are validated, and what typed `ServerCommand` object comes out.
+Nothing here starts a server. That is delegated to a `runServer` callback that
+the caller supplies, and the real implementation lives in
+[server.ts](/docs/src/experimental/server.ts).
+
+The command is built with the small `Command` builder from
+[command.ts](/docs/src/cli/experimental/command.ts), and the shared auth flags
+come from [command-options.ts](/docs/src/cli/experimental/command-options.ts).
+The sibling [client.ts](/docs/src/cli/experimental/commands/client.ts) defines
+the counterpart command.
+
+<Scrollycoding>
+
+## !!steps The parsed shape and the context
+
+`ServerCommand` is the result of a successful parse. Every field except
+`command` is optional, so an absent flag is simply absent from the object
+rather than present as `undefined`.
+
+`ServerCommandContext` is the dependency the caller injects. Keeping the action
+behind an interface means the parsing logic can be tested without launching
+anything.
+
+```ts ! server.ts
+export interface ServerCommand {
+	readonly command: "server";
+	readonly auth?: AuthInput;
+	readonly provider?: string;
+	readonly model?: string;
+	readonly pluginPackages?: readonly string[];
+	readonly serverId?: ServerId;
+	readonly sessionDir?: string;
+}
+
+export interface ServerCommandContext {
+	runServer(command: ServerCommand): void | Promise<void>;
+}
+```
+
+## !!steps Declaring the options
+
+Each option is a value object created once and later used as a key to read the
+parsed value back. Most are plain string options; `-e` is marked repeatable so
+it can be given several times and collected into `pluginPackages`.
+
+`--server-id` has a custom validator. It must be a lowercase UUIDv4, checked
+with `isServerId`, and the failure becomes a readable error message instead of
+a thrown exception.
+
+```ts ! server.ts
+const serverIdOption = valueOption("--server-id", (value) =>
+	isServerId(value)
+		? { ok: true, value }
+		: { ok: false, error: `Invalid --server-id "${value}"; expected a lowercase UUIDv4` },
+);
+const sessionDirOption = stringOption("--session-dir");
+const providerOption = stringOption("--provider");
+const modelOption = stringOption("--model");
+const pluginPackageOption = stringOption("-e", { repeatable: true });
+```
+
+## !!steps Registering options on the command
+
+The fluent chain registers the options, including the two shared auth options
+(token inline or from a file). Registration matters for more than parsing:
+any flag that was not registered is later reported as unsupported.
+
+```ts ! server.ts
+export const serverCommand = new Command<ServerCommand, ServerCommandContext>("server")
+	.option(serverIdOption)
+	.option(sessionDirOption)
+	.option(providerOption)
+	.option(modelOption)
+	.option(pluginPackageOption)
+	.option(authTokenOption)
+	.option(authTokenFileOption)
+```
+
+## !!steps Collecting errors, then building the command
+
+The build step reads every value first and accumulates errors from three
+sources: auth parsing, a cross-field rule, and `unsupportedOptions`. The
+cross-field rule is that `--provider` is only valid together with `--model`;
+the reverse (a model alone) is allowed.
+
+Errors are returned as a list so the user sees all problems at once.
+
+```ts ! server.ts
+	.build((input) => {
+		const { auth, errors: authErrors } = parseAuth(input);
+		const serverId = input.value(serverIdOption);
+		const sessionDir = input.value(sessionDirOption);
+		const provider = input.value(providerOption);
+		const model = input.value(modelOption);
+		const pluginPackages = input.values(pluginPackageOption);
+		// !mark
+		const modelErrors = provider !== undefined && model === undefined ? ["--provider requires --model"] : [];
+		const errors = [...authErrors, ...modelErrors, ...unsupportedOptions("server", input)];
+		if (errors.length > 0) return { ok: false, errors };
+```
+
+## !!steps Omitting absent fields and wiring the action
+
+On success the object is assembled with conditional spreads, so a flag the user
+did not pass leaves no key at all. Empty plugin lists are dropped the same way.
+
+Finally `.action` connects the parsed command to the injected `runServer`.
+
+```ts ! server.ts
+		return {
+			ok: true,
+			command: {
+				command: "server",
+				...(auth === undefined ? {} : { auth }),
+				...(provider === undefined ? {} : { provider }),
+				...(model === undefined ? {} : { model }),
+				...(pluginPackages.length === 0 ? {} : { pluginPackages }),
+				...(serverId === undefined ? {} : { serverId }),
+				...(sessionDir === undefined ? {} : { sessionDir }),
+			},
+		};
+	})
+	.action((command, context) => context.runServer(command));
+```
+
+</Scrollycoding>
+
+The experimental entry point [cli.ts](/docs/src/cli/experimental/cli.ts)
+collects commands like this one and dispatches to them. Only the exported
+`serverCommand` and the two interfaces are meant to be used from outside.

@@ -1,0 +1,102 @@
+---
+title: "grep.ts"
+description: "Terminal presentation for the grep tool: a slash-delimited pattern header and a 15-line match preview with three truncation warnings"
+source: "src/core/tools/renderers/grep.ts"
+full: true
+---
+
+This file renders the grep tool from [tools/grep.ts](/docs/src/core/tools/grep.ts). As with every renderer in this folder, it lives apart from the implementation so a process that only shows tool output avoids loading the execution path and the parameter schema.
+
+It follows the same template as [renderers/find.ts](/docs/src/core/tools/renderers/find.ts) and [renderers/ls.ts](/docs/src/core/tools/renderers/ls.ts), with a shorter collapsed preview and an extra warning for lines that were cut inside long matches.
+
+<Scrollycoding>
+
+## !!steps The call header
+
+The pattern is displayed between slashes in the accent color, followed by `in <path>`. An optional glob appears in parentheses and the limit as `limit N`. Each argument goes through `str` from [render-utils.ts](/docs/src/core/tools/render-utils.ts), so invalid types print `[invalid arg]`.
+
+```ts ! grep.ts
+function formatGrepCall(
+	args: { pattern: string; path?: string; glob?: string; limit?: number } | undefined,
+	theme: Theme,
+): string {
+	const pattern = str(args?.pattern);
+	const rawPath = str(args?.path);
+	const path = rawPath !== null ? shortenPath(rawPath || ".") : null;
+	const glob = str(args?.glob);
+	const limit = args?.limit;
+	const invalidArg = invalidArgText(theme);
+	let text =
+		theme.fg("toolTitle", theme.bold("grep")) +
+		" " +
+		// !mark
+		(pattern === null ? invalidArg : theme.fg("accent", `/${pattern || ""}/`)) +
+		theme.fg("toolOutput", ` in ${path === null ? invalidArg : path}`);
+	if (glob) text += theme.fg("toolOutput", ` (${glob})`);
+	if (limit !== undefined) text += theme.fg("toolOutput", ` limit ${limit}`);
+	return text;
+}
+```
+
+## !!steps Fifteen lines when collapsed
+
+Matches are verbose, so the collapsed view is shorter than find's and ls's 20 lines. The rest is the same: a muted hint states how many lines are hidden and how to expand them.
+
+```ts ! grep.ts
+	const output = getTextOutput(result, showImages).trim();
+	let text = "";
+	if (output) {
+		const lines = output.split("\n");
+		// !mark
+		const maxLines = options.expanded ? lines.length : 15;
+		const displayLines = lines.slice(0, maxLines);
+		const remaining = lines.length - maxLines;
+		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+		if (remaining > 0) {
+			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+		}
+	}
+```
+
+## !!steps Three reasons output can be incomplete
+
+The details record separates a match count limit, an overall byte truncation (limit from [truncate.ts](/docs/src/core/tools/truncate.ts)), and `linesTruncated`, which means individual long lines were shortened. All applicable reasons are joined into one `[Truncated: ...]` line so the user can tell why a match might be missing or cut.
+
+```ts ! grep.ts
+	const matchLimit = result.details?.matchLimitReached;
+	const truncation = result.details?.truncation;
+	const linesTruncated = result.details?.linesTruncated;
+	if (matchLimit || truncation?.truncated || linesTruncated) {
+		const warnings: string[] = [];
+		// !mark(1:3)
+		if (matchLimit) warnings.push(`${matchLimit} matches limit`);
+		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		if (linesTruncated) warnings.push("some lines truncated");
+		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
+	}
+	return text;
+```
+
+## !!steps The exported renderer pair
+
+The two hooks reuse the incoming `Text` component and replace its content, the cheapest way to handle repeated updates during streaming.
+
+```ts ! grep.ts
+export const grepRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
+	renderCall(args, theme, context) {
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		// !mark
+		text.setText(formatGrepCall(args as any, theme));
+		return text;
+	},
+	renderResult(result, options, theme, context) {
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		text.setText(formatGrepResult(result as any, options, theme, context.showImages));
+		return text;
+	},
+};
+```
+
+</Scrollycoding>
+
+The export is collected by [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) into the table of built-in renderers, typed by the contract in [extensions/types.ts](/docs/src/core/extensions/types.ts). The file is stateless.

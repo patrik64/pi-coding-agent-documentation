@@ -1,0 +1,176 @@
+---
+title: "command.ts"
+description: "A small typed command framework: option declarations, a builder-style Command class, subcommand dispatch and argv parsing"
+source: "src/cli/experimental/command.ts"
+full: true
+---
+
+Experimental commands do not use the main CLI parser in [args.ts](/docs/src/cli/args.ts). They use this purpose-built framework, which models a command as a typed value: options in, a validated invocation object out, plus an optional action that runs with a context.
+
+Result types are discriminated unions (`ok: true` with a command, or `ok: false` with error strings), so parsing never throws for user mistakes. Commands are composed in [cli.ts](/docs/src/cli/experimental/cli.ts), reuse shared options from [command-options.ts](/docs/src/cli/experimental/command-options.ts), and are defined in [client.ts](/docs/src/cli/experimental/commands/client.ts) and [server.ts](/docs/src/cli/experimental/commands/server.ts). This is experimental code.
+
+<Scrollycoding>
+
+## !!steps Result types
+
+Every phase returns the same two-armed union. Option parsing returns a value or a single error string.
+
+```ts ! command.ts
+export type CommandParseResult<TInvocation extends NamedCommandInvocation = NamedCommandInvocation> =
+	| { readonly ok: true; readonly command: TInvocation }
+	| { readonly ok: false; readonly errors: readonly string[] };
+
+export type CommandOptionParseResult<TValue> =
+	| { readonly ok: true; readonly value: TValue }
+	| { readonly ok: false; readonly error: string };
+```
+
+## !!steps Option constructors
+
+An option has a name starting with a dash, optional `flag` and `repeatable` markers, and a `parse` function. `valueOption` takes any parser, `stringOption` passes the string through, and `flagOption` always yields true.
+
+```ts ! command.ts
+export function valueOption<TValue>(
+	name: `-${string}`,
+	parse: (value: string) => CommandOptionParseResult<TValue>,
+	options: { readonly repeatable?: boolean } = {},
+): CommandOption<TValue> {
+	return { name, parse, ...options };
+}
+
+// !mark(1:3)
+export function flagOption(name: `-${string}`): CommandOption<boolean> {
+	return { name, flag: true, parse: () => ({ ok: true, value: true }) };
+}
+```
+
+## !!steps The Command class and registration
+
+Three type parameters track the command's own invocation, its context and the union of all invocations including subcommands. Registering an option twice throws immediately, as a programmer error rather than a user error.
+
+```ts ! command.ts
+export class Command<
+	TOwnInvocation extends NamedCommandInvocation,
+	TContext,
+	TInvocation extends NamedCommandInvocation = TOwnInvocation,
+> {
+	readonly name: string;
+	private readonly options = new Map<string, CommandOption<unknown>>();
+	private readonly subcommands = new Map<string, RegisteredCommand>();
+	private builder?: CommandBuilder<TOwnInvocation>;
+	private commandAction?: CommandAction<TOwnInvocation, TContext>;
+
+	constructor(name: string) {
+		this.name = name;
+	}
+
+	option<TValue>(option: CommandOption<TValue>): this {
+		// !mark(1:3)
+		if (this.options.has(option.name)) {
+			throw new Error(`Option ${option.name} is already registered for ${this.name}`);
+		}
+		this.options.set(option.name, option);
+		return this;
+	}
+```
+
+## !!steps Subcommands widen the types
+
+`command()` stores a type-erased `RegisteredCommand` and returns the same object cast to a type whose context is the intersection and whose invocation is the union. That cast is what lets `cli.ts` end up with one fully typed tree.
+
+```ts ! command.ts
+		if (this.subcommands.has(command.name)) throw new Error(`Command ${command.name} is already registered`);
+		this.subcommands.set(command.name, {
+			parse: (argv) => command.parse(argv),
+			execute: (argv, context) => command.execute(argv, context as TSubcommandContext),
+		});
+		// !mark(1:5)
+		return this as unknown as Command<
+			TOwnInvocation,
+			TContext & TSubcommandContext,
+			TInvocation | TSubcommandInvocation
+		>;
+```
+
+## !!steps Parse and execute dispatch
+
+`select` checks whether the first argument names a registered subcommand and, if so, delegates with the remaining argv. Otherwise the command parses its own options. `execute` additionally requires an action and throws if none is defined.
+
+```ts ! command.ts
+	async execute(argv: readonly string[], context: TContext): Promise<CommandExecutionResult<TInvocation>> {
+		const selected = this.select(argv);
+		if (selected) {
+			return selected.command.execute(selected.argv, context) as Promise<CommandExecutionResult<TInvocation>>;
+		}
+
+		const parsed = this.parseOwn(argv);
+		if (!parsed.ok) return parsed;
+		// !mark
+		if (!this.commandAction) throw new Error(`Command ${this.name} does not define an action`);
+		await this.commandAction(parsed.command, context);
+		return { ok: true, command: parsed.command as unknown as TInvocation };
+	}
+```
+
+## !!steps Building an invocation
+
+`parseOwn` collects option values, hands the builder an input view with `value`, `values` and `remainingArgs`, and merges option errors with builder errors. Only if both are empty does the built command come back.
+
+```ts ! command.ts
+	private parseOwn(argv: readonly string[]): CommandParseResult<TOwnInvocation> {
+		if (!this.builder) throw new Error(`Command ${this.name} does not define a builder`);
+		const parsed = this.parseOptions(argv);
+		const input: ParsedCommandInput = {
+			remainingArgs: parsed.remainingArgs,
+			value: <TValue>(option: CommandOption<TValue>) => parsed.values.get(option.name)?.[0] as TValue | undefined,
+			values: <TValue>(option: CommandOption<TValue>) => (parsed.values.get(option.name) ?? []) as readonly TValue[],
+		};
+		const built = this.builder(input);
+		// !mark(1:2)
+		const errors = [...parsed.errors, ...(built.ok ? [] : built.errors)];
+		if (errors.length > 0) return { ok: false, errors };
+```
+
+## !!steps Scanning argv
+
+Parsing stops at `--` or at the first argument that is not a registered option, and everything from there goes into `remainingArgs`. So options must come first, and unknown options are not errors here; the builder decides. Both `--name=value` and `--name value` work, and a following token starting with `-` is never taken as a value.
+
+```ts ! command.ts
+			if (argument === "--") {
+				parsed.remainingArgs.push(...argv.slice(index));
+				break;
+			}
+
+			const equals = argument.indexOf("=");
+			const name = equals === -1 ? argument : argument.slice(0, equals);
+			const option = this.options.get(name);
+			// !mark(1:4)
+			if (!option) {
+				parsed.remainingArgs.push(...argv.slice(index));
+				break;
+			}
+```
+
+## !!steps Values, repeats and errors
+
+Flags reject `=value`. A value option needs a non-empty candidate. Non-repeatable options error when given twice, and each option's own parser can add its error. Errors accumulate rather than aborting, so users see all problems at once.
+
+```ts ! command.ts
+			const values = parsed.values.get(name) ?? [];
+			// !mark(1:4)
+			if (values.length > 0 && option.repeatable !== true) {
+				parsed.errors.push(`${name} may only be specified once`);
+				continue;
+			}
+			const result = option.parse(value);
+			if (!result.ok) {
+				parsed.errors.push(result.error);
+				continue;
+			}
+			values.push(result.value);
+			parsed.values.set(name, values);
+```
+
+</Scrollycoding>
+
+Subcommand selection looks only at `argv[0]`, so `pi experimental client -c` works but options placed before the subcommand name are not supported. A quirk: the exported `CommandBuildResult` and `CommandExecutionResult` types duplicate `CommandParseResult` structurally.

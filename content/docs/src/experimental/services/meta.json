@@ -1,0 +1,20 @@
+{
+  "title": "services",
+  "pages": [
+    "agent-controller-provider.ts",
+    "agent-controller.ts",
+    "connection.ts",
+    "models-provider.ts",
+    "models.ts",
+    "plugins.ts",
+    "presentation-ui.ts",
+    "README.md",
+    "server.ts",
+    "sessions.ts",
+    "slash-commands-provider.ts",
+    "slash-commands.ts",
+    "transcript-provider.ts",
+    "transcript.ts",
+    "worker.ts"
+  ]
+}

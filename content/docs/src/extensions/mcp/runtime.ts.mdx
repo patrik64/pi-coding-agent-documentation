@@ -1,0 +1,313 @@
+---
+title: "runtime.ts"
+description: "McpServerConnection: one configured MCP server, its transport, lazy reconnect, retry rules and sign-in state machine"
+source: "src/extensions/mcp/runtime.ts"
+full: true
+---
+
+This is the half of the MCP integration that actually talks to servers. [index.ts](/docs/src/extensions/mcp/index.ts) holds the extension wiring, commands and UI, and loads this file through [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts) only when at least one server is configured, because importing it drags in the whole MCP client.
+
+The centre is `McpServerConnection`, a class wrapping one entry from [config.ts](/docs/src/extensions/mcp/config.ts). It owns a state (`connecting`, `connected`, `disconnected`, `needs-auth`, `failed`, `closed`), the tools and resources discovered at connect time, and the policy for what happens when a request fails.
+
+<Scrollycoding>
+
+## !!steps Which errors are worth retrying
+
+Two small helpers define the retry policy. A transient error is a network-level `TypeError` (what `fetch` throws) or an HTTP 408, 429 or 5xx, with 501 excluded because "not implemented" will not change on a second try.
+
+Connection retries use a fixed two-step backoff, 250 ms then 1 second, and apply only to HTTP servers. Stdio servers are never retried at connect time, since a process that fails to start will fail the same way again.
+
+```ts ! runtime.ts
+/** Delays between attempts to connect to an HTTP server that failed with a transient error. */
+const CONNECT_RETRY_DELAYS_MS = [250, 1_000];
+
+// ...
+/** Network failures and overloaded or restarting servers, which are worth another attempt. */
+function isTransientError(error: unknown): boolean {
+	if (error instanceof McpHttpError) {
+		// !mark
+		return error.status === 408 || error.status === 429 || (error.status >= 500 && error.status !== 501);
+	}
+	// !mark
+	return error instanceof TypeError;
+}
+```
+
+## !!steps OAuth is the default for HTTP servers
+
+`usesOAuth` decides whether to attach an OAuth provider at all. A stdio server never does. An HTTP server does unless its config names an explicit `auth` block or already carries an `Authorization` header, in which case the user has chosen their own credentials. The header comparison is case-insensitive.
+
+`signInRequiredMessage` points the user to `/login provider` when the server is tied to a pi provider, otherwise to `/mcp`, where [oauth.ts](/docs/src/extensions/mcp/oauth.ts) drives the actual flow.
+
+```ts ! runtime.ts
+function signInRequiredMessage(entry: McpServerEntry): string {
+	const provider = "url" in entry.config ? entry.config.auth?.provider : undefined;
+	return `MCP server "${entry.name}" requires sign-in. Run ${provider ? `/login ${provider}` : "/mcp"} to sign in.`;
+}
+
+/** HTTP servers authenticate with OAuth unless the config supplies an `Authorization` header or `auth`. */
+function usesOAuth(entry: McpServerEntry): boolean {
+	const { config } = entry;
+	// !mark(1:2)
+	if (!("url" in config) || config.auth) return false;
+	return !Object.keys(config.headers ?? {}).some((header) => header.toLowerCase() === "authorization");
+}
+```
+
+## !!steps Building the transport from config
+
+`createDefaultTransport` is the default `McpTransportFactory`. The union type is discriminated by the presence of `url`: HTTP entries get a `StreamableHttpTransport`, everything else is a stdio command.
+
+Header and env values go through `resolveHeadersOrThrow` and `resolveConfigValueOrThrow` from [resolve-config-value.ts](/docs/src/core/resolve-config-value.ts), so a value can be a literal or a reference resolved at connect time, and an unresolvable one fails with a message naming the server. For stdio, `~` is expanded in the command, the arguments and the working directory, and the cwd is resolved against the project directory. Stderr is piped so a failed start can be reported.
+
+```ts ! runtime.ts
+	const { config, name } = entry;
+	if ("url" in config) {
+		return new StreamableHttpTransport({
+			url: config.url,
+			// !mark
+			headers: resolveHeadersOrThrow(config.headers, `MCP server "${name}"`),
+			authProvider,
+		});
+	}
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(config.env ?? {})) {
+		env[key] = resolveConfigValueOrThrow(value, `MCP server "${name}" env "${key}"`);
+	}
+	return new StdioTransport({
+		command: expandHome(config.command),
+		args: config.args?.map(expandHome),
+		// !mark
+		cwd: resolve(cwd, expandHome(config.cwd ?? ".")),
+		env,
+		stderr: "pipe",
+	});
+```
+
+## !!steps Resources are optional and never block connecting
+
+Not every server implements `resources/templates/list`, so `withoutTemplates` converts a JSON-RPC "method not found" into an empty result and rethrows anything else.
+
+`fetchResources` runs both lists in parallel and swallows failures with `catch(() => [])`. A server whose resource lists break still connects; the resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) list and read on demand. MCP App resources are filtered out of the counts, since they are handled elsewhere.
+
+```ts ! runtime.ts
+async function withoutTemplates<T>(list: () => Promise<T>, empty: T): Promise<T> {
+	try {
+		return await list();
+	} catch (error) {
+		// !mark
+		if (error instanceof McpError && error.code === JSON_RPC_ERROR_CODES.methodNotFound) return empty;
+		throw error;
+	}
+}
+
+// ...
+async function fetchResources(
+	client: McpClient,
+): Promise<{ resources: Resource[]; resourceTemplates: ResourceTemplate[] }> {
+	const [resources, resourceTemplates] = await Promise.all([
+		// !mark(1:2)
+		client.listResources().catch(() => []),
+		listTemplates(client).catch(() => []),
+	]);
+```
+
+## !!steps Choosing an auth provider in the constructor
+
+The constructor picks one of three authentication modes. If the server uses OAuth, it builds a full provider with a per-server credential store and a settings thunk, and records every challenge the server issues in `challenge`. Otherwise, if the config names a pi provider, it builds a tiny object whose `token` reads the provider's current token on every request, so refreshes apply and MCP keeps no copy. With neither, there is no auth provider.
+
+The callbacks `onTools` and `onChange` are how the connection reports upward to [index.ts](/docs/src/extensions/mcp/index.ts) without knowing about it.
+
+```ts ! runtime.ts
+		const url = this.oauthUrl;
+		const provider = "url" in this.entry.config ? this.entry.config.auth?.provider : undefined;
+		this.authProvider = url
+			? createMcpAuthProvider({
+					serverUrl: url,
+					store: options.credentials.forServer(this.entry.name, url),
+					settings: () => this.oauthSettings(),
+					onChallenge: (challenge) => {
+						this.challenge = challenge;
+					},
+				})
+			: provider
+				? // Read on every request, so the provider's refreshes apply; MCP stores no copy.
+					// !mark
+					{ token: async () => options.providerToken?.(provider), settled: async () => {} }
+				: undefined;
+```
+
+## !!steps One connect at a time
+
+`getClient` is the single entry point every request goes through. A closed connection rejects immediately. A live client is returned as is. Otherwise the `opening` promise is created once with `??=` and shared, so concurrent callers all wait on the same connect, and it is cleared in `finally` so a failed attempt can be retried by the next call.
+
+This is what makes reconnect lazy: a stdio server that exited leaves state `disconnected`, and nothing happens until the next tool call asks for a client.
+
+```ts ! runtime.ts
+	getClient(): Promise<McpClient> {
+		if (this.closed) return Promise.reject(new Error(`MCP server "${this.entry.name}" is shut down`));
+		if (this.client?.connectionState === "connected") return Promise.resolve(this.client);
+		// !mark(1:3)
+		this.opening ??= this.open().finally(() => {
+			this.opening = undefined;
+		});
+		return this.opening;
+	}
+```
+
+## !!steps Running a request with three recovery paths
+
+`withClient` wraps every call. It has three distinct recoveries. A read-only request retries once after a transient HTTP error, but a tool call never does, because the tool may already have run. A session-expired error means the server forgot the session and did not run the request, so it retries once on a fresh session, detaching the old client without closing it so other in-flight calls fail the same way and retry themselves.
+
+Any other error is rethrown unless it is a sign-in problem, in which case the client is dropped, the state becomes `needs-auth`, and the user gets the sign-in message. The loop has no explicit bound but each retry branch checks `attempt === 1`.
+
+```ts ! runtime.ts
+	private async withClient<T>(run: (client: McpClient) => Promise<T>, readOnly = false): Promise<T> {
+		for (let attempt = 1; ; attempt++) {
+			const client = await this.getClient();
+			try {
+				return await run(client);
+			} catch (error) {
+				// !mark(1:4)
+				if (readOnly && attempt === 1 && error instanceof McpHttpError && isTransientError(error)) {
+					await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAYS_MS[0]));
+					continue;
+				}
+				if (error instanceof McpSessionExpiredError && attempt === 1) {
+					// The server no longer knows the session (restart, deploy), so it did not run the request.
+					// Retry once on a new session. The old client is detached but not closed: closing would
+					// fail its other in-flight calls, which instead get the same 404 and retry the same way.
+					if (this.client === client) this.client = undefined;
+					continue;
+				}
+				if (!this.needsSignIn(error)) throw error;
+				await this.dropClient(client);
+				this.markNeedsAuth();
+				throw new Error(signInRequiredMessage(this.entry));
+			}
+		}
+	}
+```
+
+## !!steps The connect loop and its abortable sleep
+
+`open` sets the state to `connecting`, then loops over `connectOnce`. The retry list is empty for stdio servers. On a failure it gives up if the connection is closed, the delays are exhausted, or the error is not transient. Otherwise it sleeps.
+
+The sleep takes the `shutdown` signal, so `close()` cuts the wait short, and the abort rejection is swallowed so the next line can check `closed` and fail cleanly.
+
+```ts ! runtime.ts
+	private async open(): Promise<McpClient> {
+		this.state = "connecting";
+		this.changed();
+		// !mark
+		const retries = "url" in this.entry.config ? CONNECT_RETRY_DELAYS_MS : [];
+		for (let attempt = 0; ; attempt++) {
+			this.stderrTail = undefined;
+			try {
+				return await this.connectOnce();
+			} catch (error) {
+				const delay = retries[attempt];
+				if (this.closed || delay === undefined || !isTransientError(error)) {
+					throw this.connectFailed(error);
+				}
+				// !mark
+				await sleep(delay, undefined, { signal: this.shutdown.signal }).catch(() => undefined);
+				if (this.closed) throw this.connectFailed(error);
+			}
+		}
+	}
+```
+
+## !!steps A single connect attempt
+
+`connectOnce` creates a client that advertises the project directory as an MCP root, forwards the server's log notifications to the [log.ts](/docs/src/extensions/mcp/log.ts) sink, and registers an abort listener so a shutdown during connecting closes the client. The close is memoized, because a second `client.close()` can return before the first finished closing the transport.
+
+After `connect`, it subscribes to `list_changed` notifications and to close events, then fetches tools and resources in parallel, skipping the tools request for servers that do not advertise the capability. Two checks guard the commit: a shutdown, or a connection that dropped during setup, throws before any field is assigned.
+
+```ts ! runtime.ts
+		let closing: Promise<void> | undefined;
+		const closeClient = () => {
+			closing ??= client.close().catch(() => undefined);
+			return closing;
+		};
+		this.shutdown.signal.addEventListener("abort", closeClient, { once: true });
+		let transport: McpTransport | undefined;
+		try {
+			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
+			await client.connect(transport);
+			// ...
+			const [tools, resources] = await Promise.all([
+				client.serverCapabilities?.tools ? client.listTools() : [],
+				hasResources ? fetchResources(client) : { resources: [], resourceTemplates: [] },
+			]);
+			// !mark(1:2)
+			if (this.closed) throw new Error("shut down while connecting");
+			if (client.connectionState !== "connected") throw new Error("connection closed during setup");
+			this.client = client;
+```
+
+## !!steps Failure reporting keeps the stderr tail
+
+`connectFailed` turns an error into a user-facing one and updates state. A sign-in error moves to `needs-auth` with the friendly message and no error text. Anything else becomes `failed`, or `closed` if shutdown caused it.
+
+For stdio servers the last 2000 characters of stderr, captured in the catch of `connectOnce`, are appended to the error, which is usually what explains a bad command or missing dependency. `handleClientClose` does a similar thing for a dropped connection, but ignores the event if the client was already replaced or the connection closed on purpose.
+
+```ts ! runtime.ts
+	private connectFailed(error: unknown): Error {
+		if (this.needsSignIn(error) && !this.closed) {
+			this.markNeedsAuth();
+			return new Error(signInRequiredMessage(this.entry));
+		}
+		// !mark(1:2)
+		this.state = this.closed ? "closed" : "failed";
+		this.error = this.stderrTail ? `${errorMessage(error)}\n${this.stderrTail}` : errorMessage(error);
+		this.changed();
+		return new Error(`MCP server "${this.entry.name}" failed to connect: ${this.error}`);
+	}
+
+	/** The transport dropped. The next call reconnects; until then the status shows why. */
+	private handleClientClose(client: McpClient, stdio: StdioTransport | undefined): void {
+		// !mark
+		if (this.client !== client || this.closed) return;
+```
+
+## !!steps Live refresh and careful shutdown
+
+When the server sends `list_changed`, `refreshTools` and `refreshResources` re-fetch and call `onTools` so the agent's tool set is rebuilt. Both check that the client is still the current one, so a late response from a replaced client cannot overwrite newer data.
+
+`close` aborts the shutdown controller, marks the state, and waits for both the live client and any connect in flight. Then it awaits `authProvider.settled()`. The comment explains why: a refresh the server already answered may have rotated the refresh token, and exiting before it is saved would lose the grant.
+
+```ts ! runtime.ts
+	private async refreshTools(client: McpClient): Promise<void> {
+		try {
+			const tools = await client.listTools();
+			// !mark
+			if (this.client !== client || this.closed) return;
+			this.tools = tools;
+			this.onTools(this);
+		} catch (error) {
+			this.error = `Failed to refresh tools: ${errorMessage(error)}`;
+		}
+		this.changed();
+	}
+
+	// ...
+	async close(): Promise<void> {
+		this.shutdown.abort();
+		this.state = "closed";
+		this.changed();
+		const client = this.client;
+		this.client = undefined;
+		await Promise.all([client?.close().catch(() => undefined), this.opening?.catch(() => undefined)]);
+		// A refresh the server already answered may have rotated the refresh token; exiting before the
+		// new tokens are saved would lose the grant.
+		// !mark
+		await this.authProvider?.settled();
+	}
+```
+
+</Scrollycoding>
+
+`McpServerConnection` implements the `McpToolCaller` interface from [tools.ts](/docs/src/extensions/mcp/tools.ts) and the `McpResourceServer` interface from [resources.ts](/docs/src/extensions/mcp/resources.ts), so those modules call into it without knowing about transports. [index.ts](/docs/src/extensions/mcp/index.ts) owns the set of connections and turns their `onChange` callbacks into status UI.
+
+One structural note: the state machine is implicit in assignments scattered across methods rather than a single transition function. `markNeedsAuth`, `connectFailed`, `handleClientClose` and `close` each set `state` and `error` and then call `changed()`.

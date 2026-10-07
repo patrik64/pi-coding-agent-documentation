@@ -1,0 +1,110 @@
+---
+title: "theme-selector.ts"
+description: "Bordered list of available themes that previews each theme as the highlight moves"
+source: "src/modes/interactive/components/theme-selector.ts"
+full: true
+---
+
+A modal that lists theme names from `getAvailableThemes()`. Unlike the other small selectors, it fires a third callback, `onPreview`, so the whole UI can repaint in the highlighted theme before the user commits.
+
+Because previewing mutates the live theme, whoever creates this component must restore the original theme in `onCancel`; the component itself does nothing for that. Nothing in the package instantiates it (it is only re-exported), since the settings dialog has its own theme flow. A newer, richer flow lives in [settings-selector.ts](/docs/src/modes/interactive/components/settings-selector.ts), which handles automatic light/dark themes; this component handles a plain list.
+
+<Scrollycoding>
+
+## !!steps Constructor signature
+
+Four callbacks: select, cancel, preview, plus the current theme name. `onPreview` is stored on the instance; the other two are used directly in closures.
+
+```ts ! theme-selector.ts
+const THEME_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
+	minPrimaryColumnWidth: 12,
+	maxPrimaryColumnWidth: 32,
+};
+
+/**
+ * Component that renders a theme selector
+ */
+export class ThemeSelectorComponent extends Container {
+	private selectList: SelectList;
+	private onPreview: (themeName: string) => void;
+
+	// !mark(1:5)
+	constructor(
+		currentTheme: string,
+		onSelect: (themeName: string) => void,
+		onCancel: () => void,
+		onPreview: (themeName: string) => void,
+	) {
+		super();
+		this.onPreview = onPreview;
+
+```
+
+## !!steps Build items and mark the current theme
+
+Each theme becomes an item whose label equals its name. Only the active one gets a `(current)` description. The list shows up to 10 rows.
+
+```ts ! theme-selector.ts
+		// Get available themes and create select items
+		const themes = getAvailableThemes();
+		// !mark(1:5)
+		const themeItems: SelectItem[] = themes.map((name) => ({
+			value: name,
+			label: name,
+			description: name === currentTheme ? "(current)" : undefined,
+		}));
+
+		// Add top border
+		this.addChild(new DynamicBorder());
+
+		// Create selector
+		// !mark
+		this.selectList = new SelectList(themeItems, 10, getSelectListTheme(), THEME_SELECT_LIST_LAYOUT);
+```
+
+## !!steps Preselect, select and cancel
+
+The list opens on the current theme if it is found. A missing name leaves the default index at 0.
+
+```ts ! theme-selector.ts
+		// Preselect current theme
+		// !mark(1:3)
+		const currentIndex = themes.indexOf(currentTheme);
+		if (currentIndex !== -1) {
+			this.selectList.setSelectedIndex(currentIndex);
+		}
+
+		this.selectList.onSelect = (item) => {
+			onSelect(item.value);
+		};
+
+		this.selectList.onCancel = () => {
+			onCancel();
+		};
+```
+
+## !!steps Preview on selection change
+
+Moving the highlight triggers `onSelectionChange`, which calls the preview callback with the highlighted name. Borders from [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) close the layout.
+
+```ts ! theme-selector.ts
+		// !mark(1:3)
+		this.selectList.onSelectionChange = (item) => {
+			this.onPreview(item.value);
+		};
+
+		this.addChild(this.selectList);
+
+		// Add bottom border
+		this.addChild(new DynamicBorder());
+	}
+
+	getSelectList(): SelectList {
+		return this.selectList;
+	}
+}
+```
+
+</Scrollycoding>
+
+Layout and structure mirror [show-images-selector.ts](/docs/src/modes/interactive/components/show-images-selector.ts) and [thinking-selector.ts](/docs/src/modes/interactive/components/thinking-selector.ts). Theme definitions come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).

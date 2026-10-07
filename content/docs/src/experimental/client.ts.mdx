@@ -1,0 +1,130 @@
+---
+title: "client.ts"
+description: "Non-interactive experimental client: list sessions across servers, attach to one, or create one and run a single prompt to completion"
+source: "src/experimental/client.ts"
+full: true
+---
+
+`runClient` is the headless half of the experimental `client` command. Given a parsed [ClientCommand](/docs/src/cli/experimental/commands/client.ts), it opens a connection to every discoverable server, and then does exactly one of three things: lists sessions, attaches to a session, or sends one prompt and waits for the answer.
+
+It owns no transport details. Those live in [client-runtime.ts](/docs/src/experimental/client-runtime.ts), which opens the connections and returns service facades. This file is only the decision logic on top. The interactive variant is [client-tui.ts](/docs/src/experimental/client-tui.ts), and [commands.ts](/docs/src/experimental/commands.ts) chooses between them. The code is experimental.
+
+<Scrollycoding>
+
+## !!steps Three possible outcomes
+
+The result is a discriminated union, so the caller can print each case differently. A session is addressed by a server id plus a session id, since session ids alone may collide across servers.
+
+```ts ! client.ts
+export type ClientResult =
+	| {
+			readonly kind: "list";
+			readonly sessions: readonly SessionAddress[];
+	  }
+	| { readonly kind: "attached"; readonly serverId: string; readonly sessionId: string }
+	| { readonly kind: "prompted"; readonly serverId: string; readonly sessionId: string; readonly text: string };
+
+export interface RunClientOptions {
+	/** Directory searched when --connect is omitted. Defaults to PI_SERVER_DIR or ~/.pi/server. */
+	readonly directory?: string;
+}
+```
+
+## !!steps Open, activate, and list
+
+The runtime is opened inside a `try` so that `finally` always disposes it. Every discovered server gets its built-in services activated in parallel. If neither a session id nor a prompt was given, the command is a listing: sessions from all servers are flattened and sorted by server id then session id so output is stable.
+
+```ts ! client.ts
+export async function runClient(command: ClientCommand, options: RunClientOptions = {}): Promise<ClientResult> {
+	const runtime = await openClientRuntime(command, { directory: options.directory });
+	try {
+		const discovered = await Promise.all(runtime.servers.map(activateBuiltinClientServices));
+		let sessionId = command.sessionId;
+		// !mark
+		if (sessionId === undefined && command.prompt === undefined) {
+			return {
+				kind: "list",
+				sessions: discovered
+					.flatMap(({ route, directory }) =>
+						directory.state.value!.sessions.map(({ sessionId }) => ({ serverId: route.serverId, sessionId })),
+					)
+```
+
+## !!steps A prompt with no session creates one
+
+When there is a prompt but no session id, the client needs to know which server should own the new session. It refuses to guess: unless exactly one server was discovered, it throws. With one server it calls `management.create` and takes the new session id.
+
+```ts ! client.ts
+		let match: (typeof discovered)[number];
+		if (sessionId === undefined) {
+			// !mark
+			if (discovered.length !== 1) {
+				throw new Error("Client prompt requires exactly one discovered server to create a Session");
+			}
+			match = discovered[0]!;
+			sessionId = (await match.management.create({}, BACKGROUND_CONTEXT)).sessionId;
+		} else {
+```
+
+## !!steps A session id is looked up, or created on demand
+
+With an explicit session id, the client searches each server's directory. Two matches is an error. If none match, the id is only created when all of these hold: the connection is not Radius, a prompt was supplied, and exactly one server exists. Otherwise the error says no discovered server contains the session. So `client <id>` with no prompt never creates anything.
+
+```ts ! client.ts
+			const selectedSessionId = sessionId;
+			const matches = discovered.filter((candidate) =>
+				candidate.directory.state.value!.sessions.some(({ sessionId }) => sessionId === selectedSessionId),
+			);
+			if (matches.length > 1) {
+				throw new Error(`Session ${selectedSessionId} is available from more than one server`);
+			}
+			const existing = matches[0];
+			if (existing) {
+				match = existing;
+			} else {
+				// !mark
+				if (command.connect?.transport === "radius" || command.prompt === undefined || discovered.length !== 1) {
+					throw new Error(`No discovered server contains session ${selectedSessionId}`);
+				}
+				match = discovered[0]!;
+				await match.management.create({ id: selectedSessionId }, BACKGROUND_CONTEXT);
+			}
+```
+
+## !!steps Prepare plugins and attach
+
+Once a server and session are chosen, the plugin packages given on the command line are resolved to absolute paths and passed to `prepareSession`, then the client attaches. A command without a prompt stops here and reports `attached`. Note that attachment is made through the wrapped `management` object from [client-runtime.ts](/docs/src/experimental/client-runtime.ts), whose `attach` also waits until the session-level services are connected.
+
+```ts ! client.ts
+		await match.plugins.prepareSession(
+			{
+				sessionId,
+				packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
+			},
+			BACKGROUND_CONTEXT,
+		);
+		await match.management.attach(sessionId, BACKGROUND_CONTEXT);
+		if (command.prompt === undefined) {
+			return { kind: "attached", serverId: match.route.serverId, sessionId };
+		}
+```
+
+## !!steps Send the prompt and wait for the answer
+
+Prompting is two calls. `prompt` returns an acceptance record with an operation id, and a rejected one is thrown as its error message. `waitForPrompt` then blocks until the turn finishes. A status of `unanswered` is an error, so the caller never receives empty text silently. The `finally` at the end disposes the runtime on every path.
+
+```ts ! client.ts
+		const response = await match.agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+		if (!response.accepted) throw new Error(response.error.message);
+		const result = await match.agent.waitForPrompt(response.operationId, BACKGROUND_CONTEXT);
+		if (result.status === "unanswered") throw new Error(`Prompt was not answered: ${result.reason}`);
+		return { kind: "prompted", serverId: match.route.serverId, sessionId, text: result.text };
+	} finally {
+		await runtime.dispose();
+	}
+}
+```
+
+</Scrollycoding>
+
+The service types used here come from [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts) and [sessions.ts](/docs/src/experimental/services/sessions.ts). The only consumer is [commands.ts](/docs/src/experimental/commands.ts), which prints the three result kinds in a tab-separated, script-friendly form.

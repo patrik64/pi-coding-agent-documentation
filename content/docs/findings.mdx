@@ -1,0 +1,107 @@
+---
+title: Findings
+description: Discrepancies, dead code and test gaps noticed while documenting the codebase
+---
+
+Writing a walkthrough for a file meant reading all of it, and that turned up
+things worth recording. Each entry names the page that explains it in context.
+None of this is a judgement of the code overall; it is the ordinary residue of
+a fast-moving codebase. Only the files with walkthroughs have been read this
+closely.
+
+## Behavior that looks wrong
+
+- **CLI overrides are dropped by later saves.** `applyOverrides` only touches
+  the merged settings, while `save`, `saveProjectSettings`, `setProjectTrusted`
+  and `reload` recompute them from global and project files. See
+  [settings-manager.ts](/docs/src/core/settings-manager.ts).
+- **Edit matching is fuzzy even when exact would do.** `countOccurrences`
+  always normalizes, so an exact unique `oldText` can be rejected as
+  duplicated, and one fuzzy edit switches the whole call to normalized space.
+  See [edit-diff.ts](/docs/src/core/tools/edit-diff.ts).
+- **A byte limit that counts characters.** `maxOutputBytes` is compared with
+  `text.length`. See [bash-executor.ts](/docs/src/core/bash-executor.ts).
+- **Offline flag disagrees with itself.** `PI_OFFLINE` is offline whenever it
+  is defined, even `0`, in
+  [model-runtime.ts](/docs/src/core/model-runtime.ts), while
+  [package-manager.ts](/docs/src/core/package-manager.ts) accepts only `1`,
+  `true` or `yes`.
+- **A mistyped flag can eat the prompt.** A value flag with no value, or an
+  unknown flag followed by a word, is stored silently. See
+  [args.ts](/docs/src/cli/args.ts).
+- **A failed session swap can leave a disposed session.** A factory failure
+  after teardown leaves the runtime holding it. See
+  [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts).
+- **Aborts after completion still report errors** in
+  [write.ts](/docs/src/core/tools/write.ts) and
+  [edit.ts](/docs/src/core/tools/edit.ts).
+
+## Comments that contradict the code
+
+- `findInitialModel` lists "restored from session" as a source it does not
+  implement, and `parseModelPattern` mentions "off" where it returns
+  `undefined`: [model-resolver.ts](/docs/src/core/model-resolver.ts).
+- `detectExtensionConflicts` mentions commands but checks tools and flags only:
+  [resource-loader.ts](/docs/src/core/resource-loader.ts).
+- The `createAgentSession` example uses a `continueSession` option that does
+  not exist: [sdk.ts](/docs/src/core/sdk.ts).
+- The `isIdle` comment mentions retry and queued continuation, which the code
+  does not check: [agent-session.ts](/docs/src/core/agent-session.ts).
+- Several doc comments sit above the wrong declaration, in
+  [session-manager.ts](/docs/src/core/session-manager.ts),
+  [types.ts](/docs/src/core/extensions/types.ts),
+  [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) and
+  [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts).
+
+## Dead or duplicated code
+
+- `commandDiagnostics` is reset but never filled, so `getCommandDiagnostics`
+  is always empty: [runner.ts](/docs/src/core/extensions/runner.ts).
+- `warnings` is returned but never populated:
+  [loader.ts](/docs/src/core/extensions/loader.ts).
+- Two cut-point implementations exist; `prepareCompaction` uses only the
+  projected one: [compaction.ts](/docs/src/core/compaction/compaction.ts).
+- `summary || "No summary generated"` can never fall back:
+  [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts).
+- `SessionList.onExit` is wired but never invoked, and `deleteSessionFile`
+  blocks on `spawnSync`:
+  [session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts).
+- `loadThemes` is always called with `includeDefaults` false, so that branch is
+  dead: [resource-loader.ts](/docs/src/core/resource-loader.ts).
+
+## Found while documenting the rest
+
+- **`set -e` aborts the session migration script.** `((migrated++))` and
+  `((failed++))` return status 1 while the counter is 0, so the first skipped
+  or migrated session stops the script. See
+  [migrate-sessions.sh](/docs/scripts/migrate-sessions.sh).
+- **Warnings are silenced process-wide.** `process.emitWarning` is replaced
+  with a no-op in [setup.ts](/docs/src/cli/setup.ts),
+  [rpc-entry.ts](/docs/src/rpc-entry.ts) and
+  [runtime-setup.ts](/docs/src/bun/runtime-setup.ts).
+- **Windows paths in migrations.** The file name is taken with
+  `split("/").pop() || split("\\").pop()`, so the fallback never runs. See
+  [migrations.ts](/docs/src/migrations.ts).
+- **Footer shows 0.0% instead of unknown** when context usage is undefined,
+  because `undefined !== null`. See
+  [footer.ts](/docs/src/modes/interactive/components/footer.ts).
+- **A rejected terminal-color query disables the easter egg for good.**
+  See [easter-egg-3d.ts](/docs/src/modes/interactive/components/easter-egg-3d.ts).
+- **Bash header color is lost after the first update** for `!!` commands. See
+  [bash-execution.ts](/docs/src/modes/interactive/components/bash-execution.ts).
+- **A failed Photon load is cached forever.** See
+  [photon.ts](/docs/src/utils/photon.ts).
+- **`PI_OFFLINE` is parsed three ways** across
+  [tools-manager.ts](/docs/src/utils/tools-manager.ts),
+  [version-check.ts](/docs/src/utils/version-check.ts) and the two files in
+  the first list.
+- **Dead exports:** `warnDeprecation`
+  ([deprecation.ts](/docs/src/utils/deprecation.ts)), `wrapToolDefinitions`
+  ([tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts))
+  and `isInstallTelemetryEnabled`
+  ([telemetry.ts](/docs/src/core/telemetry.ts)) have no callers in `src`.
+- **`vacation/` is a near-copy of `durable/`**, including an identical
+  `main.ts`. See [main.ts](/docs/src/experimental/vacation/main.ts).
+- **Abort handling gaps in `grep` and `ls`:** an abort during tool download is
+  missed in [grep.ts](/docs/src/core/tools/grep.ts), and
+  [ls.ts](/docs/src/core/tools/ls.ts) leaks its listener on early rejects.

@@ -1,0 +1,29 @@
+---
+title: "jiti-loader.ts"
+description: "The default jiti entry that lets extension TypeScript files load from source at runtime"
+source: "src/core/extensions/jiti-loader.ts"
+full: true
+---
+
+This three-line module re-exports `createJiti` from the regular `jiti` entry point. Extensions are TypeScript files that pi loads on the fly, and [loader.ts](/docs/src/core/extensions/loader.ts) needs a transpiling importer to do it.
+
+Keeping the import in its own file means jiti is only evaluated when an extension is actually loaded. Its static twin, [jiti-static-loader.ts](/docs/src/core/extensions/jiti-static-loader.ts), is the variant used inside compiled binaries.
+
+<Scrollycoding>
+
+## !!steps A comment and a single re-export
+
+The comment gives the reason for using plain `jiti`: its transform is lazy, so Babel is loaded only when native loading fails and an extension needs transformation.
+
+The module is the lazy boundary. Nothing imports jiti until the loader awaits a dynamic `import()` of this file.
+
+```ts ! jiti-loader.ts
+// Normal Node runtimes use jiti's lazy transform so Babel is loaded only when
+// native loading fails and an extension needs transformation.
+// !mark
+export { createJiti } from "jiti";
+```
+
+</Scrollycoding>
+
+The loader in [loader.ts](/docs/src/core/extensions/loader.ts) chooses between this file and [jiti-static-loader.ts](/docs/src/core/extensions/jiti-static-loader.ts) with a dynamic import, so only one of them is ever evaluated. [index.ts](/docs/src/core/extensions/index.ts) does not re-export either one.

@@ -1,0 +1,74 @@
+---
+title: "image-resize-worker.ts"
+description: "Worker-thread entry point that runs one image resize request and posts the result back"
+source: "src/utils/image-resize-worker.ts"
+full: true
+---
+
+Photon decoding and encoding are CPU heavy, so [image-resize.ts](/docs/src/utils/image-resize.ts) runs them in a worker thread to keep the terminal UI responsive. This file is the code inside that worker.
+
+It is deliberately minimal: it validates one message, calls `resizeImageInProcess` from [image-resize-core.ts](/docs/src/utils/image-resize-core.ts), and replies.
+
+<Scrollycoding>
+
+## !!steps Message shapes
+
+The request carries the bytes, MIME type and optional options. The response holds either a result (possibly null) or an error string.
+
+```ts ! image-resize-worker.ts
+interface ResizeImageWorkerRequest {
+	inputBytes: Uint8Array;
+	mimeType: string;
+	options?: ImageResizeOptions;
+}
+
+interface ResizeImageWorkerResponse {
+	result?: ResizedImage | null;
+	error?: string;
+}
+
+function isResizeImageWorkerRequest(value: unknown): value is ResizeImageWorkerRequest {
+	if (!value || typeof value !== "object") return false;
+	const record = value as Record<string, unknown>;
+	return record.inputBytes instanceof Uint8Array && typeof record.mimeType === "string";
+}
+```
+
+## !!steps Requiring a parent port
+
+The module throws at load if it is not running inside a worker, so importing it on the main thread fails loudly.
+
+```ts ! image-resize-worker.ts
+const port = parentPort;
+if (!port) {
+	throw new Error("image resize worker requires parentPort");
+}
+```
+
+## !!steps One message, one answer
+
+The handler uses `once`, so a worker serves exactly one request. Errors, including validation failures, are converted to a message string rather than crashing the worker. The parent creates a fresh worker per resize and terminates it afterward.
+
+```ts ! image-resize-worker.ts
+port.once("message", (message: unknown) => {
+	void (async () => {
+		try {
+			if (!isResizeImageWorkerRequest(message)) {
+				throw new Error("Invalid image resize worker request");
+			}
+			const result = await resizeImageInProcess(message.inputBytes, message.mimeType, message.options);
+			const response: ResizeImageWorkerResponse = { result };
+			port.postMessage(response);
+		} catch (error) {
+			const response: ResizeImageWorkerResponse = {
+				error: error instanceof Error ? error.message : String(error),
+			};
+			port.postMessage(response);
+		}
+	})();
+});
+```
+
+</Scrollycoding>
+
+The one-shot design means there is no queue or state inside the worker, which keeps the failure modes simple.

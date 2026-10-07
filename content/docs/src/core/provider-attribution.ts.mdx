@@ -1,0 +1,143 @@
+---
+title: "provider-attribution.ts"
+description: "Builds the extra request headers that identify pi to specific providers (OpenRouter, NVIDIA, Cloudflare, OpenCode)"
+source: "src/core/provider-attribution.ts"
+full: true
+---
+
+Several hosted providers want to know which client is calling, for rankings, billing origin or session grouping. This file decides which attribution headers a model should carry and merges them with headers from other sources.
+
+Default attribution is gated by the install telemetry setting from [telemetry.ts](/docs/src/core/telemetry.ts), read through [settings-manager.ts](/docs/src/core/settings-manager.ts). The merge function is called from [sdk.ts](/docs/src/core/sdk.ts) when it builds request options.
+
+<Scrollycoding>
+
+## !!steps Recognizing provider endpoints
+
+Models are identified by their provider id or by their base URL. `matchesHost` parses the URL and compares hostnames exactly, returning false for unparsable URLs.
+
+The OpenRouter check is looser: it uses a substring test on the whole base URL, so it would also match a proxy URL that merely contains that host name. The others use exact hostnames.
+
+```ts ! provider-attribution.ts
+const OPENROUTER_HOST = "openrouter.ai";
+const NVIDIA_NIM_HOST = "integrate.api.nvidia.com";
+const CLOUDFLARE_API_HOST = "api.cloudflare.com";
+const CLOUDFLARE_AI_GATEWAY_HOST = "gateway.ai.cloudflare.com";
+const OPENCODE_HOST = "opencode.ai";
+
+// !mark(1:7)
+function matchesHost(baseUrl: string, expectedHost: string): boolean {
+	try {
+		return new URL(baseUrl).hostname === expectedHost;
+	} catch {
+		return false;
+	}
+}
+
+// !mark(1:3)
+function isOpenRouterModel(model: Model<Api>): boolean {
+	return model.provider === "openrouter" || model.baseUrl.includes(OPENROUTER_HOST);
+}
+
+function isNvidiaNimModel(model: Model<Api>): boolean {
+	return model.provider === "nvidia" || matchesHost(model.baseUrl, NVIDIA_NIM_HOST);
+}
+
+function isCloudflareModel(model: Model<Api>): boolean {
+	return (
+		model.provider === "cloudflare-workers-ai" ||
+		model.provider === "cloudflare-ai-gateway" ||
+		matchesHost(model.baseUrl, CLOUDFLARE_API_HOST) ||
+		matchesHost(model.baseUrl, CLOUDFLARE_AI_GATEWAY_HOST)
+	);
+}
+```
+
+## !!steps Default attribution headers
+
+If install telemetry is disabled the function returns nothing. Otherwise each recognized provider gets a fixed header set: referer and title headers for OpenRouter, a billing origin for NVIDIA NIM, and a User-Agent for Cloudflare. Unknown providers get none.
+
+```ts ! provider-attribution.ts
+function getDefaultAttributionHeaders(
+	model: Model<Api>,
+	settingsManager: SettingsManager,
+): Record<string, string> | undefined {
+// !mark(1:2)
+	if (!isInstallTelemetryEnabled(settingsManager)) {
+		return undefined;
+	}
+
+// !mark(1:6)
+	if (isOpenRouterModel(model)) {
+		return {
+			"HTTP-Referer": "https://pi.dev",
+			"X-OpenRouter-Title": "pi",
+			"X-OpenRouter-Categories": "cli-agent",
+		};
+	}
+
+	if (isNvidiaNimModel(model)) {
+		return {
+			"X-BILLING-INVOKE-ORIGIN": "Pi",
+		};
+	}
+
+	if (isCloudflareModel(model)) {
+		return {
+			"User-Agent": "pi-coding-agent",
+		};
+	}
+
+	return undefined;
+}
+```
+
+## !!steps Session headers for OpenCode
+
+OpenCode headers carry the session id and client name so the service can group requests. They are not gated by the telemetry setting, only by having a session id and matching the provider.
+
+```ts ! provider-attribution.ts
+function getSessionHeaders(model: Model<Api>, sessionId: string | undefined): Record<string, string> | undefined {
+	if (!sessionId) return undefined;
+	if (
+// !mark(1:3)
+		model.provider !== "opencode" &&
+		model.provider !== "opencode-go" &&
+		!matchesHost(model.baseUrl, OPENCODE_HOST)
+	) {
+		return undefined;
+	}
+	return { "x-opencode-session": sessionId, "x-opencode-client": "pi" };
+}
+```
+
+## !!steps Merging with caller headers
+
+Layers apply in order: session headers, then default attribution, then each extra source in argument order, with later keys overwriting earlier ones. That makes user-configured headers authoritative. The result is undefined when empty, which lets callers skip setting headers at all.
+
+```ts ! provider-attribution.ts
+export function mergeProviderAttributionHeaders(
+	model: Model<Api>,
+	settingsManager: SettingsManager,
+	sessionId: string | undefined,
+	...headerSources: Array<ProviderHeaders | undefined>
+): ProviderHeaders | undefined {
+// !mark(1:4)
+	const merged: ProviderHeaders = {
+		...getSessionHeaders(model, sessionId),
+		...getDefaultAttributionHeaders(model, settingsManager),
+	};
+
+// !mark(1:4)
+	for (const headers of headerSources) {
+		if (headers) {
+			Object.assign(merged, headers);
+		}
+	}
+
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+```
+
+</Scrollycoding>
+
+Matching is by hostname and provider id only. The file has no state, and adding a provider means adding a host constant, a predicate and a branch.

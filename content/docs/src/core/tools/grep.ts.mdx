@@ -1,0 +1,257 @@
+---
+title: "grep.ts"
+description: "The grep tool: runs ripgrep with JSON output, stops at a match limit, and formats matches with optional context lines"
+source: "src/core/tools/grep.ts"
+full: true
+---
+
+`grep` searches file contents. It always uses ripgrep (`rg`), located or
+downloaded by [tools-manager.ts](/docs/src/utils/tools-manager.ts), and reads
+ripgrep's `--json` event stream line by line. Matches are collected while
+ripgrep runs and formatted after it exits.
+
+Only two filesystem operations are pluggable here: checking whether the path
+is a directory, and reading a file for context lines. The search itself is
+always local ripgrep, unlike [find.ts](/docs/src/core/tools/find.ts), which can
+swap the whole backend. Truncation constants come from
+[truncate.ts](/docs/src/core/tools/truncate.ts), and rendering is in
+[renderers/grep.ts](/docs/src/core/tools/renderers/grep.ts).
+
+<Scrollycoding>
+
+## !!steps The schema
+
+Seven parameters, all but `pattern` optional. `literal` switches to fixed-string
+matching, `ignoreCase` is explicit, and `context` asks for surrounding lines.
+The default limit is 100 matches, lower than the default of 1000 in `find`.
+
+```ts ! grep.ts
+const grepSchema = Type.Object({
+	pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
+	path: Type.Optional(Type.String({ description: "Directory or file to search (default: current directory)" })),
+	glob: Type.Optional(Type.String({ description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" })),
+	ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
+	literal: Type.Optional(
+		Type.Boolean({ description: "Treat pattern as literal string instead of regex (default: false)" }),
+	),
+	context: Type.Optional(
+		Type.Number({ description: "Number of lines to show before and after each match (default: 0)" }),
+	),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" })),
+});
+```
+
+## !!steps Setting up the search
+
+The tool first makes sure `rg` exists. It then asks `isDirectory`, and any error
+from that call, including a missing path, becomes a `Path not found` error.
+`context` is clamped to zero or more, and the limit has a minimum of one, so
+`limit: 0` cannot turn the search into an immediate no-op.
+
+```ts ! grep.ts
+						const rgPath = await ensureTool("rg");
+						if (!rgPath) {
+							settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
+							return;
+						}
+
+						const searchPath = resolveToCwd(searchDir || ".", ctx?.cwd || cwd);
+						const ops = customOps ?? defaultGrepOperations;
+						let isDirectory: boolean;
+						try {
+							isDirectory = await ops.isDirectory(searchPath);
+						} catch {
+							settle(() => reject(new Error(`Path not found: ${searchPath}`)));
+							return;
+						}
+
+						const contextValue = context && context > 0 ? context : 0;
+						const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
+```
+
+## !!steps Display paths and a file cache
+
+Paths in the output are relative to the search directory when the search target
+is a directory and the file lies inside it. Otherwise only the basename is
+shown, which is the case when a single file was searched. Context lines need the
+file's text, so files are read at most once and cached as arrays of lines, with
+all line-ending styles normalized. A file that cannot be read yields an empty
+array.
+
+```ts ! grep.ts
+						const formatPath = (filePath: string): string => {
+							if (isDirectory) {
+								const relative = path.relative(searchPath, filePath);
+								if (relative && !relative.startsWith("..")) {
+									return relative.replace(/\\/g, "/");
+								}
+							}
+							return path.basename(filePath);
+						};
+
+						const fileCache = new Map<string, string[]>();
+						const getFileLines = async (filePath: string): Promise<string[]> => {
+							let lines = fileCache.get(filePath);
+							if (!lines) {
+								try {
+									const content = await ops.readFile(filePath);
+									lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+								} catch {
+									lines = [];
+								}
+								fileCache.set(filePath, lines);
+							}
+							return lines;
+						};
+```
+
+## !!steps The ripgrep command
+
+`--json` gives structured events, `--line-number` is redundant but harmless with
+JSON, and `--hidden` includes dotfiles while ripgrep's default ignore rules
+still apply. The pattern follows `--`, so a pattern beginning with a dash is not
+parsed as a flag.
+
+```ts ! grep.ts
+						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
+						if (ignoreCase) args.push("--ignore-case");
+						if (literal) args.push("--fixed-strings");
+						if (glob) args.push("--glob", glob);
+						args.push("--", pattern, searchPath);
+
+						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const rl = createInterface({ input: child.stdout });
+						let stderr = "";
+						let matchCount = 0;
+						let matchLimitReached = false;
+						let linesTruncated = false;
+						let aborted = false;
+						let killedDueToLimit = false;
+						const outputLines: string[] = [];
+```
+
+## !!steps Stopping early at the limit
+
+While streaming, each `match` event is stored with its path, line number and
+line text. When the count reaches the limit, the child is killed and flagged
+`killedDueToLimit`, so its signal-caused exit is not mistaken for a failure.
+Lines that are not valid JSON are ignored. After the limit, any further lines
+already buffered are skipped by the early return.
+
+```ts ! grep.ts
+						const matches: Array<{ filePath: string; lineNumber: number; lineText?: string }> = [];
+						rl.on("line", (line) => {
+							if (!line.trim() || matchCount >= effectiveLimit) return;
+							let event: any;
+							try {
+								event = JSON.parse(line);
+							} catch {
+								return;
+							}
+							if (event.type === "match") {
+								matchCount++;
+								const filePath = event.data?.path?.text;
+								const lineNumber = event.data?.line_number;
+								const lineText = event.data?.lines?.text;
+								if (filePath && typeof lineNumber === "number")
+									matches.push({ filePath, lineNumber, lineText });
+								if (matchCount >= effectiveLimit) {
+									matchLimitReached = true;
+									stopChild(true);
+								}
+							}
+						});
+```
+
+## !!steps Exit codes
+
+Ripgrep exits 0 with matches and 1 with none, and both are normal. Any other
+code is an error, unless the tool killed the process itself. Zero matches
+returns the text `No matches found`.
+
+```ts ! grep.ts
+						child.on("close", async (code) => {
+							cleanup();
+							if (aborted) {
+								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							if (!killedDueToLimit && code !== 0 && code !== 1) {
+								const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
+								settle(() => reject(new Error(errorMsg)));
+								return;
+							}
+							if (matchCount === 0) {
+								settle(() =>
+									resolve({ content: [{ type: "text", text: "No matches found" }], details: undefined }),
+								);
+								return;
+							}
+```
+
+## !!steps Formatting matches and context blocks
+
+Without context, the line text ripgrep already returned is used, so no file is
+re-read. With context, `formatBlock` slices the surrounding lines from the cache.
+The match line is printed as `path:line: text` and context lines as
+`path-line- text`, the same convention as classic grep. Each line goes through
+`truncateLine`, which sets the flag that later produces a notice.
+
+```ts ! grep.ts
+						const formatBlock = async (filePath: string, lineNumber: number): Promise<string[]> => {
+							const relativePath = formatPath(filePath);
+							const lines = await getFileLines(filePath);
+							if (!lines.length) return [`${relativePath}:${lineNumber}: (unable to read file)`];
+							const block: string[] = [];
+							const start = contextValue > 0 ? Math.max(1, lineNumber - contextValue) : lineNumber;
+							const end = contextValue > 0 ? Math.min(lines.length, lineNumber + contextValue) : lineNumber;
+							for (let current = start; current <= end; current++) {
+								const lineText = lines[current - 1] ?? "";
+								const sanitized = lineText.replace(/\r/g, "");
+								const isMatchLine = current === lineNumber;
+								// Truncate long lines so grep output stays compact.
+								const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
+								if (wasTruncated) linesTruncated = true;
+								if (isMatchLine) block.push(`${relativePath}:${current}: ${truncatedText}`);
+								else block.push(`${relativePath}-${current}- ${truncatedText}`);
+							}
+							return block;
+						};
+```
+
+## !!steps Three kinds of notice
+
+After formatting, byte truncation is applied with no line limit, since the match
+cap bounds rows. Up to three notices can be combined: match limit reached,
+output bytes truncated, and some lines shortened, the last pointing the model to
+the read tool for full lines. `details` carries the same facts for renderers.
+
+```ts ! grep.ts
+							const notices: string[] = [];
+							if (matchLimitReached) {
+								notices.push(
+									`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+								);
+								details.matchLimitReached = effectiveLimit;
+							}
+							if (truncation.truncated) {
+								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+								details.truncation = truncation;
+							}
+							if (linesTruncated) {
+								notices.push(
+									`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`,
+								);
+								details.linesTruncated = true;
+							}
+							if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
+```
+
+</Scrollycoding>
+
+The structure follows [find.ts](/docs/src/core/tools/find.ts) and
+[ls.ts](/docs/src/core/tools/ls.ts), with results gathered, truncated and then
+described with actionable notices. One difference from `find`: grep registers its
+abort listener only after spawning the process, and does not check
+`signal.aborted` after the awaited `ensureTool` call, so an abort that arrives during the
+tool download is missed and the search runs to completion.

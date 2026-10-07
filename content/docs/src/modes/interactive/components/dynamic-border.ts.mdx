@@ -1,0 +1,52 @@
+---
+title: "dynamic-border.ts"
+description: "A one-line horizontal rule component that stretches to the viewport width and is used to frame dialogs"
+source: "src/modes/interactive/components/dynamic-border.ts"
+full: true
+---
+
+`DynamicBorder` is the tiniest component in the interactive UI: it renders a single line of box-drawing dashes as wide as the terminal. Selectors and dialogs such as [config-selector.ts](/docs/src/modes/interactive/components/config-selector.ts), [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts) and [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts) put one at the top and one at the bottom to frame their content.
+
+Because it implements the TUI `Component` interface directly, it re-reads the width on every render, so it follows terminal resizes with no state.
+
+<Scrollycoding>
+
+## !!steps Color injection and the jiti caveat
+
+The border takes a color function, defaulting to the theme `border` color from [theme.ts](/docs/src/modes/interactive/theme/theme.ts). The doc comment records a real pitfall: extensions are loaded through jiti (see [loader.ts](/docs/src/core/extensions/loader.ts)), which keeps a separate module cache, so the global `theme` import can be undefined there. Extension authors should therefore always pass an explicit color function.
+
+```ts ! dynamic-border.ts
+/**
+ * Dynamic border component that adjusts to viewport width.
+ *
+ * Note: When used from extensions loaded via jiti, the global `theme` may be undefined
+ * because jiti creates a separate module cache. Always pass an explicit color
+ * function when using DynamicBorder in components exported for extension use.
+ */
+export class DynamicBorder implements Component {
+	private color: (str: string) => string;
+
+	constructor(color: (str: string) => string = (str) => theme.fg("border", str)) {
+		this.color = color;
+	}
+```
+
+## !!steps Rendering
+
+`render` returns exactly one line of `─` repeated `width` times, clamped to at least 1 so a zero-width layout never produces an empty repeat. `invalidate` is a no-op because nothing is cached.
+
+```ts ! dynamic-border.ts
+	invalidate(): void {
+		// No cached state to invalidate currently
+	}
+
+	render(width: number): string[] {
+		// !mark
+		return [this.color("─".repeat(Math.max(1, width)))];
+	}
+}
+```
+
+</Scrollycoding>
+
+The same border is reused by [earendil-announcement.ts](/docs/src/modes/interactive/components/earendil-announcement.ts) with an accent color. The component is also exported from the package entry point [index.ts](/docs/src/index.ts), which is why extensions can use it and why the explicit color option exists.

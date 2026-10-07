@@ -1,0 +1,370 @@
+---
+title: "bug-report.ts"
+description: "The interactive /bug flow: consent prompts, optional model-written summary, then upload or zip export of a diagnostics bundle"
+source: "src/modes/interactive/bug-report.ts"
+full: true
+---
+
+This is the TUI half of bug reporting. The data gathering, archive format and
+HTTP upload live in [bug-report.ts](/docs/src/core/bug-report.ts) and
+[bug-report-upload.ts](/docs/src/core/bug-report-upload.ts) in core; this file
+only decides what the user agrees to send and drives the screens.
+
+Every screen is a temporary component swapped into the editor slot, so the whole
+flow is a chain of small promise-returning helpers (`input`, `choose`,
+`showLoader`) that the main function awaits in order. The privacy choices come
+first, the expensive work (summary, bundle) only runs once they are made.
+
+<Scrollycoding>
+
+## !!steps Context, options and consent text
+
+`BugReportContext` is everything the flow needs from the host: the
+[agent-session.ts](/docs/src/core/agent-session.ts), the TUI, the container that
+normally holds the editor, and status/error callbacks. `BugReportOptions` is the
+result of the consent dialogs.
+
+The two constants are the exact wording the user sees before anything leaves the
+machine. Note the disclaimer says the report is not shared publicly and excludes
+API keys.
+
+```ts ! bug-report.ts
+interface BugReportContext {
+	session: AgentSession;
+	ui: TUI;
+	editorContainer: Container;
+	editor: EditorComponent;
+	keybindings: KeybindingsManager;
+	showStatus: (message: string) => void;
+	showError: (message: string) => void;
+}
+
+interface BugReportOptions {
+	hint?: string;
+	includeSession: boolean;
+	includeSummary: boolean;
+	delivery: "upload" | "zip";
+}
+
+type Overlay = Container & { dispose?: () => void };
+
+const DISCLAIMER =
+	"This report goes to the Pi developers (Earendil) and is not shared publicly. It includes your pi version, operating system, the current model and provider configuration (without API keys), loaded extensions, settings, and provider error diagnostics from this session.";
+const TRANSCRIPT_NOTE =
+	"The transcript contains your messages, model output, tool calls and their results, including file contents and command output read during this session.";
+```
+
+## !!steps The main flow and the optional summary
+
+`reportBug` is linear: prompt, check offline mode, optionally summarize, build,
+deliver. Cancelling at any prompt returns `undefined` from `promptForOptions`
+and the flow ends with a status line.
+
+Uploading is refused when `PI_OFFLINE` is set, before any model call is made.
+The summary is produced by the session's own model via `summarizeForBugReport`,
+shown behind a cancellable loader whose `signal` is passed through. Each exit
+path calls `restoreEditor` so the editor always comes back.
+
+```ts ! bug-report.ts
+// !mark(7:8)
+export async function reportBug(context: BugReportContext, initialHint?: string): Promise<void> {
+	const options = await promptForOptions(context, initialHint);
+	if (!options) {
+		context.showStatus("Bug report cancelled");
+		return;
+	}
+	if (options.delivery === "upload" && process.env.PI_OFFLINE) {
+		context.showError("Uploading bug reports requires online mode. Use Export as Zip instead.");
+		return;
+	}
+
+	let summary: string | undefined;
+	if (options.includeSummary) {
+		const loader = showLoader(
+			context,
+			`Writing summary with ${context.session.model?.name ?? "the current model"}...`,
+		);
+		try {
+			summary = await context.session.summarizeForBugReport({ hint: options.hint, signal: loader.signal });
+		} catch (error: unknown) {
+			restoreEditor(context, loader);
+			if (loader.signal.aborted) context.showStatus("Bug report cancelled");
+			else context.showError(`Failed to write bug report summary: ${errorMessage(error)}`);
+			return;
+		}
+		restoreEditor(context, loader);
+		if (loader.signal.aborted) {
+			context.showStatus("Bug report cancelled");
+			return;
+		}
+	}
+```
+
+## !!steps Build, then upload with a zip fallback
+
+Bundle construction errors are reported and abort. For uploads, `upload` returns
+`undefined` on success or cancellation and an error string on failure. A failure
+does not lose the work: the user is offered "Export as Zip" with the error text,
+and any other answer cancels.
+
+Both paths converge on `exportZip` at the end, so a successful upload returns
+early and never reaches it.
+
+```ts ! bug-report.ts
+	let bundle: BugReportBundle;
+	try {
+		bundle = buildBundle(context.session, options, summary);
+	} catch (error: unknown) {
+		context.showError(`Failed to build bug report: ${errorMessage(error)}`);
+		return;
+	}
+
+	if (options.delivery === "upload") {
+		const failure = await upload(context, bundle);
+		if (failure === undefined) return;
+		const fallback = await choose(
+			context,
+			"Upload failed",
+			["Export as Zip", "Cancel"],
+			`${failure}\n\nExport the report as a zip archive instead?`,
+		);
+		if (fallback !== "Export as Zip") {
+			context.showStatus("Bug report cancelled");
+			return;
+		}
+	}
+	await exportZip(context, bundle);
+}
+```
+
+## !!steps The consent questions
+
+`promptForOptions` asks up to four things in sequence: a free-text hint, whether
+to include the transcript, and only if the transcript is declined, whether to
+attach a model-written summary instead. The summary question spells out that the
+transcript is still sent to the model provider, only the generated summary is
+attached.
+
+`null` from the editor and `undefined` from the selector both mean cancel.
+
+```ts ! bug-report.ts
+async function promptForOptions(
+	context: BugReportContext,
+	initialHint: string | undefined,
+): Promise<BugReportOptions | undefined> {
+	const hint = await input(context, "Report a bug", `${DISCLAIMER}\n\nWhat went wrong? (optional)`, initialHint);
+	if (hint === null) return undefined;
+	const transcript = await choose(
+		context,
+		"Include the session transcript?",
+		["Yes, include the transcript", "No"],
+		TRANSCRIPT_NOTE,
+	);
+	if (!transcript) return undefined;
+	const includeSession = transcript !== "No";
+	let includeSummary = false;
+	if (!includeSession) {
+		const model = context.session.model;
+		const summary = await choose(
+			context,
+			`Attach a summary written by ${model?.name ?? "the current model"} instead?`,
+			["Yes, generate a summary", "No"],
+			`The transcript is sent to ${model?.provider ?? "your provider"} with your credentials and tokens. Only the generated summary is attached; the transcript stays on your machine.`,
+		);
+		if (!summary) return undefined;
+		includeSummary = summary !== "No";
+	}
+```
+
+## !!steps The final confirmation
+
+The last dialog recaps the choices (description, transcript, summary) and names
+the upload host, taken from `getRadiusGatewayUrl()` in
+[radius.ts](/docs/src/core/radius.ts). An empty description becomes `undefined`
+rather than an empty string in the options.
+
+```ts ! bug-report.ts
+	const description = hint.trim();
+	const delivery = await choose(
+		context,
+		"Bug report",
+		["Upload Report", "Export as Zip", "Cancel"],
+		`Description: ${description || "none"}\nTranscript: ${includeSession ? "included" : "not included"}\nSummary: ${includeSummary ? `written by ${context.session.model?.name ?? "the current model"}` : "none"}\n\nUpload sends the report to ${new URL(getRadiusGatewayUrl()).host}. Export writes a zip archive to the current directory instead.`,
+	);
+	if (!delivery || delivery === "Cancel") return undefined;
+	return {
+		hint: description || undefined,
+		includeSession,
+		includeSummary,
+		delivery: delivery === "Upload Report" ? "upload" : "zip",
+	};
+}
+```
+
+## !!steps Assembling the bundle
+
+`buildBundle` collects metadata from the session, settings managers and loaded
+extensions, diagnostics from the session manager plus the crash log
+([crash-log.ts](/docs/src/core/crash-log.ts)), and, only when requested, the
+session branch serialized by `serializeSessionBranch` from
+[session-export.ts](/docs/src/core/session-export.ts). The trailing-entries
+callback comes from [session-share.ts](/docs/src/modes/interactive/session-share.ts)
+so a report looks like a shared session.
+
+```ts ! bug-report.ts
+function buildBundle(session: AgentSession, options: BugReportOptions, summary: string | undefined): BugReportBundle {
+	const extensions = session.resourceLoader.getExtensions();
+	return {
+		metadata: collectBugReportMetadata({
+			hint: options.hint,
+			sessionId: session.sessionId,
+			cwd: session.sessionManager.getCwd(),
+			includeSession: options.includeSession,
+			includeSummary: summary !== undefined,
+			messageCount: session.messages.length,
+			model: session.model,
+			modelRuntime: session.modelRuntime,
+			thinkingLevel: session.thinkingLevel,
+			extensions: extensions.extensions,
+			extensionErrors: extensions.errors,
+			globalSettings: session.settingsManager.getGlobalSettings(),
+			projectSettings: session.settingsManager.getProjectSettings(),
+		}),
+		diagnostics: collectBugReportDiagnostics(session.sessionManager, readCrashLog()),
+		summary,
+		sessionJsonl: options.includeSession
+			? serializeSessionBranch(session.sessionManager, (parentId, timestamp) =>
+					createShareTrailingEntries(session, parentId, timestamp),
+				)
+			: undefined,
+	};
+}
+```
+
+## !!steps Uploading with optional credentials
+
+The upload shows a loader, then looks up the Radius provider. If it is
+configured, a credential is requested with `minOAuthValidityMs` of five minutes,
+so a token about to expire is refreshed first. With no provider the upload goes
+out without a token.
+
+On abort it returns `undefined` (no fallback prompt); on other errors it returns
+the message for the caller.
+
+```ts ! bug-report.ts
+async function upload(context: BugReportContext, bundle: BugReportBundle): Promise<string | undefined> {
+	const loader = showLoader(context, "Uploading bug report...");
+	try {
+		const provider = context.session.modelRuntime.getProvider(RADIUS_PROVIDER_ID);
+		const token = provider
+			? getAuthCredential(
+					await context.session.modelRuntime.getAuth(RADIUS_PROVIDER_ID, { minOAuthValidityMs: 5 * 60_000 }),
+				)
+			: undefined;
+		const result = await uploadBugReport(bundle, { token, signal: loader.signal });
+		restoreEditor(context, loader);
+		recordInSession(context.session, bundle, { delivery: "upload" });
+		context.showStatus(`Bug report uploaded. Report ID: ${result.id}`);
+		return undefined;
+	} catch (error: unknown) {
+		restoreEditor(context, loader);
+		if (loader.signal.aborted) {
+			context.showStatus("Bug report cancelled");
+			return undefined;
+		}
+		return errorMessage(error);
+	}
+}
+```
+
+## !!steps Zip export and recording in the session
+
+`exportZip` writes the archive to the current working directory. Both delivery
+paths then call `recordInSession`, which appends a custom entry so the session
+history shows a report was filed (id, hint, what was included, how it was
+delivered).
+
+The crash log is cleared only after a report that actually contained crashes was
+recorded, so the same crashes are not reported twice.
+
+```ts ! bug-report.ts
+async function exportZip(context: BugReportContext, bundle: BugReportBundle): Promise<void> {
+	const archivePath = path.join(process.cwd(), bugReportArchiveFileName(bundle.metadata.id));
+	try {
+		await writeBugReportArchive(bundle, archivePath);
+	} catch (error: unknown) {
+		context.showError(`Failed to write bug report: ${errorMessage(error)}`);
+		return;
+	}
+	recordInSession(context.session, bundle, { delivery: "zip", path: archivePath });
+	context.showStatus(`Bug report exported to: ${archivePath}\nReport ID: ${bundle.metadata.id}`);
+}
+
+function recordInSession(
+	session: AgentSession,
+	bundle: BugReportBundle,
+	delivery: Pick<BugReportSessionEntryData, "delivery" | "path">,
+): void {
+	session.sessionManager.appendCustomEntry(BUG_REPORT_CUSTOM_ENTRY_TYPE, {
+		id: bundle.metadata.id,
+		createdAt: bundle.metadata.createdAt,
+		hint: bundle.metadata.hint,
+		sessionIncluded: bundle.metadata.session.included,
+		summaryIncluded: bundle.metadata.session.summaryIncluded,
+		...delivery,
+	} satisfies BugReportSessionEntryData);
+	if (bundle.diagnostics.crashes.length > 0) clearCrashLog();
+}
+```
+
+## !!steps Overlay helpers
+
+`choose` and `input` wrap [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts)
+and [extension-editor.ts](/docs/src/modes/interactive/components/extension-editor.ts)
+in promises. `showOverlay` replaces the editor container's child and moves
+focus; `restoreEditor` disposes the overlay and puts the real editor back.
+`showLoader` uses [bordered-loader.ts](/docs/src/modes/interactive/components/bordered-loader.ts).
+
+```ts ! bug-report.ts
+function choose(
+	context: BugReportContext,
+	title: string,
+	options: string[],
+	description?: string,
+): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		let component: ExtensionSelectorComponent;
+		const finish = (value?: string) => {
+			restoreEditor(context, component);
+			resolve(value);
+		};
+		component = new ExtensionSelectorComponent(title, options, finish, () => finish(), {
+			tui: context.ui,
+			description,
+		});
+		showOverlay(context, component);
+	});
+}
+// ...
+function showOverlay(context: BugReportContext, component: Overlay): void {
+	context.editorContainer.clear();
+	context.editorContainer.addChild(component);
+	context.ui.setFocus(component);
+	context.ui.requestRender();
+}
+
+function restoreEditor(context: BugReportContext, component: Overlay): void {
+	component.dispose?.();
+	context.editorContainer.clear();
+	context.editorContainer.addChild(context.editor);
+	context.ui.setFocus(context.editor);
+	context.ui.requestRender();
+}
+```
+
+</Scrollycoding>
+
+The file is consumed by the interactive mode's `/bug` command in
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts). It
+contains no network or file logic itself beyond `exportZip`, which keeps the
+privacy-sensitive decisions in one readable sequence.

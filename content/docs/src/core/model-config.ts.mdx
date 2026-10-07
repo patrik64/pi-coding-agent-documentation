@@ -1,0 +1,400 @@
+---
+title: "model-config.ts"
+description: "Typebox schemas for models.json plus an immutable, credential-free snapshot loader that reports errors instead of throwing"
+source: "src/core/model-config.ts"
+full: true
+---
+
+Users customize providers and models in `models.json`: custom endpoints, per-model costs, compatibility flags, thinking-level maps and so on. This file defines the schema for that file and loads it into a `ModelConfig`, a frozen snapshot that other code reads.
+
+The header says the snapshot is credential-blind: it holds the configuration but does not resolve API keys, which happens elsewhere, for example in [model-runtime.ts](/docs/src/core/model-runtime.ts) and [resolve-config-value.ts](/docs/src/core/resolve-config-value.ts). Most of the file is schema, and the loader at the bottom is short. Provider assembly lives in [provider-composer.ts](/docs/src/core/provider-composer.ts).
+
+<Scrollycoding>
+
+## !!steps Schemas build from small pieces
+
+Typebox `Type.Object` schemas are composed bottom-up, with nearly every field optional. The first ones describe OpenRouter routing preferences, which mirror OpenRouter's request fields (hence snake_case), and Vercel gateway routing.
+
+Percentile cutoffs let a latency or throughput preference be either a single number or a map of p50 to p99.
+
+```ts ! model-config.ts
+// !mark(1:6)
+const PercentileCutoffsSchema = Type.Object({
+	p50: Type.Optional(Type.Number()),
+	p75: Type.Optional(Type.Number()),
+	p90: Type.Optional(Type.Number()),
+	p99: Type.Optional(Type.Number()),
+});
+
+// !mark(1:5)
+const OpenRouterRoutingSchema = Type.Object({
+	allow_fallbacks: Type.Optional(Type.Boolean()),
+	require_parameters: Type.Optional(Type.Boolean()),
+	data_collection: Type.Optional(Type.Union([Type.Literal("deny"), Type.Literal("allow")])),
+	zdr: Type.Optional(Type.Boolean()),
+	enforce_distillable_text: Type.Optional(Type.Boolean()),
+	order: Type.Optional(Type.Array(Type.String())),
+	only: Type.Optional(Type.Array(Type.String())),
+	ignore: Type.Optional(Type.Array(Type.String())),
+	quantizations: Type.Optional(Type.Array(Type.String())),
+	sort: Type.Optional(
+		Type.Union([
+			Type.String(),
+			Type.Object({
+				by: Type.Optional(Type.String()),
+				partition: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+			}),
+		]),
+	),
+	max_price: Type.Optional(
+		Type.Object({
+			prompt: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+			completion: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+			image: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+			audio: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+			request: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+		}),
+	),
+	preferred_min_throughput: Type.Optional(Type.Union([Type.Number(), PercentileCutoffsSchema])),
+	preferred_max_latency: Type.Optional(Type.Union([Type.Number(), PercentileCutoffsSchema])),
+});
+
+// !mark(1:4)
+const VercelGatewayRoutingSchema = Type.Object({
+	only: Type.Optional(Type.Array(Type.String())),
+	order: Type.Optional(Type.Array(Type.String())),
+});
+```
+
+## !!steps Thinking levels and sampling parameters
+
+`ThinkingLevelMapSchema` maps each pi thinking level, from `off` to `max`, to a provider-specific string, or `null`. The schema allows `null` as a value distinct from a string. Sampling parameters are an open record of unknown values, and can also be given per thinking level.
+
+```ts ! model-config.ts
+// !mark(1:2)
+const ThinkingLevelMapValueSchema = Type.Union([Type.String(), Type.Null()]);
+const ThinkingLevelMapSchema = Type.Object({
+	off: Type.Optional(ThinkingLevelMapValueSchema),
+	minimal: Type.Optional(ThinkingLevelMapValueSchema),
+	low: Type.Optional(ThinkingLevelMapValueSchema),
+	medium: Type.Optional(ThinkingLevelMapValueSchema),
+	high: Type.Optional(ThinkingLevelMapValueSchema),
+	xhigh: Type.Optional(ThinkingLevelMapValueSchema),
+	max: Type.Optional(ThinkingLevelMapValueSchema),
+});
+
+// !mark(1:2)
+const SamplingParamsSchema = Type.Record(Type.String(), Type.Unknown());
+const SamplingParamsByThinkingLevelSchema = Type.Object({
+	off: Type.Optional(SamplingParamsSchema),
+	minimal: Type.Optional(SamplingParamsSchema),
+	low: Type.Optional(SamplingParamsSchema),
+	medium: Type.Optional(SamplingParamsSchema),
+	high: Type.Optional(SamplingParamsSchema),
+	xhigh: Type.Optional(SamplingParamsSchema),
+	max: Type.Optional(SamplingParamsSchema),
+});
+```
+
+## !!steps Compat flags for OpenAI-style APIs
+
+`OpenAICompletionsCompatSchema` is a long list of quirks for providers that claim OpenAI compatibility: whether they accept a developer role, which field holds the token limit, how thinking is encoded, and how prompt caching and session affinity work. The `chatTemplateKwargs` entries can reference variables such as `thinking.enabled`.
+
+The Responses API gets a shorter schema, since there are fewer divergences.
+
+```ts ! model-config.ts
+const ChatTemplateKwargScalarSchema = Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]);
+const ChatTemplateKwargVariableSchema = Type.Object({
+	$var: Type.Union([Type.Literal("thinking.enabled"), Type.Literal("thinking.effort")]),
+	omitWhenOff: Type.Optional(Type.Boolean()),
+});
+const ChatTemplateKwargSchema = Type.Union([ChatTemplateKwargScalarSchema, ChatTemplateKwargVariableSchema]);
+
+const OpenAICompletionsCompatSchema = Type.Object({
+	supportsStore: Type.Optional(Type.Boolean()),
+	supportsDeveloperRole: Type.Optional(Type.Boolean()),
+	supportsReasoningEffort: Type.Optional(Type.Boolean()),
+	// !mark(1:3)
+	supportsUsageInStreaming: Type.Optional(Type.Boolean()),
+	supportsFinishReason: Type.Optional(Type.Boolean()),
+	maxTokensField: Type.Optional(Type.Union([Type.Literal("max_completion_tokens"), Type.Literal("max_tokens")])),
+	requiresToolResultName: Type.Optional(Type.Boolean()),
+	requiresAssistantAfterToolResult: Type.Optional(Type.Boolean()),
+	requiresThinkingAsText: Type.Optional(Type.Boolean()),
+	requiresReasoningContentOnAssistantMessages: Type.Optional(Type.Boolean()),
+	// !mark
+	thinkingFormat: Type.Optional(
+		Type.Union([
+			Type.Literal("openai"),
+			Type.Literal("openrouter"),
+// ...
+// !mark
+const OpenAIResponsesCompatSchema = Type.Object({
+	supportsDeveloperRole: Type.Optional(Type.Boolean()),
+	sessionAffinityFormat: Type.Optional(
+		Type.Union([Type.Literal("openai"), Type.Literal("openai-nosession"), Type.Literal("openrouter")]),
+	),
+	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	supportsStrictMode: Type.Optional(Type.Boolean()),
+	supportsOpenAIGrammarTools: Type.Optional(Type.Boolean()),
+	supportsMaxOutputTokens: Type.Optional(Type.Boolean()),
+});
+```
+
+## !!steps Cost, limits and the Anthropic compat schema
+
+Costs have shared rate fields for input, output and cache read and write, plus optional tiers that apply above an input-token count. Prompt-cache lifetimes must be positive. Image limits cap dimensions, bytes and counts per message or request.
+
+The Anthropic schema lists `allowedFallbackModels` with at most three entries, each with its own cost.
+
+```ts ! model-config.ts
+// !mark(1:6)
+const ModelCostRatesSchema = {
+	input: Type.Number(),
+	output: Type.Number(),
+	cacheRead: Type.Number(),
+	cacheWrite: Type.Number(),
+};
+const ModelCostTierSchema = Type.Object({
+	inputTokensAbove: Type.Number(),
+	...ModelCostRatesSchema,
+});
+const ModelCostSchema = Type.Object({
+	...ModelCostRatesSchema,
+	tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
+});
+const ModelPromptCacheSchema = Type.Object({
+	short: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+	long: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+});
+// ...
+const AnthropicMessagesCompatSchema = Type.Object({
+	supportsEagerToolInputStreaming: Type.Optional(Type.Boolean()),
+	supportsLongCacheRetention: Type.Optional(Type.Boolean()),
+	sendSessionAffinityHeaders: Type.Optional(Type.Boolean()),
+	supportsCacheControlOnTools: Type.Optional(Type.Boolean()),
+	supportsTemperature: Type.Optional(Type.Boolean()),
+	forceAdaptiveThinking: Type.Optional(Type.Boolean()),
+	allowEmptySignature: Type.Optional(Type.Boolean()),
+	supportsStrictTools: Type.Optional(Type.Boolean()),
+	supportsMidConvoEffort: Type.Optional(Type.Boolean()),
+	// !mark(1:8)
+	allowedFallbackModels: Type.Optional(
+		Type.Array(
+			Type.Object({
+				provider: Type.String({ minLength: 1 }),
+				model: Type.String({ minLength: 1 }),
+				cost: ModelCostSchema,
+			}),
+			{ maxItems: 3 },
+		),
+	),
+});
+```
+
+## !!steps A union of compat shapes
+
+`ProviderCompatSchema` is a union of the three. Since every field in each schema is optional, an object can match more than one member of the union, so the compat flags carry no tag saying which API they belong to.
+
+```ts ! model-config.ts
+// !mark(1:5)
+const ProviderCompatSchema = Type.Union([
+	OpenAICompletionsCompatSchema,
+	OpenAIResponsesCompatSchema,
+	AnthropicMessagesCompatSchema,
+]);
+```
+
+## !!steps Model definitions versus overrides
+
+`ModelDefinitionSchema` requires an `id` and describes a custom model. `ModelOverrideSchema` has no id, no `api` and no `baseUrl`, because it patches a built-in model, and its cost fields are all optional so a single rate can be changed.
+
+```ts ! model-config.ts
+const ModelDefinitionSchema = Type.Object({
+	// !mark
+	id: Type.String({ minLength: 1 }),
+	name: Type.Optional(Type.String({ minLength: 1 })),
+	api: Type.Optional(Type.String({ minLength: 1 })),
+	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+	reasoning: Type.Optional(Type.Boolean()),
+// ...
+// !mark(1:2)
+const ModelOverrideSchema = Type.Object({
+	name: Type.Optional(Type.String({ minLength: 1 })),
+	reasoning: Type.Optional(Type.Boolean()),
+	thinkingLevelMap: Type.Optional(ThinkingLevelMapSchema),
+	input: Type.Optional(Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")]))),
+	inputLimits: Type.Optional(ModelInputLimitsSchema),
+	cost: Type.Optional(
+		Type.Object({
+			input: Type.Optional(Type.Number()),
+			output: Type.Optional(Type.Number()),
+			cacheRead: Type.Optional(Type.Number()),
+			cacheWrite: Type.Optional(Type.Number()),
+			tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
+		}),
+	),
+```
+
+## !!steps Provider and file schemas
+
+A provider can set a base URL, an API key reference, an API type, headers, compat flags, a custom model list, and `modelOverrides` keyed by model id. The only `oauth` value allowed is the literal `radius`, used for the built-in Radius provider ([radius.ts](/docs/src/core/radius.ts)).
+
+The file is a record of providers by id. The schema is compiled once at module load into a validator. Exported types come from `Static`.
+
+```ts ! model-config.ts
+const ProviderConfigSchema = Type.Object({
+	name: Type.Optional(Type.String({ minLength: 1 })),
+	baseUrl: Type.Optional(Type.String({ minLength: 1 })),
+	apiKey: Type.Optional(Type.String({ minLength: 1 })),
+	api: Type.Optional(Type.String({ minLength: 1 })),
+	// !mark
+	oauth: Type.Optional(Type.Literal("radius")),
+	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
+	compat: Type.Optional(ProviderCompatSchema),
+	authHeader: Type.Optional(Type.Boolean()),
+	// !mark(1:2)
+	models: Type.Optional(Type.Array(ModelDefinitionSchema)),
+	modelOverrides: Type.Optional(Type.Record(Type.String(), ModelOverrideSchema)),
+});
+
+const ModelsConfigSchema = Type.Object({
+	providers: Type.Record(Type.String(), ProviderConfigSchema),
+});
+// !mark
+const validateModelsConfig = Compile(ModelsConfigSchema);
+
+export type ModelsJsonModel = Static<typeof ModelDefinitionSchema>;
+export type ModelsJsonModelOverride = Static<typeof ModelOverrideSchema>;
+export type ModelsJsonProvider = Static<typeof ProviderConfigSchema>;
+type ModelsJson = Static<typeof ModelsConfigSchema>;
+```
+
+## !!steps Readable validation paths and freezing
+
+Typebox errors give JSON pointers. `formatValidationPath` turns them into dotted paths, and for `required` errors it appends the missing property name, so the message points at what is absent. An empty path becomes `root`.
+
+`deepFreeze` freezes recursively and skips values that are already frozen.
+
+```ts ! model-config.ts
+function formatValidationPath(error: TLocalizedValidationError): string {
+	// !mark(1:7)
+	if (error.keyword === "required") {
+		const requiredProperties = (error.params as { requiredProperties?: string[] }).requiredProperties;
+		const requiredProperty = requiredProperties?.[0];
+		if (requiredProperty) {
+			const basePath = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+			return basePath ? `${basePath}.${requiredProperty}` : requiredProperty;
+		}
+	}
+	// !mark(1:2)
+	const path = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+	return path || "root";
+}
+
+function deepFreeze<T>(value: T): T {
+	// !mark(1:3)
+	if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value)) deepFreeze(child);
+	return Object.freeze(value);
+}
+```
+
+## !!steps Loading never throws
+
+`ModelConfig.load` has four outcomes besides success. No path or a missing file gives an empty config with no error. Any other read error, a parse failure or a schema failure gives an empty config with a message that includes the file path. Comments and a BOM are stripped before parsing, so `models.json` may contain comments.
+
+The schema failure message lists every violation on its own line.
+
+```ts ! model-config.ts
+	static async load(modelsJsonPath: string | undefined): Promise<ModelConfig> {
+		// !mark(1:2)
+		if (!modelsJsonPath) return new ModelConfig(new Map());
+		const path = normalizePath(modelsJsonPath);
+		let content: string;
+		try {
+			content = await readFile(path, "utf-8");
+		// !mark(1:3)
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return new ModelConfig(new Map());
+			return new ModelConfig(
+				new Map(),
+				`Failed to load models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
+			);
+		}
+
+		let parsed: unknown;
+		try {
+			// !mark
+			parsed = JSON.parse(stripJsonComments(stripBom(content)));
+		} catch (error) {
+			return new ModelConfig(
+				new Map(),
+				`Failed to parse models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${path}`,
+			);
+		}
+
+		// !mark(1:7)
+		if (!validateModelsConfig.Check(parsed)) {
+			const errors =
+				validateModelsConfig
+					.Errors(parsed)
+					.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+					.join("\n") || "Unknown schema error";
+			return new ModelConfig(new Map(), `Invalid models.json schema:\n${errors}\n\nFile: ${path}`);
+		}
+
+		const config = parsed as ModelsJson;
+		const providers = new Map<string, ModelsJsonProvider>();
+		for (const [providerId, provider] of Object.entries(config.providers)) {
+			providers.set(providerId, deepFreeze(structuredClone(provider)));
+		}
+		return new ModelConfig(providers);
+	}
+```
+
+## !!steps Frozen providers and accessors
+
+On success, each provider is cloned with `structuredClone` and deep-frozen, so nothing can mutate the snapshot or share structure with the parsed JSON. The private constructor forces all creation through `load`.
+
+Accessors expose a provider by id, all provider ids, and the error string. Callers must check `getError()` themselves, because a failed load looks like an empty config.
+
+```ts ! model-config.ts
+export class ModelConfig {
+	private readonly providers: ReadonlyMap<string, ModelsJsonProvider>;
+	private readonly error: string | undefined;
+
+	// !mark
+	private constructor(providers: ReadonlyMap<string, ModelsJsonProvider>, error?: string) {
+		this.providers = providers;
+		this.error = error;
+	}
+
+// ...
+		const config = parsed as ModelsJson;
+		const providers = new Map<string, ModelsJsonProvider>();
+		for (const [providerId, provider] of Object.entries(config.providers)) {
+			// !mark
+			providers.set(providerId, deepFreeze(structuredClone(provider)));
+		}
+		return new ModelConfig(providers);
+	}
+
+	getProvider(providerId: string): ModelsJsonProvider | undefined {
+		return this.providers.get(providerId);
+	}
+
+	getProviderIds(): readonly string[] {
+		return [...this.providers.keys()];
+	}
+
+	// !mark(1:3)
+	getError(): string | undefined {
+		return this.error;
+	}
+}
+```
+
+</Scrollycoding>
+
+A failed load being an empty config, rather than an exception, lets [model-runtime.ts](/docs/src/core/model-runtime.ts) carry on with built-in models and surface the message through its own `getError()`. The schemas are also the only definition of the file format, so adding a field to models.json means editing this file first. Related catalog caching is handled by [models-store.ts](/docs/src/core/models-store.ts).

@@ -1,0 +1,264 @@
+---
+title: "system-theme.ts"
+description: "Generates pi's system theme from the terminal's own colors by solving contrast rules in OKHSL, with an ANSI-index fallback"
+source: "src/modes/interactive/theme/system-theme.ts"
+full: true
+---
+
+Pi's `system` theme is not a JSON file like [dark.json](/docs/src/modes/interactive/theme/dark.json). It is computed. Given the terminal's reported foreground, background and 16-color palette, this module produces a color for every theme token such that text is readable on every surface it is drawn on, while hues follow the user's terminal palette.
+
+The design is a small constraint solver. Each token belongs to a color family (a hue) and has contrast rules: "this token must reach level L on these surfaces". Levels are fitted polynomial curves giving the lightness needed on a surface of a given lightness. [theme.ts](/docs/src/modes/interactive/theme/theme.ts) calls `generateSystemThemeColors` and uses `terminalAppearance` and `SYSTEM_THEME_NAME`; [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) supplies the terminal colors.
+
+<Scrollycoding>
+
+## !!steps Three tiers of fidelity
+
+The header comment lays out the contract: lightness always comes from the rules, hue and saturation from the terminal's palette color for a family's ANSI slot (or from the family's own hue when no palette is reported). With no background at all, the theme falls back to ANSI indices and lets the terminal render them.
+
+Working in OKHSL matters: its saturation is relative to the sRGB gamut and fades near black and white, so a pastel palette stays pastel when a color moves to another lightness.
+
+```ts ! system-theme.ts
+ * Depending on what the terminal reports, the theme is generated in one of three tiers:
+ * - background and palette: hues from the palette, lightness from the background;
+ * - background only: the families' own hues, lightness from the background;
+ * - nothing: ANSI palette indices and the default colors, which the terminal renders itself.
+ */
+
+import {
+	colorToOkhsl,
+	colorToOklch,
+	colorToRgb,
+	type OkhslChannels,
+	okhslColor,
+	oklabToOkhslLightness,
+	oklchColor,
+	type RgbColor,
+	rgbColor,
+} from "@earendil-works/pi-tui";
+import type { ThemeAppearance, ThemeBg, ThemeColor, ThemeToken } from "./theme.ts";
+
+export const SYSTEM_THEME_NAME = "system";
+```
+
+## !!steps Color families and token assignment
+
+A family has an OKHSL hue, a saturation range (`max` at mid lightness, falling toward `min` at the extremes) and the ANSI slot whose palette color it borrows. Fourteen families cover the neutral greys, the main hues, and one family per thinking level.
+
+`TOKEN_FAMILIES` then assigns every theme token to a family. Note the two overrides in `TOKEN_SLOTS`: syntax strings and numbers, and the search-match background, use a different palette slot than their family, so they do not share a hue with a similar token (strings would otherwise match the warning yellow).
+
+```ts ! system-theme.ts
+interface Family {
+	hue: number;
+	saturation: { min: number; max: number };
+	/** ANSI palette slot the family takes its hue and saturation from. */
+	slot: number;
+}
+
+const FAMILIES = {
+	neutral: { hue: 231.49, saturation: { min: 0.02, max: 0.08 }, slot: 8 },
+	blue: { hue: 231.49, saturation: { min: 0.1, max: 0.68 }, slot: 4 },
+	green: { hue: 158.68, saturation: { min: 0.1, max: 0.76 }, slot: 2 },
+	red: { hue: 20, saturation: { min: 0.1, max: 0.92 }, slot: 1 },
+	yellow: { hue: 82.36, saturation: { min: 0.5, max: 1 }, slot: 3 },
+	orange: { hue: 52, saturation: { min: 0.12, max: 0.85 }, slot: 3 },
+	violet: { hue: 295, saturation: { min: 0.2, max: 0.6 }, slot: 5 },
+	calamine: { hue: 202.43, saturation: { min: 0.1, max: 0.74 }, slot: 6 },
+```
+
+## !!steps Contrast levels as polynomials
+
+A level is a pair of curves, one per appearance. Each is a polynomial in the surface's OKLab lightness that returns the lightness a token needs. `reachable` bounds the surfaces where the level can be met; outside that range the target is `undefined` and the solver must relax.
+
+Names describe use: `panel` for surfaces versus the background, `readable` for ordinary colored text, `subtle` for dim text, `emphasis` and `text` for the strongest, and `thinking0` to `thinking6` for the ramp of border colors. The coefficients are fitted constants from a design review, not derived in the code.
+
+```ts ! system-theme.ts
+interface Curve {
+	coefficients: number[];
+	reachable: [number, number];
+}
+
+const LEVELS = {
+	panel: {
+		dark: { coefficients: [0.29131, -0.39746, 2.33185, -0.85524, -1.2076, 0.86276], reachable: [0, 0.979] },
+		light: { coefficients: [-3.74073, 27.94549, -78.44258, 112.6798, -79.60015, 22.11277], reachable: [0.348, 1] },
+	},
+	track: {
+		dark: { coefficients: [0.39028, -0.23015, 0.83573, 2.43829, -4.38292, 2.01582], reachable: [0, 0.946] },
+		light: { coefficients: [-5.24921, 38.37322, -107.28833, 152.10005, -106.17127, 29.18061], reachable: [0.368, 1] },
+	},
+```
+
+## !!steps Rules: which token on which surface
+
+Each rule says that a token must hit a level on one or more surfaces. Surfaces are the background, the seven panel backgrounds and the scrollbar track. Constants like `TOOL_PANELS` and `MESSAGE_PANELS` group them, and the `each` helper expands a list of tokens into one rule apiece.
+
+The list is declarative, so the whole accessibility policy is readable in one place: for example `accent`, `success`, `error` and `warning` must be `readable` on the background, the selected row and all tool panels.
+
+```ts ! system-theme.ts
+const each = (tokens: ThemeToken[], on: Surface[], level: Level): Rule[] =>
+	tokens.map((token) => ({ token, on, level }));
+
+const RULES: Rule[] = [
+	...each(PANELS, ["background"], "panel"),
+	{ token: "text", on: ["background"], level: "text" },
+	{ token: "text", on: ["selectedBg"], level: "textOnPanel" },
+	{ token: "userMessageText", on: ["userMessageBg"], level: "textOnPanel" },
+	{ token: "toolTitle", on: TOOL_PANELS, level: "textOnPanel" },
+	...each(["accent", "success", "error", "warning"], ["background", "selectedBg", ...TOOL_PANELS], "readable"),
+	{ token: "muted", on: ["background", "selectedBg", "customMessageBg", ...TOOL_PANELS], level: "readable" },
+	{ token: "dim", on: ["background", "selectedBg", "customMessageBg", ...TOOL_PANELS], level: "subtle" },
+	{ token: "thinkingText", on: ["background"], level: "readable" },
+```
+
+## !!steps Solving surfaces before the tokens drawn on them
+
+A text color can only be computed once the surface under it exists, and panels themselves depend on the background. `SOLVE_ORDER` is a depth-first topological order over the rules: visiting a token first visits every non-background surface it sits on, then appends the token.
+
+```ts ! system-theme.ts
+/** Tokens in dependency order: every surface before the tokens drawn on it. */
+const SOLVE_ORDER: ThemeToken[] = (() => {
+	const order: ThemeToken[] = [];
+	const visit = (token: ThemeToken): void => {
+		if (order.includes(token)) return;
+		for (const rule of RULES) {
+			if (rule.token !== token) continue;
+			for (const surface of rule.on) if (surface !== "background") visit(surface);
+		}
+		order.push(token);
+	};
+	for (const rule of RULES) visit(rule.token);
+	return order;
+})();
+```
+
+## !!steps Dark or light, from the colors themselves
+
+`terminalAppearance` decides which polynomial set to use. It first trusts the terminal's own foreground direction (lighter than background means a dark theme), but only if that direction can give at least WCAG 4.5:1 text. Otherwise it picks dark when white text has more contrast on the background than black.
+
+The WCAG helpers are exported. `generateSystemThemeColors` starts by delegating to the index fallback when there is no background, and only uses a palette if it has all 16 entries.
+
+```ts ! system-theme.ts
+export function terminalAppearance(background: RgbColor, foreground?: RgbColor): ThemeAppearance {
+	const white = { r: 255, g: 255, b: 255 };
+	const black = { r: 0, g: 0, b: 0 };
+	const whiteContrast = wcagContrast(white, background);
+	const blackContrast = wcagContrast(black, background);
+	if (foreground) {
+		const foregroundL = oklabLightness(foreground);
+		const backgroundL = oklabLightness(background);
+		if (Math.abs(foregroundL - backgroundL) > 0.05) {
+			const appearance = foregroundL > backgroundL ? "dark" : "light";
+			const best = appearance === "dark" ? whiteContrast : blackContrast;
+			if (best >= TEXT_MINIMUM_WCAG_CONTRAST) return appearance;
+		}
+	}
+	return whiteContrast >= blackContrast ? "dark" : "light";
+}
+```
+
+## !!steps Relaxation when a level cannot be reached
+
+On mid-gray backgrounds not every level fits. `target` takes a relaxation `t` from 0 to 2: from 0 to 1, levels stronger than the readable floor are compressed toward it; from 1 to 2, all levels move toward the surface itself. At `t = 0` an unreachable level gives `undefined`, which makes the whole solve fail and triggers relaxation.
+
+`solve(t)` walks `SOLVE_ORDER`, collects one target lightness per rule and surface, and takes the most extreme (lightest on dark, darkest on light) so that a token satisfying all its surfaces satisfies each one. Panels pass through `limitPanel`, which keeps them far enough from the extreme that white or black text still reaches 4.5:1.
+
+```ts ! system-theme.ts
+	const target = (level: Level, surfaceL: number, t: number): number | undefined => {
+		const reached = levelTarget(level, appearance, surfaceL);
+		if (reached === undefined && t === 0) return undefined;
+		const distance = (reached ?? extreme) - surfaceL;
+		const floor = (levelTarget(READABLE_FLOOR[appearance], appearance, surfaceL) ?? extreme) - surfaceL;
+		const compressed =
+			Math.abs(distance) > Math.abs(floor) ? distance - (distance - floor) * Math.min(t, 1) : distance;
+		return surfaceL + compressed * (1 - Math.max(0, t - 1));
+	};
+```
+
+## !!steps Finding the least relaxation
+
+If the strict solve fails, a 20-step bisection over `t` in 0 to 2 finds the smallest relaxation that works. Full relaxation (2) always fits, so the loop starts from a known-good result and only improves it.
+
+```ts ! system-theme.ts
+	let relaxation = 0;
+	let colors = solve(0);
+	if (!colors) {
+		// Mid-gray backgrounds cannot fit every level: relax as little as possible. Full relaxation always fits.
+		let [low, high] = [0, 2];
+		colors = solve(high);
+		for (let index = 0; index < 20; index++) {
+			const middle = (low + high) / 2;
+			const attempt = solve(middle);
+			// !mark
+			if (attempt) [high, colors] = [middle, attempt];
+			else low = middle;
+		}
+		relaxation = high;
+	}
+```
+
+## !!steps Body text prefers the terminal's own foreground
+
+For `text`, `userMessageText` and `toolTitle`, an empty string (the terminal default) is used when the terminal's foreground is already strong enough for the `emphasis` level on every surface. Otherwise the foreground's hue is moved to just the lightness needed, then pushed by `withTextContrast` until every surface meets 4.5:1.
+
+This is why body text matches the user's terminal exactly when possible, while the colored tokens are generated.
+
+```ts ! system-theme.ts
+		let text = solved.get(token);
+		if (foreground) {
+			const targets = surfaces.map((surface) => target(FOREGROUND_LEVEL, oklabLightness(surface), relaxation));
+			if (targets.every((value) => value !== undefined && value >= 0 && value <= 1)) {
+				const needed = lighter ? Math.max(...(targets as number[])) : Math.min(...(targets as number[]));
+				const foregroundL = oklabLightness(foreground);
+				// !mark(1:3)
+				if (lighter ? foregroundL >= needed : foregroundL <= needed) {
+					result[token] = "";
+					continue;
+				}
+				text = anchored(sourceOf(foreground), FAMILIES.neutral, oklabToOkhslLightness(needed), saturation);
+			}
+		}
+```
+
+## !!steps Keeping palette colors from getting garish
+
+`anchored` re-targets a palette color to a new lightness. The source's saturation applies at its own lightness and falls off along the family's curve toward black and white. But OKHSL saturation is relative to the gamut, so the same saturation can mean far more chroma at another lightness: the comment's example is a Catppuccin pastel pink that would double its chroma. So chroma is also capped at the source's, with the same falloff.
+
+```ts ! system-theme.ts
+function anchored(source: SourceColor, family: Family, lightness: number, saturation: number): RgbColor {
+	const anchor = saturationCurve(family, source.l);
+	const falloff = anchor > 0 ? Math.min(1, saturationCurve(family, lightness) / anchor) : 1;
+	const color = okhslColor(source.h, source.s * falloff * saturation, lightness);
+	const cap = source.chroma * falloff * saturation;
+	const { l, c } = colorToOklch(color);
+	return c <= cap ? color : colorToRgb(oklchColor(l, cap, source.h));
+}
+```
+
+## !!steps Nothing reported: ANSI indices
+
+With no background, the generator cannot compute contrast, so `indexedColors` returns palette slot numbers for colored tokens (the terminal renders them in its own theme), an empty string for panels and neutral body text, and a `dim` list for other neutral tokens, which the theme renders with SGR 2 (faint). The comment gives the reason: bright black is nearly invisible in some terminal themes.
+
+A saturation of 0 (the grayscale first frame) maps colored tokens to the default too.
+
+```ts ! system-theme.ts
+function indexedColors(saturation: number, appearance: ThemeAppearance | undefined): SystemThemeColors {
+	const colors = {} as Record<ThemeToken, string | number>;
+	const dim: ThemeColor[] = [];
+	for (const [token, familyName] of Object.entries(TOKEN_FAMILIES) as [ThemeToken, FamilyName][]) {
+		if (PANELS.includes(token as ThemeBg)) {
+			colors[token] = "";
+			continue;
+		}
+		const neutral = familyName === "neutral";
+		colors[token] = !neutral && saturation > 0 ? (TOKEN_SLOTS[token] ?? FAMILIES[familyName].slot) : "";
+		if (neutral && !FOREGROUND_TOKENS.includes(token as ThemeColor)) dim.push(token as ThemeColor);
+	}
+	return { colors, dim, appearance };
+}
+```
+
+</Scrollycoding>
+
+The output (`SystemThemeColors`) is plain data: hex strings, ANSI indices or empty strings, plus the detected appearance, so [theme.ts](/docs/src/modes/interactive/theme/theme.ts) can treat it like any theme. The `thinkingMax` and other thinking families here must stay in step with the `thinking*` tokens in [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts).
+
+One structural note: `generateSystemThemeColors` is a single 120-line function with several closures (`paint`, `target`, `limitPanel`, `solve`) sharing local state. That keeps the data tables at the top clean, but makes the solver hard to unit test in pieces; the exported surface is only the generator, the WCAG helpers and `terminalAppearance`.

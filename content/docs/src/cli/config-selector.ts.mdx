@@ -1,0 +1,89 @@
+---
+title: "config-selector.ts"
+description: "Launches the standalone TUI that `pi config` uses to enable and disable resources"
+source: "src/cli/config-selector.ts"
+full: true
+---
+
+`pi config` lets a user toggle extensions, skills and other resources interactively. This file is the thin launcher: it creates a terminal UI, mounts the real selector component, and returns a promise that resolves when the user closes it.
+
+The selector itself lives in [config-selector.ts](/docs/src/modes/interactive/components/config-selector.ts). This wrapper supplies its inputs (resolved paths, [settings-manager.ts](/docs/src/core/settings-manager.ts), directories, write scope) and handles theme setup and teardown through [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+<Scrollycoding>
+
+## !!steps Options passed in by the command
+
+The caller has already resolved which resource paths exist per scope. `writeScope` decides whether changes go to global or project settings, and `projectModeAvailable` tells the UI whether the project scope can be offered at all.
+
+```ts ! config-selector.ts
+export interface ConfigSelectorOptions {
+	resolvedPaths: ScopedResolvedPaths;
+	settingsManager: SettingsManager;
+	cwd: string;
+	agentDir: string;
+	writeScope: "global" | "project";
+	projectModeAvailable: boolean;
+}
+```
+
+## !!steps Theme before TUI
+
+The theme is initialized from settings before any rendering, and the promise wraps the whole interactive session. The screen is created from user settings: hardware cursor visibility and clear-on-shrink behavior.
+
+```ts ! config-selector.ts
+export async function selectConfig(options: ConfigSelectorOptions): Promise<void> {
+	// Initialize theme before showing TUI
+	// !mark
+	initTheme(options.settingsManager.getTheme(), true);
+
+	return new Promise((resolve) => {
+		const ui: TUI = new TuiMainScreen(
+			new ProcessTerminal(),
+			options.settingsManager.getShowHardwareCursor(),
+			options.agentDir,
+		);
+		ui.setClearOnShrink(options.settingsManager.getClearOnShrink());
+		let resolved = false;
+```
+
+## !!steps Two ways to leave
+
+The component receives two callbacks. The close callback is guarded by a `resolved` flag so repeated invocations stop the UI and theme watcher only once, then resolve the promise. The cancel callback stops everything and calls `process.exit(0)` directly, so cancelling never returns to the caller.
+
+```ts ! config-selector.ts
+			() => {
+				// !mark(1:5)
+				if (!resolved) {
+					resolved = true;
+					ui.stop();
+					stopThemeWatcher();
+					resolve();
+				}
+			},
+			() => {
+				ui.stop();
+				stopThemeWatcher();
+				process.exit(0);
+			},
+```
+
+## !!steps Mounting and focus
+
+The selector is added as a child, focus goes to its resource list so keys work immediately, and `ui.start()` begins rendering. The render callback and the terminal row count passed earlier let the component size and repaint itself.
+
+```ts ! config-selector.ts
+			() => ui.requestRender(),
+			ui.terminal.rows,
+			options.writeScope,
+			options.projectModeAvailable,
+		);
+
+		ui.addChild(selector);
+		// !mark
+		ui.setFocus(selector.getResourceList());
+		ui.start();
+```
+
+</Scrollycoding>
+
+The row count is captured once at construction, so the component must handle later resizes itself. Note the asymmetry between the two exits: only the normal close path lets the caller continue.

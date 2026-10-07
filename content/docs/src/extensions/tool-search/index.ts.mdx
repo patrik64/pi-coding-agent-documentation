@@ -1,0 +1,54 @@
+---
+title: "index.ts"
+description: "Packages the tool_search tool as an extension, registered inactive by default, for both the CLI and SDK users"
+source: "src/extensions/tool-search/index.ts"
+full: true
+---
+
+A tiny file that turns the tool in [tool.ts](/docs/src/extensions/tool-search/tool.ts) into an extension. The CLI loads it as a built-in extension through the registry in [index.ts](/docs/src/extensions/index.ts) (marked replaceable), and SDK users can add `createToolSearchExtension()` to their own extension factories.
+
+The extension API it receives is the `ExtensionAPI` from [types.ts](/docs/src/core/extensions/types.ts). Passing it as the `tools` option is what lets the tool read and change the session's active tool set, because the API provides `getAllTools`, `getActiveTools` and `setActiveTools`.
+
+<Scrollycoding>
+
+## !!steps Why the tool starts inactive
+
+The header comment states the rule: `tool_search` is registered but not active. A user turns it on with `--tools`, the `defaultTools` setting, or `setActiveTools()`. Sessions that do not use deferred tools never pay for the extra tool in their prompt.
+
+```ts ! index.ts
+/**
+ * The `tool_search` tool as an extension. The CLI loads it as a built-in extension; SDK users add
+ * `createToolSearchExtension()` to their extension factories.
+ *
+ * `tool_search` is registered inactive. Activate it with `--tools`, the `defaultTools` setting, or
+ * `setActiveTools()`.
+ */
+
+```
+
+## !!steps The factory
+
+`createToolSearchExtension` returns an extension factory. It registers the tool definition with `defaultActive: false`, passing the API itself as the tool source. A factory function, rather than a constant, lets SDK users create independent instances.
+
+```ts ! index.ts
+import { createToolSearchToolDefinition } from "./tool.ts";
+
+export function createToolSearchExtension(): ExtensionFactory {
+	return (pi) => {
+		// !mark
+		pi.registerTool({ ...createToolSearchToolDefinition({ tools: pi }), defaultActive: false });
+	};
+}
+```
+
+## !!steps The default export
+
+The default export is a ready instance, which is what the built-in extension list imports.
+
+```ts ! index.ts
+export default createToolSearchExtension();
+```
+
+</Scrollycoding>
+
+The pairing is simple: tool.ts holds all logic and index.ts holds the registration policy. The same ranker is reused by codemode scripts in [execute.ts](/docs/src/extensions/codemode/execute.ts) without going through this extension.

@@ -1,0 +1,409 @@
+---
+title: "prompt-templates.ts"
+description: "Loads markdown prompt templates from disk and expands slash-command input like /review arg1 into the template body with arguments substituted"
+source: "src/core/prompt-templates.ts"
+full: true
+---
+
+A prompt template is a markdown file whose name becomes a slash command. Typing `/review src/foo.ts` in the editor sends the body of review.md with placeholders such as `$1` replaced by the arguments. This file does three jobs: parse the argument string, substitute placeholders, and discover template files with provenance information.
+
+[resource-loader.ts](/docs/src/core/resource-loader.ts) calls the loader, passing the explicit paths from settings and CLI flags, and [agent-session.ts](/docs/src/core/agent-session.ts) calls `expandPromptTemplate` on user input. Frontmatter parsing is shared with skills through [frontmatter.ts](/docs/src/utils/frontmatter.ts).
+
+<Scrollycoding>
+
+## !!steps What a template is
+
+A template has a name (the file name without .md), a description, an optional argument hint for autocomplete, the body, and a `sourceInfo` describing where it came from, as defined in [source-info.ts](/docs/src/core/source-info.ts). `filePath` is always absolute.
+
+```ts ! prompt-templates.ts
+/**
+ * Represents a prompt template loaded from a markdown file
+ */
+// !mark(1:7)
+export interface PromptTemplate {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	content: string;
+	sourceInfo: SourceInfo;
+	filePath: string; // Absolute path to the template file
+}
+```
+
+## !!steps Bash-style argument splitting
+
+`parseCommandArgs` is a small state machine. Whitespace separates arguments unless inside single or double quotes, and the quote characters themselves are removed.
+
+There is no escape handling and no check for unterminated quotes: an unclosed quote swallows the rest of the line as one argument. An empty quoted string yields no argument at all, because empty values are never pushed.
+
+```ts ! prompt-templates.ts
+/**
+ * Parse command arguments respecting quoted strings (bash-style)
+ * Returns array of arguments
+ */
+export function parseCommandArgs(argsString: string): string[] {
+	const args: string[] = [];
+	let current = "";
+	let inQuote: string | null = null;
+
+	for (let i = 0; i < argsString.length; i++) {
+		const char = argsString[i];
+
+// !mark(1:3)
+		if (inQuote) {
+			if (char === inQuote) {
+				inQuote = null;
+			} else {
+				current += char;
+			}
+// !mark(1:2)
+		} else if (char === '"' || char === "'") {
+			inQuote = char;
+		} else if (/\s/.test(char)) {
+			if (current) {
+				args.push(current);
+				current = "";
+			}
+		} else {
+			current += char;
+		}
+	}
+
+	if (current) {
+		args.push(current);
+	}
+
+	return args;
+}
+```
+
+## !!steps Placeholder substitution
+
+One regular expression handles every placeholder form in a single pass: positional `$1`, all arguments as `$@` or `$ARGUMENTS`, defaults like `${1:-fallback}`, and bash-style slices `${@:2}` and `${@:2:3}`.
+
+Because everything runs through one `replace`, substituted values are never rescanned. An argument that literally contains `$1` stays as text, as the doc comment promises.
+
+```ts ! prompt-templates.ts
+/**
+ * Substitute argument placeholders in template content
+ * Supports:
+ * - $1, $2, ... for positional args
+ * - $@ and $ARGUMENTS for all args
+ * - ${N:-default} for positional arg N with default when missing/empty
+ * - ${@:-default} and ${ARGUMENTS:-default} for all args with a default when empty
+ * - ${@:N} for args from Nth onwards (bash-style slicing)
+ * - ${@:N:L} for L args starting from Nth
+ *
+ * Note: Replacement happens on the template string only. Argument and default values
+ * containing patterns like $1, $@, or $ARGUMENTS are NOT recursively substituted.
+ */
+export function substituteArgs(content: string, args: string[]): string {
+	const allArgs = args.join(" ");
+
+// !mark(1:2)
+	return content.replace(
+		/\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+		(_match, defaultTarget, defaultValue, sliceStart, sliceLength, simple) => {
+			if (defaultTarget) {
+				const value =
+					defaultTarget === "@" || defaultTarget === "ARGUMENTS" ? allArgs : args[parseInt(defaultTarget, 10) - 1];
+				return value ? value : defaultValue;
+			}
+
+```
+
+## !!steps Substitution rules in detail
+
+A default applies when the value is missing or empty. Slices are one-indexed, and an index of zero is clamped to the first argument as in bash. A positional reference beyond the supplied arguments becomes an empty string rather than being left in the text.
+
+Joined arguments use a single space, so quoting information is lost once the arguments are re-joined by `$@`.
+
+```ts ! prompt-templates.ts
+	return content.replace(
+		/\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+		(_match, defaultTarget, defaultValue, sliceStart, sliceLength, simple) => {
+			if (defaultTarget) {
+				const value =
+// !mark
+					defaultTarget === "@" || defaultTarget === "ARGUMENTS" ? allArgs : args[parseInt(defaultTarget, 10) - 1];
+				return value ? value : defaultValue;
+			}
+
+			if (sliceStart) {
+// !mark(1:3)
+				let start = parseInt(sliceStart, 10) - 1; // Convert to 0-indexed (user provides 1-indexed)
+				// Treat 0 as 1 (bash convention: args start at 1)
+				if (start < 0) start = 0;
+
+				if (sliceLength) {
+					const length = parseInt(sliceLength, 10);
+					return args.slice(start, start + length).join(" ");
+				}
+				return args.slice(start).join(" ");
+			}
+
+			if (simple === "ARGUMENTS" || simple === "@") {
+				return allArgs;
+			}
+
+// !mark(1:2)
+			const index = parseInt(simple, 10) - 1;
+			return args[index] ?? "";
+		},
+	);
+}
+```
+
+## !!steps Loading one file
+
+Read and parse failures become warning diagnostics (type from [diagnostics.ts](/docs/src/core/diagnostics.ts)) and the file is skipped, so one bad template does not hide the others.
+
+The description comes from frontmatter, or else from the first non-empty body line truncated to 60 characters with an ellipsis. The `argument-hint` key is read only if it is a string.
+
+```ts ! prompt-templates.ts
+function loadTemplateFromFile(
+	filePath: string,
+	sourceInfo: SourceInfo,
+): { template: PromptTemplate | null; diagnostics: ResourceDiagnostic[] } {
+	const diagnostics: ResourceDiagnostic[] = [];
+	let rawContent: string;
+	try {
+// !mark(1:6)
+		rawContent = readFileSync(filePath, "utf-8");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "failed to read prompt template file";
+		diagnostics.push({ type: "warning", message, path: filePath });
+		return { template: null, diagnostics };
+	}
+
+	let frontmatter: Record<string, unknown>;
+	let body: string;
+	try {
+		({ frontmatter, body } = parseFrontmatter(rawContent));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "failed to parse prompt template file";
+		diagnostics.push({ type: "warning", message, path: filePath });
+		return { template: null, diagnostics };
+	}
+
+// !mark
+	const name = basename(filePath).replace(/\.md$/, "");
+
+	// Get description from frontmatter or first non-empty line
+	let description = typeof frontmatter.description === "string" ? frontmatter.description : "";
+// !mark(1:8)
+	if (!description) {
+		const firstLine = body.split("\n").find((line) => line.trim());
+		if (firstLine) {
+			// Truncate if too long
+			description = firstLine.slice(0, 60);
+			if (firstLine.length > 60) description += "...";
+		}
+	}
+
+	const argumentHint = typeof frontmatter["argument-hint"] === "string" ? frontmatter["argument-hint"] : undefined;
+	return {
+		template: {
+			name,
+			description,
+			...(argumentHint && { argumentHint }),
+			content: body,
+			sourceInfo,
+			filePath,
+		},
+		diagnostics,
+	};
+}
+```
+
+## !!steps Scanning a directory
+
+Directory scans are non-recursive and only consider files ending in .md. Symlinks are resolved with `stat` so a link to a file counts and a broken link is skipped silently. A directory that cannot be read yields whatever was found so far.
+
+```ts ! prompt-templates.ts
+/**
+ * Scan a directory for .md files (non-recursive) and load them as prompt templates.
+ */
+function loadTemplatesFromDir(dir: string, getSourceInfo: (filePath: string) => SourceInfo): LoadPromptTemplatesResult {
+	const templates: PromptTemplate[] = [];
+	const diagnostics: ResourceDiagnostic[] = [];
+
+	if (!existsSync(dir)) {
+		return { templates, diagnostics };
+	}
+
+	try {
+		const entries = readdirSync(dir, { withFileTypes: true });
+
+		for (const entry of entries) {
+			const fullPath = join(dir, entry.name);
+
+// !mark(1:9)
+			// For symlinks, check if they point to a file
+			let isFile = entry.isFile();
+			if (entry.isSymbolicLink()) {
+				try {
+					const stats = statSync(fullPath);
+					isFile = stats.isFile();
+				} catch {
+					// Broken symlink, skip it
+					continue;
+				}
+			}
+
+// !mark
+			if (isFile && entry.name.endsWith(".md")) {
+				const result = loadTemplateFromFile(fullPath, getSourceInfo(fullPath));
+				if (result.template) {
+					templates.push(result.template);
+				}
+				diagnostics.push(...result.diagnostics);
+			}
+		}
+	} catch {
+		return { templates, diagnostics };
+	}
+
+	return { templates, diagnostics };
+}
+```
+
+## !!steps Choosing sources and scopes
+
+`loadPromptTemplates` has three sources: the global prompts folder in the agent directory, the project prompts folder under the config directory name, and explicit paths. Provenance is computed from the path: under the global folder means user scope, under the project folder means project scope, anything else is a plain local source whose base directory is the path itself or its parent.
+
+`isUnderPath` compares with a trailing separator, so a sibling folder with a common prefix is not mistaken for a child.
+
+```ts ! prompt-templates.ts
+/**
+ * Load all prompt templates from:
+ * 1. Global: agentDir/prompts/
+ * 2. Project: cwd/{CONFIG_DIR_NAME}/prompts/
+ * 3. Explicit prompt paths
+ */
+export function loadPromptTemplates(options: LoadPromptTemplatesOptions): LoadPromptTemplatesResult {
+	const resolvedCwd = resolvePath(options.cwd);
+	const resolvedAgentDir = resolvePath(options.agentDir);
+	const promptPaths = options.promptPaths;
+	const includeDefaults = options.includeDefaults;
+
+	const templates: PromptTemplate[] = [];
+	const diagnostics: ResourceDiagnostic[] = [];
+	const addResult = (result: LoadPromptTemplatesResult): void => {
+		templates.push(...result.templates);
+		diagnostics.push(...result.diagnostics);
+	};
+
+// !mark(1:2)
+	const globalPromptsDir = join(resolvedAgentDir, "prompts");
+	const projectPromptsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "prompts");
+
+// !mark(1:8)
+	const isUnderPath = (target: string, root: string): boolean => {
+		const normalizedRoot = resolve(root);
+		if (target === normalizedRoot) {
+			return true;
+		}
+		const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
+		return target.startsWith(prefix);
+	};
+
+	const getSourceInfo = (resolvedPath: string): SourceInfo => {
+		if (isUnderPath(resolvedPath, globalPromptsDir)) {
+			return createSyntheticSourceInfo(resolvedPath, {
+				source: "local",
+				scope: "user",
+				baseDir: globalPromptsDir,
+			});
+		}
+		if (isUnderPath(resolvedPath, projectPromptsDir)) {
+			return createSyntheticSourceInfo(resolvedPath, {
+				source: "local",
+				scope: "project",
+				baseDir: projectPromptsDir,
+			});
+		}
+		return createSyntheticSourceInfo(resolvedPath, {
+			source: "local",
+			baseDir: statSync(resolvedPath).isDirectory() ? resolvedPath : dirname(resolvedPath),
+		});
+	};
+```
+
+## !!steps Defaults, explicit paths, and errors
+
+Defaults are loaded only if `includeDefaults` is true. Explicit paths are resolved relative to the working directory with trimming, silently skipped if missing, and may be files or directories. A file must still end in .md.
+
+Duplicate names are not detected here. Collisions are left to the caller, and `expandPromptTemplate` simply uses the first match.
+
+```ts ! prompt-templates.ts
+// !mark(1:4)
+	if (includeDefaults) {
+		addResult(loadTemplatesFromDir(globalPromptsDir, getSourceInfo));
+		addResult(loadTemplatesFromDir(projectPromptsDir, getSourceInfo));
+	}
+
+	// 3. Load explicit prompt paths
+// !mark(1:4)
+	for (const rawPath of promptPaths) {
+		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
+		if (!existsSync(resolvedPath)) {
+			continue;
+		}
+
+		try {
+			const stats = statSync(resolvedPath);
+			if (stats.isDirectory()) {
+				addResult(loadTemplatesFromDir(resolvedPath, getSourceInfo));
+// !mark
+			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
+				const result = loadTemplateFromFile(resolvedPath, getSourceInfo(resolvedPath));
+				if (result.template) {
+					templates.push(result.template);
+				}
+				diagnostics.push(...result.diagnostics);
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "failed to read prompt template path";
+			diagnostics.push({ type: "warning", message, path: resolvedPath });
+		}
+	}
+
+	return { templates, diagnostics };
+}
+```
+
+## !!steps Expanding user input
+
+Only input beginning with a slash is considered. The regular expression takes the first token as the name and everything after the first whitespace run as the arguments, including newlines. If no template has that name, the original text is returned unchanged so other slash commands can handle it, see [slash-commands.ts](/docs/src/core/slash-commands.ts).
+
+```ts ! prompt-templates.ts
+/**
+ * Expand a prompt template if it matches a template name.
+ * Returns the expanded content or the original text if not a template.
+ */
+export function expandPromptTemplate(text: string, templates: PromptTemplate[]): string {
+// !mark(1:2)
+	if (!text.startsWith("/")) return text;
+
+// !mark
+	const match = text.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+	if (!match) return text;
+
+	const templateName = match[1];
+	const argsString = match[2] ?? "";
+
+// !mark(1:4)
+	const template = templates.find((t) => t.name === templateName);
+	if (template) {
+		const args = parseCommandArgs(argsString);
+		return substituteArgs(template.content, args);
+	}
+
+	return text;
+}
+```
+
+</Scrollycoding>
+
+The file is pure functions plus synchronous disk reads, so it is easy to test. Errors are contained at both levels: the directory scan has its own try block, and explicit paths are wrapped so an unreadable path becomes a warning diagnostic.

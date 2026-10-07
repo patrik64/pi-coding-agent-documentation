@@ -1,0 +1,266 @@
+---
+title: "loader.ts"
+description: "Finds extension files, imports them through jiti, and runs each factory against a per-extension ExtensionAPI that stages its changes until the factory succeeds"
+source: "src/core/extensions/loader.ts"
+full: true
+---
+
+Extensions are TypeScript or JavaScript modules whose default export is a factory function that receives the `pi` API. This file is the first half of their lifecycle: discovery on disk, importing the module, calling the factory, and collecting what it registered into an `Extension` record. The second half, running the handlers, is [runner.ts](/docs/src/core/extensions/runner.ts).
+
+The module is mostly plumbing, but two ideas stand out. The runtime object is created before anything is bound, with stub actions that throw until the runner replaces them, and each extension's API is transactional: registrations take effect only if the factory finishes without throwing. The shapes involved are declared in [types.ts](/docs/src/core/extensions/types.ts).
+
+Callers include [resource-loader.ts](/docs/src/core/resource-loader.ts), which loads extensions through these entry points, and [agent-session.ts](/docs/src/core/agent-session.ts), which owns the resulting runner.
+
+<Scrollycoding>
+
+## !!steps Choosing a jiti flavor and module resolution
+
+Extensions are written in TypeScript and imported at runtime through jiti, so the loader has to decide how an extension's own imports of pi packages are resolved. That depends on how pi itself is running. Bun binaries, Node single executable builds and the bundled Node distribution all count as embedded modules.
+
+The jiti implementation is imported lazily and cached in a module-level promise. Embedded builds use [jiti-static-loader.ts](/docs/src/core/extensions/jiti-static-loader.ts), everything else [jiti-loader.ts](/docs/src/core/extensions/jiti-loader.ts). The virtual module table in [virtual-modules.ts](/docs/src/core/extensions/virtual-modules.ts) is loaded the same lazy way.
+
+```ts ! loader.ts
+const isNodeSeaBinary =
+	("sea" in process.features && process.features.sea === true) ||
+	process.getBuiltinModule("node:sea")?.isSea() === true;
+const isTypeScriptSourceRuntime = !isBunBinary && path.extname(fileURLToPath(import.meta.url)) === ".ts";
+const usesEmbeddedModules = isBunBinary || isNodeSeaBinary || isBundledNode;
+
+let createJitiPromise: Promise<typeof createJiti> | undefined;
+
+function getCreateJiti(): Promise<typeof createJiti> {
+	// !mark
+	createJitiPromise ??= (usesEmbeddedModules ? import("./jiti-static-loader.ts") : import("./jiti-loader.ts")).then(
+		(module) => module.createJiti,
+	);
+	return createJitiPromise;
+}
+```
+
+## !!steps Aliases for built Node mode
+
+In a plain Node installation an extension that imports a pi package must resolve it to the same instance the host uses. `getAliases` builds that table once. It points the coding-agent package to the sibling index file, and resolves the agent core, tui and ai packages either to the workspace build or to whatever `import.meta.resolve` finds.
+
+The table also maps the old `@mariozechner` scope and the old `@sinclair/typebox` name to the current entries, so extensions written before the renames keep working. The comment notes that the root `pi-ai` specifier resolves to the compat entry, a superset of the core one.
+
+```ts ! loader.ts
+	_aliases = {
+		"@earendil-works/pi-coding-agent": piCodingAgentEntry,
+		"@earendil-works/pi-agent-core": piAgentCoreEntry,
+		"@earendil-works/pi-tui": piTuiEntry,
+		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
+		"@earendil-works/pi-ai/compat": piAiCompatEntry,
+		"@earendil-works/pi-ai/oauth": piAiOauthEntry,
+		"@earendil-works/pi-ai": piAiCompatEntry,
+		// !mark(1:2)
+		"@mariozechner/pi-coding-agent": piCodingAgentEntry,
+		"@mariozechner/pi-agent-core": piAgentCoreEntry,
+		"@mariozechner/pi-tui": piTuiEntry,
+		"@mariozechner/pi-ai/providers/all": piAiProvidersEntry,
+		"@mariozechner/pi-ai/compat": piAiCompatEntry,
+		"@mariozechner/pi-ai/oauth": piAiOauthEntry,
+		"@mariozechner/pi-ai": piAiCompatEntry,
+		typebox: typeboxEntry,
+		"typebox/compile": typeboxCompileEntry,
+		"typebox/value": typeboxValueEntry,
+		"@sinclair/typebox": typeboxEntry,
+		"@sinclair/typebox/compile": typeboxCompileEntry,
+		"@sinclair/typebox/value": typeboxValueEntry,
+	};
+```
+
+## !!steps A runtime of throwing stubs
+
+`createExtensionRuntime` builds the shared state before any extension runs. Action methods such as `sendMessage` are stubs that throw "not initialized", because during loading there is no session to act on. The runner's `bindCore` later overwrites them with real implementations.
+
+Two exceptions are deliberate. `refreshTools` is a no-op, since registering a tool is valid during load and only needs a refresh after binding. `registerProvider` and friends queue into `pendingProviderRegistrations` and its siblings, to be flushed once the model registry exists. The `unregister` variants remove from those queues.
+
+```ts ! loader.ts
+		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
+		getThinkingLevel: notInitialized,
+		setThinkingLevel: notInitialized,
+		flagValues: new Map(),
+		pendingProviderRegistrations: [],
+		pendingNativeProviderRegistrations: [],
+		mcpServers: new McpServerRegistry(),
+		pendingVirtualModelRegistrations: [],
+		createContext: notInitialized,
+		assertActive,
+		invalidate: (message) => {
+		// ...
+		// Pre-bind: queue registrations so bindCore() can flush them once the
+		// model registry is available. bindCore() replaces both with direct calls.
+		registerProvider: (name, config, extensionPath = "<unknown>") => {
+			// !mark
+			runtime.pendingProviderRegistrations.push({ name, config, extensionPath });
+		},
+```
+
+## !!steps Staleness and event bus cleanup
+
+After `/reload` or a session replacement an extension may still hold a captured `pi` object. `invalidate` records a long, specific message once, and `assertActive` throws it from then on, so stale calls fail loudly with advice on what to do instead (use the context passed to `withSession`).
+
+Invalidation also runs every tracked event bus unsubscribe. `trackEventBusSubscription` wraps each unsubscribe so it only runs once and removes itself from the set, which makes it safe for an extension to unsubscribe manually before the runtime does it.
+
+```ts ! loader.ts
+		trackEventBusSubscription: (unsubscribe) => {
+			let active = true;
+			const trackedUnsubscribe = () => {
+				if (!active) return;
+				active = false;
+				eventBusUnsubscribers.delete(trackedUnsubscribe);
+				unsubscribe();
+			};
+			// !mark
+			eventBusUnsubscribers.add(trackedUnsubscribe);
+			return trackedUnsubscribe;
+		},
+```
+
+## !!steps A transactional API per extension
+
+`createExtensionAPI` returns the `api` object plus `commit` and `discard`. While the extension is in the `loading` state, anything that touches shared runtime state, such as provider or MCP registration, is pushed onto `pendingRuntimeChanges` instead of being applied. Default flag values are held in `pendingFlagValues` the same way.
+
+`commit` runs after the factory resolves: it copies pending flag defaults that no one has set yet, replays the queued runtime changes, and flips the state to `active`. `discard` runs if the factory throws: it unsubscribes event bus listeners added during load and marks the API `failed`, so a half-initialized extension leaves no trace in the shared runtime.
+
+```ts ! loader.ts
+	return {
+		api,
+		commit: () => {
+			if (state !== "loading") return;
+			runtime.assertActive();
+			for (const [name, value] of pendingFlagValues) {
+				if (!runtime.flagValues.has(name)) runtime.flagValues.set(name, value);
+			}
+			// !mark
+			for (const apply of pendingRuntimeChanges) apply();
+			state = "active";
+			clearPending();
+		},
+		discard: () => {
+			if (state !== "loading") return;
+			state = "failed";
+			for (const unsubscribe of loadingUnsubscribers) unsubscribe();
+			clearPending();
+		},
+	};
+```
+
+## !!steps Registration methods validate and write into the extension
+
+Registration methods write into the `Extension` record rather than the runtime. `registerTool` insists on an object parameter schema and calls `refreshTools`. `registerCommand` requires a non-empty name and a handler function. `registerFlag` rejects defaults whose type does not match the declared type. Errors mention the extension path, which is what the user sees in the load diagnostics.
+
+`on` wraps each handler so the same function can be registered twice and unsubscribed independently, and returns a function that removes just that registration. Flag access is scoped: `getFlag` returns `undefined` for flags the extension never declared, even if another extension did.
+
+```ts ! loader.ts
+		registerTool(tool: ToolDefinition): void {
+			assertActive();
+			// !mark
+			if (typeof tool.parameters !== "object" || tool.parameters === null || Array.isArray(tool.parameters)) {
+				throw new Error(
+					`Tool "${tool.name}" registered by extension "${extension.path}" must define an object parameter schema.`,
+				);
+			}
+			extension.tools.set(tool.name, {
+				definition: tool,
+				sourceInfo: extension.sourceInfo,
+			});
+			runtime.refreshTools();
+		},
+```
+
+## !!steps MCP server registration rules
+
+`registerMcpServer` validates the config with `validateMcpServerConfig` from [mcp-servers.ts](/docs/src/core/mcp-servers.ts) and refuses a name already owned by another extension. It also rejects names that differ only by `-` versus `_`, since those would share a tool namespace after `mcpNamespace` normalization.
+
+The server record stores a `structuredClone` of the config, so later mutation by the extension cannot alter the registered server, and the actual registration is deferred through `applyRuntimeChange`, like providers. The ownership and clash checks read the registry when the call is made, while the registration itself is only applied on commit.
+
+```ts ! loader.ts
+			const owner = runtime.mcpServers.get(name)?.extensionPath;
+			if (owner !== undefined && owner !== extension.path) {
+				throw new Error(`MCP server "${name}" is already registered by extension "${owner}"`);
+			}
+			// Names that differ only in `-` and `_` would share a namespace.
+			const clash = runtime.mcpServers
+				.list()
+				.find((server) => server.name !== name && mcpNamespace(server.name) === mcpNamespace(name));
+			// !mark
+			if (clash) throw new Error(`MCP server "${name}" conflicts with registered server "${clash.name}"`);
+			const server = { name, config: structuredClone(validated), extensionPath: extension.path };
+			applyRuntimeChange(() => runtime.mcpServers.register(server));
+```
+
+## !!steps Importing the module, with a cache
+
+`loadExtensionModule` imports the file with jiti, `moduleCache: false`, and takes the default export as the factory. If it is not a function the loader returns `undefined`, which becomes the "does not export a valid factory function" error.
+
+Resolution options depend on the runtime flavor from the first step. The loader keeps its own cache of factories keyed by path. A cache token ties entries to a working directory and a generation counter, so changing directories or calling `clearExtensionCache` invalidates everything.
+
+```ts ! loader.ts
+	const resolutionOptions = usesEmbeddedModules
+		? { virtualModules: await getVirtualModules(), tryNative: false }
+		: isTypeScriptSourceRuntime
+			? { virtualModules: await getVirtualModules(), tsconfigPaths: true }
+			: { alias: getAliases() };
+	const jiti = createJitiImpl(import.meta.url, {
+		moduleCache: false,
+		...resolutionOptions,
+	});
+
+	const module = await jiti.import(extensionPath, { default: true });
+	const factory = module as ExtensionFactory;
+	if (typeof factory !== "function") {
+		return undefined;
+	}
+```
+
+## !!steps Running a factory and collecting errors
+
+`initializeExtension` is the common path for file-based and inline factories. It creates the empty `Extension`, builds the API, awaits the factory, and commits. If anything throws, it discards and rethrows. `loadExtension` catches that and returns an error string, so one broken extension never stops the others from loading.
+
+`loadExtensionsInternal` loads the paths sequentially, collecting `extensions` and `errors`. It returns a shared runtime and event bus: if the caller supplies none, fresh ones are created. The `warnings` array in the result is declared but this function never adds to it.
+
+```ts ! loader.ts
+	const extension = createExtension(extensionPath, resolvedPath);
+	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
+	try {
+		await factory(load.api);
+		// !mark
+		load.commit();
+	} catch (error) {
+		// !mark
+		load.discard();
+		throw error;
+	}
+	time(`${extensionPath} factory`, "extensions");
+	return extension;
+```
+
+## !!steps Discovery rules and precedence
+
+`discoverAndLoadExtensions` gathers paths in a fixed order: project-local `extensions` under the config directory, then the global agent directory, then explicitly configured paths. A set of resolved paths removes duplicates, so the first source to mention a file wins its position.
+
+Within a directory, discovery is one level deep. Direct `.ts` and `.js` files load. A subdirectory loads via the `pi` manifest in its `package.json` (read by [pi-manifest.ts](/docs/src/core/pi-manifest.ts)) or else its `index.ts` or `index.js`. A configured directory is tried as a package first and then scanned like an extensions directory.
+
+```ts ! loader.ts
+	// 1. Project-local extensions: cwd/${CONFIG_DIR_NAME}/extensions/
+	const localExtDir = path.join(resolvedCwd, CONFIG_DIR_NAME, "extensions");
+	addPaths(discoverExtensionsInDir(localExtDir));
+
+	// 2. Global extensions: agentDir/extensions/
+	const globalExtDir = path.join(resolvedAgentDir, "extensions");
+	addPaths(discoverExtensionsInDir(globalExtDir));
+
+	// 3. Explicitly configured paths
+	for (const p of configuredPaths) {
+		const resolved = resolvePath(p, resolvedCwd, { normalizeUnicodeSpaces: true });
+		if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+			// Check for package.json with pi manifest or index.ts
+			const entries = resolveExtensionEntries(resolved);
+```
+
+</Scrollycoding>
+
+The loader produces data and leaves behavior to others. Its output is a `LoadExtensionsResult`, a list of `Extension` records plus the shared runtime, which the [ExtensionRunner](/docs/src/core/extensions/runner.ts) takes over. The barrel [index.ts](/docs/src/core/extensions/index.ts) re-exports the public entry points.
+
+Structurally, the file is split between a module-level cache and jiti setup at the top, the API factory in the middle, and path discovery at the bottom. The cache and the loading-state machinery are what let `/reload` replace extensions safely without leaking registrations or listeners.

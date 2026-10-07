@@ -1,0 +1,110 @@
+---
+title: "visual-truncate.ts"
+description: "Shared helpers that cut text down to N wrapped terminal rows, plus a cached component that shows the result with a hidden-lines hint"
+source: "src/modes/interactive/components/visual-truncate.ts"
+full: true
+---
+
+Collapsed tool output has to fit a fixed number of screen rows. Counting logical lines does not work, because a single long line (minified JSON, for instance) wraps over the whole screen. This file counts and cuts in visual lines, meaning lines after wrapping at the current terminal width.
+
+It has two layers: a pure function, `truncateToVisualLines`, and a component, `VisualLinePreview`, that wraps it with a hint line and caches. Consumers include [bash-execution.ts](/docs/src/modes/interactive/components/bash-execution.ts), [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts) and the tool renderers such as [bash.ts](/docs/src/core/tools/renderers/bash.ts).
+
+<Scrollycoding>
+
+## !!steps The result shape
+
+The function returns the lines to show and how many were hidden, so callers can print "N more lines" themselves.
+
+```ts ! visual-truncate.ts
+export interface VisualTruncateResult {
+	/** The visual lines to display */
+	visualLines: string[];
+	/** Number of visual lines that were skipped (hidden) */
+	skippedCount: number;
+}
+```
+
+## !!steps Letting Text do the wrapping
+
+Instead of reimplementing wrapping, the function builds a throwaway `Text` from pi-tui and renders it at the given width. That guarantees the count matches what the real component would draw, including ANSI-aware width handling.
+
+`paddingX` must match where the result will be placed: 0 inside a `Box` (which pads itself), 1 in a plain container. When the text already fits, it is returned whole. Otherwise `keep` picks the head or the tail (tail is the default, which suits streaming command output).
+
+```ts ! visual-truncate.ts
+export function truncateToVisualLines(
+	text: string,
+	maxVisualLines: number,
+	width: number,
+	paddingX: number = 0,
+	keep: "start" | "end" = "end",
+): VisualTruncateResult {
+	if (!text) {
+		return { visualLines: [], skippedCount: 0 };
+	}
+
+	// Create a temporary Text component to render and get visual lines
+	// !mark(1:2)
+	const tempText = new Text(text, paddingX, 0);
+	const allVisualLines = tempText.render(width);
+
+	if (allVisualLines.length <= maxVisualLines) {
+		return { visualLines: allVisualLines, skippedCount: 0 };
+	}
+
+	const truncatedLines =
+		keep === "start" ? allVisualLines.slice(0, maxVisualLines) : allVisualLines.slice(-maxVisualLines);
+	const skippedCount = allVisualLines.length - maxVisualLines;
+
+	return { visualLines: truncatedLines, skippedCount };
+}
+```
+
+## !!steps Options of the preview component
+
+The component takes already styled text, a row budget, which end to keep, and a callback that formats the hint for a given hidden count. Keeping the hint as a callback leaves wording and color to the caller.
+
+```ts ! visual-truncate.ts
+export interface VisualLinePreviewOptions {
+	/** Styled text; may contain newlines. */
+	text: string;
+	maxVisualLines: number;
+	/** Which visual lines to keep. The hint goes before kept end lines and after kept start lines. */
+	keep: "start" | "end";
+	/** Styled hint line for the given number of hidden visual lines. */
+	formatHint: (hidden: number) => string;
+}
+```
+
+## !!steps Caching per width
+
+The doc comment gives the reason for the cache: every result in the transcript re-renders on every frame. So lines are computed once per width and reused until `invalidate()` clears both fields.
+
+The hint is truncated to the width with `...` and placed on the side that faces the hidden content: after the lines when keeping the start, before them when keeping the end. If nothing was hidden there is no hint.
+
+```ts ! visual-truncate.ts
+	render(width: number): string[] {
+		if (this.cachedLines === undefined || this.cachedWidth !== width) {
+			const { text, maxVisualLines, keep, formatHint } = this.options;
+			const preview = truncateToVisualLines(text, maxVisualLines, width, 0, keep);
+			const lines = preview.visualLines;
+			// !mark(1:4)
+			if (preview.skippedCount > 0) {
+				const hint = truncateToWidth(formatHint(preview.skippedCount), width, "...");
+				this.cachedLines = keep === "start" ? [...lines, hint] : [hint, ...lines];
+			} else {
+				this.cachedLines = lines;
+			}
+			this.cachedWidth = width;
+		}
+		return this.cachedLines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
+```
+
+</Scrollycoding>
+
+The preview always passes `paddingX` 0, so callers that want padding wrap it themselves. There is no way to update `options` after construction, so a streaming result needs a new instance (or the owner to create one per update).

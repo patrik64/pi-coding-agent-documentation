@@ -1,0 +1,110 @@
+---
+title: "jsonl.ts"
+description: "Strict LF-only JSONL framing for the RPC protocol, deliberately avoiding Node readline"
+source: "src/modes/rpc/jsonl.ts"
+full: true
+---
+
+RPC mode talks to its host as newline-delimited JSON. This file is the entire
+framing layer: one function to write a record and one to read records from a
+stream.
+
+It exists because the obvious tool, Node's `readline`, is wrong for this job.
+JSON allows the Unicode separators U+2028 and U+2029 inside strings, and
+readline treats them as line breaks, which would split a valid record in two.
+The reader here splits on `\n` only. It is used by
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) for stdin and by
+[rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts) for the child process's stdout.
+
+<Scrollycoding>
+
+## !!steps Writing a record
+
+A record is the JSON text followed by a single `\n`. `JSON.stringify` escapes
+raw newlines inside strings, so a serialized value never contains a bare line
+break and the framing stays unambiguous.
+
+```ts ! jsonl.ts
+/**
+ * Serialize a single strict JSONL record.
+ *
+ * Framing is LF-only. Payload strings may contain other Unicode separators such as
+ * U+2028 and U+2029. Clients must split records on `\n` only.
+ */
+export function serializeJsonLine(value: unknown): string {
+	return `${JSON.stringify(value)}\n`;
+}
+```
+
+## !!steps A reader built on raw data events
+
+`attachJsonlLineReader` listens to `data` and `end` events directly and returns
+a detach function. A `StringDecoder` is used so a multi-byte UTF-8 character
+split across two chunks is reassembled correctly instead of producing
+replacement characters.
+
+```ts ! jsonl.ts
+export function attachJsonlLineReader(stream: Readable, onLine: (line: string) => void): () => void {
+	const decoder = new StringDecoder("utf8");
+	let buffer = "";
+
+	const emitLine = (line: string) => {
+		onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
+	};
+```
+
+## !!steps Draining complete lines from the buffer
+
+Each chunk is appended to a buffer, then complete lines are peeled off one at a
+time. Whatever remains after the last `\n` stays in the buffer until more data
+arrives. A trailing `\r` is stripped in `emitLine`, so clients that send CRLF
+still work even though the framing is LF.
+
+```ts ! jsonl.ts
+	const onData = (chunk: string | Buffer) => {
+		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+
+		while (true) {
+			const newlineIndex = buffer.indexOf("\n");
+			if (newlineIndex === -1) {
+				return;
+			}
+
+			emitLine(buffer.slice(0, newlineIndex));
+			buffer = buffer.slice(newlineIndex + 1);
+		}
+	};
+```
+
+## !!steps Flushing on end and detaching
+
+When the stream ends, any leftover text without a final newline is emitted as a
+last line, so a client that forgets the trailing LF is not silently dropped.
+The returned closure removes both listeners, which is how
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) stops reading during shutdown.
+
+```ts ! jsonl.ts
+	const onEnd = () => {
+		buffer += decoder.end();
+		if (buffer.length > 0) {
+			emitLine(buffer);
+			buffer = "";
+		}
+	};
+
+	stream.on("data", onData);
+	stream.on("end", onEnd);
+
+	return () => {
+		stream.off("data", onData);
+		stream.off("end", onEnd);
+	};
+```
+
+</Scrollycoding>
+
+The reader never parses JSON itself: it hands raw strings to the caller, which
+decides what a malformed line means. In RPC mode that becomes a `parse` error
+response. Note that the buffer string is re-sliced for every line, so a very
+large burst of small records is quadratic in the worst case, which is fine for
+command-sized traffic.

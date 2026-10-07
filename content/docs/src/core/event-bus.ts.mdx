@@ -1,0 +1,83 @@
+---
+title: "event-bus.ts"
+description: "A 33-line string-channel pub/sub wrapper around Node's EventEmitter that isolates handler failures from the emitter"
+source: "src/core/event-bus.ts"
+full: true
+---
+
+Extensions, tools and the interactive UI sometimes need to talk to each other without importing one another. This file provides the smallest possible answer: a bus keyed by plain string channel names carrying `unknown` payloads. It is a thin skin over `node:events`, and nearly all of its value is in what the skin changes.
+
+Three decisions matter. Subscriptions return their own unsubscribe function instead of requiring the caller to keep the handler around. Every handler is wrapped so a throwing or rejecting handler is logged rather than propagated into the code that emitted. And a `clear()` exists on a separate controller type, so only the owner of the bus (not an extension holding the narrower `EventBus`) can drop every listener at once.
+
+<Scrollycoding>
+
+## !!steps Two interfaces, one of them privileged
+
+`EventBus` is what gets handed to consumers: `emit` and `on`, nothing else. `EventBusController` extends it with `clear()`. Because the factory returns the controller type while consumers are typed against `EventBus`, the capability to wipe every subscription stays with whoever created the bus.
+
+Payloads are `unknown` on both sides, so each channel's contract is a convention between emitter and subscriber, not something the compiler checks.
+
+```ts ! event-bus.ts
+export interface EventBus {
+	emit(channel: string, data: unknown): void;
+	on(channel: string, handler: (data: unknown) => void): () => void;
+}
+
+export interface EventBusController extends EventBus {
+	clear(): void;
+}
+```
+
+## !!steps Emitting is synchronous and fire-and-forget
+
+`emit` forwards straight to `EventEmitter.emit`, so listeners run synchronously, in subscription order, before `emit` returns. Nothing is returned to the caller: there is no result, and no way to await handlers.
+
+One quirk is inherited from Node. A channel literally named `error` with no listener makes `EventEmitter` throw, which would bypass the protection described next. Channel names in this codebase are things like extension events, so this does not bite in practice, but it is a trap for a new channel name.
+
+```ts ! event-bus.ts
+export function createEventBus(): EventBusController {
+	const emitter = new EventEmitter();
+	return {
+		emit: (channel, data) => {
+			emitter.emit(channel, data);
+		},
+```
+
+## !!steps Handlers are wrapped so failures stay local
+
+`on` does not register the caller's function. It registers `safeHandler`, an async wrapper that awaits the handler inside a try/catch and logs `Event handler error (channel)` to `console.error`. That covers both synchronous throws and rejected promises, which is why the handler may be async even though the declared type returns `void`.
+
+Since the wrapper is async, a handler that returns a promise is not awaited by `emit`; its rejection is caught later, on the microtask queue.
+
+The unsubscribe closure removes that exact wrapper with `off`, which is why the wrapper is kept in a local variable rather than being created inline.
+
+```ts ! event-bus.ts
+		on: (channel, handler) => {
+			const safeHandler = async (data: unknown) => {
+				try {
+					await handler(data);
+				} catch (err) {
+					console.error(`Event handler error (${channel}):`, err);
+				}
+			};
+			emitter.on(channel, safeHandler);
+			return () => emitter.off(channel, safeHandler);
+		},
+```
+
+## !!steps Clearing everything
+
+`clear()` calls `removeAllListeners()` with no argument, which drops every channel at once. It is the owner's tear-down hook: when a session is rebuilt, the old extensions' subscriptions must not keep firing into dead state. Any unsubscribe function handed out earlier becomes a harmless no-op afterward, since `off` on a missing listener does nothing.
+
+```ts ! event-bus.ts
+		clear: () => {
+			emitter.removeAllListeners();
+		},
+	};
+}
+```
+
+</Scrollycoding>
+
+The bus is referenced from [resource-loader.ts](/docs/src/core/resource-loader.ts), which hands it to extensions, and it is re-exported from [index.ts](/docs/src/core/index.ts). [agent-session.ts](/docs/src/core/agent-session.ts) sits on the same extension plumbing. Structurally the file is a single factory returning an object literal, so there is no class and no shared module state: each call to `createEventBus` yields an independent bus.
+

@@ -1,0 +1,184 @@
+---
+title: "theme-schema.json"
+description: "JSON Schema (draft-07) that validates and documents custom theme files for the interactive TUI"
+source: "src/modes/interactive/theme/theme-schema.json"
+full: true
+---
+
+This is the JSON Schema for theme files. Editors use it for completion and validation through the `$schema` property, and it documents every color token the TUI paints with. The shipped themes [dark.json](/docs/src/modes/interactive/theme/dark.json) and [light.json](/docs/src/modes/interactive/theme/light.json) follow it, and the runtime loader lives in [theme.ts](/docs/src/modes/interactive/theme/theme.ts), with parsing helpers in [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts).
+
+A theme has a `name`, an optional `appearance` and `vars`, a required `colors` object, and an optional `export` object for HTML export colors. All objects use `additionalProperties: false`, so unknown keys are rejected.
+
+<Scrollycoding>
+
+## !!steps Top level and name rules
+
+Only `name` and `colors` are required. The name pattern forbids a slash because `light/dark` pairs are reserved syntax for the automatic theme setting, handled by [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts). `appearance` records which background the theme targets and is detected from colors when omitted.
+
+```json ! theme-schema.json
+{
+	"$schema": "http://json-schema.org/draft-07/schema#",
+	"title": "Pi Coding Agent Theme",
+	"description": "Theme schema for Pi coding agent",
+	"type": "object",
+	"required": ["name", "colors"],
+	"properties": {
+		"$schema": {
+			"type": "string",
+			"description": "JSON schema reference"
+		},
+		"name": {
+			"type": "string",
+			"pattern": "^[^/]+$",
+			"description": "Theme name. Must not contain '/' because it is reserved for automatic light/dark theme settings."
+		},
+		"appearance": {
+			"type": "string",
+			"enum": ["dark", "light"],
+			"description": "Background the theme is designed for. Detected from the theme colors when omitted."
+		},
+```
+
+## !!steps Reusable variables
+
+`vars` lets a theme define a palette once and refer to names from the color entries. A value is either a string (hex, OKLCH or OKHSL color, a variable reference, or an empty string meaning the terminal default) or an integer 0 to 255 for the 256-color palette.
+
+```json ! theme-schema.json
+		"vars": {
+			"type": "object",
+			"description": "Reusable color variables",
+			"additionalProperties": {
+				"oneOf": [
+					{
+						"type": "string",
+						"description": "Hex color (#RGB or #RRGGBB), OKLCH or OKHSL color, variable reference, or empty string for terminal default"
+					},
+					{
+						"type": "integer",
+						"minimum": 0,
+						"maximum": 255,
+						"description": "256-color palette index (0-255)"
+					}
+				]
+			}
+		},
+```
+
+## !!steps Required color tokens
+
+`colors` lists the mandatory tokens: general UI (accent, borders, status colors), message and tool backgrounds, markdown, diff, syntax and thinking-level colors, plus `bashMode`. A theme missing any of these fails validation.
+
+```json ! theme-schema.json
+		"colors": {
+			"type": "object",
+			"description": "Theme color definitions (scrollbar, thinkingMax, and search highlight colors are optional and use compatible fallbacks)",
+			"required": [
+				"accent",
+				"border",
+				"borderAccent",
+				"borderMuted",
+				"success",
+				"error",
+				"warning",
+				"muted",
+				"dim",
+				"text",
+				"thinkingText",
+				"selectedBg",
+				"userMessageBg",
+				"userMessageText",
+				"customMessageBg",
+				"customMessageText",
+				"customMessageLabel",
+				"toolPendingBg",
+				"toolSuccessBg",
+				"toolErrorBg",
+				"toolTitle",
+				"toolOutput",
+```
+
+## !!steps Core tokens with descriptions
+
+Each property reuses one shared definition through `$ref` and adds a description that says where the color is used. Note that `text` is documented as usually the empty string, meaning the terminal's own foreground.
+
+```json ! theme-schema.json
+			"properties": {
+				"accent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Primary accent color (logo, selected items, cursor)"
+				},
+				"border": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Normal borders"
+				},
+				"borderAccent": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Highlighted borders"
+				},
+				"borderMuted": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Subtle borders"
+				},
+				"success": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Success states"
+				},
+```
+
+## !!steps Optional tokens and fallbacks
+
+Scrollbar, transcript search and `thinkingMax` colors are not in the required list. Their descriptions state the fallback used when omitted, so older themes keep working as new tokens are added: the track falls back to `muted`, the thumb to `text`, search background to `selectedBg`, and `thinkingMax` to `thinkingXhigh`.
+
+```json ! theme-schema.json
+				"scrollbarTrack": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Fullscreen scrollbar track foreground (falls back to muted when omitted)"
+				},
+				"scrollbarThumb": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Fullscreen scrollbar thumb foreground (falls back to text when omitted)"
+				},
+				"searchMatchBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match background and current-match text (falls back to selectedBg when omitted)"
+				},
+				"searchMatchText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Transcript search match text and current-match background (falls back to text when omitted)"
+				},
+```
+
+## !!steps Export colors and the shared colorValue
+
+The optional `export` object carries `pageBg`, `cardBg` and `infoBg` for HTML session export; when absent they are derived from `userMessageBg`. At the bottom, `$defs/colorValue` is the single definition every token references: a string or a 0 to 255 integer.
+
+```json ! theme-schema.json
+		"export": {
+			"type": "object",
+			"description": "Optional colors for HTML export (defaults derived from userMessageBg if not specified)",
+			"properties": {
+				"pageBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Page background color"
+				},
+				"cardBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Card/container background color"
+				},
+				"infoBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Info sections background (system prompt, notices)"
+				}
+			},
+			"additionalProperties": false
+		}
+	},
+	"additionalProperties": false,
+	"$defs": {
+		"colorValue": {
+			"oneOf": [
+```
+
+</Scrollycoding>
+
+The schema is a contract only; actual resolution of variable references and color formats happens in code, so a value can pass schema validation yet still fail to resolve if it names an unknown variable. The `required` array is also duplicated against the `properties` list, so adding a token means updating both.

@@ -1,0 +1,293 @@
+---
+title: "runner.ts"
+description: "ExtensionRunner: binds loaded extensions to a live session and dispatches every lifecycle event to their handlers, each with its own merge and error rules"
+source: "src/core/extensions/runner.ts"
+full: true
+---
+
+After [loader.ts](/docs/src/core/extensions/loader.ts) has produced `Extension` records, something has to connect them to a running agent and call their handlers at the right moments. That is `ExtensionRunner`. It owns the list of extensions, the shared runtime, the UI context, and a set of callbacks supplied by whichever mode is running, and it exposes one `emit` method per family of events.
+
+The reason there are so many `emitXxx` methods is that events do not share one result semantics. Some are notifications. Some can cancel, some chain transformations, some replace a value and some short-circuit. The runner encodes those rules in code, while the event and result shapes live in [types.ts](/docs/src/core/extensions/types.ts).
+
+Two invariants hold throughout. A handler that throws is reported as an `ExtensionError` and does not stop the others, with a couple of deliberate exceptions. And every context handed to an extension checks staleness first, so a context captured before a reload fails loudly.
+
+<Scrollycoding>
+
+## !!steps Reserved keybindings
+
+Extension shortcuts compete with the app's own keys. The runner keeps a short list of canonical keybinding ids that extensions may never override: interrupt, exit, model selection, submit, and similar editor-global actions.
+
+`buildBuiltinKeybindings` flattens the user's resolved [keybindings.ts](/docs/src/core/keybindings.ts) config into a map from normalized key to action, flagging reserved ones. When two actions share a key, a reserved one wins regardless of iteration order, so an extension cannot sneak in through a shared key.
+
+```ts ! runner.ts
+const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
+	const builtinKeybindings = {} as BuiltInKeyBindings;
+	for (const [keybinding, keys] of Object.entries(resolvedKeybindings)) {
+		if (keys === undefined) continue;
+		const keyList = Array.isArray(keys) ? keys : [keys];
+		const restrictOverride = (RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS as readonly string[]).includes(keybinding);
+		for (const key of keyList) {
+			const normalizedKey = key.toLowerCase() as KeyId;
+			// If multiple actions bind the same key, the reserved action wins so extensions
+			// remain blocked by reserved shortcuts regardless of iteration order.
+			const existing = builtinKeybindings[normalizedKey];
+			// !mark
+			if (existing?.restrictOverride && !restrictOverride) continue;
+```
+
+## !!steps Typing which events go through the generic emit
+
+`RunnerEmitEvent` is the union of all events minus those with a dedicated method. This makes it a type error to push, say, a `tool_call` through the generic path where its blocking semantics would be lost.
+
+`RunnerEmitResult` then maps the four cancellable `session_before_*` events to their result types and everything else to `undefined`. `snapshotEventHandlers` copies each extension's handler list with `slice()` before iteration, so a handler that unsubscribes or registers another handler mid-dispatch cannot disturb the loop.
+
+```ts ! runner.ts
+type RunnerEmitEvent = Exclude<
+	ExtensionEvent,
+	| ToolCallEvent
+	| ProjectTrustEvent
+	| ToolResultEvent
+	| UserBashEvent
+	| ContextEvent
+	| ContextWithSystemEvent
+	| CacheWarmingDecisionEvent
+	| BeforeProviderRequestEvent
+	| BeforeProviderHeadersEvent
+	| BeforeAgentStartEvent
+	| MessageEndEvent
+	| ResourcesDiscoverEvent
+	| InputEvent
+	| TurnEndEvent
+	| AgentBeforeSettleEvent
+>;
+```
+
+## !!steps First decisive handler wins: project trust
+
+`emitProjectTrustEvent` is a free function rather than a method, because it runs before any runner exists: trust decides whether project-local extensions may load at all. Each handler answers `yes`, `no` or `undecided`. The first definite answer is returned. `undecided` falls through to the next handler.
+
+Errors are collected into the returned array instead of being emitted, again since there is no runner and no listeners yet.
+
+```ts ! runner.ts
+	for (const { ext, handlers } of snapshotEventHandlers(extensionsResult.extensions, "project_trust")) {
+		// A single extension may register multiple handlers for the same event.
+		// The first project_trust handler that returns yes/no wins; undecided falls through.
+		for (const handler of handlers) {
+			try {
+				const handlerResult = (await handler(event, ctx)) as ProjectTrustEventResult;
+				if (handlerResult.trusted === "undecided") {
+					continue;
+				}
+				// !mark
+				return { result: handlerResult, errors };
+			} catch (error) {
+```
+
+## !!steps bindCore: swapping stubs for real actions
+
+The runner is constructed with the loader's runtime still full of throwing stubs. `bindCore` copies the session's action implementations onto that same runtime object, which every extension's `pi` already references, so extensions loaded earlier start working without being re-created.
+
+Context actions (model, idle state, abort, compaction and so on) are stored on the runner. Then it flushes the provider and virtual model registrations queued during loading, reporting failures through `emitError` with the registering extension's path. Finally it replaces the queueing `registerProvider` functions with ones that act immediately, which is why a command handler can register a provider without `/reload`.
+
+```ts ! runner.ts
+		// Flush provider registrations queued during extension loading
+		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
+			try {
+				if (providerActions?.registerProvider) {
+					providerActions.registerProvider(name, config);
+				} else {
+					this.modelRegistry.registerProvider(name, config);
+				}
+			} catch (err) {
+				// !mark
+				this.emitError({
+					extensionPath,
+					event: "register_provider",
+					error: err instanceof Error ? err.message : String(err),
+					stack: err instanceof Error ? err.stack : undefined,
+				});
+			}
+		}
+		this.runtime.pendingProviderRegistrations = [];
+```
+
+## !!steps Prompts that block, observed from outside
+
+The runner wraps the mode's UI context so that every dialog, `select`, `confirm`, `input`, `editor` and `custom`, is reported with `ui_prompt_start` and `ui_prompt_end` events. This lets other extensions know that pi is waiting on a person, for example to pause timers.
+
+Nesting is handled with a depth counter: only the outermost prompt emits events, and the end event fires when the depth returns to zero. Emission goes through `queueMicrotask`, so handlers never run inside the dialog call itself. When no UI is set, the runner falls back to `noOpUIContext`, whose `hasUI` check is an identity comparison.
+
+```ts ! runner.ts
+	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {
+		const outerPrompt = this.uiPromptDepth++ === 0;
+		if (outerPrompt) {
+			this.activeUIPrompt = { kind, title };
+			this.emitUIPromptEvent({ type: "ui_prompt_start", reason: "ui_prompt", kind, ...(title ? { title } : {}) });
+		}
+
+		const finish = () => {
+			// !mark
+			if (--this.uiPromptDepth > 0) return;
+			this.uiPromptDepth = 0;
+```
+
+## !!steps Conflict rules for commands and shortcuts
+
+Command names are not globally unique. When two extensions register the same name, `resolveRegisteredCommands` gives each an `invocationName` with a numeric suffix such as `name:1` and `name:2`, and a loop guards against collisions with a name that is already taken.
+
+Shortcuts follow a different policy. A shortcut that collides with a reserved built-in is skipped with a warning. A collision with a non-reserved built-in lets the extension win, with a warning. When two extensions claim one key, the later one overrides the earlier. Warnings print to the console only when there is no UI to show them.
+
+```ts ! runner.ts
+				const builtInKeybinding = builtinKeybindings[normalizedKey];
+				if (builtInKeybinding?.restrictOverride === true) {
+					addDiagnostic(
+						`Extension shortcut '${key}' from ${shortcut.extensionPath} conflicts with built-in shortcut. Skipping.`,
+						shortcut.extensionPath,
+					);
+					continue;
+				}
+
+				// !mark
+				if (builtInKeybinding?.restrictOverride === false) {
+					addDiagnostic(
+						`Extension shortcut conflict: '${key}' is built-in shortcut for ${builtInKeybinding.keybinding} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
+						shortcut.extensionPath,
+					);
+				}
+```
+
+## !!steps Contexts that go stale
+
+`createContext` returns an object of getters, each calling `assertActive` first. Values are resolved at call time, so a context created before `bindCore` still sees the real model and idle state afterwards. After `invalidate`, any property access throws the stale message.
+
+`createToolContext` extends it with `tools` and `executeTool` using `Object.defineProperties`, and `createCommandContext` copies property descriptors instead of spreading. The comment explains why: a spread would read every getter once and freeze the values, which also bypasses the stale check. A nested call without a bound `executeToolFn` returns an error result instead of throwing.
+
+```ts ! runner.ts
+	createCommandContext(): ExtensionCommandContext {
+		// Use property descriptors instead of object spread so the guarded getters from
+		// createContext() stay lazy. A spread would eagerly read them once and freeze the
+		// old values into the returned object, bypassing stale-instance checks.
+		const context = Object.defineProperties(
+			{},
+			// !mark
+			Object.getOwnPropertyDescriptors(this.createContext()),
+		) as ExtensionCommandContext;
+		context.getSystemPromptOptions = () => {
+			this.assertActive();
+			return this.getSystemPromptOptionsFn();
+		};
+```
+
+## !!steps The generic emit and cancellable events
+
+`emit` runs every handler in extension order and then registration order. For the four `session_before_*` events a truthy handler result replaces the running result, and `cancel: true` returns immediately, so a later handler cannot un-cancel. Errors in handlers are reported and dispatch continues.
+
+For other events the handler return value is ignored. Callers such as [agent-session.ts](/docs/src/core/agent-session.ts) check the returned result for `cancel` or an extension-provided `compaction` or `summary`. The last non-cancelling result is returned, so with several handlers the last one wins.
+
+```ts ! runner.ts
+					const handlerResult = await handler(event, ctx);
+
+					if (this.isSessionBeforeEvent(event) && handlerResult) {
+						result = handlerResult as SessionBeforeEventResult;
+						if (result.cancel) {
+							return result as RunnerEmitResult<TEvent>;
+						}
+					}
+				} catch (err) {
+```
+
+## !!steps Chained transforms: tool results and message end
+
+`emitToolResult` threads one mutable event through all handlers, so each sees its predecessors' changes. It records whether anything changed and returns `undefined` if not. One rule is specific: replacing `content` without also returning `structuredContent` deletes the structured version, because it may no longer match.
+
+`emitMessageEnd` is stricter. A handler may replace the finalized message but must keep its role. A different role is reported as an error and ignored.
+
+```ts ! runner.ts
+					if (handlerResult.content !== undefined) {
+						currentEvent.content = handlerResult.content;
+						// Structured content that is not replaced along with the content may no longer match it.
+						// !mark
+						if (handlerResult.structuredContent === undefined) delete currentEvent.structuredContent;
+						modified = true;
+					}
+					if (handlerResult.details !== undefined) {
+						currentEvent.details = handlerResult.details;
+						modified = true;
+					}
+```
+
+## !!steps Blocking and rejecting: tool calls and user bash
+
+`emitToolCall` is the one dispatch method with no try/catch. A handler that throws propagates to the caller, which means a crashing permission extension is not silently ignored. A result with `block: true` returns at once, so the first blocker wins. Otherwise the last non-empty result is returned.
+
+`emitUserBash` validates what handlers return with `isUserBashEventResult`. A handler must return nothing, or exactly one of `operations` or `result`, each with the right shape. A malformed result is reported as an error and then rethrown. Unlike most events, a bad answer fails the command rather than falling back to local execution.
+
+```ts ! runner.ts
+					const handlerResult = await handler(event, ctx);
+					if (handlerResult === undefined) continue;
+					if (!isUserBashEventResult(handlerResult)) {
+						// !mark
+						throw new Error(
+							"Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object",
+						);
+					}
+					return handlerResult;
+```
+
+## !!steps Context handlers in two phases
+
+`emitContext` runs before each model call. First come `context` handlers, which see only non-system messages. After each, `restoreSystemMessages` puts the prompt back. If the handler returned the same messages, the original array is reused so provider prompt caches stay valid. If it changed them, the current system message is prepended as a single leading message.
+
+Handlers may return a new list or mutate `event.messages` in place, and the runner detects both. Then `context_with_system` handlers see the full transcript and their output is used as is. The runner only reports an error if the leading system message disappeared.
+
+```ts ! runner.ts
+					// Handlers may return a new list or edit event.messages in place.
+					const returned =
+						handlerResult?.messages ??
+						(sameMessages(visibleMessages, visibleSnapshot) ? undefined : visibleMessages);
+					if (!returned) continue;
+					// !mark
+					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
+```
+
+## !!steps Boundary events that can add entries and continue
+
+`emitBoundary` serves `turn_end` and `agent_before_settle`. Handlers may return draft session entries to append and a `continue` flag asking for another provider request. Each handler receives the entries and flag produced so far, plus a `context` preview of what the transcript would look like with those entries.
+
+After every handler the runner rebuilds that preview with `buildContext`. If that throws, the entries are invalid, and the overall result is dropped to an empty entry list with `continue: false` and `valid: false`. Notice that `valid` is reset to true after any later handler whose preview builds successfully.
+
+```ts ! runner.ts
+				try {
+					context = await buildContext(entries);
+					valid = true;
+				} catch (err) {
+					valid = false;
+					this.emitError({
+						extensionPath: ext.path,
+						event: baseEvent.type,
+						error: `Invalid boundary entries: ${err instanceof Error ? err.message : String(err)}`,
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+				}
+```
+
+## !!steps Prompt rewriting and input transforms
+
+`emitBeforeAgentStart` lets handlers add messages and replace the system prompt. The event's `systemPrompt` is a getter that renders from the current options each time, so a later handler observes an earlier one's override. An override sets `forceSystemPrompt` on the normalized options built by [system-prompt.ts](/docs/src/core/system-prompt.ts).
+
+`emitInput` chains text transformations. A handler returning `handled` stops everything immediately, while `transform` updates the text and optionally images for the next handler. The final result is `continue` only when nothing changed.
+
+```ts ! runner.ts
+					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					if (result?.action === "handled") return result;
+					if (result?.action === "transform") {
+						currentText = result.text;
+						currentImages = result.images ?? currentImages;
+					}
+```
+
+</Scrollycoding>
+
+Where the loader builds the structure, the runner animates it. Its consumers are [agent-session.ts](/docs/src/core/agent-session.ts), which constructs it and calls the `emit` family at every lifecycle point, and the interactive and RPC modes, which supply UI contexts. Extension-contributed tools reach the agent through [wrapper.ts](/docs/src/core/extensions/wrapper.ts).
+
+Structurally, the file is a long list of dispatchers that look alike but differ in how they merge results. Most share a try/catch and `emitError` skeleton, which is why a missing try/catch in `emitToolCall` stands out.

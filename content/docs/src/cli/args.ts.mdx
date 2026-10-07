@@ -1,0 +1,267 @@
+---
+title: "args.ts"
+description: "Hand-rolled argv parser that turns flags, messages and @files into an Args record, plus the --help text"
+source: "src/cli/args.ts"
+full: true
+---
+
+pi does not use a command-line library. `parseArgs` is a single loop over
+`argv` that fills an `Args` record, and `printHelp` is one large template
+literal. The parser never exits and never throws: problems are collected as
+`diagnostics` and the caller in [main.ts](/docs/src/main.ts) decides what is fatal.
+
+Two design choices matter for the rest of the system. First, unknown `--flags`
+are not errors; they are stored in `unknownFlags` so that extensions can
+register their own flags, which are read through
+[the resource loader](/docs/src/core/resource-loader.ts) and
+[extension types](/docs/src/core/extensions/types.ts) after extensions load.
+Second, positional arguments are split into prompt messages and `@file`
+attachments, which [file-processor.ts](/docs/src/cli/file-processor.ts) and
+[initial-message.ts](/docs/src/cli/initial-message.ts) consume later.
+
+<Scrollycoding>
+
+## !!steps The Args record and its escape hatches
+
+Almost every field is optional, because absence means "use the setting or the
+default". The required fields are the accumulators: `messages`,
+`fileArgs`, `unknownFlags`, and `diagnostics` for problems found while
+parsing.
+
+`mode` is `text`, `json` or `rpc`. `listModels` is `string | true`: a bare
+`--list-models` is `true`, and a following word becomes a search pattern.
+
+```ts ! args.ts
+export type Mode = "text" | "json" | "rpc";
+
+export interface Args {
+	provider?: string;
+	model?: string;
+	apiKey?: string;
+	systemPrompt?: string;
+	appendSystemPrompt?: string[];
+	thinking?: ThinkingLevel;
+	continue?: boolean;
+	resume?: boolean;
+// ...
+	listModels?: string | true;
+	offline?: boolean;
+	tuiMode?: TuiMode;
+	verbose?: boolean;
+	projectTrustOverride?: boolean;
+	messages: string[];
+	fileArgs: string[];
+	/** Unknown flags (potentially extension flags) - map of flag name to value */
+	unknownFlags: Map<string, boolean | string>;
+	diagnostics: Array<{ type: "warning" | "error"; message: string }>;
+}
+```
+
+## !!steps Thinking levels and session names
+
+The seven thinking levels are listed once and reused both for validation and
+for the warning text. `normalizeSessionName` is exported separately because
+[main.ts](/docs/src/main.ts) applies it to `--name` after parsing, rejecting
+names that are blank after trimming.
+
+```ts ! args.ts
+const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+export function isValidThinkingLevel(level: string): level is ThinkingLevel {
+	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
+}
+
+export function normalizeSessionName(value: string): string | undefined {
+	const name = value.trim();
+	return name.length > 0 ? name : undefined;
+}
+```
+
+## !!steps The loop, the double dash, and the missing value trap
+
+The loop uses an index so flags can consume the following argument. After a
+`--`, everything is positional: `@name` entries still become file arguments, the
+rest become messages, which is how a prompt starting with a dash can be passed.
+
+Most value flags are written as `arg === "--model" && i + 1 < args.length`. That
+guard has a consequence: if the value is missing, the condition is false and
+control falls to the later branches, so a trailing `--model` ends up in
+`unknownFlags` as a boolean instead of producing an error.
+
+```ts ! args.ts
+export function parseArgs(args: string[]): Args {
+	const result: Args = {
+		messages: [],
+		fileArgs: [],
+		unknownFlags: new Map(),
+		diagnostics: [],
+	};
+
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+
+		if (arg === "--") {
+			for (const positionalArg of args.slice(i + 1)) {
+				if (positionalArg.startsWith("@")) {
+					result.fileArgs.push(positionalArg.slice(1));
+				} else {
+					result.messages.push(positionalArg);
+				}
+			}
+			break;
+```
+
+## !!steps Strict flags report errors instead
+
+A few flags check their value explicitly. `--mode` rejects a missing value or
+one that begins with `-`, and then validates against the three modes. Note the
+`i++` before the validity check: an invalid mode is still consumed, so the bad
+word is not also treated as a message.
+
+```ts ! args.ts
+		} else if (arg === "--mode") {
+			const mode = args[i + 1];
+			if (mode === undefined || mode.startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--mode requires text, json, or rpc" });
+				continue;
+			}
+			i++;
+			if (mode !== "text" && mode !== "json" && mode !== "rpc") {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid mode "${mode}". Valid values: text, json, rpc`,
+				});
+				continue;
+			}
+			result.mode = mode;
+```
+
+## !!steps Comma lists, repeatable flags and downgraded errors
+
+`--models`, `--tools` and `--exclude-tools` split on commas, trim, and drop
+empty entries. Repeatable flags such as `--append-system-prompt` and
+`--extension` accumulate into arrays. An invalid `--thinking` value is only a
+warning, so a typo does not abort the run; the level is simply left unset.
+
+```ts ! args.ts
+		} else if (arg === "--models" && i + 1 < args.length) {
+			result.models = args[++i]
+				.split(",")
+				.map((s) => s.trim())
+				.filter((pattern) => pattern.length > 0);
+		} else if (arg === "--no-tools" || arg === "-nt") {
+			result.noTools = true;
+		} else if (arg === "--no-builtin-tools" || arg === "-nbt") {
+			result.noBuiltinTools = true;
+// ...
+		} else if (arg === "--thinking" && i + 1 < args.length) {
+			const level = args[++i];
+			if (isValidThinkingLevel(level)) {
+				result.thinking = level;
+			} else {
+				result.diagnostics.push({
+					type: "warning",
+					message: `Invalid thinking level "${level}". Valid values: ${VALID_THINKING_LEVELS.join(", ")}`,
+				});
+			}
+```
+
+## !!steps Print mode swallows one prompt
+
+`-p` sets `print` and then looks at the next argument. If it is not an `@file`
+and does not look like a flag, it is taken as the prompt. The exception
+`startsWith("---")` lets a prompt such as a Markdown rule through. Because of
+this peek, `-p` followed by a normal word never leaves that word to be
+parsed as an ordinary message.
+
+```ts ! args.ts
+		} else if (arg === "--print" || arg === "-p") {
+			result.print = true;
+			const next = args[i + 1];
+			if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))) {
+				result.messages.push(next);
+				i++;
+			}
+```
+
+## !!steps Trust flags and the tri-state override
+
+`--approve` and `--no-approve` write `true` and `false` into the same field,
+and leaving both out keeps it `undefined`. That three-way value is what
+[main.ts](/docs/src/main.ts) and [project-trust.ts](/docs/src/cli/project-trust.ts)
+use to decide whether to prompt, trust silently or ignore project-local files.
+
+```ts ! args.ts
+		} else if (arg === "--verbose") {
+			result.verbose = true;
+		} else if (arg === "--approve" || arg === "-a") {
+			result.projectTrustOverride = true;
+		} else if (arg === "--no-approve" || arg === "-na") {
+			result.projectTrustOverride = false;
+		} else if (arg === "--offline") {
+			result.offline = true;
+```
+
+## !!steps Files, unknown flags and plain messages
+
+The tail of the chain is the catch-all. `@path` becomes a file argument. Any
+other `--name` is treated as a potential extension flag: `--name=value` stores
+the value, `--name value` takes the next word unless it starts with `-` or `@`,
+and otherwise the flag is a boolean `true`. Unknown short flags are errors, and
+every remaining word is a message.
+
+Because `--flag word` consumes the word, a typo such as `--verbos "fix bug"`
+silently swallows the prompt into `unknownFlags`.
+
+```ts ! args.ts
+		} else if (arg.startsWith("@")) {
+			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
+		} else if (arg.startsWith("--")) {
+			const eqIndex = arg.indexOf("=");
+			if (eqIndex !== -1) {
+				result.unknownFlags.set(arg.slice(2, eqIndex), arg.slice(eqIndex + 1));
+			} else {
+				const flagName = arg.slice(2);
+				const next = args[i + 1];
+				if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
+					result.unknownFlags.set(flagName, next);
+					i++;
+				} else {
+					result.unknownFlags.set(flagName, true);
+				}
+			}
+		} else if (arg.startsWith("-") && !arg.startsWith("--")) {
+			result.diagnostics.push({ type: "error", message: `Unknown option: ${arg}` });
+		} else if (!arg.startsWith("-")) {
+			result.messages.push(arg);
+		}
+```
+
+## !!steps Help text with extension flags appended
+
+`printHelp` receives the flags that loaded extensions registered and renders
+them in their own section, so help is accurate only after extensions load. That
+is why [main.ts](/docs/src/main.ts) builds the whole runtime before printing help.
+Each line is padded to 30 columns, and a string flag gets a `value` placeholder.
+
+```ts ! args.ts
+export function printHelp(extensionFlags?: ExtensionFlag[]): void {
+	const extensionFlagsText =
+		extensionFlags && extensionFlags.length > 0
+			? `\n${chalk.bold("Extension CLI Flags:")}\n${extensionFlags
+					.map((flag) => {
+						const value = flag.type === "string" ? " <value>" : "";
+						const description = flag.description ?? `Registered by ${flag.extensionPath}`;
+						return `  --${flag.name}${value}`.padEnd(30) + description;
+					})
+					.join("\n")}\n`
+			: "";
+```
+
+</Scrollycoding>
+
+The rest of `printHelp` is static text: commands, every option, examples, and a
+long list of provider environment variables. It has to be kept in sync with
+`parseArgs` by hand. Some flags handled above, such as `--no-mcp` and
+`--session-id`, matter in [main.ts](/docs/src/main.ts) where they are validated
+against each other; the parser itself never checks that flags are compatible.

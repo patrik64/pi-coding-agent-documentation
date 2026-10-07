@@ -1,0 +1,286 @@
+---
+title: "execute.ts"
+description: "Runs one codemode script in a QuickJS sandbox: nested tool bridging, models.* globals, store persistence, output truncation and image saving."
+source: "src/extensions/codemode/execute.ts"
+full: true
+---
+
+This is the engine behind the codemode tool. [tool.ts](/docs/src/extensions/codemode/tool.ts) describes the tool to the model; this file takes the model's script, builds a `CodemodeSandbox` from the `pi-codemode` package, wires the sandbox to the session's tools, runs it, and turns the outcome into a tool result.
+
+It is loaded lazily through [execute.lazy.ts](/docs/src/extensions/codemode/execute.lazy.ts). Most of the file is defensive input checking and bookkeeping, so that mistakes in a script produce messages that say what shape was expected.
+
+<Scrollycoding>
+
+## !!steps Limits and the model call limiter
+
+Two limits protect the host. At most four `models.classify()` and `models.generateImages()` calls run at once, and the QuickJS heap is capped at 256 MiB. The worker shares pi's process, so without a cap a runaway script could grow towards the 4 GiB wasm limit and take the session down; overruns throw `InternalError: out of memory` inside the script.
+
+`createLimiter` is a small queue: calls wait in order when the limit is reached, and each finished call wakes the next.
+
+```ts ! execute.ts
+/** `models.classify()` and `models.generateImages()` calls one script may have in flight; `Promise.all` over many items queues the rest. */
+const MAX_CONCURRENT_MODEL_CALLS = 4;
+/**
+ * Heap limit for the QuickJS VM. The worker shares pi's process, so without a limit a runaway
+ * script can grow to wasm32's 4 GiB and take the session down. Overruns throw
+ * `InternalError: out of memory` inside the script.
+ */
+const CODEMODE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024;
+// ...
+/** Runs at most `limit` calls at once, in call order. */
+function createLimiter(limit: number): <T>(run: () => Promise<T>) => Promise<T> {
+	let active = 0;
+	const waiting: (() => void)[] = [];
+	return async (run) => {
+		if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+		active++;
+		try {
+			return await run();
+		} finally {
+			active--;
+			waiting.shift()?.();
+		}
+	};
+}
+```
+
+## !!steps Validating classifier contexts
+
+Scripts pass plain objects to `models.classify()`. Rather than let a malformed context reach a provider and come back as an obscure error, `checkClassifierContext` validates it and throws with the expected shape and a pointer to the docs. It checks that `state` is an object, that `questions` is a non-empty map, and that each question's criteria match its type: choice maps labels to meanings, score lists levels lowest first, bool has `true` and `false` strings.
+
+`checkImagesContext` does the same for `models.generateImages()`, requiring a non-empty `input` array of text or image blocks.
+
+```ts ! execute.ts
+	const isStrings = (values: unknown[]) => values.length > 0 && values.every((value) => typeof value === "string");
+	for (const [id, question] of Object.entries(questions)) {
+		const at = `context.questions.${id}`;
+		if (!isRecord(question)) throw fail(`${at} must be a question object, got ${describeValue(question)}`);
+		if (typeof question.instructions !== "string") throw fail(`${at}.instructions must be a string`);
+		const { criteria } = question;
+		if (question.type === "choice") {
+			if (!isRecord(criteria) || !isStrings(Object.values(criteria))) {
+				throw fail(`${at} is a "choice" question, so criteria must map each label to its meaning`);
+			}
+		} else if (question.type === "score") {
+			if (!Array.isArray(criteria) || !isStrings(criteria)) {
+				throw fail(`${at} is a "score" question, so criteria must list the levels as strings, lowest first`);
+			}
+		} else if (question.type === "bool") {
+			if (!isRecord(criteria) || typeof criteria.true !== "string" || typeof criteria.false !== "string") {
+				throw fail(`${at} is a "bool" question, so criteria must be { true: string, false: string }`);
+			}
+		} else {
+			throw fail(`${at}.type must be "choice", "score", or "bool", got ${JSON.stringify(question.type)}`);
+		}
+		}
+```
+
+## !!steps Reading the store from the branch
+
+`store(key, value)` persists across codemode calls through session entries, not a side file. `readCodemodeStore` walks the current branch from the root and applies each `codemode-store` custom entry: deletes first, then sets. Because it reads the branch, forking a session gives each branch the values written on its own path.
+
+`isStoreEntryData` guards against malformed entries instead of trusting the stored data.
+
+```ts ! execute.ts
+/** Values of `load()`: the `codemode-store` entries on the branch, applied from the root. */
+export function readCodemodeStore(branch: readonly SessionEntry[]): Record<string, unknown> {
+	const store = new Map<string, unknown>();
+	for (const entry of branch) {
+		if (entry.type !== "custom" || entry.customType !== CODEMODE_STORE_ENTRY_TYPE || !isStoreEntryData(entry.data)) {
+			continue;
+		}
+		for (const key of entry.data.delete) store.delete(key);
+		for (const [key, value] of Object.entries(entry.data.set)) store.set(key, value);
+	}
+	return Object.fromEntries(store);
+}
+```
+
+## !!steps Errors that keep context
+
+When a script fails, the model gets the script's own stack plus a list of the nested tool calls that already ran, with the explicit warning that they are not undone. That matters because a script may have written files before throwing. Timeouts, aborts and sandbox failures each get their own prefix.
+
+```ts ! execute.ts
+function formatCallSummary(calls: readonly CodemodeNestedCall[]): string {
+	if (calls.length === 0) return "No tool calls were made.";
+	return `Tool calls made before the failure (they are not undone): ${calls.map((call) => `${call.name} (${call.status})`).join(", ")}`;
+}
+
+function formatError(result: Extract<CodemodeResult, { ok: false }>, calls: readonly CodemodeNestedCall[]): string {
+	const { error } = result;
+	const head =
+		error.kind === "script"
+			? (error.stack ?? `${error.name ?? "Error"}: ${error.message}`)
+			: error.kind === "timeout"
+				? `Script timed out: ${error.message}`
+				: error.kind === "aborted"
+					? `Script aborted: ${error.message}`
+					: `Script sandbox failed: ${error.message}`;
+	return `${head}\n\n${formatCallSummary(calls)}`;
+}
+```
+
+## !!steps Saving images
+
+The model can see an image returned by `image()`, but it cannot reach the bytes: scripts cannot write files and the `write` tool takes only text. So `saveImages` writes each image to a temp file with [output-files.ts](/docs/src/utils/output-files.ts) and puts a text label with the path in front of the image block.
+
+A write failure becomes part of the label instead of an exception, so a full disk cannot discard the result of a script whose tool calls already ran. Identical images are saved once.
+
+```ts ! execute.ts
+	const label = async ({ data, mimeType }: ImageContent): Promise<string> => {
+		const bytes = Buffer.from(data, "base64");
+		const kind = `${mimeType}, ${formatSize(bytes.length)}`;
+		const extension = IMAGE_EXTENSIONS[mimeType];
+		if (!extension) throw new Error(`No file extension for image type ${mimeType}`);
+		// A failed write (disk full, unwritable temp dir) must not discard the result of a script whose
+		// tool calls already ran, so it becomes part of the label.
+		try {
+			const path = await writeOutputFile("pi-codemode", extension, bytes);
+			return `[Image saved to ${path} (${kind})]`;
+		} catch (error) {
+			return `[Image (${kind}) could not be saved: ${error instanceof Error ? error.message : String(error)}]`;
+		}
+	};
+```
+
+## !!steps Truncating output to a token budget
+
+Output is limited to 10,000 estimated tokens by default (four characters per token); a script can change it with the `max_output_tokens` option. When the combined text is over budget, `truncateOutput` keeps half the budget from the start and half from the end, inserts a count of removed tokens, and writes the full text to a temp file whose path is appended. Images are kept and moved after the text.
+
+This mirrors how bash output is spilled to a file, and the path goes into `details.fullOutputPath` for the renderer.
+
+```ts ! execute.ts
+	const texts = items.filter((item): item is TextContent => item.type === "text").map((item) => item.text);
+	const combined = texts.join("\n");
+	const budget = maxTokens * CHARS_PER_TOKEN;
+	if (texts.length === 0 || combined.length <= budget) return { items };
+	const headChars = Math.floor(budget / 2);
+	const tailChars = budget - headChars;
+	const removed = combined.length - headChars - tailChars;
+	const head = combined.slice(0, headChars);
+	const tail = tailChars > 0 ? combined.slice(-tailChars) : "";
+	let text = `Warning: truncated output (original token count: ${Math.ceil(combined.length / CHARS_PER_TOKEN)})\nTotal output lines: ${combined.split("\n").length}\n\n${head}…${Math.ceil(removed / CHARS_PER_TOKEN)} tokens truncated…${tail}`;
+	const spilled = await spillOutput(combined);
+```
+
+## !!steps Bridging nested tool calls
+
+Each callable tool becomes a `CodemodeTool` for the sandbox. When a script calls it, a nested-call record is pushed with status `running` and published through `onUpdate`, which is what the live rows in [renderer.ts](/docs/src/extensions/codemode/renderer.ts) show.
+
+The call itself goes through `ctx.executeTool`, so it passes the same pipeline as a direct call, including hooks and permissions (see also [nested-tool-calls.ts](/docs/src/core/nested-tool-calls.ts)). The record then gets the real tool call id, a duration and a final status, where an aborted signal means `cancelled` rather than `error`. `toScriptValue` decides what the script receives.
+
+```ts ! execute.ts
+		execute: async (args, { signal: callSignal }) => {
+			const record: CodemodeNestedCall = {
+				id: `${toolCallId}/?`,
+				name: tool.name,
+				args: previewArgs(args),
+				status: "running",
+			};
+			calls.push(record);
+			publish();
+			const callStartedAt = performance.now();
+			// Only tools from ctx.tools are callable, so ctx is set here.
+			if (!ctx) throw new Error("Tool calls need a session");
+			const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal });
+			record.id = outcome.toolCall.id;
+			record.durationMs = performance.now() - callStartedAt;
+```
+
+## !!steps Running the sandbox
+
+The sandbox is created with the nested tools, discovery and model globals, the timeout from `// @options:` (infinite by default), the memory cap, the wasm module and the worker specifier from [config.ts](/docs/src/config.ts). The store is read from the branch right before execution, and `sandbox.close()` runs in a `finally` so the worker is always released.
+
+Afterwards any call still marked `running` is relabeled `cancelled`: the script ended, timed out or was aborted before it finished.
+
+```ts ! execute.ts
+	const sandbox = new CodemodeSandbox({
+		tools: sandboxTools,
+		globals: [
+			...createDiscoveryGlobals(callable, samples, options),
+			...(options.models && ctx
+				? createModelGlobals(ctx.modelRegistry, toolCallId, calls, publish, addModelUsage, addGeneratedImages)
+				: []),
+		],
+		timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
+		memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
+		wasm: loadQuickJSWasm(getQuickJSWasmPath()),
+		workerUrl: getCodemodeWorkerSpecifier(),
+	});
+
+	let result: CodemodeResult;
+	try {
+		const store = ctx ? readCodemodeStore(ctx.sessionManager.getBranch()) : {};
+		result = await sandbox.execute(code, { signal, store });
+	} finally {
+		await sandbox.close();
+	}
+```
+
+## !!steps Assembling the result
+
+On success, store writes are appended to the session as one `codemode-store` entry, and a returned value is added as text (a pi extension to the script contract). On failure, the error text is appended after whatever partial output exists. If `models.generateImages()` produced images that the script never showed, a note tells the model how to show them.
+
+The result always starts with a header giving success or failure and wall time, which the renderer strips. Model usage from `models.*` calls is returned as `usage`, and failures set `isError`.
+
+```ts ! execute.ts
+	if (result.ok) {
+		const { set, delete: deleted } = result.storeWrites;
+		if (Object.keys(set).length > 0 || deleted.length > 0) {
+			options.appendEntry?.(CODEMODE_STORE_ENTRY_TYPE, { set, delete: deleted });
+		}
+		// pi extension: a returned value is appended like text().
+		if (result.value !== undefined) items.push({ type: "text", text: valueText(result.value) });
+	} else {
+		items.push({ type: "text", text: `Script error:\n${formatError(result, calls)}` });
+	}
+```
+
+## !!steps Discovery globals
+
+`searchTools`, `describeTool` and `describeNamespace` let a script find tools that were not listed in the description because of the budget or deferred exposure. `searchTools` ranks with the BM25 ranker from [tool-search/tool.ts](/docs/src/extensions/tool-search/tool.ts), validates its limit and optional namespace filter, and returns names plus declaration samples.
+
+Namespace matching is lenient through `isNamespaceName`: a query can be the namespace name, its script identifier, or the part after the last double underscore.
+
+```ts ! execute.ts
+function isNamespaceName(namespace: string, query: string): boolean {
+	const id = toCodemodeIdentifier(namespace);
+	const queryId = toCodemodeIdentifier(query);
+	const suffix = (name: string) => (name.includes("__") ? name.slice(name.lastIndexOf("__") + 2) : undefined);
+	return namespace === query || id === queryId || suffix(namespace) === query || suffix(id) === queryId;
+}
+// ...
+				const documents = tools.flatMap((tool) => {
+					const toolNamespace = options.getToolNamespace?.(tool.name);
+					if (namespace && (!toolNamespace || !isNamespaceName(toolNamespace.name, namespace))) return [];
+					return [createToolSearchDocument(tool, toolNamespace)];
+				});
+				return ranker.rank(query, documents, limit).map((match) => entry(match.name));
+```
+
+## !!steps Model globals and credential safety
+
+`createModelGlobals` implements `models.*`. `runModelCall` resolves a model by provider and id only, looks it up in the registry ([model-registry.ts](/docs/src/core/model-registry.ts)), and validates the context. The comment states why: a script-supplied base URL or headers must never receive the session's credentials. A wrong-type model gets a message such as that it is an image model, not a classifier.
+
+Each call appears as a nested row, runs under the four-call limiter, and records its cost, which feeds the total in the renderer and the usage returned by `executeCodemode`. Catalog entries have `headers` removed first, since `models.json` headers can carry credentials.
+
+```ts ! execute.ts
+		const { provider, id } = model;
+		const ref = `${provider}/${id}`;
+		const resolved = models.getModelOfType(type, provider, id);
+		if (!resolved) {
+			const actualType = [...MODEL_TYPES].find(
+				(other) => other !== type && models.getModelOfType(other as ModelType, provider, id) !== undefined,
+			);
+			throw new Error(
+				actualType
+					? `"${ref}" is ${withArticle(actualType)} model, not ${withArticle(type)} model. ${listHint}`
+					: `Unknown ${type} model "${ref}". ${listHint}`,
+			);
+		}
+		const checked = checkContext(context);
+```
+
+</Scrollycoding>
+
+Usage from model calls is merged with `combineUsage` from [usage-totals.ts](/docs/src/core/usage-totals.ts), and sizes are formatted with [truncate.ts](/docs/src/core/tools/truncate.ts). Types such as `CodemodeNestedCall` and the option bag come from [tool.ts](/docs/src/extensions/codemode/tool.ts), and the actual sandbox thread starts from [worker.ts](/docs/src/extensions/codemode/worker.ts). Without a session context a script cannot call tools, `store()` starts empty and writes are dropped.

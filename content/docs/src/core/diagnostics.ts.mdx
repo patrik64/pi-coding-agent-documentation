@@ -1,0 +1,45 @@
+---
+title: "diagnostics.ts"
+description: "Type declarations for resource-loading warnings, errors and name collisions"
+source: "src/core/diagnostics.ts"
+full: true
+---
+
+When pi loads extensions, skills, prompt templates and themes from several places, things go wrong in non-fatal ways: a file fails to parse, or two resources claim the same name. Rather than throwing, loaders collect these problems as data. This file defines the two shapes they use.
+
+The producers are [resource-loader.ts](/docs/src/core/resource-loader.ts), [skills.ts](/docs/src/core/skills.ts) and [prompt-templates.ts](/docs/src/core/prompt-templates.ts); the results are surfaced to the user at startup.
+
+<Scrollycoding>
+
+## !!steps Describing a collision
+
+A collision records which resource won and which lost, by file path. The optional source fields say where each came from, for example an npm package, a git URL or a local directory, so the message can tell the user which one to remove.
+
+```ts ! diagnostics.ts
+export interface ResourceCollision {
+	resourceType: "extension" | "skill" | "prompt" | "theme";
+	name: string; // skill name, command/tool/flag name, prompt name, theme name
+	winnerPath: string;
+	loserPath: string;
+	winnerSource?: string; // e.g., "npm:foo", "git:...", "local"
+	loserSource?: string;
+}
+```
+
+## !!steps The diagnostic itself
+
+A diagnostic has a severity, a human message and an optional path. The `collision` field is only meaningful when `type` is `collision`, but the type system does not enforce that pairing; it is a convention between producers and the display code.
+
+```ts ! diagnostics.ts
+// ...
+export interface ResourceDiagnostic {
+	type: "warning" | "error" | "collision";
+	message: string;
+	path?: string;
+	collision?: ResourceCollision;
+}
+```
+
+</Scrollycoding>
+
+Because the file has only interfaces, it compiles away entirely. It sits next to [settings-diagnostics.ts](/docs/src/core/settings-diagnostics.ts), which does the equivalent job for settings files.

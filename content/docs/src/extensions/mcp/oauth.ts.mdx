@@ -1,0 +1,422 @@
+---
+title: "oauth.ts"
+description: "OAuth sign-in for remote MCP servers: credential storage with cross-process refresh locking, a token-refreshing auth provider, and the loopback sign-in flow"
+source: "src/extensions/mcp/oauth.ts"
+full: true
+---
+
+Remote MCP servers often require OAuth. This file is the pi side of that: it decides where credentials live, how access tokens are kept fresh, and how a user signs in. The protocol machinery itself (PKCE, discovery, dynamic client registration, the callback server) comes from the `@earendil-works/pi-mcp/oauth` package; this file wires it to pi's storage and UI.
+
+A key design rule is stated in the header comment: connections never open a browser on their own. They send the stored token, try a refresh after a 401, and otherwise fail with `McpOAuthAuthorizationRequiredError`. Only the user, through the `/mcp` UI in [ui.ts](/docs/src/extensions/mcp/ui.ts), triggers the interactive flow.
+
+Credentials are stored in `mcp-auth.json` through [auth-storage.ts](/docs/src/core/auth-storage.ts), keyed with the namespace helper from [mcp-servers.ts](/docs/src/core/mcp-servers.ts). The connection layer in [runtime.ts](/docs/src/extensions/mcp/runtime.ts) creates the auth provider; [config.ts](/docs/src/extensions/mcp/config.ts) defines the user-facing OAuth settings.
+
+<Scrollycoding>
+
+## !!steps Timing constants and settings
+
+The constants encode the refresh policy. Tokens are refreshed 30 seconds before expiry, each refresh request is capped at 15 seconds, and a refresh lock is considered abandoned after 20 seconds. The wait for another process (25 seconds) is deliberately longer than the stale time, so a crashed holder is always taken over before waiters give up.
+
+`McpOAuthSettings` is the already-resolved form of the user's oauth config, for example the client secret has been looked up.
+
+```ts ! oauth.ts
+const CALLBACK_HOST = "127.0.0.1";
+const CALLBACK_PATH = "/callback";
+/** Where pi.dev serves pi's Client ID Metadata Documents: `client.json` and `<callback ID>/client.json`. */
+const CLIENT_METADATA_BASE_URL = "https://pi.dev/oauth";
+/** Redirect URI for refreshes when none is stored. Refreshing never redirects the user. */
+const FALLBACK_REDIRECT_URL = `http://${CALLBACK_HOST}${CALLBACK_PATH}`;
+/** Access tokens this close to expiry are refreshed before they are sent. */
+// !mark
+const REFRESH_SKEW_MS = 30_000;
+/** Bounds each request of a refresh, so it cannot hold the refresh lock or delay shutdown for long. */
+// !mark
+const REFRESH_REQUEST_TIMEOUT_MS = 15_000;
+/** A refresh lock that its holder stopped renewing (the process was killed) is taken over after this. */
+// !mark
+const REFRESH_LOCK_STALE_MS = 20_000;
+/** How long to wait for another process's refresh: longer than a stale lock lives. */
+// !mark
+const REFRESH_LOCK_WAIT_MS = 25_000;
+const REFRESH_LOCK_RETRY_MS = 100;
+
+export interface McpOAuthSettings {
+	clientId?: string;
+	/** Already resolved. */
+	clientSecret?: string;
+	callbackPort?: number;
+	/** Loopback redirect URI; see `McpOAuthConfig.callbackUrl`. */
+	callbackUrl?: string;
+	/** Scopes to request, separated by spaces. */
+	scope?: string;
+	/** `client_name` for dynamic client registration. Default: `APP_NAME`. */
+	clientName?: string;
+	/** See `McpOAuthConfig.clientRegistration`. */
+	clientRegistration?: "dcr" | "cimd";
+	/** See `McpOAuthConfig.authServerMetadataUrl`. */
+	authServerMetadataUrl?: URL;
+```
+
+## !!steps Choosing the loopback callback address
+
+`callbackSettings` turns the optional `callbackUrl` and `callbackPort` into the address to listen on and the redirect URI to send. If the configured URL has a port it is sent exactly as written, because authorization servers compare redirect URIs as strings.
+
+`localhost` is served on `127.0.0.1`, while the redirect URI keeps the host the user wrote.
+
+```ts ! oauth.ts
+function callbackSettings(settings: McpOAuthSettings): CallbackSettings {
+	const url = new URL(settings.callbackUrl ?? `http://${CALLBACK_HOST}${CALLBACK_PATH}`);
+	const address = url.hostname.replace(/^\[|\]$/g, "");
+	const port = url.port ? Number(url.port) : settings.callbackPort;
+	let fixedRedirectUrl: string | undefined;
+	// A configured URI with a port is sent exactly as written, since servers compare it as a string.
+	// !mark
+	if (url.port) fixedRedirectUrl = settings.callbackUrl;
+	else if (port !== undefined) {
+		url.port = String(port);
+		fixedRedirectUrl = url.href;
+	}
+	return {
+		// !mark
+		// `localhost` is served on 127.0.0.1; browsers fall back to it when ::1 refuses.
+		host: address === "localhost" ? CALLBACK_HOST : address,
+		redirectHost: address,
+		port,
+		path: url.pathname,
+		fixedRedirectUrl,
+	};
+}
+
+```
+
+## !!steps Credential store keyed by name and URL
+
+Each server's state (client registration, tokens, pending PKCE verifier) is one entry in a shared JSON file. The key is the server name plus URL so two servers on the same URL can have different accounts. Older versions keyed by URL alone, and `load` migrates that legacy entry to the new key the first time a server reads it. Other servers with the same URL must sign in again.
+
+Every access goes through `backend.withLock`, so reads and writes of the file are serialized.
+
+```ts ! oauth.ts
+ */
+function storeKeys(name: string, serverUrl: string): { key: string; legacyKey: string } {
+	const legacyKey = String(new URL(serverUrl));
+	return { key: `${mcpNamespace(name)}|${legacyKey}`, legacyKey };
+}
+
+// ...
+export class McpOAuthCredentialStore {
+	private readonly backend: AuthStorageBackend;
+	/** Directory for the refresh lock files. Without one, refreshes are only serialized in this process. */
+	private readonly lockDir: string | undefined;
+
+	constructor(backend?: AuthStorageBackend, lockDir?: string) {
+		this.backend = backend ?? new FileAuthStorageBackend(join(getAgentDir(), "mcp-auth.json"));
+		this.lockDir = backend ? lockDir : getAgentDir();
+	}
+
+	forServer(name: string, serverUrl: string): McpOAuthServerStore {
+		const { key, legacyKey } = storeKeys(name, serverUrl);
+		return {
+			// !mark
+			// The first server to load legacy state takes it over; others with the same URL sign in again.
+			load: () =>
+				// !mark
+				this.backend.withLock((current) => {
+					const states = parseStates(current);
+					if (states[key] || !states[legacyKey]) return { result: states[key] };
+					states[key] = states[legacyKey];
+					delete states[legacyKey];
+					return { result: states[key], next: serializeStates(states) };
+				}),
+			save: (state) =>
+				this.write((states) => {
+					states[key] = state;
+				}),
+			withRefreshLock: (fn) => this.withRefreshLock(key, fn),
+		};
+	}
+```
+
+## !!steps A lock file so processes do not race a refresh
+
+Many servers rotate refresh tokens: using the same one twice loses the grant. Two pi processes with the same server could do exactly that, so refreshes take a per-server lock file whose name is a hash of the key.
+
+The retry settings turn into a poll every 100 ms for up to 25 seconds. `onCompromised` is a no-op on purpose: the default throws from a timer, and a lost lock only risks overlapping refreshes. Without a `lockDir` (a custom backend), refreshes are only serialized within this process.
+
+```ts ! oauth.ts
+	private async withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+		// !mark
+		if (!this.lockDir) return fn();
+		mkdirSync(this.lockDir, { recursive: true, mode: 0o700 });
+		const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
+		const release = await lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
+			realpath: false,
+			// !mark
+			stale: REFRESH_LOCK_STALE_MS,
+			retries: {
+				retries: REFRESH_LOCK_WAIT_MS / REFRESH_LOCK_RETRY_MS,
+				factor: 1,
+				minTimeout: REFRESH_LOCK_RETRY_MS,
+				maxTimeout: REFRESH_LOCK_RETRY_MS,
+			},
+			// The default throws from a timer. A lost lock at worst lets two refreshes overlap.
+			// !mark
+			onCompromised: () => {},
+		});
+		try {
+			return await fn();
+		} finally {
+			await release().catch(() => undefined);
+		}
+	}
+```
+
+## !!steps Choosing a client metadata document
+
+With `clientRegistration: "cimd"`, pi identifies itself by a URL on pi.dev instead of registering dynamically. If the authorization server does not return the RFC 9207 `iss` parameter, the redirect URI and the document become specific to the MCP server (using a hash of its URL), so a response cannot be confused with one from another authorization server.
+
+The function throws a clear configuration error when the server does not support this for public clients.
+
+```ts ! oauth.ts
+function clientMetadataDocument(
+	serverUrl: string,
+	redirectUrl: string,
+	// !mark(1:3)
+	metadata: AuthorizationServerMetadata | undefined,
+): OAuthClientMetadataDocument {
+	if (
+		!metadata?.client_id_metadata_document_supported ||
+		!metadata.token_endpoint_auth_methods_supported?.includes("none")
+	) {
+		throw new Error(
+			'The authorization server does not support Client ID Metadata Documents for public clients; remove oauth.clientRegistration "cimd"',
+		);
+	}
+	// !mark
+	if (metadata.authorization_response_iss_parameter_supported) {
+		return { url: `${CLIENT_METADATA_BASE_URL}/client.json`, redirectUrl };
+	}
+	const id = callbackId(serverUrl);
+	// !mark(1:4)
+	const redirect = new URL(redirectUrl);
+	redirect.pathname = `${CALLBACK_PATH}/${id}`;
+	return { url: `${CLIENT_METADATA_BASE_URL}/${id}/client.json`, redirectUrl: redirect.href };
+}
+```
+
+## !!steps The auth provider used by every connection
+
+`createMcpAuthProvider` returns the object the MCP client calls. `refresh` is shared: the `??=` means concurrent callers in this process await a single refresh promise. Inside the file lock it re-reads the state, and if the access token already differs from the stale one (another process refreshed, or the user signed in) it returns without refreshing. With no refresh token, or when the library reports a redirect is needed, it throws the authorization-required error.
+
+```ts ! oauth.ts
+	const { serverUrl, store } = options;
+	let refreshing: Promise<void> | undefined;
+
+	/** Replace `staleToken`, the access token that expired or was rejected. */
+	const refresh = (staleToken: string | undefined, fetch: McpFetch = globalThis.fetch, challenge?: OAuthChallenge) => {
+		// !mark
+		refreshing ??= store
+			.withRefreshLock(async () => {
+				const state = await store.load();
+				// !mark(1:2)
+				if (state?.tokens?.access_token !== staleToken) return;
+				if (!state?.tokens?.refresh_token) throw new McpOAuthAuthorizationRequiredError();
+				const settings = options.settings();
+				const redirectUrl =
+					callbackSettings(settings).fixedRedirectUrl ??
+					registeredRedirectUrls(state.clientInformation)[0] ??
+					FALLBACK_REDIRECT_URL;
+				const provider = createProvider(serverUrl, store, settings, redirectUrl, () => {});
+				// Refreshes the tokens, or reports that a new sign-in is needed.
+				const result = await authorizeMcp(provider, {
+					serverUrl,
+					resourceMetadataUrl: challenge?.resourceMetadataUrl,
+					authorizationServerMetadataUrl: settings.authServerMetadataUrl,
+					scope: challenge?.scope,
+					fetch: (input, init) =>
+						fetch(input, { ...init, signal: AbortSignal.timeout(REFRESH_REQUEST_TIMEOUT_MS) }),
+				});
+				// !mark
+				if (result === "REDIRECT") throw new McpOAuthAuthorizationRequiredError();
+			})
+			.finally(() => {
+				refreshing = undefined;
+			});
+		return refreshing;
+	};
+```
+
+## !!steps Proactive refresh and 401 handling
+
+`token` waits for any running refresh, then refreshes early when the token is within the skew of expiring. Failures are swallowed there: the request goes out with the old token and a 401 decides what happens.
+
+`onUnauthorized` parses the `WWW-Authenticate` challenge and passes it to `onChallenge`. An `insufficient_scope` error cannot be fixed by a refresh, since a refresh keeps the granted scope, so it throws and the user must sign in again. `settled` lets shutdown wait so rotated tokens are saved first.
+
+```ts ! oauth.ts
+	return {
+		token: async () => {
+			await refreshing?.catch(() => undefined);
+			const state = await store.load();
+			const token = state?.tokens?.access_token;
+			// !mark(1:2)
+			const expired = state?.tokensExpireAt !== undefined && state.tokensExpireAt - REFRESH_SKEW_MS <= Date.now();
+			if (!expired || !state?.tokens?.refresh_token) return token;
+			// Failures fall through: the request goes out with the old token and a 401 decides what happens.
+			await refresh(token).catch(() => undefined);
+			return (await store.load())?.tokens?.access_token;
+		},
+		onUnauthorized: async (context) => {
+			const challenge = parseWwwAuthenticate(context.response.headers.get("www-authenticate"));
+			options.onChallenge(challenge);
+			// A refresh keeps the granted scope, so more scope needs a new sign-in.
+			// !mark
+			if (challenge.error === "insufficient_scope") throw new McpOAuthAuthorizationRequiredError();
+			await refresh(context.token, context.fetch, challenge);
+		},
+		// !mark(1:3)
+		settled: async () => {
+			await refreshing?.catch(() => undefined);
+		},
+	};
+```
+
+## !!steps Waiting for the browser or a pasted URL
+
+When the browser cannot reach the loopback server (SSH, for example), the user can paste the redirect URL instead. `waitForAuthorizationResponse` races the callback server against that prompt. The `finally` aborts the prompt and silences the loser's rejection.
+
+`responseFromRedirectUrl` validates the pasted URL strictly: origin and path must match, an `error` parameter is raised, the `state` must match this sign-in, and a code must exist.
+
+```ts ! oauth.ts
+function responseFromRedirectUrl(input: string, state: string, redirectUrl: URL): AuthorizationResponse {
+	let url: URL;
+	try {
+		url = new URL(input.trim());
+	} catch {
+		throw new Error("Expected the full redirect URL from the browser address bar");
+	}
+	// A server-specific redirect URI tells authorization servers apart, so it must match exactly.
+	if (url.origin !== redirectUrl.origin || url.pathname !== redirectUrl.pathname) {
+		throw new Error("The redirect URL does not match this sign-in's redirect URI");
+	// !mark(1:5)
+	}
+	const error = url.searchParams.get("error");
+	if (error) throw new Error(url.searchParams.get("error_description") ?? error);
+	if (url.searchParams.get("state") !== state) throw new Error("The redirect URL belongs to a different sign-in");
+	const code = url.searchParams.get("code");
+	if (!code) throw new Error("The redirect URL does not contain an authorization code");
+	return { code, iss: url.searchParams.get("iss") ?? undefined };
+}
+
+/** Wait for the browser callback or a pasted redirect URL, whichever comes first. */
+async function waitForAuthorizationResponse(
+	callback: OAuthCallbackServer,
+	state: string,
+	redirectUrl: URL,
+	prompt: McpSignInPrompt,
+): Promise<AuthorizationResponse> {
+	const controller = new AbortController();
+	const fromBrowser = callback.waitForCallback(state, redirectUrl.pathname);
+	const fromUser = prompt.promptForRedirectUrl(controller.signal).then((input) => {
+		if (!input?.trim()) throw new McpSignInCancelledError();
+		return responseFromRedirectUrl(input, state, redirectUrl);
+	});
+	try {
+		// !mark(1:3)
+		return await Promise.race([fromBrowser, fromUser]);
+	} finally {
+		// The losing side rejects once the prompt is aborted or the callback server closes.
+		controller.abort();
+		fromBrowser.catch(() => undefined);
+		fromUser.catch(() => undefined);
+	}
+}
+
+```
+
+## !!steps Starting the callback server
+
+`listenForCallback` tries the preferred port. If it is taken and the port was not explicitly configured, it retries with any free port; if the port was required it fails. The success and error pages are rendered with the shared helpers from pi-ai.
+
+```ts ! oauth.ts
+async function listenForCallback(
+	settings: CallbackSettings,
+	extraPaths: string[],
+	port: number | undefined,
+	required: boolean,
+): Promise<OAuthCallbackServer> {
+	const options = {
+		host: settings.host,
+		redirectHost: settings.redirectHost,
+		path: settings.path,
+		extraPaths,
+		renderPage: (page: OAuthCallbackPage) =>
+			page.ok
+				? oauthSuccessHtml("Signed in to the MCP server. You may now close this page.")
+				: oauthErrorHtml(page.message, page.details),
+	};
+	try {
+		return await OAuthCallbackServer.listen({ ...options, port: port ?? 0 });
+	} catch (error) {
+		if (required || port === undefined) throw error;
+		return OAuthCallbackServer.listen(options);
+	// !mark(1:3)
+	}
+}
+
+/**
+ * Sign in to an MCP server. Uses the stored refresh token when possible; otherwise runs the browser
+ * authorization code flow. Tokens are saved to `store`.
+```
+
+## !!steps The sign-in function
+
+`signInMcpServer` prefers to reuse the port of the registered redirect URI so a registered client stays valid. Before starting, it decides whether to keep the stored client: a different redirect URI means the registration and tokens are discarded.
+
+It then calls `authorizeMcp` once. That either refreshes and returns `AUTHORIZED`, or produces an authorization URL through the provider's `onRedirect`. The URL is shown to the user, and after the code arrives `authorizeMcp` is called a second time to exchange it. A step-up (more scope) skips the refresh attempt and merges the old and requested scopes.
+
+```ts ! oauth.ts
+	try {
+		if (stored) {
+			const next: McpOAuthState = { ...stored };
+			// Every sign-in gets a fresh `state` parameter.
+			delete next.oauthState;
+			// A registered client cannot use another redirect URI, and its tokens belong to it. A Client ID
+			// Metadata Document is not stored, so with one, a stored client was registered before and is replaced.
+			// !mark(1:3)
+			const keepClient =
+				settings.clientId ||
+				(cimd ? !stored.clientInformation : registeredRedirectUrls(stored.clientInformation).includes(redirectUrl));
+			if (!keepClient) {
+				delete next.clientInformation;
+				delete next.tokens;
+				delete next.tokensExpireAt;
+			}
+			await store.save(next);
+		}
+		// ...
+		// A refresh keeps the granted scope; a server asking for more needs the browser flow.
+		// !mark(1:2)
+		const skipRefresh = stepUp;
+		if ((await authorizeMcp(provider, { ...flow, skipRefresh })) === "AUTHORIZED") return;
+		if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
+
+		const state = await provider.state();
+		// The flow picks the redirect URI, which may be specific to the MCP server.
+		const authorizationRedirectUrl = new URL(authorizationUrl.searchParams.get("redirect_uri") ?? redirectUrl);
+		options.prompt.showAuthorizationUrl(authorizationUrl);
+		const { code, iss } = await waitForAuthorizationResponse(
+			callback,
+			state,
+			authorizationRedirectUrl,
+			options.prompt,
+		);
+		await authorizeMcp(provider, { ...flow, authorizationCode: code, iss });
+	// !mark(1:3)
+	} finally {
+		await callback.close();
+	}
+}
+```
+
+</Scrollycoding>
+
+The file has three layers: storage (`McpOAuthCredentialStore`), passive use (`createMcpAuthProvider`, called on every request), and active sign-in (`signInMcpServer`, called only from the UI). All three share `McpOAuthState`, so a sign-in done in one process is picked up by the others through `tokens()` and the re-read inside the refresh lock.

@@ -1,0 +1,133 @@
+---
+title: "zip.ts"
+description: "A tiny dependency-free ZIP writer built on node:zlib, used to bundle bug reports"
+source: "src/utils/zip.ts"
+full: true
+---
+
+This file writes classic ZIP archives without any third-party library. It only needs `node:zlib` for raw deflate and CRC-32, plus `writeFile`. The sole caller is [bug-report.ts](/docs/src/core/bug-report.ts), which bundles diagnostic files into one archive a user can attach to an issue.
+
+The format is deliberately minimal: no ZIP64, no directories, no encryption. Each entry gets a local header, the compressed bytes, and a matching record in the central directory at the end. [output-files.ts](/docs/src/utils/output-files.ts) and [paths.ts](/docs/src/utils/paths.ts) handle other file concerns, but nothing else in utils touches archives.
+
+<Scrollycoding>
+
+## !!steps Entry shape and DOS timestamps
+
+An entry is just a name and either a string or raw bytes. ZIP stores timestamps in the old MS-DOS packed format: time is hours, minutes and seconds divided by two (so two-second resolution) in 16 bits, and the date packs year since 1980, month and day.
+
+`Math.max(1980, ...)` clamps the year so a machine with a bad clock cannot produce a negative packed value.
+
+```ts ! zip.ts
+interface ZipEntry {
+	name: string;
+	data: string | Uint8Array;
+}
+
+function dosDateTime(date: Date): { time: number; day: number } {
+	return {
+		// !mark
+		time: (date.getHours() << 11) | (date.getMinutes() << 5) | (date.getSeconds() >> 1),
+		// !mark
+		day: ((Math.max(1980, date.getFullYear()) - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+	};
+}
+```
+
+## !!steps Per-entry compression
+
+The function computes one timestamp for the whole archive, then loops over the entries. Each is converted to a `Buffer`, compressed with `deflateRawSync` (ZIP wants raw deflate without the zlib header) and checksummed with `crc32` over the uncompressed data.
+
+Everything is built in memory, which is fine for the small bundles this was written for, as the doc comment says.
+
+```ts ! zip.ts
+/** Create the small, classic ZIP archives used by bug reports. */
+function createZipArchive(entries: readonly ZipEntry[]): Buffer {
+	const files: Buffer[] = [];
+	const directory: Buffer[] = [];
+	const { time, day } = dosDateTime(new Date());
+	let offset = 0;
+
+	for (const entry of entries) {
+		const name = Buffer.from(entry.name);
+		const data = typeof entry.data === "string" ? Buffer.from(entry.data) : Buffer.from(entry.data);
+		// !mark
+		const compressed = deflateRawSync(data);
+		// !mark
+		const checksum = crc32(data);
+```
+
+## !!steps Local file header
+
+The 30-byte local header starts with the signature `0x04034b50`. Version 20 means "needs deflate". Flag `0x0800` declares the file name as UTF-8, and method 8 is deflate. Then come the time, date, CRC, compressed size, uncompressed size and name length.
+
+Because sizes are known up front there is no data descriptor. The extra-field length at offset 28 is left zero by `Buffer.alloc`.
+
+```ts ! zip.ts
+		const local = Buffer.alloc(30);
+		// !mark
+		local.writeUInt32LE(0x04034b50, 0);
+		local.writeUInt16LE(20, 4);
+		// !mark
+		local.writeUInt16LE(0x0800, 6);
+		// !mark
+		local.writeUInt16LE(8, 8);
+		local.writeUInt16LE(time, 10);
+		local.writeUInt16LE(day, 12);
+		local.writeUInt32LE(checksum, 14);
+		local.writeUInt32LE(compressed.length, 18);
+		local.writeUInt32LE(data.length, 22);
+		local.writeUInt16LE(name.length, 26);
+```
+
+## !!steps Central directory record
+
+Each entry also gets a 46-byte central record (signature `0x02014b50`) that repeats the same metadata and adds a "version made by" field. The crucial extra field is at offset 42: the byte offset of this entry's local header in the file. Readers use it to jump straight to the data.
+
+```ts ! zip.ts
+		const central = Buffer.alloc(46);
+		central.writeUInt32LE(0x02014b50, 0);
+		central.writeUInt16LE(20, 4);
+		central.writeUInt16LE(20, 6);
+		central.writeUInt16LE(0x0800, 8);
+		central.writeUInt16LE(8, 10);
+		central.writeUInt16LE(time, 12);
+		central.writeUInt16LE(day, 14);
+		central.writeUInt32LE(checksum, 16);
+		central.writeUInt32LE(compressed.length, 20);
+		central.writeUInt32LE(data.length, 24);
+		central.writeUInt16LE(name.length, 28);
+		// !mark
+		central.writeUInt32LE(offset, 42);
+```
+
+## !!steps End record and file write
+
+After each entry the running `offset` advances by the header, name and compressed size. When the loop ends, the end-of-central-directory record (signature `0x06054b50`) stores the entry count twice, the directory size and where the directory starts. The final buffer is local parts, then directory, then the end record.
+
+`writeZipArchive` is the only export and simply writes that buffer to disk.
+
+```ts ! zip.ts
+		files.push(local, name, compressed);
+		directory.push(central, name);
+		// !mark
+		offset += local.length + name.length + compressed.length;
+	}
+
+	const centralDirectory = Buffer.concat(directory);
+	const end = Buffer.alloc(22);
+	end.writeUInt32LE(0x06054b50, 0);
+	end.writeUInt16LE(entries.length, 8);
+	end.writeUInt16LE(entries.length, 10);
+	end.writeUInt32LE(centralDirectory.length, 12);
+	end.writeUInt32LE(offset, 16);
+	return Buffer.concat([...files, centralDirectory, end]);
+}
+
+export function writeZipArchive(filePath: string, entries: readonly ZipEntry[]): Promise<void> {
+	return writeFile(filePath, createZipArchive(entries));
+}
+```
+
+</Scrollycoding>
+
+The whole module is one pure builder plus one write call. Limits to remember: entries over 4 GB or more than 65535 files would overflow the 32/16-bit fields because there is no ZIP64 support, and entry names are not sanitized, so callers such as [bug-report.ts](/docs/src/core/bug-report.ts) must pass safe relative names.

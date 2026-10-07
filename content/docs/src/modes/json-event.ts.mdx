@@ -1,0 +1,100 @@
+---
+title: "json-event.ts"
+description: "Converts internal session events into the slimmer wire format used by --mode json and RPC stdout"
+source: "src/modes/json-event.ts"
+full: true
+---
+
+Streaming assistant messages carry a `partial` field: a cumulative snapshot of the whole message so far. Inside the process that is convenient, but if every token delta serialized the full snapshot, output size would grow quadratically. This file strips those snapshots before events are written to stdout.
+
+Two consumers use it: [print-mode.ts](/docs/src/modes/print-mode.ts) for `--mode json`, and [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) for the RPC protocol. The matching reader side is [rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts), which types incoming events as `JsonAgentSessionEvent`. The source event type comes from [agent-session.ts](/docs/src/core/agent-session.ts).
+
+<Scrollycoding>
+
+## !!steps Type-level removal of partial
+
+`WithoutPartial` removes the `partial` key only from union members that have it. The tool-call variant additionally gains `id` and `toolName`, because once the snapshot is gone a consumer would otherwise have no way to know which tool a `toolcall_start` refers to.
+
+```ts ! json-event.ts
+type WithoutPartial<T> = T extends { partial: unknown } ? Omit<T, "partial"> : T;
+
+type ToJsonAssistantMessageEvent<T> = T extends { type: "toolcall_start"; partial: unknown }
+	? WithoutPartial<T> & { id: string; toolName: string }
+	: WithoutPartial<T>;
+```
+
+## !!steps The wire event union
+
+Only `message_update` changes shape. It keeps `usage` (cumulative, but constant size) and the transformed delta event, and drops the full `message`. Every other session event passes through unchanged, which `JsonAgentSessionEvent` expresses with `Exclude`.
+
+```ts ! json-event.ts
+type MessageUpdateEvent = Extract<AgentSessionEvent, { type: "message_update" }>;
+type JsonMessageUpdateEvent = {
+	type: "message_update";
+	usage: Usage;
+	assistantMessageEvent: ToJsonAssistantMessageEvent<MessageUpdateEvent["assistantMessageEvent"]>;
+};
+
+/** Session event shape emitted by the JSON and RPC stdout protocols. */
+export type JsonAgentSessionEvent = Exclude<AgentSessionEvent, { type: "message_update" }> | JsonMessageUpdateEvent;
+```
+
+## !!steps Rewriting the delta event
+
+For `toolcall_start` the id and name are read out of the snapshot at `contentIndex` before it is discarded. If that slot is not a tool call the function throws, since that would mean the upstream stream is inconsistent. Other events that have a `partial` just drop it; events without one are returned as is.
+
+```ts ! json-event.ts
+function toJsonAssistantMessageEvent(
+	event: MessageUpdateEvent["assistantMessageEvent"],
+): JsonMessageUpdateEvent["assistantMessageEvent"] {
+	if (event.type === "toolcall_start") {
+		const toolCall = event.partial.content[event.contentIndex];
+		if (toolCall?.type !== "toolCall") {
+			throw new Error(`toolcall_start content at index ${event.contentIndex} is not a tool call`);
+		}
+		const { partial: _partial, ...deltaEvent } = event;
+		return { ...deltaEvent, id: toolCall.id, toolName: toolCall.name };
+	}
+
+	if (!("partial" in event)) {
+		return event;
+	}
+
+	const { partial: _partial, ...deltaEvent } = event;
+	return deltaEvent;
+}
+```
+
+## !!steps The public entry point
+
+The doc comment states the contract: `message_start` gives the initial message, deltas build it, and `message_end` gives the authoritative final one. The overloads let callers that already hold a `message_update` get the narrower return type. Non-update events return as is, and a `message_update` whose message is not from the assistant is rejected.
+
+```ts ! json-event.ts
+/**
+ * Remove cumulative assistant snapshots from streaming wire events.
+ * `message_start` provides the initial message, deltas build it, and
+ * `message_end` provides the final authoritative message. Cumulative usage,
+ * tool-call ids, and tool names remain available because their size is constant.
+ */
+export function toJsonEvent(event: MessageUpdateEvent): JsonMessageUpdateEvent;
+export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent;
+export function toJsonEvent(event: AgentSessionEvent): JsonAgentSessionEvent {
+	if (event.type !== "message_update") {
+		return event;
+	}
+	// !mark
+	if (event.message.role !== "assistant") {
+		throw new Error("message_update message is not an assistant message");
+	}
+
+	return {
+		type: "message_update",
+		usage: event.message.usage,
+		assistantMessageEvent: toJsonAssistantMessageEvent(event.assistantMessageEvent),
+	};
+}
+```
+
+</Scrollycoding>
+
+The practical effect is that a JSON-mode consumer must reassemble messages itself from start, delta and end events. The throws are defensive: a thrown error inside a session subscriber in [print-mode.ts](/docs/src/modes/print-mode.ts) would surface only if upstream event invariants break.

@@ -1,0 +1,410 @@
+---
+title: "bash.ts"
+description: "The bash tool and the shared shell machinery: local process spawning with timeout and abort, session env vars, throttled streaming updates, and output truncation"
+source: "src/core/tools/bash.ts"
+full: true
+---
+
+This file implements the tool the model uses to run shell commands, and, because the PowerShell tool needs almost the same behavior, it exports the generic parts as well. `createLocalShellOperations` spawns a process and streams its output. `createShellToolDefinition` wraps any `BashOperations` into a tool with streaming updates, truncation, error reporting and structured output. The bash tool itself is just a configuration object passed to that factory, and [powershell.ts](/docs/src/core/tools/powershell.ts) does the same with its own config.
+
+Output accounting is delegated to [output-accumulator.ts](/docs/src/core/tools/output-accumulator.ts), limits come from [truncate.ts](/docs/src/core/tools/truncate.ts), process-tree killing and shell detection from [shell.ts](/docs/src/utils/shell.ts), and the user-initiated variant lives in [bash-executor.ts](/docs/src/core/bash-executor.ts).
+
+<Scrollycoding>
+
+## !!steps Validating the timeout
+
+The model supplies the timeout in seconds. It must be a positive finite number, and the converted milliseconds must fit in the 32-bit range that `setTimeout` accepts, otherwise Node would fire the timer immediately. There is no default timeout.
+
+```ts ! bash.ts
+const MAX_TIMEOUT_MS = 2_147_483_647;
+/** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+
+function resolveTimeoutMs(timeout: number | undefined): number | undefined {
+	if (timeout === undefined) return undefined;
+	if (!Number.isFinite(timeout) || timeout <= 0) {
+		throw new Error("Invalid timeout: must be a finite number of seconds");
+	}
+
+	const timeoutMs = timeout * 1000;
+	if (timeoutMs > MAX_TIMEOUT_MS) {
+		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+	}
+	return timeoutMs;
+}
+```
+
+## !!steps Input and structured output
+
+The input is a command and an optional timeout. The output schema is for programmatic callers: combined output, a truncation flag, the temp file path, an exit code and wall time. The comment points out that a non-zero exit is an error for the model but still resolves for scripts.
+
+```ts ! bash.ts
+const bashSchema = Type.Object({
+	command: Type.String({ description: "Shell command to execute" }),
+	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+});
+// ...
+const bashOutputSchema = Type.Object({
+	output: Type.String({ description: "Combined stdout and stderr, possibly truncated" }),
+	truncated: Type.Boolean(),
+	full_output_path: Type.Optional(Type.String({ description: "Full output, when truncated" })),
+	exit_code: Type.Number(),
+	wall_time_seconds: Type.Number(),
+});
+
+export type BashToolOutput = Static<typeof bashOutputSchema>;
+
+export interface BashToolDetails {
+	truncation?: TruncationResult;
+	fullOutputPath?: string;
+}
+```
+
+## !!steps The BashOperations contract
+
+This interface is the remote-execution seam. Implementations stream bytes through `onData`, honor the `signal` and `timeout`, and resolve with an exit code. The doc comment sets a convention: a process killed by a signal reports 128 plus the signal number, and `null` is treated as failure.
+
+```ts ! bash.ts
+export interface BashOperations {
+	/**
+	 * Execute a command and stream output.
+	 * @param command The command to execute
+	 * @param cwd Working directory
+	 * @param options Execution options
+	 * @returns Promise resolving to the exit code. Report signal terminations as 128 + signal number;
+	 * a null exit code is treated as a failed command.
+	 */
+	exec: (
+		command: string,
+		cwd: string,
+		options: {
+			onData: (data: Buffer) => void;
+			signal?: AbortSignal;
+			timeout?: number;
+			env?: NodeJS.ProcessEnv;
+		},
+	) => Promise<{ exitCode: number | null }>;
+}
+```
+
+## !!steps Spawning the process
+
+The local operations check the abort signal and the working directory before spawning. The shell comes from `getShellConfig`, and the command is passed either as an argument or, for shells configured with the stdin transport, written to stdin. On POSIX the child is `detached`, so it leads its own process group and the whole tree can be killed later.
+
+Environment defaults to `getShellEnv()` unless the caller passes one.
+
+```ts ! bash.ts
+export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
+	return {
+		exec: async (command, cwd, { onData, signal, timeout, env }) => {
+			const timeoutMs = resolveTimeoutMs(timeout);
+			if (signal?.aborted) {
+				throw new Error("aborted");
+			}
+			const shellConfig = resolveShellConfig();
+			try {
+				await fsAccess(cwd, constants.F_OK);
+			} catch {
+				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute ${shellName} commands.`);
+			}
+
+			const commandFromStdin = shellConfig.commandTransport === "stdin";
+			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+				cwd,
+				detached: process.platform !== "win32",
+				env: env ?? getShellEnv(),
+				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+				windowsHide: true,
+			});
+			if (commandFromStdin) {
+				child.stdin?.on("error", () => {});
+				child.stdin?.end(command);
+			}
+```
+
+## !!steps Timeout, abort and streaming
+
+The child's pid is tracked so it can be cleaned up when the host exits. A timer, if requested, marks `timedOut` and kills the tree. Both stdout and stderr feed the same `onData`, which is why the result is combined output. An abort signal kills the tree too, and an already-aborted signal is handled immediately.
+
+`waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) resolves on exit without hanging on stdio handles inherited by detached descendants.
+
+```ts ! bash.ts
+			if (child.pid) trackDetachedChildPid(child.pid);
+			let timedOut = false;
+			let timeoutHandle: NodeJS.Timeout | undefined;
+			const onAbort = () => {
+				if (child.pid) killProcessTree(child.pid);
+			};
+
+			try {
+				// Set timeout if provided.
+				if (timeoutMs !== undefined) {
+					timeoutHandle = setTimeout(() => {
+						timedOut = true;
+						if (child.pid) killProcessTree(child.pid);
+					}, timeoutMs);
+				}
+				// Stream stdout and stderr.
+				child.stdout?.on("data", onData);
+				child.stderr?.on("data", onData);
+				// Handle abort signal by killing the entire process tree.
+				if (signal) {
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}
+				// Handle shell spawn errors and wait for the process to terminate without hanging
+				// on inherited stdio handles held by detached descendants.
+```
+
+## !!steps Outcome ordering and cleanup
+
+After the process ends, abort wins over timeout, and timeout wins over a normal exit. Both are reported by throwing errors whose messages the tool later pattern-matches, `aborted` and `timeout:` followed by the seconds. A missing exit code becomes 128 plus the signal number, or 1 if no signal is known.
+
+The `finally` block always untracks the pid, clears the timer and removes the abort listener.
+
+```ts ! bash.ts
+				// Handle shell spawn errors and wait for the process to terminate without hanging
+				// on inherited stdio handles held by detached descendants.
+				const exitCode = await waitForChildProcess(child);
+				if (signal?.aborted) {
+					throw new Error("aborted");
+				}
+				if (timedOut) {
+					throw new Error(`timeout:${timeout}`);
+				}
+				// A signal-killed shell has no exit code. Use the standard shell convention so
+				// callers do not mistake the termination for a successful command.
+				const signalCode = child.signalCode;
+				return { exitCode: exitCode ?? (signalCode ? 128 + (osConstants.signals[signalCode] ?? 0) : 1) };
+			} finally {
+				if (child.pid) untrackDetachedChildPid(child.pid);
+				if (timeoutHandle) clearTimeout(timeoutHandle);
+				if (signal) signal.removeEventListener("abort", onAbort);
+			}
+		},
+	};
+```
+
+## !!steps Session environment for the child
+
+Before each run, the environment is rebuilt: any inherited `PI_SESSION_*`, `PI_PROVIDER`, `PI_MODEL` and `PI_REASONING_LEVEL` values are deleted first, so a nested pi process cannot leak stale values. Then, if enabled, the current session id, session file, provider, model and thinking level are set.
+
+The optional spawn hook runs last and may rewrite the command, cwd or env. See [session-manager.ts](/docs/src/core/session-manager.ts) for where the session id and file come from.
+
+```ts ! bash.ts
+function resolveSpawnContext(
+	command: string,
+	cwd: string,
+	spawnHook: BashSpawnHook | undefined,
+	exposeSessionEnvironment: boolean,
+	ctx: ExtensionContext | undefined,
+): BashSpawnContext {
+	const env = { ...getShellEnv() };
+	delete env.PI_SESSION_ID;
+	delete env.PI_SESSION_FILE;
+	delete env.PI_PROVIDER;
+	delete env.PI_MODEL;
+	delete env.PI_REASONING_LEVEL;
+	if (exposeSessionEnvironment && ctx) {
+		const model = ctx.model;
+		env.PI_SESSION_ID = ctx.sessionManager.getSessionId();
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+		if (model) {
+			env.PI_PROVIDER = model.provider;
+			env.PI_MODEL = model.id;
+		}
+		if (ctx.thinkingLevel) env.PI_REASONING_LEVEL = ctx.thinkingLevel;
+	}
+	const baseContext: BashSpawnContext = { command, cwd, env };
+	return spawnHook ? spawnHook(baseContext) : baseContext;
+}
+```
+
+## !!steps Tool options
+
+The options expose the pieces above: replaceable operations, a command prefix that is joined to every command with a newline, an explicit shell path, the environment toggle and the spawn hook. The `exposeSessionEnvironment` flag also controls whether the PI_* guideline reaches the system prompt, so the model is not told about variables that are not set.
+
+```ts ! bash.ts
+export interface BashToolOptions {
+	/** Custom operations for command execution. Default: local shell */
+	operations?: BashOperations;
+	/** Command prefix prepended to every command (for example shell setup commands) */
+	commandPrefix?: string;
+	/** Optional explicit shell path from settings */
+	shellPath?: string;
+	/** Expose current Pi session metadata as PI_* environment variables. Default: true */
+	exposeSessionEnvironment?: boolean;
+	/** Hook to adjust command, cwd, or env before execution */
+	spawnHook?: BashSpawnHook;
+}
+```
+
+## !!steps Throttled live updates
+
+Output can arrive in tiny chunks, so updates to the UI are throttled. The first call emits immediately; later calls within `BASH_UPDATE_THROTTLE_MS` of the last emit set a single timer for the remaining delay. Each emitted update is a snapshot of the accumulator that persists a temp file when truncated, so the final notice can point to it.
+
+```ts ! bash.ts
+			const emitOutputUpdate = () => {
+				if (!onUpdate || !updateDirty) return;
+				updateDirty = false;
+				lastUpdateAt = Date.now();
+				const snapshot = output.snapshot({ persistIfTruncated: true });
+				onUpdate({
+					content: [{ type: "text", text: snapshot.content || "" }],
+					details: {
+						truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
+						fullOutputPath: snapshot.fullOutputPath,
+					},
+				});
+			};
+
+			const clearUpdateTimer = () => {
+				if (updateTimer) {
+					clearTimeout(updateTimer);
+					updateTimer = undefined;
+				}
+			};
+
+			const scheduleOutputUpdate = () => {
+				if (!onUpdate) return;
+				updateDirty = true;
+				const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+				if (delay <= 0) {
+					clearUpdateTimer();
+					emitOutputUpdate();
+					return;
+				}
+				updateTimer ??= setTimeout(() => {
+					updateTimer = undefined;
+					emitOutputUpdate();
+				}, delay);
+			};
+```
+
+## !!steps Formatting truncated output
+
+When the accumulator reports truncation, the text gets a footer in one of three forms: a partial last line, a line-limit notice, or a byte-limit notice. All three include the temp file path so the model can read the rest with the [read.ts](/docs/src/core/tools/read.ts) tool. An empty result becomes the placeholder `(no output)`.
+
+```ts ! bash.ts
+			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
+				const truncation = snapshot.truncation;
+				let text = snapshot.content || emptyText;
+				let details: BashToolDetails | undefined;
+				if (truncation.truncated) {
+					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					const startLine = truncation.totalLines - truncation.outputLines + 1;
+					const endLine = truncation.totalLines;
+					if (truncation.lastLinePartial) {
+						const lastLineSize = formatSize(output.getLastLineBytes());
+						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+					} else if (truncation.truncatedBy === "lines") {
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+					} else {
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+					}
+				}
+				return { text, details };
+			};
+```
+
+## !!steps Mapping failures to messages
+
+If `exec` throws, output collected so far is finalized first so it is not lost. An error whose message is `aborted` becomes `Command aborted` appended to that output, and `timeout:N` becomes `Command timed out after N seconds`. Anything else is rethrown unchanged.
+
+```ts ! bash.ts
+			try {
+				let exitCode: number | null;
+				try {
+					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
+						onData: handleData,
+						signal,
+						timeout,
+						env: spawnContext.env,
+					});
+					exitCode = result.exitCode;
+				} catch (err) {
+					const snapshot = await finishOutput();
+					const { text } = formatOutput(snapshot, "");
+					if (err instanceof Error && err.message === "aborted") {
+						throw new Error(appendStatus(text, "Command aborted"));
+					}
+					if (err instanceof Error && err.message.startsWith("timeout:")) {
+						const timeoutSecs = err.message.split(":")[1];
+						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+					}
+					throw err;
+				}
+```
+
+## !!steps Exit codes and the result
+
+A null exit code is an error. Otherwise the tool computes wall time to a tenth of a second and reads the full output, capped at 1MB, for the structured result. A non-zero exit returns normally with `isError: true` and a status line, so the model sees both the output and the code. Success returns the formatted text.
+
+```ts ! bash.ts
+				const snapshot = await finishOutput();
+				const { text: outputText, details } = formatOutput(snapshot);
+				if (exitCode === null) {
+					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
+				}
+				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
+				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				const structuredContent: BashToolOutput = {
+					output: fullOutput.content,
+					truncated: fullOutput.truncated,
+					...(fullOutput.truncated && snapshot.fullOutputPath
+						? { full_output_path: snapshot.fullOutputPath }
+						: {}),
+					exit_code: exitCode,
+					wall_time_seconds: wallTimeSeconds,
+				};
+				if (exitCode !== 0) {
+					return {
+						content: [{ type: "text", text: appendStatus(outputText, `Command exited with code ${exitCode}`) }],
+						details,
+						structuredContent,
+						isError: true,
+					};
+				}
+				return { content: [{ type: "text", text: outputText }], details, structuredContent };
+```
+
+## !!steps The bash configuration and factories
+
+The bash tool is a config: name, prompt symbol, temp file prefix and the system-prompt contribution. `createBashTool` wraps the definition with [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts) and then copies the prompt snippet and guidelines onto the resulting tool, since the wrapper does not carry them.
+
+```ts ! bash.ts
+const bashToolConfig: ShellToolConfig = {
+	name: "bash",
+	label: "bash",
+	shellName: "bash",
+	prompt: "$",
+	promptSnippet: bashToolSystemPromptContribution.snippet,
+	promptGuidelines: bashToolSystemPromptContribution.guidelines,
+	tempFilePrefix: "pi-bash",
+};
+
+export function createBashToolDefinition(
+	cwd: string,
+	options?: BashToolOptions,
+): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {
+	return createShellToolDefinition(cwd, bashToolConfig, options);
+}
+
+export function createBashTool(cwd: string, options?: BashToolOptions): AgentTool<typeof bashSchema> {
+	const definition = createBashToolDefinition(cwd, options);
+	const tool = wrapToolDefinition(definition);
+	Object.assign(tool, {
+		promptSnippet: definition.promptSnippet,
+		promptGuidelines: definition.promptGuidelines,
+	});
+	return tool;
+}
+```
+
+</Scrollycoding>
+
+[index.ts](/docs/src/core/tools/index.ts) exports the factories and types, and the rendering lives in [bash.ts](/docs/src/core/tools/renderers/bash.ts). Because the process layer only reports bytes and an exit code, an extension can swap in SSH or container execution through `BashOperations` and keep all the truncation, throttling and error behavior.
+
+Structurally, the control flow depends on error message strings: `aborted` and `timeout:` are produced in one function and matched in another with `startsWith` and `split`, so any custom `BashOperations` has to produce the same strings to get friendly messages.

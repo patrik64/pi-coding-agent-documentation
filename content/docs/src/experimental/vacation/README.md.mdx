@@ -1,0 +1,106 @@
+---
+title: "README.md"
+description: "Readme for the experimental vacation demo: a durable vacation-planning agent with a background research subagent, built as a trimmed copy of the durable coding agent"
+source: "src/experimental/vacation/README.md"
+full: true
+---
+
+The vacation demo is a small, deliberately artificial agent whose purpose is to show durable-execution features of the Harness without any coding tools in the way. It is a copy of the durable coding agent in [durable/README.md](/docs/src/experimental/durable/README.md), with the coding tools and pi's coding prompt replaced by a vacation planner, and it looks like a coding agent only because it reuses pi's interactive TUI components.
+
+The README covers how to start it, what behaviors it demonstrates, a short script to try them, and a table of the files. It is experimental and has no consumers other than people reading and running it.
+
+<Scrollycoding>
+
+## !!steps What the demo is
+
+The opening paragraph states the relationship to the durable agent. Everything structural (session storage, runtime, TUI) is shared in shape; only the extensions and the prompt differ. Those live in [vacation.ts](/docs/src/experimental/vacation/vacation.ts).
+
+````md ! README.md
+# vacation
+
+A durable vacation planning agent with a TUI, built on `@earendil-works/pi-durable`. It is a copy of the durable coding
+agent in [`../durable`](../durable) with the coding tools and pi's coding prompt replaced by a vacation planner. It only
+looks like a coding agent because it reuses pi's interactive TUI components.
+````
+
+## !!steps Running it
+
+The demo is a plain Node entry point, [main.ts](/docs/src/experimental/vacation/main.ts). With a build, it runs directly; without one, the [source-resolver.ts](/docs/src/experimental/source-resolver.ts) preload makes workspace packages load from `src` instead of `dist`.
+
+Note the README mentions only `--continue`; the entry point does not accept anything else, and a new session uses pi's default model.
+
+````md ! README.md
+From a pi checkout, after `npm install` and `npm run build`:
+
+```bash
+node packages/coding-agent/src/experimental/vacation/main.ts
+node packages/coding-agent/src/experimental/vacation/main.ts --continue
+```
+
+Without a build, preload the source resolver so the workspace packages load from `src` instead of `dist`:
+
+```bash
+node --import ./packages/coding-agent/src/experimental/source-resolver.ts packages/coding-agent/src/experimental/vacation/main.ts
+```
+````
+
+## !!steps Where sessions live
+
+A new session picks up pi's default model and thinking level from settings. `--continue` opens the newest session for the current directory. Each session is a directory containing a SQLite database, under a folder named by a hash of the working directory. [sessions.ts](/docs/src/experimental/vacation/sessions.ts) implements this layout and the lock.
+
+Credentials are shared with pi, so there is no separate login.
+
+````md ! README.md
+A new session starts with pi's default model and thinking level from `settings.json`. `--continue` opens the newest
+session for the current directory. Sessions live under
+`~/.pi/agent/experimental/vacation-sessions/<cwd-hash>/<session>/session.sqlite`. Log in with pi itself; credentials are
+shared.
+````
+
+## !!steps What it demonstrates
+
+The list names the durable features on show: a background subagent started by the `research` tool, parallel `search` calls that each appear as a task, recovery after killing the process, and the inherited commands.
+
+Recovery works because `search` is safe to rerun and because request IDs keep a restart from sending the request or the report twice. The rendering of tasks and subagent conversations is in [tui.ts](/docs/src/experimental/vacation/tui.ts).
+
+````md ! README.md
+## What it shows
+
+- **Background subagent:** the `research` tool starts a subagent in its own conversation and returns at once. A
+  background task delivers the request and posts the subagent's report back to the main conversation as a new message,
+  so you keep chatting with the main agent while the research runs.
+- **Parallel durable tool calls:** the subagent's `search` calls run in parallel, each as its own task in the task
+  panel. The results are canned; each topic takes a different time.
+- **Recovery:** `search` is safe to rerun. Kill the process while a search runs and start it again with `--continue`:
+  finished searches are kept, the unfinished one runs again, and the report still arrives. Request IDs keep a restart
+  from sending the request or the report twice.
+- **Everything else from the durable coding agent:** steering, follow-ups, `/agents`, `/compact`, `/tasks`, `/model`.
+````
+
+## !!steps Try it and the file layout
+
+The scripted exercise ends with the interesting one: interrupt while only one search is left, restart with `--continue`, and watch the report still arrive. The table maps each file to its role; the runtime that bridges the Harness to the TUI is [runtime.ts](/docs/src/experimental/vacation/runtime.ts) and the startup wiring is [harness-setup.ts](/docs/src/experimental/vacation/harness-setup.ts).
+
+````md ! README.md
+## Try it
+
+1. "Plan a weekend in Vienna for two. Hand the research to a subagent."
+2. While the searches run, ask the main agent something else.
+3. Ctrl+C while only the trains search is left, then start again with `--continue`.
+4. `/agents` to watch or steer the subagent, `/agents` again to go back to main.
+
+## Layout
+
+| file | role |
+| --- | --- |
+| `vacation.ts` | the vacation extensions: `search`, `research`, the report task, and the prompt |
+| `main.ts` | arguments, open, run, close |
+| `sessions.ts` | session directories and the lock |
+| `harness-setup.ts` | HTTP setup, settings, the registry, the initial model |
+| `runtime.ts` | Harness and the plain `DurableView` and `DurableController` |
+| `tui.ts` | rendering with pi's interactive components |
+````
+
+</Scrollycoding>
+
+The README is the only prose description of the demo, so it is the right starting point before reading [vacation.ts](/docs/src/experimental/vacation/vacation.ts). One structural note: the layout table lists six files and the directory contains exactly those six plus this readme.

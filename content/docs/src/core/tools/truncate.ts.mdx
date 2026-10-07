@@ -1,0 +1,264 @@
+---
+title: "truncate.ts"
+description: "Line-and-byte output limits shared by every tool: head truncation for file reads, tail truncation for shell output, and a middle cut for MCP results"
+source: "src/core/tools/truncate.ts"
+full: true
+---
+
+Everything a tool returns ends up in the model's context window, so each tool needs a policy for output that is too large. This file holds those policies in one place. Two independent limits apply, 2000 lines and 50KB, and whichever is hit first wins.
+
+The two main functions differ in which end they keep. `truncateHead` keeps the beginning and is what [read.ts](/docs/src/core/tools/read.ts) uses, since the start of a file is the useful part and the model can continue with an offset. `truncateTail` keeps the end and is what [bash.ts](/docs/src/core/tools/bash.ts) and [bash-executor.ts](/docs/src/core/bash-executor.ts) use, because the last lines of a command are where errors and results are.
+
+Both return the same `TruncationResult` shape, so renderers and tool details can describe what happened (how many lines were shown, which limit applied) without caring which function ran.
+
+<Scrollycoding>
+
+## !!steps Two limits and the options type
+
+The defaults are 2000 lines and 50KB. Every function takes an optional `TruncationOptions` so callers can override either number, but the built-in tools mostly use the defaults and print them in their descriptions.
+
+`GREP_MAX_LINE_LENGTH` is separate: it is a per-line character cap used only by the grep tool, not a limit on total output. See [grep.ts](/docs/src/core/tools/grep.ts).
+
+```ts ! truncate.ts
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024; // 50KB
+export const GREP_MAX_LINE_LENGTH = 500; // Max chars per grep match line
+// ...
+export interface TruncationOptions {
+	/** Maximum number of lines (default: 2000) */
+	maxLines?: number;
+	/** Maximum number of bytes (default: 50KB) */
+	maxBytes?: number;
+}
+```
+
+## !!steps Counting lines without the trailing newline
+
+A file that ends in a newline would naively split into one extra empty string. `splitLinesForCounting` drops that final element, so `"a\nb\n"` counts as two lines, not three. An empty string counts as zero lines rather than one.
+
+All the truncation functions share this helper, which is why their line counts agree with what an editor shows.
+
+```ts ! truncate.ts
+// !mark(1:10)
+function splitLinesForCounting(content: string): string[] {
+	if (content.length === 0) {
+		return [];
+	}
+	const lines = content.split("\n");
+	if (content.endsWith("\n")) {
+		lines.pop();
+	}
+	return lines;
+}
+```
+
+## !!steps Head truncation: the fast path and the oversized first line
+
+`truncateHead` computes total bytes with `Buffer.byteLength`, so multi-byte characters count correctly, and returns the input untouched when both limits are satisfied.
+
+The second early exit handles a file whose very first line is bigger than the byte limit, such as a minified bundle. Since the function never returns partial lines, it returns empty content and sets `firstLineExceedsLimit`. The read tool turns that flag into a hint to use `sed` and `head -c` through bash.
+
+```ts ! truncate.ts
+export function truncateHead(content: string, options: TruncationOptions = {}): TruncationResult {
+	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+
+	const totalBytes = Buffer.byteLength(content, "utf-8");
+	const lines = splitLinesForCounting(content);
+	const totalLines = lines.length;
+// ...
+	// Check if no truncation needed
+	if (totalLines <= maxLines && totalBytes <= maxBytes) {
+		return {
+// ...
+	// !mark(1:3)
+	// Check if first line alone exceeds byte limit
+	const firstLineBytes = Buffer.byteLength(lines[0], "utf-8");
+	if (firstLineBytes > maxBytes) {
+		return {
+			content: "",
+			truncated: true,
+			truncatedBy: "bytes",
+			totalLines,
+			totalBytes,
+```
+
+## !!steps Head truncation: accumulating whole lines
+
+The loop walks forward and stops at whichever limit trips first. Each line costs its byte length plus one byte for the newline that joins it to the previous line, except the first.
+
+`truncatedBy` starts as `"lines"` and flips to `"bytes"` on the break. The check after the loop corrects the case where the loop ended by reaching the line limit with bytes to spare, so the reported reason is the one that actually applied.
+
+```ts ! truncate.ts
+	// Collect complete lines that fit
+	const outputLinesArr: string[] = [];
+	let outputBytesCount = 0;
+	let truncatedBy: "lines" | "bytes" = "lines";
+
+	for (let i = 0; i < lines.length && i < maxLines; i++) {
+		const line = lines[i];
+		const lineBytes = Buffer.byteLength(line, "utf-8") + (i > 0 ? 1 : 0); // +1 for newline
+
+		if (outputBytesCount + lineBytes > maxBytes) {
+			truncatedBy = "bytes";
+			break;
+		}
+
+		outputLinesArr.push(line);
+		outputBytesCount += lineBytes;
+	}
+
+	// If we exited due to line limit
+	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
+		truncatedBy = "lines";
+	}
+
+	const outputContent = outputLinesArr.join("\n");
+	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
+```
+
+## !!steps Tail truncation works backwards
+
+`truncateTail` has the same fast path and then iterates from the last line toward the first, using `unshift` to rebuild the output in order. The byte accounting mirrors the head version, but the newline cost applies once at least one line has been collected.
+
+The special case is a last line larger than the whole byte limit. Rather than return nothing, which would hide the final output of a command, it keeps the end of that line and sets `lastLinePartial`. The file header says "never returns partial lines", and this is the one documented exception.
+
+```ts ! truncate.ts
+	// Work backwards from the end
+	const outputLinesArr: string[] = [];
+	let outputBytesCount = 0;
+	let truncatedBy: "lines" | "bytes" = "lines";
+	let lastLinePartial = false;
+
+	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
+		const line = lines[i];
+		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
+
+		if (outputBytesCount + lineBytes > maxBytes) {
+			truncatedBy = "bytes";
+			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
+			// take the end of the line (partial)
+			if (outputLinesArr.length === 0) {
+				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
+				outputLinesArr.unshift(truncatedLine);
+				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
+				lastLinePartial = true;
+			}
+			break;
+		}
+
+		outputLinesArr.unshift(line);
+		outputBytesCount += lineBytes;
+	}
+
+	// If we exited due to line limit
+	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
+		truncatedBy = "lines";
+	}
+
+	const outputContent = outputLinesArr.join("\n");
+```
+
+## !!steps Cutting a string at a UTF-8 boundary
+
+The partial-line fallback has to cut by bytes without splitting a character. UTF-8 continuation bytes all look like `10xxxxxx`, so the function starts `maxBytes` back from the end and advances past any byte matching that pattern until it lands on the start of a character.
+
+The result can be a few bytes shorter than `maxBytes`, never longer.
+
+```ts ! truncate.ts
+/**
+ * Truncate a string to fit within a byte limit (from the end).
+ * Handles multi-byte UTF-8 characters correctly.
+ */
+function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
+	const buf = Buffer.from(str, "utf-8");
+	if (buf.length <= maxBytes) {
+		return str;
+	}
+
+	// Start from the end, skip maxBytes back
+	let start = buf.length - maxBytes;
+
+	// Find a valid UTF-8 boundary (start of a character)
+	while (start < buf.length && (buf[start] & 0xc0) === 0x80) {
+		start++;
+	}
+
+	return buf.slice(start).toString("utf-8");
+}
+```
+
+## !!steps Size formatting and single-line truncation
+
+`formatSize` produces the `50.0KB` style strings that appear in the truncation notices the tools append. `truncateLine` is the character-based cap for grep matches; it slices at `maxChars` UTF-16 units and appends a literal `... [truncated]` marker.
+
+```ts ! truncate.ts
+/**
+ * Format bytes as human-readable size.
+ */
+export function formatSize(bytes: number): string {
+	if (bytes < 1024) {
+		return `${bytes}B`;
+	} else if (bytes < 1024 * 1024) {
+		return `${(bytes / 1024).toFixed(1)}KB`;
+	} else {
+		return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+	}
+}
+// ...
+/**
+ * Truncate a single line to max characters, adding [truncated] suffix.
+ * Used for grep match lines.
+ */
+export function truncateLine(
+	line: string,
+	maxChars: number = GREP_MAX_LINE_LENGTH,
+): { text: string; wasTruncated: boolean } {
+	if (line.length <= maxChars) {
+		return { text: line, wasTruncated: false };
+	}
+	return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
+}
+```
+
+## !!steps Middle truncation for MCP output
+
+`truncateMiddle` is the newest addition and is used differently from the others: it keeps half of the byte budget from the start and half from the end and replaces the middle with a marker that says how many characters were removed. The doc comment says this follows Codex. It is not re-exported from [index.ts](/docs/src/core/tools/index.ts); its caller is the MCP extension in `src/extensions/mcp/tools.ts`.
+
+Both cut points are moved onto character boundaries with the same continuation-byte test, the head cut backwards and the tail cut forwards. `removedChars` is counted in code points, so the marker is accurate for emoji and CJK text.
+
+```ts ! truncate.ts
+/**
+ * Keep the start and the end of `content`, half of `maxBytes` each, and replace the middle with a
+ * `…N chars truncated…` marker, like Codex does for tool output. Cuts only at character boundaries.
+ */
+export function truncateMiddle(content: string, maxBytes: number): MiddleTruncationResult {
+	const buf = Buffer.from(content, "utf-8");
+	const totalLines = splitLinesForCounting(content).length;
+	if (buf.length <= maxBytes) {
+		return { content, truncated: false, removedChars: 0, totalBytes: buf.length, totalLines };
+	}
+	// Continuation bytes (10xxxxxx) are not character starts.
+	const isBoundary = (index: number) => index >= buf.length || (buf[index] & 0xc0) !== 0x80;
+	let headEnd = Math.floor(maxBytes / 2);
+	while (headEnd > 0 && !isBoundary(headEnd)) headEnd--;
+	let tailStart = buf.length - (maxBytes - Math.floor(maxBytes / 2));
+	while (tailStart < buf.length && !isBoundary(tailStart)) tailStart++;
+	const head = buf.subarray(0, headEnd).toString("utf-8");
+	const tail = buf.subarray(tailStart).toString("utf-8");
+	const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString("utf-8")).length;
+	return {
+		content: `${head}…${removedChars} chars truncated…${tail}`,
+		truncated: true,
+		removedChars,
+		totalBytes: buf.length,
+		totalLines,
+	};
+}
+```
+
+</Scrollycoding>
+
+The file has no dependencies beyond Node's `Buffer`, which is why every tool and the shell executor can import it freely. [index.ts](/docs/src/core/tools/index.ts) re-exports the head, tail, line and size helpers as part of the public tool API, and [output-accumulator.ts](/docs/src/core/tools/output-accumulator.ts) builds on the same limits for streaming bash output.
+
+One structural note: the byte-based limits are real byte counts, while `truncateLine` and the rolling buffer in bash-executor count characters. The two units are not interchangeable for non-ASCII output.

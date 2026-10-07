@@ -1,0 +1,175 @@
+---
+title: "read.ts"
+description: "Terminal presentation for the read tool: line-range header, compact one-liners for skills and docs, and syntax-highlighted output only when expanded"
+source: "src/core/tools/renderers/read.ts"
+full: true
+---
+
+Reading a file is the most frequent thing an agent does, so this renderer is built to stay quiet. By default a read shows only a header line and no content at all; the file body appears only when the user expands the tool. For a few special files (skills, the agent's own docs, project instruction files) the header is replaced by a compact label.
+
+The renderer lives apart from [tools/read.ts](/docs/src/core/tools/read.ts) so display code does not load the execution path. It leans on [render-utils.ts](/docs/src/core/tools/render-utils.ts) for path and text helpers and on [theme.ts](/docs/src/modes/interactive/theme/theme.ts) for syntax highlighting.
+
+<Scrollycoding>
+
+## !!steps The line range suffix
+
+When the model passes `offset` and/or `limit`, the header shows a warning-colored `:start-end` suffix, like a file location. A missing limit gives an open-ended `:start`. The check uses `== null` rather than `=== undefined` because, as the comment says, strict tool schemas make models send null for omitted optional fields.
+
+```ts ! read.ts
+type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
+function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
+	// Strict tool schemas make models send null for omitted optional fields.
+	// !mark
+	if (args?.offset == null && args?.limit == null) return "";
+	const startLine = args.offset ?? 1;
+	const endLine = args.limit != null ? startLine + args.limit - 1 : "";
+	return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+}
+function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: string): string {
+	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
+	return `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${formatReadLineRange(args, theme)}`;
+}
+```
+
+## !!steps Recognizing the agent's own docs
+
+`getPiDocsClassification` decides whether a path is inside the package that ships the agent (located through the README path from [config.ts](/docs/src/config.ts)). It computes a relative path and rejects empty, `..`, `../` prefixed and absolute results, which means the file is outside the package. Only `README.md`, `docs/` and `examples/` count as docs; the label is the posix-style relative path.
+
+```ts ! read.ts
+function getPiDocsClassification(absolutePath: string): CompactReadClassification | undefined {
+	const packageRoot = dirname(getReadmePath());
+	const relativePath = relative(resolvePath(packageRoot), resolvePath(absolutePath));
+	// !mark(1:6)
+	if (
+		relativePath === "" ||
+		relativePath === ".." ||
+		relativePath.startsWith(`..${sep}`) ||
+		isAbsolute(relativePath)
+	) {
+		return undefined;
+	}
+
+	const label = toPosixPath(relativePath);
+	if (label === "README.md" || label.startsWith("docs/") || label.startsWith("examples/")) {
+		return { kind: "docs", label };
+	}
+	return undefined;
+}
+```
+
+## !!steps Choosing a compact classification
+
+Three kinds get compact treatment, checked in order. A file named `SKILL.md` is a skill, labelled by its parent directory name. Anything under the package docs is `docs`. Project instruction files (`AGENTS.md`, `CLAUDE.md` and their variants, from the `COMPACT_RESOURCE_FILE_NAMES` set) are `resource`, labelled by a cwd-relative path. Paths are resolved with `resolveToCwd` from [path-utils.ts](/docs/src/core/tools/path-utils.ts).
+
+Because skills are matched first, a `SKILL.md` inside the docs folder is still shown as a skill.
+
+```ts ! read.ts
+function getCompactReadClassification(
+	args: ReadRenderArgs | undefined,
+	cwd: string,
+): CompactReadClassification | undefined {
+	const rawPath = str(args?.file_path ?? args?.path);
+	if (!rawPath) return undefined;
+
+	const absolutePath = resolveToCwd(rawPath, cwd);
+	const fileName = basename(absolutePath);
+	// !mark(1:3)
+	if (fileName === "SKILL.md") {
+		return { kind: "skill", label: basename(dirname(absolutePath)) || fileName };
+	}
+
+	const docsClassification = getPiDocsClassification(absolutePath);
+	if (docsClassification) return docsClassification;
+
+	if (COMPACT_RESOURCE_FILE_NAMES.has(fileName)) {
+		return { kind: "resource", label: formatPathRelativeToCwdOrAbsolute(absolutePath, cwd) };
+	}
+
+	return undefined;
+}
+```
+
+## !!steps The compact header
+
+A skill renders as a `[skill]` label plus its name; docs and resources render as `read docs <label>` or `read resource <label>`. Both end with a dim hint naming the key that expands the call. The raw `\x1b[1m` and `\x1b[22m` sequences make only the bracketed label bold inside the themed segment.
+
+```ts ! read.ts
+function formatCompactReadCall(
+	classification: CompactReadClassification,
+	args: ReadRenderArgs | undefined,
+	theme: Theme,
+): string {
+	const expandHint = theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+	if (classification.kind === "skill") {
+		return (
+			// !mark
+			theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
+			theme.fg("customMessageText", classification.label) +
+			formatReadLineRange(args, theme) +
+			expandHint
+		);
+	}
+```
+
+## !!steps Content only when expanded
+
+`formatReadResult` returns an empty string unless the tool is expanded or errored, so a successful collapsed read prints nothing under the header. When shown, the text is syntax-highlighted using a language guessed from the path, except for errors, which are plain.
+
+Trailing empty lines are trimmed. Collapsed-with-error shows ten lines and a hint for the rest; expanded shows all.
+
+```ts ! read.ts
+	// !mark(1:3)
+	if (!options.expanded && !isError) {
+		return "";
+	}
+
+	const rawPath = str(args?.file_path ?? args?.path);
+	const output = getTextOutput(result, showImages);
+	const lang = !isError && rawPath ? getLanguageFromPath(rawPath) : undefined;
+	const renderedLines = lang ? highlightCode(replaceTabs(output), lang) : output.split("\n");
+	const lines = trimTrailingEmptyLines(renderedLines);
+	const maxLines = options.expanded ? lines.length : 10;
+	const displayLines = lines.slice(0, maxLines);
+	const remaining = lines.length - maxLines;
+```
+
+## !!steps Truncation notices
+
+The read tool truncates by lines or bytes, and may fail outright if the first line alone is over the byte cap. Each case gets its own warning text. The defaults come from [truncate.ts](/docs/src/core/tools/truncate.ts) when the details carry no explicit limit.
+
+```ts ! read.ts
+	const truncation = result.details?.truncation;
+	if (truncation?.truncated) {
+		// !mark
+		if (truncation.firstLineExceedsLimit) {
+			text += `\n${theme.fg("warning", `[First line exceeds ${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit]`)}`;
+		} else if (truncation.truncatedBy === "lines") {
+			text += `\n${theme.fg("warning", `[Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines (${truncation.maxLines ?? DEFAULT_MAX_LINES} line limit)]`)}`;
+		} else {
+			text += `\n${theme.fg("warning", `[Truncated: ${truncation.outputLines} lines shown (${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit)]`)}`;
+		}
+	}
+	return text;
+```
+
+## !!steps Switching headers on expansion
+
+The compact classification is applied only while collapsed (`!context.expanded`); expanding swaps back to the normal header with the full path. `renderResult` forwards the call arguments from the context so it can recompute the language from the path.
+
+```ts ! read.ts
+export const readRenderers: Pick<ToolDefinition<any, ReadToolDetails | undefined>, "renderCall" | "renderResult"> = {
+	renderCall(rawArgs, theme, context) {
+		const args = rawArgs as ReadRenderArgs | undefined;
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		// !mark
+		const classification = !context.expanded ? getCompactReadClassification(args, context.cwd) : undefined;
+		text.setText(
+			classification ? formatCompactReadCall(classification, args, theme) : formatReadCall(args, theme, context.cwd),
+		);
+		return text;
+	},
+```
+
+</Scrollycoding>
+
+The renderer is registered in [renderers/index.ts](/docs/src/core/tools/renderers/index.ts), and its contract is the one in [extensions/types.ts](/docs/src/core/extensions/types.ts). One small oddity: `formatReadResult` takes a `_cwd` parameter it never uses.

@@ -1,0 +1,311 @@
+---
+title: "skills.ts"
+description: "Discovers SKILL.md files on disk, validates them against the Agent Skills spec, resolves name collisions, and renders the skill list for the system prompt"
+source: "src/core/skills.ts"
+full: true
+---
+
+A skill is a markdown file with frontmatter that gives the model specialized
+instructions for a kind of task. Only the name, description and file location go
+into the system prompt; the model reads the full file when the task matches. This
+file does the discovery, validation and formatting.
+
+Skills come from the user's agent directory, from the project's config
+directory, and from explicit paths in settings. Discovery honors ignore files,
+follows symlinks, and reports problems as warnings instead of failing. Names that
+collide are resolved in load order, first wins. The result feeds
+[resource-loader.ts](/docs/src/core/resource-loader.ts), and the prompt text is
+inserted by [system-prompt.ts](/docs/src/core/system-prompt.ts).
+
+<Scrollycoding>
+
+## !!steps Limits and the data model
+
+The limits come from the Agent Skills spec: names up to 64 characters,
+descriptions up to 1024. A `Skill` records where it was found (`filePath`,
+`baseDir`), its provenance as a `SourceInfo` from
+[source-info.ts](/docs/src/core/source-info.ts), and the
+`disable-model-invocation` frontmatter flag. A disabled skill is hidden from the
+prompt and can only be invoked explicitly.
+
+```ts ! skills.ts
+/** Max name length per spec */
+const MAX_NAME_LENGTH = 64;
+
+/** Max description length per spec */
+const MAX_DESCRIPTION_LENGTH = 1024;
+
+const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
+```
+
+## !!steps Ignore rules scoped to a directory
+
+Skill directories may contain `.gitignore`, `.ignore` or `.fdignore`. A single
+`ignore` matcher is shared across the whole scan, and the rules of each nested
+directory are added with their patterns prefixed by that directory's path
+relative to the root. A leading `/` is stripped so anchored patterns still apply
+only below the directory that declared them. Comments and blank lines are skipped,
+`!` negation is kept, and `\!` and `\#` escapes are respected.
+
+```ts ! skills.ts
+function prefixIgnorePattern(line: string, prefix: string): string | null {
+	const trimmed = line.trim();
+	if (!trimmed) return null;
+	if (trimmed.startsWith("#") && !trimmed.startsWith("\\#")) return null;
+
+	let pattern = line;
+	let negated = false;
+
+	if (pattern.startsWith("!")) {
+		negated = true;
+		pattern = pattern.slice(1);
+	} else if (pattern.startsWith("\\!")) {
+		pattern = pattern.slice(1);
+	}
+
+	if (pattern.startsWith("/")) {
+		pattern = pattern.slice(1);
+	}
+
+	const prefixed = prefix ? `${prefix}${pattern}` : pattern;
+	return negated ? `!${prefixed}` : prefixed;
+}
+```
+
+## !!steps Spec validation
+
+Validation returns lists of messages and never throws. A name must be lowercase
+letters, digits and hyphens, not begin or end with a hyphen, and not contain
+two hyphens in a row. A description is required and must be non-blank. These
+messages become `warning` diagnostics. The loader still loads a skill with a bad
+name, but not one with no description.
+
+```ts ! skills.ts
+function validateName(name: string): string[] {
+	const errors: string[] = [];
+
+	if (name.length > MAX_NAME_LENGTH) {
+		errors.push(`name exceeds ${MAX_NAME_LENGTH} characters (${name.length})`);
+	}
+
+	if (!/^[a-z0-9-]+$/.test(name)) {
+		errors.push(`name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)`);
+	}
+
+	if (name.startsWith("-") || name.endsWith("-")) {
+		errors.push(`name must not start or end with a hyphen`);
+	}
+
+	if (name.includes("--")) {
+		errors.push(`name must not contain consecutive hyphens`);
+	}
+
+	return errors;
+}
+```
+
+## !!steps Where a skill came from
+
+The `source` string passed by the loader is turned into a `SourceInfo`. User and
+project skills are labeled `local` with the matching scope. An explicitly
+configured path is `local` with the default `temporary` scope. Any other label
+is kept as the source name, which lets other loaders reuse the function.
+
+```ts ! skills.ts
+function createSkillSourceInfo(filePath: string, baseDir: string, source: string): SourceInfo {
+	switch (source) {
+		case "user":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				scope: "user",
+				baseDir,
+			});
+		case "project":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				scope: "project",
+				baseDir,
+			});
+		case "path":
+			return createSyntheticSourceInfo(filePath, {
+				source: "local",
+				baseDir,
+			});
+		default:
+			return createSyntheticSourceInfo(filePath, { source, baseDir });
+	}
+}
+```
+
+## !!steps Discovery rules: SKILL.md wins and stops recursion
+
+The doc comment states the three rules. The first loop over a directory's entries
+looks only for a `SKILL.md`. If one is found, it is loaded and the function
+returns immediately, so a skill directory is a leaf and its subfolders, which may
+hold reference files, are never scanned. A symlink is followed with `stat`, and a
+broken one is skipped.
+
+```ts ! skills.ts
+/**
+ * Load skills from a directory.
+ *
+ * Discovery rules:
+ * - if a directory contains SKILL.md, treat it as a skill root and do not recurse further
+ * - otherwise, load direct .md children in the root
+ * - recurse into subdirectories to find SKILL.md
+ */
+export function loadSkillsFromDir(options: LoadSkillsFromDirOptions): LoadSkillsResult {
+	const { dir, source } = options;
+	return loadSkillsFromDirInternal(dir, source, true);
+}
+```
+
+## !!steps Walking the rest of the tree
+
+When there is no `SKILL.md`, the second loop handles every entry. Hidden entries
+and `node_modules` are skipped, and ignore rules are checked with a trailing
+slash for directories. Subdirectories recurse with `includeRootFiles` false, so
+loose `.md` files count only at the top level of a configured directory. In
+nested directories only a `SKILL.md` makes a skill.
+
+```ts ! skills.ts
+		for (const entry of entries) {
+			if (entry.name.startsWith(".")) {
+				continue;
+			}
+
+			// Skip node_modules to avoid scanning dependencies
+			if (entry.name === "node_modules") {
+				continue;
+			}
+
+			const fullPath = join(dir, entry.name);
+```
+
+## !!steps Loading one file
+
+Reading and frontmatter parsing use
+[frontmatter.ts](/docs/src/utils/frontmatter.ts). A parse error is reported
+only for a file named `SKILL.md`; a stray markdown file that fails to parse is
+quietly ignored because it was never declared to be a skill. A loose `.md`
+without a description is also skipped with no diagnostic. The name falls back to
+the parent directory's name.
+
+```ts ! skills.ts
+	const description = frontmatter.description;
+	const hasDescription = typeof description === "string" && description.trim() !== "";
+	if (!isDeclaredSkill && !hasDescription) {
+		return { skill: null, diagnostics };
+	}
+
+	const skillDir = dirname(filePath);
+	const parentDirName = basename(skillDir);
+
+	// Validate description
+	const descErrors = validateDescription(description);
+	for (const error of descErrors) {
+		diagnostics.push({ type: "warning", message: error, path: filePath });
+	}
+
+	// Use name from frontmatter, or fall back to parent directory name
+	const frontmatterName = typeof frontmatter.name === "string" ? frontmatter.name : undefined;
+	const name = frontmatterName || parentDirName;
+```
+
+## !!steps Formatting skills for the prompt
+
+Skills with `disableModelInvocation` are filtered out first, and an empty list
+produces an empty string so no heading is added. The wording of the instruction
+line depends on how the model can read files: with the `read` tool, with `bash`,
+or neither. The skill entries use the XML layout of the Agent Skills standard,
+with names, descriptions and locations escaped by `escapeXml`.
+
+```ts ! skills.ts
+export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" | "indirect" = "read"): string {
+	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
+
+	if (visibleSkills.length === 0) {
+		return "";
+	}
+
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		fileReadTool === "read"
+			? "Use the read tool to load a skill's file when the task matches its description."
+			: fileReadTool === "bash"
+				? "Use bash to load a skill's file when the task matches its description."
+				: "Load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"",
+		"<available_skills>",
+	];
+```
+
+## !!steps Merging sources and resolving collisions
+
+`loadSkills` builds one map keyed by name. Defaults are loaded first, user before
+project, then explicit paths, so on a name clash the earlier skill wins and the
+later one produces a `collision` diagnostic naming both paths. Before checking
+names, `canonicalizePath` resolves symlinks, so the same real file reached by two
+routes is skipped silently rather than reported as a collision.
+
+```ts ! skills.ts
+	function addSkills(result: LoadSkillsResult) {
+		allDiagnostics.push(...result.diagnostics);
+		for (const skill of result.skills) {
+			// Resolve symlinks to detect duplicate files
+			const realPath = canonicalizePath(skill.filePath);
+
+			// Skip silently if we've already loaded this exact file (via symlink)
+			if (realPathSet.has(realPath)) {
+				continue;
+			}
+
+			const existing = skillMap.get(skill.name);
+			if (existing) {
+				collisionDiagnostics.push({
+					type: "collision",
+					message: `name "${skill.name}" collision`,
+					path: skill.filePath,
+					collision: {
+						resourceType: "skill",
+						name: skill.name,
+						winnerPath: existing.filePath,
+						loserPath: skill.filePath,
+					},
+				});
+			} else {
+				skillMap.set(skill.name, skill);
+				realPathSet.add(realPath);
+			}
+		}
+	}
+```
+
+## !!steps Defaults, then explicit paths
+
+With `includeDefaults` the user skills directory is loaded, then the project's.
+Each configured path must exist and be either a directory, scanned as above, or a
+`.md` file, loaded directly. Anything else yields a warning. When defaults are
+off, a configured path that lies under one of the default directories is still
+labeled `user` or `project`, so its source label is the same either way.
+Collision diagnostics are placed after all other diagnostics in the result.
+
+```ts ! skills.ts
+	if (includeDefaults) {
+		addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
+		addSkills(loadSkillsFromDirInternal(resolve(resolvedCwd, CONFIG_DIR_NAME, "skills"), "project", true));
+	}
+
+	const userSkillsDir = join(resolvedAgentDir, "skills");
+	const projectSkillsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "skills");
+```
+
+</Scrollycoding>
+
+The diagnostic type comes from [diagnostics.ts](/docs/src/core/diagnostics.ts).
+Skills can also be invoked as `/skill:name` commands, which is why a skill
+hidden from the prompt is still loaded; see
+[slash-commands.ts](/docs/src/core/slash-commands.ts) for the command types.
+Note that `loadSkills` declares `agentDir` as required but still contains a
+`?? getAgentDir()` fallback, which can never trigger.

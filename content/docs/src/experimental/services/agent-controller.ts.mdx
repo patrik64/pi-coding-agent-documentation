@@ -1,0 +1,112 @@
+---
+title: "agent-controller.ts"
+description: "The AgentController service contract: a presentation-safe set of prompt, steer, queue, abort and compact operations over the worker's root conversation."
+source: "src/experimental/services/agent-controller.ts"
+full: true
+---
+
+A presentation (the client TUI, a slash command, a plugin) never touches the durable conversation directly. It talks to the Session worker through a small RPC service, and this file defines that service. It holds only types and one service token, so it is safe to import on both sides of the wire.
+
+The shapes are deliberately flat and JSON friendly. Optional values are `null` rather than `undefined`, and every result is a discriminated union with an `accepted` or `status` flag, because the payloads cross the transport as opaque data. The worker-side implementation lives in [agent-controller-provider.ts](/docs/src/experimental/services/agent-controller-provider.ts); the service catalogue is described in [README.md](/docs/src/experimental/services/README.md).
+
+<Scrollycoding>
+
+## !!steps Prompt requests and errors
+
+A prompt is a message plus an optional list of base64 images. `images` is `null` rather than missing so the shape is fixed on the wire. Failures are reported as a code and message pair instead of a thrown error.
+
+```ts ! agent-controller.ts
+export interface AgentPromptImage {
+	type: "image";
+	data: string;
+	mimeType: string;
+}
+
+export interface AgentPromptRequest {
+	message: string;
+// !mark
+	images: AgentPromptImage[] | null;
+}
+
+export interface AgentOperationError {
+	code: string;
+	message: string;
+}
+```
+
+## !!steps Operation and queue responses
+
+Starting a run and queueing input return different ids. A prompt or compaction returns an `operationId`; steer and follow-up return an `entryId` that can later be passed to `cancelQueued`. Each response is a union where the failure branch carries `null` ids, so callers must check `accepted` before reading an id.
+
+```ts ! agent-controller.ts
+/** `operationId` identifies the durable submission of a prompt, or the task of a compaction. */
+// !mark(1:3)
+export type AgentOperationResponse =
+	| { accepted: true; operationId: string; error: null }
+	| { accepted: false; operationId: null; error: AgentOperationError };
+
+/** `entryId` identifies the durable submission; `cancelQueued()` withdraws it while it is still queued. */
+// !mark(1:3)
+export type AgentQueueResponse =
+	| { accepted: true; entryId: string; error: null }
+	| { accepted: false; entryId: null; error: AgentOperationError };
+```
+
+## !!steps Prompt results and compaction
+
+`AgentPromptResult` is what waiting for a prompt settles to: either the answer text or a reason it got none. A compaction request only carries optional custom instructions.
+
+```ts ! agent-controller.ts
+/** The settled outcome of a prompt: the answer's text, or why it got none. */
+export type AgentPromptResult =
+	| { status: "done"; text: string; reason: null }
+	| { status: "unanswered"; text: null; reason: string };
+
+export interface AgentCompactionRequest {
+	customInstructions: string | null;
+}
+```
+
+## !!steps The controller interface
+
+The comments carry the semantics. `prompt` is rejected with `busy` while a run is active. `steer` and `followUp` both start a run when idle, but differ when busy: steering redirects the active run, follow-up waits for it. `abort` withdraws queued input as well as stopping the run and any compaction. Every method receives a Chord `Context` so cancellation and tracing follow the call.
+
+```ts ! agent-controller.ts
+/** Presentation-safe command facade over the worker-owned root conversation. */
+export interface AgentController {
+// !mark
+	/** Start a run; rejected with `busy` while one is active. */
+	prompt(request: AgentPromptRequest, context: Context): Promise<AgentOperationResponse>;
+// !mark
+	/** Steer the active run, or start one when idle. */
+	steer(request: AgentPromptRequest, context: Context): Promise<AgentQueueResponse>;
+// !mark
+	/** Queue input for after the active run, or start one when idle. */
+	followUp(request: AgentPromptRequest, context: Context): Promise<AgentQueueResponse>;
+	cancelQueued(
+		entryId: string,
+		context: Context,
+	): Promise<{ outcome: "cancelled" | "already_consumed" | "not_found" }>;
+// !mark
+	/** Withdraw queued input and abort the active run and compaction. */
+	abort(context: Context): Promise<void>;
+	compact(request: AgentCompactionRequest, context: Context): Promise<AgentOperationResponse>;
+	/** Wait until the prompt with this `operationId` is answered or settles unanswered. */
+	waitForPrompt(operationId: string, context: Context): Promise<AgentPromptResult>;
+}
+```
+
+## !!steps The service token
+
+`defineService` pairs the interface with the id `pi.agent-controller`. The same name is both a type and a value, so a facet can write `env.use(AgentController)` and get a typed handle. The worker publishes it, and the client binds to it through the service sources in [connection.ts](/docs/src/experimental/services/connection.ts).
+
+```ts ! agent-controller.ts
+import { type Context, defineService } from "@earendil-works/chord";
+// ...
+// !mark
+export const AgentController = defineService<AgentController>("pi.agent-controller");
+```
+
+</Scrollycoding>
+
+The contract is consumed by the slash-command and chat code on the client and implemented by [agent-controller-provider.ts](/docs/src/experimental/services/agent-controller-provider.ts) on the worker. The README lists navigation and next-run queueing as dropped operations, which is why the interface is so small.

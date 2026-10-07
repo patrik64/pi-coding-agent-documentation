@@ -1,0 +1,48 @@
+---
+title: "main.ts"
+description: "Executable entry point of the experimental durable TUI: parse --continue, open the session, run the UI"
+source: "src/experimental/durable/main.ts"
+full: true
+---
+
+The shortest file of the durable experiment. It is a Node script with a shebang line, so it is run directly and not through pi's regular CLI.
+
+It does three things: parse arguments, open a durable session through [runtime.ts](/docs/src/experimental/durable/runtime.ts), and hand the result to the terminal UI in [tui.ts](/docs/src/experimental/durable/tui.ts). This is experimental code.
+
+<Scrollycoding>
+
+## !!steps Argument parsing
+
+The only supported flag is `--continue` or `-c`. Any other argument throws immediately, so there is no help text and no `--cwd`, `--model` or `--provider` option, although `OpenDurableOptions` and [harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts) could support some of them.
+
+```ts ! main.ts
+function parseArgs(argv: readonly string[]): OpenDurableOptions {
+	let continueSession = false;
+	for (const arg of argv) {
+		// !mark
+		if (arg === "--continue" || arg === "-c") continueSession = true;
+		// !mark
+		else throw new Error(`Unknown argument: ${arg}`);
+	}
+	return { continueSession };
+}
+```
+
+## !!steps Open, run, always close
+
+The script uses top-level await. `openDurable` returns a view source, a controller, the settings manager and a `close` function. `runDurableTui` resolves when the user exits, and the `finally` block closes the Harness and releases the session lock even if the UI throws.
+
+Closing writes no outcome for a running turn, which is why a later `--continue` can resume it (see [sessions.ts](/docs/src/experimental/durable/sessions.ts) for how the session is found).
+
+```ts ! main.ts
+const durable = await openDurable(parseArgs(process.argv.slice(2)));
+try {
+	await runDurableTui(durable.view, durable.controller, durable.settings);
+} finally {
+	await durable.close();
+}
+```
+
+</Scrollycoding>
+
+The file has no exports. Everything of substance lives in [runtime.ts](/docs/src/experimental/durable/runtime.ts) (state and commands) and [tui.ts](/docs/src/experimental/durable/tui.ts) (rendering), with this script only wiring them.

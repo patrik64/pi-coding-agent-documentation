@@ -1,0 +1,297 @@
+---
+title: "tools.ts"
+description: "Adapts MCP tools to pi tool definitions: name sanitizing, result conversion, output truncation, binary handling and TUI renderers"
+source: "src/extensions/mcp/tools.ts"
+full: true
+---
+
+Every tool an MCP server exposes becomes a pi `ToolDefinition` through this file. The work is mostly translation in both directions: a provider-safe tool name, an input schema that every provider will accept, annotations carried across, and the server's `CallToolResult` converted into the text and images the model can see.
+
+Two audiences read each result. The model gets bounded, readable content. Codemode scripts get the whole `CallToolResult` as `structuredContent`, never truncated. The resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) reuse the same conversion and limiting helpers, and [runtime.ts](/docs/src/extensions/mcp/runtime.ts) calls `createMcpToolDefinition` for each discovered tool.
+
+The file leans on [truncate.ts](/docs/src/core/tools/truncate.ts) for the middle-cut, [output-files.ts](/docs/src/utils/output-files.ts) for temp files, [render-utils.ts](/docs/src/core/tools/render-utils.ts) and [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts) for the TUI, and the types in [types.ts](/docs/src/core/extensions/types.ts).
+
+<Scrollycoding>
+
+## !!steps Exposure and the output limits
+
+MCP exposure has a `codemode` value that the core tool exposure type lacks. `toToolExposure` maps it to `deferred`: both keep the tool out of the codemode description, and they differ only in which tool the MCP extension activates to reach them.
+
+The constants set the policy: names up to 64 characters, model-facing text up to 20 KB, and 5 visual lines in the collapsed TUI view.
+
+```ts ! tools.ts
+export function toToolExposure(exposure: McpExposure): ToolExposure {
+	// !mark
+	return exposure === "codemode" ? "deferred" : exposure;
+}
+
+/** Provider tool names are limited to 64 characters of `[A-Za-z0-9_-]`. */
+// !mark
+const MAX_TOOL_NAME_LENGTH = 64;
+/** Model-facing text of an MCP result beyond this is cut in the middle. */
+// !mark
+export const MCP_OUTPUT_MAX_BYTES = 20 * 1024;
+/** Visual (wrapped) result lines shown before the output is expanded. */
+// !mark
+const OUTPUT_PREVIEW_LINES = 5;
+/** Tool that reads the resources named by resource links. */
+export { READ_MCP_RESOURCE_TOOL };
+
+export interface McpToolDetails {
+	server: string;
+	tool: string;
+	/** Temp file with the full text output, when the model-facing text was truncated. */
+	fullOutputPath?: string;
+}
+```
+
+## !!steps Provider-safe tool names
+
+Names follow `mcp__server__tool`, with everything outside `[A-Za-z0-9_]` replaced by an underscore, as Codex does. That makes the name usable as a script identifier too. Sanitizing can make distinct tools collide (`a-b` and `a_b`), and long names exceed provider limits; in both cases the name is cut and gets an 8-character hash of the original server and tool names.
+
+```ts ! tools.ts
+export function createMcpToolName(
+	server: string,
+	tool: string,
+	isTaken: (name: string) => boolean = () => false,
+): string {
+	// !mark(1:4)
+	const name = `mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, "_");
+	if (name.length <= MAX_TOOL_NAME_LENGTH && !isTaken(name)) return name;
+	const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 8);
+	return `${name.slice(0, MAX_TOOL_NAME_LENGTH - hash.length - 1)}_${hash}`;
+}
+```
+
+## !!steps Cutting the middle of long output
+
+`limitMcpContent` joins all text blocks and asks `truncateMiddle` to fit the byte limit. If it did not fit, the model sees one text block in Codex's truncation format (a warning, line count and the kept start and end) followed by the path of a temp file with the full text. If saving fails, the model is told that instead of the path. Images are kept after the text block.
+
+```ts ! tools.ts
+export async function limitMcpContent(
+	content: (TextContent | ImageContent)[],
+	saveOutput: McpOutputSaver = saveToTempFile,
+): Promise<{ content: (TextContent | ImageContent)[]; fullOutputPath?: string }> {
+	const combined = textOf(content);
+	// !mark(1:2)
+	const truncation = truncateMiddle(combined, MCP_OUTPUT_MAX_BYTES);
+	if (!truncation.truncated) return { content };
+	let fullOutputPath: string | undefined;
+	let where: string;
+	try {
+		// !mark
+		fullOutputPath = await saveOutput(combined, ".txt");
+		where = `[Full output: ${fullOutputPath} (read it with offset/limit)]`;
+	} catch (error) {
+		where = `[Could not save the full output: ${error instanceof Error ? error.message : String(error)}]`;
+	}
+	const tokens = Math.ceil(truncation.totalBytes / 4);
+	const text = `Warning: truncated output (original token count: ${tokens})\nTotal output lines: ${truncation.totalLines}\n\n${truncation.content}\n\n${where}`;
+	return {
+		// !mark
+		content: [{ type: "text", text }, ...content.filter((block) => block.type === "image")],
+		...(fullOutputPath ? { fullOutputPath } : {}),
+	};
+}
+```
+
+## !!steps Converting one content block
+
+Resource links become a bracketed text line with URI, title, MIME type and size, and name the `read_mcp_resource` tool when the server's resources are readable. Embedded binary resources are decoded: text-like MIME types (text, JSON, or any JSON or XML suffix) are shown as text, other blobs are saved to a temp file with an extension taken from the URI, and the model gets a pointer. Images and everything else go through `toLlmContent`.
+
+```ts ! tools.ts
+/** Model-facing content of one block of `server`'s result. */
+async function blockToContent(
+	server: string,
+	block: ContentBlock,
+	options: ConvertMcpResultOptions,
+): Promise<(TextContent | ImageContent)[]> {
+	// !mark
+	if (block.type === "resource_link") {
+		const details = [block.mimeType, block.size === undefined ? undefined : formatSize(block.size)].filter(Boolean);
+		const read = options.readableResources ? `. Read it with ${READ_MCP_RESOURCE_TOOL} (server "${server}")` : "";
+		const description = block.description ? `: ${block.description}` : "";
+		return [
+			{
+				type: "text",
+				text: `[Resource ${block.uri} "${block.title ?? block.name}"${details.length > 0 ? ` (${details.join(", ")})` : ""}${description}${read}]`,
+			},
+		];
+	}
+	// !mark
+	if (block.type === "resource" && "blob" in block.resource && !block.resource.mimeType?.startsWith("image/")) {
+		const { uri, mimeType, blob } = block.resource;
+		const data = Buffer.from(blob, "base64");
+		// !mark
+		if (isTextMimeType(mimeType)) return [{ type: "text", text: data.toString("utf8") }];
+		const kind = `${mimeType ?? "unknown type"}, ${formatSize(data.length)}`;
+		try {
+			// !mark
+			const path = await (options.saveOutput ?? saveToTempFile)(data, extensionOf(uri));
+			return [{ type: "text", text: `[Binary resource ${uri} (${kind}) saved to ${path}]` }];
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			return [{ type: "text", text: `[Binary resource ${uri} (${kind}) could not be saved: ${reason}]` }];
+		}
+	}
+	return toLlmContent({ content: [block] });
+}
+```
+
+## !!steps The whole result
+
+`convertMcpResult` converts all blocks in parallel, falls back to the structured content when there are no blocks, and guarantees an error result is never empty. The script-facing `structuredContent` is the original result minus `_meta`, so truncation never affects scripts, and `isError` is carried onto the result so the agent marks it as an error.
+
+```ts ! tools.ts
+export async function convertMcpResult(
+	server: string,
+	tool: string,
+	result: CallToolResult,
+	options: ConvertMcpResultOptions = {},
+): Promise<AgentToolResult<McpToolDetails>> {
+	// !mark(1:6)
+	// Without content blocks, toLlmContent falls back to the structured content as JSON.
+	const converted: (TextContent | ImageContent)[] =
+		result.content.length > 0 ? await toModelContent(server, result.content, options) : toLlmContent(result);
+	if (result.isError && textOf(converted) === "") {
+		converted.push({ type: "text", text: `MCP tool ${server}/${tool} returned an error` });
+	}
+	const { content, fullOutputPath } = await limitMcpContent(converted, options.saveOutput);
+	// !mark
+	const { _meta: _ignored, ...scriptResult } = result;
+	return {
+		content,
+		details: { server, tool, ...(fullOutputPath ? { fullOutputPath } : {}) },
+		structuredContent: scriptResult as unknown as JsonValue,
+		// !mark
+		...(result.isError ? { isError: true } : {}),
+	};
+}
+```
+
+## !!steps Schemas and annotations
+
+MCP servers may omit `type` in an input schema, and some providers reject an object schema without `properties`; `toParameters` fixes both. Only the four boolean annotation hints survive. Every tool gets an output schema that describes the `CallToolResult` shape, with the server's own output schema nested as `structuredContent`, which codemode uses to generate types.
+
+```ts ! tools.ts
+/**
+ * Output schema of every MCP tool: the `CallToolResult` scripts receive, with the tool's own output
+ * schema as `structuredContent`. Codemode detects this shape to render `CallToolResult<T>`
+ * declarations.
+ */
+// !mark(1:2)
+export function createMcpResultSchema(structuredContentSchema: Record<string, unknown> | undefined): TSchema {
+	return {
+		type: "object",
+		properties: {
+			content: { type: "array", items: { type: "object" } },
+			// !mark
+			...(structuredContentSchema ? { structuredContent: structuredContentSchema } : {}),
+			isError: { type: "boolean" },
+			_meta: { type: "object" },
+		},
+		// !mark
+		required: ["content"],
+	} as unknown as TSchema;
+}
+```
+
+## !!steps Building the tool definition
+
+The definition carries the label `server/tool`, a description that falls back from description to title to a generated sentence, and the exposure and namespace. `execute` obtains the client lazily through `getClient`, forwards progress notifications as tool updates, and finishes with `convertMcpResult`.
+
+```ts ! tools.ts
+export function createMcpToolDefinition(options: {
+	server: string;
+	tool: McpTool;
+	name: string;
+	exposure: McpExposure;
+	namespace: ToolNamespace;
+	timeoutMs: number;
+	getClient: () => Promise<McpToolCaller>;
+	/** Whether `read_mcp_resource` can read the server's resources. */
+	readableResources?: () => boolean;
+}): ToolDefinition<TSchema, McpToolDetails> {
+	const { server, tool } = options;
+	const title = tool.title ?? tool.annotations?.title;
+	const annotations = toToolAnnotations(tool);
+	const label = `${server}/${tool.name}`;
+	return {
+		name: options.name,
+		label,
+		// !mark
+		description: tool.description?.trim() || title || `MCP tool ${tool.name} from server ${server}`,
+		parameters: toParameters(tool.inputSchema),
+		outputSchema: createMcpResultSchema(tool.outputSchema),
+		exposure: toToolExposure(options.exposure),
+		namespace: options.namespace,
+		...(annotations ? { annotations } : {}),
+		...createMcpToolRenderers(label),
+		// !mark(1:3)
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const client = await options.getClient();
+			const result = await client.callTool(tool.name, (params ?? {}) as Record<string, unknown>, {
+				signal,
+				timeoutMs: options.timeoutMs,
+				onProgress: (progress) => {
+					const total = progress.total === undefined ? "" : `/${progress.total}`;
+					const text = progress.message ?? `Progress ${progress.progress}${total}`;
+					onUpdate?.({ content: [{ type: "text", text }], details: { server, tool: tool.name } });
+				},
+			});
+			// !mark
+			return convertMcpResult(server, tool.name, result, { readableResources: options.readableResources?.() });
+		},
+```
+
+## !!steps Collapsed and expanded rendering
+
+`createMcpToolRenderers` is exported separately because the label is needed before the tool is registered (a call can be shown while the server is still connecting). Results are colored by error state and, when collapsed, limited to 5 wrapped lines. The comment explains why: MCP results are often a single long JSON line, so logical lines would not limit anything. When the output was truncated, the full-output path is shown below.
+
+```ts ! tools.ts
+/** Renderers of calls to an MCP tool, labeled `server/tool`, also used before the tool is registered. */
+export function createMcpToolRenderers(label: string): ToolRenderers {
+	return {
+		renderCall(args, theme, context) {
+			const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			component.setText(formatToolCallWithArgs(label, args, theme, context.expanded));
+			return component;
+		},
+		renderResult(result, options, theme, context) {
+			const component = (context.lastComponent as Container | undefined) ?? new Container();
+			component.clear();
+			const output = getTextOutput(result, context.showImages).trim();
+			if (!output) return component;
+			const color = context.isError ? "error" : "toolOutput";
+			const styled = replaceTabs(output)
+				.split("\n")
+				.map((line) => theme.fg(color, line))
+				.join("\n");
+			component.addChild(new Spacer(1));
+			if (options.expanded) {
+				component.addChild(new Text(styled, 0, 0));
+			} else {
+				// !mark(1:6)
+				// Limit wrapped lines, not logical ones: MCP results are often one long JSON line.
+				component.addChild(
+					new VisualLinePreview({
+						text: styled,
+						maxVisualLines: OUTPUT_PREVIEW_LINES,
+						keep: "start",
+						formatHint: (hidden) =>
+							`${theme.fg("muted", `... (${hidden} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+					}),
+				);
+				// !mark(1:2)
+				const fullOutputPath = (result.details as McpToolDetails | undefined)?.fullOutputPath;
+				if (fullOutputPath) component.addChild(new Text(theme.fg("muted", `Full output: ${fullOutputPath}`), 0, 0));
+			}
+			return component;
+		},
+	};
+}
+```
+
+</Scrollycoding>
+
+The key invariant of the file is that conversion for the model (bounded, human-readable, with files saved on the side) and conversion for scripts (complete) are produced together in one result object. Other modules only need `createMcpToolName`, `createMcpToolDefinition`, `limitMcpContent` and `toModelContent`.

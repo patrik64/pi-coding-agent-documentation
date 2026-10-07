@@ -1,0 +1,183 @@
+---
+title: "index.ts"
+description: "Barrel and registry for the built-in tools: re-exports every tool factory and builds the coding, read-only and full tool sets by name"
+source: "src/core/tools/index.ts"
+full: true
+---
+
+This file does two jobs. The first half is a barrel: it re-exports the factories, option types and truncation helpers of each tool module so the rest of the codebase imports from one place. The second half is a small registry that knows the eight built-in tool names and can build any of them, or a preset group, for a working directory.
+
+Each tool exists in two forms. A `ToolDefinition` is the rich description used by the extension system and the renderers. An `AgentTool` is the plain form the agent loop executes, produced from the definition by [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts). The registry mirrors every function in both forms.
+
+<Scrollycoding>
+
+## !!steps Re-exporting the tool modules
+
+Each module contributes a `createXTool`, a `createXToolDefinition`, and its operations, details, input and options types. Operations types are what remote backends implement, and details types are what renderers read from results. Here are bash and edit; the other modules follow the identical pattern.
+
+```ts ! index.ts
+export {
+	type BashOperations,
+	type BashSpawnContext,
+	type BashSpawnHook,
+	type BashToolDetails,
+	type BashToolInput,
+	type BashToolOptions,
+	createBashTool,
+	createBashToolDefinition,
+	createLocalBashOperations,
+} from "./bash.ts";
+export {
+	createEditTool,
+	createEditToolDefinition,
+	type EditOperations,
+	type EditToolDetails,
+	type EditToolInput,
+	type EditToolOptions,
+} from "./edit.ts";
+```
+
+## !!steps Truncation helpers and the write tool
+
+The truncation exports are part of the public surface so extensions can apply the same limits as built-in tools. Only `truncateHead`, `truncateTail`, `truncateLine`, `formatSize` and the two defaults are re-exported; `truncateMiddle` and the grep line length constant stay internal to [truncate.ts](/docs/src/core/tools/truncate.ts).
+
+```ts ! index.ts
+export {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	type TruncationOptions,
+	type TruncationResult,
+	truncateHead,
+	truncateLine,
+	truncateTail,
+} from "./truncate.ts";
+export {
+	createWriteTool,
+	createWriteToolDefinition,
+	type WriteOperations,
+	type WriteToolInput,
+	type WriteToolOptions,
+} from "./write.ts";
+```
+
+## !!steps Tool names
+
+`ToolName` is the closed set of built-in tool names and `allToolNames` is the runtime copy of it. Having both a union type and a Set means a name coming from settings or the command line can be validated at runtime and then used as a typed key.
+
+Note that `powershell` is a first-class name next to `bash`, defined in [powershell.ts](/docs/src/core/tools/powershell.ts).
+
+```ts ! index.ts
+export type Tool = AgentTool<any>;
+export type ToolDef = ToolDefinition<any, any>;
+export type ToolName = "read" | "bash" | "powershell" | "edit" | "write" | "grep" | "find" | "ls";
+export const allToolNames: Set<ToolName> = new Set([
+	"read",
+	"bash",
+	"powershell",
+	"edit",
+	"write",
+	"grep",
+	"find",
+	"ls",
+]);
+```
+
+## !!steps One options object for all tools
+
+`ToolsOptions` groups the per-tool options under the tool's own name. Every factory in this file takes the whole object and picks out its own slice with `options?.read`, `options?.bash` and so on, so a caller configures everything in one literal.
+
+```ts ! index.ts
+export interface ToolsOptions {
+	read?: ReadToolOptions;
+	bash?: BashToolOptions;
+	powershell?: PowerShellToolOptions;
+	write?: WriteToolOptions;
+	edit?: EditToolOptions;
+	grep?: GrepToolOptions;
+	find?: FindToolOptions;
+	ls?: LsToolOptions;
+}
+```
+
+## !!steps Building a tool by name
+
+`createToolDefinition` is a switch over the name. The `default` branch throws, which is a runtime guard: the TypeScript union already makes it unreachable for typed callers, but names also arrive from user configuration.
+
+`createTool`, further down, is the same switch returning plain tools.
+
+```ts ! index.ts
+export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
+	switch (toolName) {
+		case "read":
+			return createReadToolDefinition(cwd, options?.read);
+		case "bash":
+			return createBashToolDefinition(cwd, options?.bash);
+		case "powershell":
+			return createPowerShellToolDefinition(cwd, options?.powershell);
+		case "edit":
+			return createEditToolDefinition(cwd, options?.edit);
+		case "write":
+			return createWriteToolDefinition(cwd, options?.write);
+		case "grep":
+			return createGrepToolDefinition(cwd, options?.grep);
+		case "find":
+			return createFindToolDefinition(cwd, options?.find);
+		case "ls":
+			return createLsToolDefinition(cwd, options?.ls);
+		default:
+			throw new Error(`Unknown tool name: ${toolName}`);
+	}
+}
+```
+
+## !!steps Presets: coding tools and read-only tools
+
+The two presets decide what the agent gets by default. The coding set is read, bash, edit and write, the minimum needed to inspect and change a project. The read-only set swaps the mutating tools for grep, find and ls, which is useful for planning or review modes where nothing may change.
+
+Neither preset includes powershell; it is only available through the by-name functions or the full set.
+
+```ts ! index.ts
+export function createCodingToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	return [
+		createReadToolDefinition(cwd, options?.read),
+		createBashToolDefinition(cwd, options?.bash),
+		createEditToolDefinition(cwd, options?.edit),
+		createWriteToolDefinition(cwd, options?.write),
+	];
+}
+
+export function createReadOnlyToolDefinitions(cwd: string, options?: ToolsOptions): ToolDef[] {
+	return [
+		createReadToolDefinition(cwd, options?.read),
+		createGrepToolDefinition(cwd, options?.grep),
+		createFindToolDefinition(cwd, options?.find),
+		createLsToolDefinition(cwd, options?.ls),
+	];
+}
+```
+
+## !!steps The full record
+
+`createAllTools` returns a record keyed by `ToolName`. [agent-session.ts](/docs/src/core/agent-session.ts) calls `createAllToolDefinitions`, the definition-producing twin with the same body, to build every tool once and then activate a subset by name, while [sdk.ts](/docs/src/core/sdk.ts) re-exports the coding and read-only presets for embedders. The `Definition` variant uses the matching factories.
+
+```ts ! index.ts
+export function createAllTools(cwd: string, options?: ToolsOptions): Record<ToolName, Tool> {
+	return {
+		read: createReadTool(cwd, options?.read),
+		bash: createBashTool(cwd, options?.bash),
+		powershell: createPowerShellTool(cwd, options?.powershell),
+		edit: createEditTool(cwd, options?.edit),
+		write: createWriteTool(cwd, options?.write),
+		grep: createGrepTool(cwd, options?.grep),
+		find: createFindTool(cwd, options?.find),
+		ls: createLsTool(cwd, options?.ls),
+	};
+}
+```
+
+</Scrollycoding>
+
+Individual tool files live next to this one: [read.ts](/docs/src/core/tools/read.ts), [bash.ts](/docs/src/core/tools/bash.ts), [edit.ts](/docs/src/core/tools/edit.ts), [write.ts](/docs/src/core/tools/write.ts), [grep.ts](/docs/src/core/tools/grep.ts), [find.ts](/docs/src/core/tools/find.ts) and [ls.ts](/docs/src/core/tools/ls.ts).
+
+The structure is repetitive on purpose: eight tools times two forms is six lists that must be kept in sync by hand. Adding a ninth tool means touching the name union, the Set, the options interface, two switches and two record builders, and nothing in the types forces the Set to match the union.

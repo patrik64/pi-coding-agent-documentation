@@ -1,0 +1,190 @@
+---
+title: "server.ts"
+description: "Server-side services for the experimental server: the replicated session directory, serialized session management, and plugin preparation per client attachment"
+source: "src/experimental/services/server.ts"
+full: true
+---
+
+This file builds what a connecting client can call on the server itself, as opposed to inside a session worker. It exposes the session list from [sessions.ts](/docs/src/experimental/services/sessions.ts), session create, remove, attach and detach, and the presentation plugin calls from [plugins.ts](/docs/src/experimental/services/plugins.ts).
+
+It does not know how sessions are actually stored or run. The caller passes in callbacks for list, create, remove and plugin preparation, and this file adds the replicated directory, per-client service endpoints and, importantly, ordering of mutations.
+
+<Scrollycoding>
+
+## !!steps The callbacks and the replicated directory
+
+`createExperimentalServerServices` takes five callbacks. The directory state starts at revision 1 with the list read from `options.list`, using the background context. `attachments` tracks every connected client's endpoint, so they can all be released at shutdown.
+
+```ts ! server.ts
+export async function createExperimentalServerServices(options: {
+	list(context: Context): Promise<SessionSummary[]>;
+	create(createOptions: SessionCreateOptions, context: Context): Promise<SessionSummary>;
+	remove(sessionId: string, context: Context): Promise<void>;
+	prepareSessionPlugins(
+		sessionId: string,
+		packagePaths: readonly string[] | undefined,
+		context: Context,
+	): Promise<{ readonly packagePaths: readonly string[]; readonly presentationPlugins: JsonValue }>;
+	reloadPresentationPlugins(packagePaths: readonly string[], context: Context): Promise<JsonValue>;
+}): Promise<ExperimentalServerServices> {
+	// !mark(1:5)
+	let revision = 1;
+	const directory = replicatedState<SessionDirectoryState>({
+		revision,
+		sessions: await options.list(BACKGROUND_CONTEXT),
+	});
+	const attachments = new Set<RoutedServerServiceAttachment>();
+	let mutationTail = Promise.resolve();
+
+```
+
+## !!steps Refreshing and serializing
+
+`refreshNow` reads the list again and bumps the revision in one `directory.change`, so clients receive a consistent pair.
+
+`serialize` chains operations on a promise tail. A failure is swallowed in the tail so one failed create does not block the next call, while the caller still receives the original rejection through `result`.
+
+```ts ! server.ts
+	const refreshNow = async (context: Context): Promise<void> => {
+		const sessions = await options.list(context);
+		revision += 1;
+		directory.change(context, (draft) => {
+			draft.revision = revision;
+			draft.sessions = sessions;
+		});
+	};
+	const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
+		// !mark
+		const result = mutationTail.catch(() => {}).then(operation);
+		// !mark(1:4)
+		mutationTail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	};
+```
+
+## !!steps One provider per attached client
+
+`attachClient` creates a `RemoteServiceProvider` with three singleton services. The directory is shared across clients, while plugin selection is per client: `preparedPluginPackagePaths` is a local variable in this closure.
+
+`reload` throws unless `prepareSession` ran first for that client, and both are serialized.
+
+```ts ! server.ts
+	return {
+		host: {
+			attachClient(presentation) {
+				// !mark
+				let preparedPluginPackagePaths: readonly string[] | undefined;
+				const provider = new RemoteServiceProvider([
+					{ service: SessionDirectory, mode: "singleton" },
+					{ service: SessionManagement, mode: "singleton" },
+					{ service: PresentationPlugins, mode: "singleton" },
+				]);
+				// !mark
+				provider.provide(SessionDirectory, { state: directory });
+				provider.provide(PresentationPlugins, {
+					prepareSession: ({ sessionId, packagePaths }, context) =>
+						serialize(async () => {
+							const selected = await options.prepareSessionPlugins(
+								sessionId,
+								packagePaths ?? undefined,
+								context,
+							);
+							preparedPluginPackagePaths = selected.packagePaths;
+							return selected.presentationPlugins;
+						}),
+					reload: (context) =>
+						serialize(() => {
+							// !mark(1:3)
+							if (preparedPluginPackagePaths === undefined) {
+								throw new Error("No Session plugin selection is prepared");
+							}
+							return options.reloadPresentationPlugins(preparedPluginPackagePaths, context);
+						}),
+				});
+```
+
+## !!steps Session management
+
+`create` and `remove` refresh the directory afterward, so the replicated list is updated before the call returns. `remove` first asks the presentation to prepare removal, giving the host a chance to close a running worker.
+
+`attach` and `detach` delegate to the presentation, which holds the real attachment. Detach also forgets the prepared plugin selection.
+
+```ts ! server.ts
+				provider.provide(SessionManagement, {
+					create: (createOptions, context) =>
+						serialize(async () => {
+							const created = await options.create(createOptions, context);
+							await refreshNow(context);
+							return created;
+						}),
+					remove: (sessionId, context) =>
+						// !mark(1:2)
+						serialize(async () => {
+							await presentation.prepareSessionRemoval(sessionId, context);
+							await options.remove(sessionId, context);
+							await refreshNow(context);
+						}),
+					attach: (sessionId, context) =>
+						serialize(async () => {
+							await presentation.attachSession(sessionId, context);
+						}),
+					detach: (context) =>
+						serialize(async () => {
+							// !mark
+							await presentation.detachSession(context);
+							preparedPluginPackagePaths = undefined;
+						}),
+				});
+```
+
+## !!steps Attachments and disposal
+
+The attachment wraps the provider in an endpoint. `createProviderAttachment` rejects invocations after release, and release is idempotent. It disposes both the endpoint and the provider and removes the attachment from the set.
+
+`dispose` releases all attachments with `allSettled`, waits for pending mutations, and throws a single error or an `AggregateError` if several releases failed.
+
+```ts ! server.ts
+		refresh: (context = BACKGROUND_CONTEXT) => serialize(() => refreshNow(context)),
+		async dispose() {
+			const releases = await Promise.allSettled(
+				[...attachments].map((attachment) => attachment.release(BACKGROUND_CONTEXT)),
+			);
+			attachments.clear();
+			await mutationTail;
+			const errors = releases.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+			if (errors.length === 1) throw errors[0];
+			if (errors.length > 1) throw new AggregateError(errors, "Failed to release server service attachments");
+		},
+// ...
+function createProviderAttachment(
+	provider: RemoteServiceProvider,
+	onRelease: () => void,
+): RoutedServerServiceAttachment {
+	const endpoint = createRemoteServiceEndpoint(provider);
+	// !mark
+	let released = false;
+	return {
+		invokeService(call, publish, context) {
+			// !mark
+			if (released) return Promise.reject(new Error("Server service attachment is released"));
+			return endpoint.invoke(call, publish, context);
+		},
+		release() {
+			if (released) return;
+			// !mark
+			released = true;
+			endpoint.dispose();
+			provider.dispose();
+			onRelease();
+		},
+	};
+```
+
+</Scrollycoding>
+
+This module is consumed by the experimental server entry in [server.ts](/docs/src/experimental/server.ts), which supplies the callbacks and uses [session-worker-manager.ts](/docs/src/experimental/session-worker-manager.ts) to run the actual workers.
+
+Note that the `release` method in the attachment ignores its context argument, and the `attach` and `detach` paths do not call `refreshNow`.

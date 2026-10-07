@@ -1,0 +1,13 @@
+{
+  "title": "renderers",
+  "pages": [
+    "bash.ts",
+    "edit.ts",
+    "find.ts",
+    "grep.ts",
+    "index.ts",
+    "ls.ts",
+    "read.ts",
+    "write.ts"
+  ]
+}

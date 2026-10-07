@@ -1,0 +1,10 @@
+{
+  "title": "llama",
+  "pages": [
+    "client.ts",
+    "huggingface.ts",
+    "index.ts",
+    "provider.ts",
+    "ui.ts"
+  ]
+}

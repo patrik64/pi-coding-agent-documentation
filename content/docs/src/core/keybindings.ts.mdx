@@ -1,0 +1,296 @@
+---
+title: "keybindings.ts"
+description: "Defines every app keybinding with platform-specific defaults, migrates legacy names in keybindings.json, and wraps the TUI keybindings manager"
+source: "src/core/keybindings.ts"
+full: true
+---
+
+pi's terminal UI library ships a keybindings manager and a set of `tui.*` bindings for the editor and selectors. This file extends it with the application's own `app.*` bindings, adjusts a few defaults per platform, and loads the user's overrides from `keybindings.json` in the agent directory.
+
+Two things make it more than a table. First, default keys differ on Windows and WSL, where many Ctrl chords are taken by the terminal. Second, old config files used short names such as `cursorUp`, so a migration step renames them to the namespaced form. Display of the resulting keys is handled in [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), and the extension API exposes the manager type from [types.ts](/docs/src/core/extensions/types.ts).
+
+<Scrollycoding>
+
+## !!steps Typing the app bindings into the TUI library
+
+`AppKeybindings` lists every app action as a key with value `true`. The module augmentation further down merges this interface into the TUI package's `Keybindings` interface, so the manager's methods accept `app.*` ids with full type checking.
+
+`useWindowsKeybindings` is true on win32 and on Linux under WSL, detected through `WSL_DISTRO_NAME` or `WSL_INTEROP`.
+
+```ts ! keybindings.ts
+export interface AppKeybindings {
+	"app.interrupt": true;
+	"app.clear": true;
+	"app.exit": true;
+	"app.suspend": true;
+// ...
+// !mark
+export type AppKeybinding = keyof AppKeybindings;
+
+export function useWindowsKeybindings(
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): boolean {
+	// !mark
+	return platform === "win32" || (platform === "linux" && Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP));
+}
+
+// !mark(1:3)
+declare module "@earendil-works/pi-tui" {
+	interface Keybindings extends AppKeybindings {}
+}
+
+const windowsKeybindings = useWindowsKeybindings();
+```
+
+## !!steps Overriding TUI defaults per platform
+
+`KEYBINDINGS` starts from the TUI defaults and spreads over the few that need platform handling. Undo is `ctrl+z` on Windows, `alt+z` under WSL and `ctrl+-` elsewhere. The previous and next prompt keys and search also change on Windows-like platforms.
+
+Each override spreads the original definition first, so descriptions are kept.
+
+```ts ! keybindings.ts
+export const KEYBINDINGS = {
+	...TUI_KEYBINDINGS,
+	"tui.editor.undo": {
+		...TUI_KEYBINDINGS["tui.editor.undo"],
+		// !mark
+		defaultKeys: process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z" : "ctrl+-",
+	},
+	"tui.altScreen.previousPrompt": {
+		...TUI_KEYBINDINGS["tui.altScreen.previousPrompt"],
+		// !mark
+		defaultKeys: windowsKeybindings ? "ctrl+up" : ["ctrl+shift+up", "ctrl+up"],
+	},
+	"tui.altScreen.nextPrompt": {
+		...TUI_KEYBINDINGS["tui.altScreen.nextPrompt"],
+		defaultKeys: windowsKeybindings ? "ctrl+down" : ["ctrl+shift+down", "ctrl+down"],
+	},
+	"tui.altScreen.search": {
+		...TUI_KEYBINDINGS["tui.altScreen.search"],
+		// !mark
+		defaultKeys: windowsKeybindings ? "ctrl+f" : "ctrl+shift+f",
+	},
+```
+
+## !!steps App actions and their defaults
+
+Each entry has `defaultKeys`, a string or array, and a `description`. Escape interrupts, `ctrl+c` clears the editor, `ctrl+d` exits only when the editor is empty, and `ctrl+z` suspends, with no default on Windows where there is no job control.
+
+The follow-up and dequeue keys change on Windows and WSL to different chords, `ctrl+q` and `alt+q`, instead of `alt+enter` and `alt+up`.
+
+```ts ! keybindings.ts
+	// !mark(1:3)
+	"app.interrupt": { defaultKeys: "escape", description: "Cancel or abort" },
+	"app.clear": { defaultKeys: "ctrl+c", description: "Clear editor" },
+	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
+	"app.suspend": {
+		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",
+		description: "Suspend to background",
+	},
+// ...
+	"app.message.followUp": {
+		// !mark
+		defaultKeys: windowsKeybindings ? "ctrl+q" : "alt+enter",
+		description: "Queue follow-up message",
+	},
+	"app.message.dequeue": {
+		// !mark
+		defaultKeys: windowsKeybindings ? "alt+q" : "alt+up",
+		description: "Restore queued messages",
+	},
+	"app.clipboard.pasteImage": {
+		defaultKeys: windowsKeybindings ? "alt+v" : "ctrl+v",
+		description: "Paste files on macOS, images, or text from clipboard",
+	},
+```
+
+## !!steps Intentional key reuse across contexts
+
+The same chord appears for different actions: `ctrl+p` cycles models, toggles the session path and toggles a provider's models. `ctrl+s` saves thinking level, toggles session sort and saves model selection. The source does not enforce uniqueness, so presumably each action is only active in its own screen. A user remapping one binding should know the others are separate ids.
+
+Several session actions, such as new, tree, fork and resume, have empty default keys. They exist so users can bind them.
+
+```ts ! keybindings.ts
+	"app.session.new": { defaultKeys: [], description: "Start a new session" },
+	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
+	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
+	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
+// ...
+	// !mark(1:3)
+	"app.session.togglePath": {
+		defaultKeys: "ctrl+p",
+		description: "Toggle session path display",
+	},
+	"app.session.toggleSort": {
+		defaultKeys: "ctrl+s",
+		description: "Toggle session sort mode",
+// ...
+	// !mark(1:3)
+	"app.models.save": {
+		defaultKeys: "ctrl+s",
+		description: "Save model selection",
+	},
+// ...
+	// !mark(1:2)
+	"app.models.toggleProvider": {
+		defaultKeys: "ctrl+p",
+		description: "Toggle all models for provider",
+	},
+```
+
+## !!steps Legacy names map to namespaced ids
+
+Before the `tui.` and `app.` prefixes existed, config keys were short names. This table is the one source of truth for renaming them. The `satisfies Record<string, Keybinding>` clause makes the compiler check that every target is a real binding id.
+
+```ts ! keybindings.ts
+// !mark(1:2)
+const KEYBINDING_NAME_MIGRATIONS = {
+	cursorUp: "tui.editor.cursorUp",
+	cursorDown: "tui.editor.cursorDown",
+	cursorLeft: "tui.editor.cursorLeft",
+	cursorRight: "tui.editor.cursorRight",
+	cursorWordLeft: "tui.editor.cursorWordLeft",
+	cursorWordRight: "tui.editor.cursorWordRight",
+	cursorLineStart: "tui.editor.cursorLineStart",
+	cursorLineEnd: "tui.editor.cursorLineEnd",
+	jumpForward: "tui.editor.jumpForward",
+	jumpBackward: "tui.editor.jumpBackward",
+// ...
+	toggleSessionSort: "app.session.toggleSort",
+	renameSession: "app.session.rename",
+	deleteSession: "app.session.delete",
+	// !mark(1:2)
+	deleteSessionNoninvasive: "app.session.deleteNoninvasive",
+} as const satisfies Record<string, Keybinding>;
+```
+
+## !!steps Migrating and ordering a config
+
+`migrateKeybindingsConfig` walks the raw object. A legacy key is renamed and `migrated` is set. If the new name is also present in the file, the legacy entry is dropped and the explicit new one wins.
+
+The result is passed through `orderKeybindingsConfig`, which puts known bindings in definition order and sorts the unknown extras alphabetically, so a rewritten file is stable.
+
+```ts ! keybindings.ts
+export function migrateKeybindingsConfig(rawConfig: Record<string, unknown>): {
+	config: Record<string, unknown>;
+	migrated: boolean;
+} {
+	const config: Record<string, unknown> = {};
+	let migrated = false;
+
+	for (const [key, value] of Object.entries(rawConfig)) {
+		// !mark(1:8)
+		const nextKey = isLegacyKeybindingName(key) ? KEYBINDING_NAME_MIGRATIONS[key] : key;
+		if (nextKey !== key) {
+			migrated = true;
+		}
+		if (key !== nextKey && Object.hasOwn(rawConfig, nextKey)) {
+			migrated = true;
+			continue;
+		}
+		config[nextKey] = value;
+	}
+
+	return { config: orderKeybindingsConfig(config), migrated };
+}
+
+function orderKeybindingsConfig(config: Record<string, unknown>): Record<string, unknown> {
+	const ordered: Record<string, unknown> = {};
+	for (const keybinding of Object.keys(KEYBINDINGS)) {
+		if (Object.hasOwn(config, keybinding)) {
+			ordered[keybinding] = config[keybinding];
+		}
+	}
+
+	const extras = Object.keys(config)
+		.filter((key) => !Object.hasOwn(ordered, key))
+		.sort();
+	for (const key of extras) {
+		ordered[key] = config[key];
+	}
+
+	return ordered;
+}
+```
+
+## !!steps Loading the file defensively
+
+`loadRawConfig` returns `undefined` for a missing file, bad JSON, or a non-object, and never throws. `toKeybindingsConfig` then keeps only string or string-array values, silently skipping entries of other types.
+
+Silent dropping keeps a broken config from preventing startup, at the cost of no feedback about what was ignored.
+
+```ts ! keybindings.ts
+function toKeybindingsConfig(value: Record<string, unknown>): KeybindingsConfig {
+	const config: KeybindingsConfig = {};
+	for (const [key, binding] of Object.entries(value)) {
+		// !mark(1:3)
+		if (typeof binding === "string") {
+			config[key] = binding as KeyId;
+			continue;
+		}
+		// !mark(1:3)
+		if (Array.isArray(binding) && binding.every((entry) => typeof entry === "string")) {
+			config[key] = binding as KeyId[];
+		}
+	}
+	return config;
+}
+// ...
+function loadRawConfig(path: string): Record<string, unknown> | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		const parsed = JSON.parse(stripBom(readFileSync(path, "utf-8"))) as unknown;
+		if (typeof parsed !== "object" || parsed === null) return undefined;
+		return parsed as Record<string, unknown>;
+	} catch {
+		return undefined;
+	}
+}
+```
+
+## !!steps The manager
+
+`KeybindingsManager` extends the TUI manager, passing the combined defaults and the user's overrides. `create` builds the path `keybindings.json` under the agent directory from [config.ts](/docs/src/config.ts) and loads it. `reload` re-reads the file when there is a path. `getEffectiveConfig` returns the resolved bindings.
+
+Note that `loadFromFile` migrates names in memory only. Nothing in this file writes the migrated config back to disk, so the file keeps its old names unless something else saves it.
+
+```ts ! keybindings.ts
+export class KeybindingsManager extends TuiKeybindingsManager {
+	private configPath: string | undefined;
+
+	constructor(userBindings: KeybindingsConfig = {}, configPath?: string) {
+		super(KEYBINDINGS, userBindings);
+		this.configPath = configPath;
+	}
+
+	// !mark(1:5)
+	static create(agentDir: string = getAgentDir()): KeybindingsManager {
+		const configPath = join(agentDir, "keybindings.json");
+		const userBindings = KeybindingsManager.loadFromFile(configPath);
+		return new KeybindingsManager(userBindings, configPath);
+	}
+
+	// !mark(1:4)
+	reload(): void {
+		if (!this.configPath) return;
+		this.setUserBindings(KeybindingsManager.loadFromFile(this.configPath));
+	}
+
+	getEffectiveConfig(): KeybindingsConfig {
+		return this.getResolvedBindings();
+	}
+
+	private static loadFromFile(path: string): KeybindingsConfig {
+		const rawConfig = loadRawConfig(path);
+		if (!rawConfig) return {};
+		return toKeybindingsConfig(migrateKeybindingsConfig(rawConfig).config);
+	}
+}
+
+export type { Keybinding, KeyId, KeybindingsConfig };
+```
+
+</Scrollycoding>
+
+Callers obtain a manager through `create` and can call `reload` to pick up edits to the file. The final line re-exports the TUI types so other modules import them from here rather than from the library.

@@ -1,0 +1,85 @@
+---
+title: "keybinding-hints.ts"
+description: "Formats keybinding hints such as 'esc cancel' for the UI, turning configured keys into themed, platform-aware text"
+source: "src/modes/interactive/components/keybinding-hints.ts"
+full: true
+---
+
+Almost every dialog in the interactive TUI ends with a footer line such as "enter submit  esc cancel". This file builds those hints. It asks the global keybinding table from `@earendil-works/pi-tui` which keys are currently bound to an action, so the text always reflects the user's own configuration instead of hard-coded defaults.
+
+It is deliberately small and pure: a couple of string helpers, then two themed wrappers. [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts), [extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts), [extension-editor.ts](/docs/src/modes/interactive/components/extension-editor.ts) and [first-time-setup.ts](/docs/src/modes/interactive/components/first-time-setup.ts) all use `keyHint` and `rawKeyHint`. Colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+<Scrollycoding>
+
+## !!steps Displaying one key part
+
+`formatKeyPart` handles a single piece of a key id such as `alt` or `ctrl`. On macOS the Alt key is labelled Option on the keyboard, so `alt` is rewritten to `option` there. The comparison is case-insensitive, and the optional `capitalize` flag upper-cases the first letter for places that want prose style.
+
+```ts ! keybinding-hints.ts
+export interface KeyTextFormatOptions {
+	capitalize?: boolean;
+}
+
+function formatKeyPart(part: string, options: KeyTextFormatOptions): string {
+// !mark
+	const displayPart = process.platform === "darwin" && part.toLowerCase() === "alt" ? "option" : part;
+	return options.capitalize ? displayPart.charAt(0).toUpperCase() + displayPart.slice(1) : displayPart;
+}
+```
+
+## !!steps Formatting a whole key string
+
+`formatKeyText` takes a key id string and splits it twice. A `/` separates alternative bindings (for example `up/k`), and a `+` separates the parts of a chord (`ctrl+c`). Each part is passed through `formatKeyPart` and the pieces are glued back together with the same separators, so only the parts that need translation change.
+
+```ts ! keybinding-hints.ts
+export function formatKeyText(key: string, options: KeyTextFormatOptions = {}): string {
+	return key
+		.split("/")
+		.map((k) =>
+			k
+				.split("+")
+				.map((part) => formatKeyPart(part, options))
+				.join("+"),
+		)
+		.join("/");
+}
+```
+
+## !!steps Looking up the bound keys
+
+`formatKeys` joins a list of key ids with `/` and reuses `formatKeyText`; an unbound action produces an empty string. `keyText` and `keyDisplayText` fetch the live bindings with `getKeybindings().getKeys(...)`. The second capitalizes, which suits menus and help text rather than inline hints. Note that `keyDisplayText` is not re-exported from the components barrel [index.ts](/docs/src/modes/interactive/components/index.ts), which only exposes `keyHint`, `keyText` and `rawKeyHint`.
+
+```ts ! keybinding-hints.ts
+function formatKeys(keys: KeyId[], options: KeyTextFormatOptions = {}): string {
+	if (keys.length === 0) return "";
+	return formatKeyText(keys.join("/"), options);
+}
+
+export function keyText(keybinding: Keybinding): string {
+	return formatKeys(getKeybindings().getKeys(keybinding));
+}
+
+export function keyDisplayText(keybinding: Keybinding): string {
+	return formatKeys(getKeybindings().getKeys(keybinding), { capitalize: true });
+}
+```
+
+## !!steps Themed hints
+
+`keyHint` is the everyday entry point: the key in the dim color followed by the description in the muted color, so the key reads as a label and the description as the explanation. `rawKeyHint` does the same for a literal string such as the arrow pair, which is not a configurable binding. It still passes through `formatKeyText`, so a raw `alt+x` would also become `option+x` on a Mac.
+
+```ts ! keybinding-hints.ts
+export function keyHint(keybinding: Keybinding, description: string): string {
+// !mark
+	return theme.fg("dim", keyText(keybinding)) + theme.fg("muted", ` ${description}`);
+}
+
+export function rawKeyHint(key: string, description: string): string {
+// !mark
+	return theme.fg("dim", formatKeyText(key)) + theme.fg("muted", ` ${description}`);
+}
+```
+
+</Scrollycoding>
+
+The module is a leaf: it depends only on the keybinding registry and the theme, and nothing here has state. Because the key text is read at call time, hints built once in a component constructor will show whatever bindings were active at construction. [keybindings.ts](/docs/src/core/keybindings.ts) holds the application-level binding definitions that populate that registry.

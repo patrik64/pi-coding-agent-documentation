@@ -1,0 +1,251 @@
+---
+title: "find.ts"
+description: "The find tool: glob-based file search that shells out to fd by default, or to a custom glob backend, with result and byte limits"
+source: "src/core/tools/find.ts"
+full: true
+---
+
+`find` lets the model locate files by glob pattern, for example `src/**/*.spec.ts`.
+By default it runs the `fd` binary, which is fast and respects `.gitignore`;
+the binary is located or downloaded by
+[tools-manager.ts](/docs/src/utils/tools-manager.ts). An alternative backend can
+be injected with a `glob` operation, which is how remote or sandboxed
+environments reuse the tool.
+
+The file has more branches than its sibling [ls.ts](/docs/src/core/tools/ls.ts)
+because it must manage a child process, an abort signal and two result paths,
+and format both in the same way. Output limits come from
+[truncate.ts](/docs/src/core/tools/truncate.ts), path resolution from
+[path-utils.ts](/docs/src/core/tools/path-utils.ts), and rendering from
+[renderers/find.ts](/docs/src/core/tools/renderers/find.ts).
+
+<Scrollycoding>
+
+## !!steps Normalizing result paths
+
+Whatever the backend returns is converted to a path relative to the search root,
+with forward slashes. A trailing separator, which `fd` adds for directories, is
+preserved as `/`. The path module is a parameter so the Windows behavior can be
+tested on any platform.
+
+```ts ! find.ts
+export function relativizeFindResultPath(
+	resultPath: string,
+	searchPath: string,
+	pathModule: path.PlatformPath = path,
+): string {
+	const hadTrailingSeparator =
+		resultPath.endsWith(pathModule.sep) || (pathModule.sep === "\\" && resultPath.endsWith("/"));
+	const relativePath = pathModule.isAbsolute(resultPath) ? pathModule.relative(searchPath, resultPath) : resultPath;
+	const posixPath = relativePath.split(pathModule.sep).join("/");
+	return hadTrailingSeparator && !posixPath.endsWith("/") ? `${posixPath}/` : posixPath;
+}
+```
+
+## !!steps Schema and the pluggable glob
+
+Only `pattern` is required. `FindOperations` has `exists` and `glob`. The default
+`glob` is an empty placeholder, as its comment says: the real default work
+happens inside `execute` when no custom operations are given. The tool decides
+which path to take by checking `customOps?.glob`, not the placeholder.
+
+```ts ! find.ts
+export interface FindOperations {
+	/** Check if path exists */
+	exists: (absolutePath: string) => Promise<boolean> | boolean;
+	/** Find files matching glob pattern. Returns relative or absolute paths. */
+	glob: (pattern: string, cwd: string, options: { ignore: string[]; limit: number }) => Promise<string[]> | string[];
+}
+
+const defaultFindOperations: FindOperations = {
+	exists: pathExists,
+	// This is a placeholder. Actual fd execution happens in execute() when no custom glob is provided.
+	glob: () => [],
+};
+```
+
+## !!steps One settle function for every exit
+
+There are many ways out: abort, process error, process close, or a thrown
+exception. `settle` runs the first resolve or reject only, removes the abort
+listener, and clears `stopChild`. `onAbort` kills the child process if one is
+running and then rejects.
+
+```ts ! find.ts
+				let settled = false;
+				let stopChild: (() => void) | undefined;
+				const settle = (fn: () => void) => {
+					if (settled) return;
+					settled = true;
+					signal?.removeEventListener("abort", onAbort);
+					stopChild = undefined;
+					fn();
+				};
+				const onAbort = () => {
+					stopChild?.();
+					settle(() => reject(new Error("Operation aborted")));
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+```
+
+## !!steps The custom glob path
+
+With a custom backend, the tool checks that the root exists, calls `glob` with
+ignores for `node_modules` and `.git` and the limit, and checks for abort after
+each await because the backend cannot be interrupted. The results are
+relativized and assembled like the fd results.
+
+```ts ! find.ts
+						if (customOps?.glob) {
+							if (!(await ops.exists(searchPath))) {
+								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
+								return;
+							}
+							if (signal?.aborted) {
+								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							const results = await ops.glob(pattern, searchPath, {
+								ignore: ["**/node_modules/**", "**/.git/**"],
+								limit: effectiveLimit,
+							});
+```
+
+## !!steps Choosing fd flags: git awareness
+
+fd always gets `--glob`, `--hidden` and no color. Whether to add
+`--no-require-git` depends on whether the search path or any ancestor contains
+a `.git`: outside a repository, fd would otherwise ignore `.gitignore` files, so
+the flag forces it to honor them. Inside a repository the flag is omitted so
+that a parent repo's rules stop at nested repo boundaries, as the comment
+explains with a link to the issue.
+
+```ts ! find.ts
+						const args: string[] = ["--glob", "--color=never", "--hidden"];
+
+						// fd normally ignores .gitignore outside git repos, so keep --no-require-git
+						// there. Inside repos, use fd's default git-aware behavior so parent
+						// .gitignore rules stop at nested repo boundaries:
+						// https://github.com/earendil-works/pi/issues/5960
+						let insideGitRepo = false;
+						for (let current = searchPath; ; ) {
+							if (await pathExists(path.join(current, ".git"))) {
+								insideGitRepo = true;
+								break;
+							}
+							const parent = path.dirname(current);
+							if (parent === current) break;
+							current = parent;
+						}
+						if (!insideGitRepo) args.push("--no-require-git");
+						args.push("--max-results", String(effectiveLimit));
+```
+
+## !!steps Making path patterns work with fd
+
+By default `fd --glob` matches only the basename. If the pattern contains a
+slash, the tool switches to `--full-path`, in which fd matches against the whole
+absolute path. A pattern like `src/**/*.spec.ts` would then never match, so it
+is prefixed with `**/` unless it is already absolute or starts with `**`. On
+Windows the slashes become a character class matching either separator.
+
+```ts ! find.ts
+						let effectivePattern = pattern;
+						if (pattern.includes("/")) {
+							args.push("--full-path");
+							if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") {
+								effectivePattern = `**/${pattern}`;
+							}
+							// fd matches full paths using native separators on Windows.
+							if (process.platform === "win32")
+								effectivePattern = effectivePattern.replaceAll("/", String.raw`[/\\]`);
+						}
+						args.push("--", effectivePattern, searchPath);
+```
+
+## !!steps Running the process and reading lines
+
+The child is spawned with stdin ignored and its stdout wrapped in a readline
+interface that collects lines. stderr is collected separately for error
+messages. `stopChild` is assigned here, which is what lets an abort kill the
+process. A spawn failure becomes a `Failed to run fd` error.
+
+```ts ! find.ts
+						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const rl = createInterface({ input: child.stdout });
+						let stderr = "";
+						const lines: string[] = [];
+
+						stopChild = () => {
+							if (!child.killed) {
+								child.kill();
+							}
+						};
+
+						const cleanup = () => {
+							rl.close();
+						};
+
+						child.stderr?.on("data", (chunk) => {
+							stderr += chunk.toString();
+						});
+
+						rl.on("line", (line) => {
+							lines.push(line);
+						});
+```
+
+## !!steps Interpreting the exit
+
+On close, an abort wins first. A nonzero exit code only becomes an error when
+there is no output at all, so a partial result with a warning on stderr is
+still returned. Empty output returns the text `No files found matching pattern`.
+
+```ts ! find.ts
+						child.on("close", (code) => {
+							cleanup();
+							if (signal?.aborted) {
+								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							const output = lines.join("\n");
+							if (code !== 0) {
+								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
+								if (!output) {
+									settle(() => reject(new Error(errorMsg)));
+									return;
+								}
+							}
+```
+
+## !!steps Notices for limits
+
+Lines are cleaned of trailing carriage returns and relativized. The result
+limit is considered reached when the count is at least the limit, which also
+fires when there are exactly that many matches. The fd path adds a hint to double
+`limit` or refine the pattern; the custom path in the same file uses a shorter
+notice without the hint.
+
+```ts ! find.ts
+							const resultLimitReached = relativized.length >= effectiveLimit;
+							const rawOutput = relativized.join("\n");
+							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							let resultOutput = truncation.content;
+							const details: FindToolDetails = {};
+							const notices: string[] = [];
+							if (resultLimitReached) {
+								notices.push(
+									`${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+								);
+								details.resultLimitReached = effectiveLimit;
+							}
+```
+
+</Scrollycoding>
+
+[grep.ts](/docs/src/core/tools/grep.ts) uses the same pattern with `rg` in
+place of `fd`. The result-formatting block is written out twice in this file,
+once for each backend, and the two copies already differ in the wording of the
+limit notice. The system-prompt snippet says the tool respects `.gitignore`,
+which holds for fd but not for a custom backend, where only `node_modules` and
+`.git` are excluded.

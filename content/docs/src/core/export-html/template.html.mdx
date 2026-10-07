@@ -1,0 +1,86 @@
+---
+title: "template.html"
+description: "The static HTML shell of an exported session, with placeholders for CSS, JS, vendored libraries and session data"
+source: "src/core/export-html/template.html"
+full: true
+---
+
+This is the skeleton of the standalone HTML file that session export produces. It contains no logic of its own: just the page layout (a sidebar with the session tree, a main column for messages) and a handful of `{{PLACEHOLDER}}` tokens that [index.ts](/docs/src/core/export-html/index.ts) fills in with string replacement.
+
+Everything the page needs is inlined, so the exported file works offline and can be shared as a single attachment or gist. The behavior lives in [template.js](/docs/src/core/export-html/template.js) and the styling in [template.css](/docs/src/core/export-html/template.css).
+
+<Scrollycoding>
+
+## !!steps Head and the CSS slot
+
+The title is a fixed `Session Export`. The whole stylesheet is injected into an inline style element through the CSS token, so there is no external request. [template.css](/docs/src/core/export-html/template.css) is the file that gets substituted here.
+
+```html ! template.html
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Export</title>
+  <style>
+{{CSS}}
+  </style>
+```
+
+## !!steps Sidebar with search and filters
+
+The sidebar holds a search box and five filter buttons whose `data-filter` values (`default`, `no-tools`, `user-only`, `labeled-only`, `all`) are matched by the `filterNodes` switch in [template.js](/docs/src/core/export-html/template.js). The tree itself is empty here; JavaScript fills the tree container at load time.
+
+```html ! template.html
+    <aside id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-controls">
+          <input type="text" class="sidebar-search" id="tree-search" placeholder="Search...">
+        </div>
+        <div class="sidebar-filters">
+          <button class="filter-btn active" data-filter="default" title="Hide settings entries">Default</button>
+          <button class="filter-btn" data-filter="no-tools" title="Default minus tool results">No-tools</button>
+          <button class="filter-btn" data-filter="user-only" title="Only user messages">User</button>
+          <button class="filter-btn" data-filter="labeled-only" title="Only labeled entries">Labeled</button>
+          <button class="filter-btn" data-filter="all" title="Show everything">All</button>
+          <button class="sidebar-close" id="sidebar-close" title="Close">✕</button>
+        </div>
+```
+
+## !!steps Content column and image modal
+
+The main element has two empty containers: one for the header with session stats, one for the messages of the currently selected branch. The image modal is a hidden overlay that the script shows when an image is clicked.
+
+```html ! template.html
+    <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize session tree sidebar"></div>
+    <main id="content">
+      <div id="header-container"></div>
+      <div id="messages"></div>
+    </main>
+    <div id="image-modal" class="image-modal">
+      <img id="modal-image" src="" alt="">
+    </div>
+  </div>
+```
+
+## !!steps Data and scripts, in dependency order
+
+The session is embedded as a JSON script element, but the token holds base64 text, not raw JSON, which avoids any escaping problems with `</script>` inside conversation text. The vendored marked and highlight.js bundles come before the main script because it uses both as globals. The vendor files are read from disk by the generator in [index.ts](/docs/src/core/export-html/index.ts).
+
+```html ! template.html
+  <script id="session-data" type="application/json">{{SESSION_DATA}}</script>
+
+  <!-- Vendored libraries -->
+  <script>{{MARKED_JS}}</script>
+
+  <!-- highlight.js -->
+  <script>{{HIGHLIGHT_JS}}</script>
+
+  <!-- Main application code -->
+  <script>
+{{JS}}
+  </script>
+</body>
+</html>
+```
+
+</Scrollycoding>
+
+Nothing is parsed or rendered at build time. The exporter only substitutes tokens, so a bug in the shell shows up as a blank page rather than a TypeScript error. Because the tokens are replaced with plain string replacement, the order of script blocks is the only structural contract with [template.js](/docs/src/core/export-html/template.js).

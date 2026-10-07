@@ -1,0 +1,391 @@
+---
+title: "edit-diff.ts"
+description: "The matching and diff engine behind the edit tool: exact-then-fuzzy text lookup, overlap checks, line-preserving replacement, and diff generation"
+source: "src/core/tools/edit-diff.ts"
+full: true
+---
+
+This file holds the pure logic of the edit tool. Given LF-normalized file content and a list of `oldText`/`newText` pairs, it finds each `oldText`, checks that the edits are unambiguous and disjoint, applies them, and produces diffs. [edit.ts](/docs/src/core/tools/edit.ts) calls it for the real write, and the TUI preview in [edit.ts](/docs/src/core/tools/renderers/edit.ts) uses `computeEditsDiff` to show a diff before the tool runs.
+
+The central design choice is tolerance with safety. Models routinely reproduce text with smart quotes, odd dashes or trailing spaces. When an exact match fails, the code retries in a normalized space, but it still demands exactly one match and then copies unchanged lines back from the original so the rest of the file is not silently normalized.
+
+<Scrollycoding>
+
+## !!steps Line endings
+
+The tool works internally with LF only. `detectLineEnding` looks at the first line break in the file: CRLF only if a `\r\n` appears before any bare `\n`. A file with no newline defaults to LF. `normalizeToLF` also converts lone `\r`, and `restoreLineEndings` converts back only for CRLF files.
+
+A file with mixed endings is restored entirely as one style, whichever came first.
+
+```ts ! edit-diff.ts
+export function detectLineEnding(content: string): "\r\n" | "\n" {
+	const crlfIdx = content.indexOf("\r\n");
+	const lfIdx = content.indexOf("\n");
+	if (lfIdx === -1) return "\n";
+	if (crlfIdx === -1) return "\n";
+	return crlfIdx < lfIdx ? "\r\n" : "\n";
+}
+
+export function normalizeToLF(text: string): string {
+	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
+	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
+}
+```
+
+## !!steps Fuzzy normalization
+
+The normalizer is applied to both the file content and the model's `oldText`. It uses NFKC, strips trailing whitespace on each line, and maps smart quotes, assorted dashes and unusual space characters to ASCII.
+
+NFKC is the broadest step: it also folds compatibility forms such as full-width letters and ligatures, so the fuzzy space is more permissive than the comments listing four transformations suggest.
+
+```ts ! edit-diff.ts
+export function normalizeForFuzzyMatch(text: string): string {
+	return (
+		text
+			.normalize("NFKC")
+			// Strip trailing whitespace per line
+			.split("\n")
+			.map((line) => line.trimEnd())
+			.join("\n")
+			// Smart single quotes → '
+			// !mark
+			.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+// ...
+			// !mark
+			.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+			// !mark(1:2)
+			.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ")
+	);
+```
+
+## !!steps Exact first, then fuzzy
+
+`fuzzyFindText` tries `indexOf` on the raw content first. Only if that fails does it normalize both strings and search again. In the fuzzy case the returned index refers to the normalized content, and `contentForReplacement` is that normalized content, so callers must apply the replacement there.
+
+```ts ! edit-diff.ts
+	// Try fuzzy match - work entirely in normalized space
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
+
+	if (fuzzyIndex === -1) {
+		return {
+			found: false,
+			index: -1,
+			matchLength: 0,
+			usedFuzzyMatch: false,
+			contentForReplacement: content,
+		};
+	}
+
+	// When fuzzy matching, return offsets in normalized space. Callers can use
+	// the normalized content to compute replacements, then decide how much of
+	// that normalized output should be written back.
+	return {
+		found: true,
+		index: fuzzyIndex,
+		matchLength: fuzzyOldText.length,
+		usedFuzzyMatch: true,
+		contentForReplacement: fuzzyContent,
+	};
+}
+```
+
+## !!steps Uniqueness and error messages
+
+`countOccurrences` always normalizes both sides before counting, even when the match was exact. A separate family of small functions builds error messages that differ for single-edit and multi-edit calls, naming `edits[i]` only when there are several so the model knows which entry to fix.
+
+```ts ! edit-diff.ts
+function countOccurrences(content: string, oldText: string): number {
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	return fuzzyContent.split(fuzzyOldText).length - 1;
+}
+
+function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+	if (totalEdits === 1) {
+		return new Error(
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+		);
+	}
+	return new Error(
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+	);
+}
+```
+
+## !!steps Matching every edit against the same content
+
+`applyEditsToNormalizedContent` first normalizes line endings in the edits and rejects empty `oldText`. It then does a trial pass to see whether any edit needs fuzzy matching. If one does, the whole call is switched to normalized space, so all edits are located in the same coordinate system.
+
+Each edit is then matched again in the chosen content, must be found, and must occur once. Because all matches are against the original, edits cannot depend on each other.
+
+```ts ! edit-diff.ts
+	const normalizedEdits = edits.map((edit) => ({
+		oldText: normalizeToLF(edit.oldText),
+		newText: normalizeToLF(edit.newText),
+	}));
+
+	for (let i = 0; i < normalizedEdits.length; i++) {
+		if (normalizedEdits[i].oldText.length === 0) {
+			throw getEmptyOldTextError(path, i, normalizedEdits.length);
+		}
+	}
+
+	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
+	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
+	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+
+	const matchedEdits: MatchedEdit[] = [];
+	for (let i = 0; i < normalizedEdits.length; i++) {
+		const edit = normalizedEdits[i];
+		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
+		if (!matchResult.found) {
+			throw getNotFoundError(path, i, normalizedEdits.length);
+		}
+
+		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
+		if (occurrences > 1) {
+			throw getDuplicateError(path, i, normalizedEdits.length, occurrences);
+		}
+```
+
+## !!steps Overlap check and the no-op guard
+
+Matches are sorted by position and neighbours are compared: if one starts before the previous ends, the call fails with a message telling the model to merge them. Disjointness is what makes it safe to apply them in any order.
+
+An exact-only call applies replacements straight to the content. A fuzzy call goes through the line-preserving path. Finally, if the result equals the input, the function throws rather than reporting a successful no-op.
+
+```ts ! edit-diff.ts
+		matchedEdits.push({
+			editIndex: i,
+			matchIndex: matchResult.index,
+			matchLength: matchResult.matchLength,
+			newText: edit.newText,
+		});
+	}
+
+	matchedEdits.sort((a, b) => a.matchIndex - b.matchIndex);
+	for (let i = 1; i < matchedEdits.length; i++) {
+		const previous = matchedEdits[i - 1];
+		const current = matchedEdits[i];
+		if (previous.matchIndex + previous.matchLength > current.matchIndex) {
+			throw new Error(
+				`edits[${previous.editIndex}] and edits[${current.editIndex}] overlap in ${path}. Merge them into one edit or target disjoint regions.`,
+			);
+		}
+	}
+
+	const baseContent = normalizedContent;
+	const newContent = usedFuzzyMatch
+		? applyReplacementsPreservingUnchangedLines(normalizedContent, replacementBaseContent, matchedEdits)
+		: applyReplacements(replacementBaseContent, matchedEdits);
+
+	if (baseContent === newContent) {
+		throw getNoChangeError(path, normalizedEdits.length);
+	}
+
+	return { baseContent, newContent };
+}
+```
+
+## !!steps Applying replacements from the end
+
+Replacements are applied from the last to the first, so the earlier offsets stay valid while the string changes length. The `offset` parameter lets the same function work on a slice of the content, which the line-preserving variant uses.
+
+```ts ! edit-diff.ts
+function applyReplacements(content: string, replacements: TextReplacement[], offset = 0): string {
+	let result = content;
+	for (let i = replacements.length - 1; i >= 0; i--) {
+		const replacement = replacements[i];
+		const matchIndex = replacement.matchIndex - offset;
+		result =
+			result.substring(0, matchIndex) + replacement.newText + result.substring(matchIndex + replacement.matchLength);
+	}
+	return result;
+}
+```
+
+## !!steps Widening a replacement to whole lines
+
+To keep untouched lines byte-identical, each replacement is mapped to the lines it touches. `getLineSpans` gives character offsets per line, and `getReplacementLineRange` finds the first line containing the match start and the last line whose end reaches the match end.
+
+```ts ! edit-diff.ts
+function getReplacementLineRange(lines: LineSpan[], replacement: TextReplacement) {
+	const replacementStart = replacement.matchIndex;
+	const replacementEnd = replacement.matchIndex + replacement.matchLength;
+
+	let startLine = -1;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		if (replacementStart >= line.start && replacementStart < line.end) {
+			startLine = i;
+			break;
+		}
+	}
+	if (startLine === -1) {
+		throw new Error("Replacement range is outside the base content.");
+	}
+
+	let endLine = startLine;
+	while (endLine < lines.length && lines[endLine].end < replacementEnd) {
+		endLine++;
+	}
+	if (endLine >= lines.length) {
+		throw new Error("Replacement range is outside the base content.");
+	}
+
+	return { startLine, endLine: endLine + 1 };
+}
+```
+
+## !!steps Preserving unchanged lines
+
+This function takes the original text, the normalized base the matches were found in, and the replacements. It requires equal line counts, groups replacements whose line ranges overlap or touch, rewrites only those line blocks from the normalized base, and copies every other line from the original.
+
+The comment notes why the replacement ranges, not a line-by-line diff, drive this: duplicate normalized lines could otherwise be aligned to the wrong occurrence.
+
+```ts ! edit-diff.ts
+	const originalLines = splitLinesWithEndings(originalContent);
+	const baseLines = getLineSpans(baseContent);
+	if (originalLines.length !== baseLines.length) {
+		throw new Error("Cannot preserve unchanged lines because the base content has a different line count.");
+	}
+
+	const groups: Array<{ startLine: number; endLine: number; replacements: TextReplacement[] }> = [];
+	const sortedReplacements = [...replacements].sort((a, b) => a.matchIndex - b.matchIndex);
+	for (const replacement of sortedReplacements) {
+		const range = getReplacementLineRange(baseLines, replacement);
+		const current = groups[groups.length - 1];
+		if (current && range.startLine < current.endLine) {
+			current.endLine = Math.max(current.endLine, range.endLine);
+			current.replacements.push(replacement);
+			continue;
+		}
+		groups.push({ ...range, replacements: [replacement] });
+	}
+// ...
+	let originalLineIndex = 0;
+	let result = "";
+	for (const group of groups) {
+		result += originalLines.slice(originalLineIndex, group.startLine).join("");
+
+		const groupStartOffset = baseLines[group.startLine].start;
+		const groupEndOffset = baseLines[group.endLine - 1].end;
+		result += applyReplacements(
+			baseContent.slice(groupStartOffset, groupEndOffset),
+			group.replacements,
+			groupStartOffset,
+```
+
+## !!steps Unified patch and the display diff
+
+`generateUnifiedPatch` delegates to the `diff` package with four lines of context. `generateDiffString` builds the display format itself from `diffLines` parts, with right-aligned line numbers whose width comes from the longer file, and records `firstChangedLine` in new-file numbering.
+
+```ts ! edit-diff.ts
+/** Generate a standard unified patch. */
+export function generateUnifiedPatch(path: string, oldContent: string, newContent: string, contextLines = 4): string {
+	return Diff.createTwoFilesPatch(path, path, oldContent, newContent, undefined, undefined, {
+		context: contextLines,
+		headerOptions: Diff.FILE_HEADERS_ONLY,
+	});
+}
+// ...
+export function generateDiffString(
+	oldContent: string,
+	newContent: string,
+	contextLines = 4,
+): { diff: string; firstChangedLine: number | undefined } {
+	const parts = Diff.diffLines(oldContent, newContent);
+	const output: string[] = [];
+
+	const oldLines = oldContent.split("\n");
+	const newLines = newContent.split("\n");
+	const maxLineNum = Math.max(oldLines.length, newLines.length);
+	const lineNumWidth = String(maxLineNum).length;
+
+	let oldLineNum = 1;
+	let newLineNum = 1;
+	let lastWasChange = false;
+	let firstChangedLine: number | undefined;
+```
+
+## !!steps Trimming unchanged context
+
+Unchanged parts are shown only near changes. A block between two changes shows the first and last four lines with a `...` marker, or all of it if it is short. A block after a change shows only its leading lines, and a block before a change only its trailing lines. Line counters are advanced over skipped lines so the numbers stay correct.
+
+```ts ! edit-diff.ts
+		} else {
+			// Context lines - only show a few before/after changes
+			const nextPartIsChange = i < parts.length - 1 && (parts[i + 1].added || parts[i + 1].removed);
+			const hasLeadingChange = lastWasChange;
+			const hasTrailingChange = nextPartIsChange;
+
+			if (hasLeadingChange && hasTrailingChange) {
+				if (raw.length <= contextLines * 2) {
+					for (const line of raw) {
+						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+						output.push(` ${lineNum} ${line}`);
+						oldLineNum++;
+						newLineNum++;
+					}
+				} else {
+					const leadingLines = raw.slice(0, contextLines);
+					const trailingLines = raw.slice(raw.length - contextLines);
+					const skippedLines = raw.length - leadingLines.length - trailingLines.length;
+
+					for (const line of leadingLines) {
+						const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
+						output.push(` ${lineNum} ${line}`);
+						oldLineNum++;
+						newLineNum++;
+					}
+
+					output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
+```
+
+## !!steps Previewing without writing
+
+`computeEditsDiff` mirrors the real tool: check read access, read, strip the BOM, normalize, apply, diff. It returns either a diff or an `error` string and never throws, which suits UI preview. It checks only `R_OK`, while the real edit also requires write access.
+
+```ts ! edit-diff.ts
+export async function computeEditsDiff(
+	path: string,
+	edits: Edit[],
+	cwd: string,
+): Promise<EditDiffResult | EditDiffError> {
+	const absolutePath = resolveToCwd(path, cwd);
+
+	try {
+		// Check if file exists and is readable
+		try {
+			await access(absolutePath, constants.R_OK);
+		} catch (error: unknown) {
+			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
+		}
+
+		// Read the file
+		const rawContent = await readFile(absolutePath, "utf-8");
+
+		// Strip BOM before matching (LLM won't include invisible BOM in oldText)
+		const { text: content } = splitBom(rawContent);
+		const normalizedContent = normalizeToLF(content);
+		const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+
+		// Generate the diff
+		return generateDiffString(baseContent, newContent);
+	} catch (err) {
+		return { error: err instanceof Error ? err.message : String(err) };
+	}
+}
+```
+
+</Scrollycoding>
+
+Callers are the edit tool and its renderer; the paths come from [path-utils.ts](/docs/src/core/tools/path-utils.ts) and BOM handling from [text.ts](/docs/src/utils/text.ts). `computeEditDiff`, the single-edit wrapper at the end of the file, is kept for convenience.
+
+Because uniqueness is always checked in normalized space, an exact, unique `oldText` can still be rejected as duplicated when a second location differs from it only by trailing whitespace, quote style or similar. The error text says to add context, which does fix it.

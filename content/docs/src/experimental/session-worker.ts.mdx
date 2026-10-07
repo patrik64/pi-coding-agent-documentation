@@ -1,0 +1,570 @@
+---
+title: "session-worker.ts"
+description: "The per-session child process: it owns one Session's Harness, serves service calls from the coordinator's server over a socket, and retires itself when nobody needs it"
+source: "src/experimental/session-worker.ts"
+full: true
+---
+
+In the experimental multi-process design, each coding session runs in its own worker process. The worker takes the session lock, opens the durable Harness over the session's SQLite file, and then answers requests relayed by the [coordinator.ts](/docs/src/experimental/coordinator.ts) from the [server.ts](/docs/src/experimental/server.ts). It does not listen on a port itself; it connects out to the coordinator over a local socket and speaks newline-delimited JSON.
+
+The file holds three things: the TypeBox schemas that define the worker protocol, a small state machine called `WorkerLifecycle` that decides when the worker may exit, and the `run` function that wires the socket, the services and the Harness together. The process that spawns it is [session-worker-manager.ts](/docs/src/experimental/session-worker-manager.ts); the services it exposes are built by [worker.ts](/docs/src/experimental/services/worker.ts).
+
+<Scrollycoding>
+
+## !!steps Environment and the options contract
+
+A worker is configured by four environment variables (control address, token, session key, peer ID) and one JSON command-line argument. The options schema is strict: unknown keys are rejected, and `provider` and `model` are optional strings.
+
+The paths in `metadata` are later required to be absolute; see the last steps for the validation.
+
+```ts ! session-worker.ts
+// !mark(1:4)
+export const SESSION_WORKER_CONTROL_ADDRESS_ENV = "PI_SESSION_WORKER_CONTROL_ADDRESS";
+export const SESSION_WORKER_CONTROL_TOKEN_ENV = "PI_SESSION_WORKER_CONTROL_TOKEN";
+export const SESSION_WORKER_SESSION_KEY_ENV = "PI_SESSION_WORKER_SESSION_KEY_BASE64";
+export const SESSION_WORKER_PEER_ID_ENV = "PI_SESSION_WORKER_PEER_ID";
+
+export const SessionWorkerMetadataSchema = StrictObject({
+	id: Type.String({ minLength: 1 }),
+	createdAt: Type.Number(),
+	cwd: Type.String(),
+	path: Type.String(),
+});
+
+export const SessionWorkerOptionsSchema = StrictObject({
+	sessionDir: Type.String({ minLength: 1 }),
+	metadata: SessionWorkerMetadataSchema,
+	provider: Type.Optional(Type.String({ minLength: 1 })),
+	model: Type.Optional(Type.String({ minLength: 1 })),
+	pluginManifestPaths: Type.Array(Type.String({ minLength: 1 })),
+});
+export type SessionWorkerOptions = Static<typeof SessionWorkerOptionsSchema>;
+```
+
+## !!steps Commands in, events out
+
+Two unions define the protocol. Commands come from the server: shutdown, worker discovery, session demand (an attachment appeared or went away), a service operation, and operation cancel. Events go back: ready, failed, demand applied or rejected, an operation response, and a streamed service update.
+
+Every event carries the shared `token` and `sessionKey`, so the receiving side can discard messages from the wrong worker generation.
+
+```ts ! session-worker.ts
+export const SessionWorkerCommandSchema = Type.Union([
+	// !mark(1:3)
+	Type.Object({ type: Type.Literal("shutdown") }),
+	Type.Object({ type: Type.Literal("discover_workers") }),
+	Type.Object({
+		type: Type.Literal("session_demand"),
+		serverConnectionId: Type.String(),
+		requestId: Type.String(),
+		attachmentId: Type.String(),
+		attached: Type.Boolean(),
+	}),
+	WorkerOperationRequestSchema,
+	StrictObject({
+		type: Type.Literal("operation_cancel"),
+		requestId: Type.String({ minLength: 1 }),
+		scope: WorkerOperationScopeSchema,
+	}),
+]);
+export type SessionWorkerCommand = Static<typeof SessionWorkerCommandSchema>;
+// ...
+// !mark(1:2)
+export const SessionWorkerEventSchema = Type.Union([
+	Type.Object({
+		type: Type.Literal("worker_ready"),
+		token: Type.String(),
+		sessionKey: Type.String(),
+		sessionId: Type.String(),
+		pid: Type.Integer({ minimum: 1 }),
+		metadata: SessionWorkerMetadataSchema,
+		pluginManifestPaths: Type.Array(Type.String({ minLength: 1 })),
+	}),
+```
+
+## !!steps WorkerLifecycle: the state it tracks
+
+The lifecycle object decides when the worker should retire. It tracks the set of demands (one per server connection and attachment), whether the Harness has live tasks, how many retirement holds are outstanding, and the current server connection.
+
+An initial timer gives the server a grace period to announce demand after startup. The timer is `unref`ed so it never keeps the process alive by itself.
+
+```ts ! session-worker.ts
+export class WorkerLifecycle {
+	readonly #initialDemandGraceMs: number;
+	readonly #orphanDemandGraceMs: number;
+	readonly #onRetire: () => void;
+	// !mark
+	readonly #demands = new Map<string, { serverConnectionId: string; attachmentId: string; timer?: NodeJS.Timeout }>();
+	#harnessActive = false;
+	#currentServerConnectionId: string | undefined;
+	#initialTimer: NodeJS.Timeout | undefined;
+	#demandInitialized: boolean;
+	// !mark
+	#retirementHolds = 0;
+	#retiring = false;
+
+	constructor(options: {
+		initialServerConnectionId?: string;
+		initialDemandGraceMs: number;
+		orphanDemandGraceMs: number;
+		onRetire(): void;
+	}) {
+		this.#currentServerConnectionId = options.initialServerConnectionId;
+		this.#initialDemandGraceMs = options.initialDemandGraceMs;
+		this.#orphanDemandGraceMs = options.orphanDemandGraceMs;
+		this.#onRetire = options.onRetire;
+		this.#demandInitialized = false;
+		// !mark(1:2)
+		this.#initialTimer = setTimeout(() => {
+			this.#initialTimer = undefined;
+			this.#demandInitialized = true;
+			this.#reconcile();
+		}, this.#initialDemandGraceMs);
+		this.#initialTimer.unref();
+	}
+```
+
+## !!steps Guarding requests and recording demand
+
+`beginRequest` refuses work in three cases: the worker is already retiring, the request came from a stale server generation, or its attachment is not an active demand. On success it returns a release function created by `holdRetirement`, so an in-flight request keeps the worker alive.
+
+`setDemand` also rejects stale or retiring callers. It marks demand as initialized, cancels the initial timer, replaces any previous record for the same key, and reconciles.
+
+```ts ! session-worker.ts
+	beginRequest(serverConnectionId: string, attachmentId: string): () => void {
+		// !mark(1:4)
+		if (this.#retiring) throw new Error("Session worker is retiring");
+		if (serverConnectionId !== this.#currentServerConnectionId) {
+			throw new Error("Session worker received a request from a stale server generation");
+		}
+		const demand = this.#demands.get(demandKey(serverConnectionId, attachmentId));
+		if (!demand || demand.timer) {
+			throw new Error("Session worker request does not match the active attachment");
+		}
+		return this.holdRetirement();
+	}
+	// ...
+	setDemand(serverConnectionId: string, attachmentId: string, attached: boolean): void {
+		if (this.#retiring) throw new Error("Session worker is retiring");
+		if (serverConnectionId !== this.#currentServerConnectionId) {
+			throw new Error("Session worker received demand from a stale server generation");
+		}
+		this.#demandInitialized = true;
+		// !mark(1:3)
+		if (this.#initialTimer) {
+			clearTimeout(this.#initialTimer);
+			this.#initialTimer = undefined;
+		}
+		const key = demandKey(serverConnectionId, attachmentId);
+		const previous = this.#demands.get(key);
+		if (previous?.timer) clearTimeout(previous.timer);
+		if (attached) this.#demands.set(key, { serverConnectionId, attachmentId });
+		else this.#demands.delete(key);
+		this.#reconcile();
+	}
+```
+
+## !!steps Server disconnects and the retire decision
+
+Demands are not dropped the instant a server disconnects. `serverDisconnected` starts a per-demand orphan timer, and a reconnect of the same server connection cancels it. That lets a restarted server reattach without losing the worker.
+
+`#reconcile` is the single place retirement is decided: the worker retires only when demand was initialized, no holds remain, the Harness is idle and no demands are left. Live Harness tasks, background work included, therefore keep a session open.
+
+```ts ! session-worker.ts
+	serverConnected(serverConnectionId: string): void {
+		this.#currentServerConnectionId = serverConnectionId;
+		for (const demand of this.#demands.values()) {
+			if (demand.serverConnectionId !== serverConnectionId || !demand.timer) continue;
+			clearTimeout(demand.timer);
+			delete demand.timer;
+		}
+	}
+
+	serverDisconnected(serverConnectionId: string): void {
+		if (this.#currentServerConnectionId === serverConnectionId) this.#currentServerConnectionId = undefined;
+		for (const [key, demand] of this.#demands) {
+			if (demand.serverConnectionId !== serverConnectionId || demand.timer) continue;
+			demand.timer = setTimeout(() => {
+				if (this.#demands.get(key) !== demand) return;
+				this.#demands.delete(key);
+				this.#reconcile();
+			}, this.#orphanDemandGraceMs);
+			demand.timer.unref();
+		}
+	}
+	// ...
+	/** Live Harness tasks, such as runs and compactions, hold the worker until they end. */
+	setHarnessActive(active: boolean): void {
+		this.#harnessActive = active;
+		if (!active) this.#reconcile();
+	}
+
+	close(): void {
+		if (this.#initialTimer) clearTimeout(this.#initialTimer);
+		for (const demand of this.#demands.values()) {
+			if (demand.timer) clearTimeout(demand.timer);
+		}
+		this.#demands.clear();
+	}
+
+	#reconcile(): void {
+		// !mark(1:2)
+		if (
+			this.#retiring ||
+			!this.#demandInitialized ||
+			this.#retirementHolds !== 0 ||
+			this.#harnessActive ||
+			this.#demands.size !== 0
+		) {
+			return;
+		}
+		// !mark(1:2)
+		this.#retiring = true;
+		this.#onRetire();
+	}
+```
+
+## !!steps Connecting to the coordinator
+
+`connectControl` reads its settings from the environment, connects, and registers as a peer using `COORDINATOR_PROTOCOL_VERSION` from [coordinator.ts](/docs/src/experimental/coordinator.ts). It waits for exactly one reply, validates it against a schema, and fails if it is anything other than `peer_registered`.
+
+The reply may carry the id of a server that is already connected, which seeds the lifecycle. Everything the worker sends is wrapped as a `send` to the `server` peer.
+
+```ts ! session-worker.ts
+async function connectControl(): Promise<WorkerControl> {
+	const address = process.env[SESSION_WORKER_CONTROL_ADDRESS_ENV];
+	const token = process.env[SESSION_WORKER_CONTROL_TOKEN_ENV];
+	const encodedSessionKey = process.env[SESSION_WORKER_SESSION_KEY_ENV];
+	if (!address || !token || !encodedSessionKey) throw new Error("Session worker requires a control address");
+	const peerId = process.env[SESSION_WORKER_PEER_ID_ENV];
+	if (!peerId) throw new Error("Session worker requires a peer ID");
+	const socket = createConnection(address);
+	await new Promise<void>((resolve, reject) => {
+		socket.once("connect", resolve);
+		socket.once("error", reject);
+	});
+	const messages = createJsonLineMessages(socket);
+	// !mark(1:2)
+	await writeJsonLine(socket, { type: "register_peer", protocol: COORDINATOR_PROTOCOL_VERSION, peerId });
+	const registered = await messages[Symbol.asyncIterator]().next();
+	if (
+		registered.done ||
+		!Check(CoordinatorInputSchema, registered.value) ||
+		registered.value.type !== "peer_registered"
+	) {
+		throw new Error("Coordinator rejected the session worker registration");
+	}
+	// !mark(1:2)
+	return {
+		...(registered.value.serverConnectionId === undefined
+			? {}
+			: { initialServerConnectionId: registered.value.serverConnectionId }),
+		messages,
+		socket,
+		send: (event) => writeJsonLine(socket, { type: "send", to: "server", payload: event }),
+	};
+}
+```
+
+## !!steps Newline-delimited JSON with a size limit
+
+Messages are read as lines. Chunks are appended to a buffer, and if the buffer ever exceeds `MAX_CONTROL_LINE_BYTES` from [process.ts](/docs/src/experimental/process.ts) the socket is destroyed. Complete lines are parsed; invalid JSON also destroys the socket.
+
+The returned async iterable hands values to a waiting consumer or queues them. It never reports `done`, so `for await` over it ends only because the process exits or the socket closes the loop elsewhere.
+
+```ts ! session-worker.ts
+function createJsonLineMessages(socket: Socket): AsyncIterable<unknown> {
+	const queued: unknown[] = [];
+	const waiters: ((value: unknown) => void)[] = [];
+	let buffered = "";
+	socket.setEncoding("utf8");
+	socket.on("data", (chunk: string) => {
+		buffered += chunk;
+		// !mark(1:4)
+		if (Buffer.byteLength(buffered) > MAX_CONTROL_LINE_BYTES) {
+			socket.destroy(new Error("Session worker control message is too large"));
+			return;
+		}
+		while (true) {
+			const newline = buffered.indexOf("\n");
+			if (newline === -1) return;
+			const line = buffered.slice(0, newline);
+			buffered = buffered.slice(newline + 1);
+			try {
+				const value: unknown = JSON.parse(line);
+				const waiter = waiters.shift();
+				if (waiter) waiter(value);
+				else queued.push(value);
+			// !mark(1:4)
+			} catch {
+				socket.destroy(new Error("Session worker received invalid control JSON"));
+				return;
+			}
+		}
+	});
+```
+
+## !!steps Dispatching commands
+
+`readCommands` validates every incoming object against the coordinator input schema and destroys the socket on a mismatch. Connection notices go to the lifecycle; messages that are not valid worker commands are skipped.
+
+Demand commands are awaited, so they apply in order, while operations are fired without awaiting so a slow service call cannot block the loop.
+
+```ts ! session-worker.ts
+	for await (const value of control.messages) {
+		// !mark(1:4)
+		if (!Check(CoordinatorInputSchema, value)) {
+			control.socket.destroy(new Error("Coordinator sent an invalid worker message"));
+			return;
+		}
+		const message: CoordinatorInput = value;
+		if (message.type === "server_connected") {
+			handlers.onServerConnected(message.serverConnectionId);
+			continue;
+		}
+		if (message.type === "server_disconnected") {
+			handlers.onServerDisconnected(message.serverConnectionId);
+			continue;
+		}
+		if (message.type !== "message" || !Check(SessionWorkerCommandSchema, message.payload)) continue;
+		const command: SessionWorkerCommand = message.payload;
+		if (command.type === "shutdown") handlers.onShutdown();
+		else if (command.type === "discover_workers") handlers.onDiscovery();
+		// !mark(1:3)
+		else if (command.type === "session_demand") await handlers.onDemand(command);
+		else if (command.type === "operation_cancel") handlers.onOperationCancel(command);
+		else handlers.onOperation(command);
+	}
+```
+
+## !!steps Starting up under the session lock
+
+`run` connects first, then takes the session lock with `proper-lockfile` using a short stale window and a bounded retry loop of roughly eight seconds. The lock is on the session path from the metadata, which is how two workers are prevented from opening the same Session.
+
+Next it calls the injected `createHarness`, subscribes to the task graph, and builds the services. If any step fails, everything opened so far is closed and both errors are reported together.
+
+```ts ! session-worker.ts
+async function run(options: SessionWorkerOptions, createHarness: CreateSessionWorkerHarness): Promise<void> {
+	const { metadata } = options;
+	const sessionId = metadata.id;
+	const control = await connectControl();
+	const token = process.env[SESSION_WORKER_CONTROL_TOKEN_ENV]!;
+	const sessionKey = Buffer.from(process.env[SESSION_WORKER_SESSION_KEY_ENV]!, "base64url").toString();
+	failureControl = control;
+	const pluginManifestPaths = options.pluginManifestPaths;
+	// !mark(1:3)
+	const releaseOwnership = await lockfile.lock(metadata.path, {
+		realpath: true,
+		stale: 2_000,
+		update: 1_000,
+		retries: { retries: 320, factor: 1, minTimeout: 25, maxTimeout: 25, maxRetryTime: 8_000 },
+	});
+	let runtime: SessionWorkerRuntime | undefined;
+	let services: SessionWorkerServices | undefined;
+	let taskGraph: AttachedReplicatedState<TaskGraph> | undefined;
+	try {
+		// !mark
+		runtime = await createHarness(sessionStoragePath(metadata), options);
+		taskGraph = await runtime.harness.taskGraph(TODO_CONTEXT);
+```
+
+## !!steps Closing and wiring the lifecycle
+
+`close` is idempotent and cancels in-flight requests before closing resources. `closeResources` tries each cleanup step even if an earlier one failed and then throws either the single error or an `AggregateError`.
+
+The lifecycle's retire callback is `closeAndExit`. The task graph subscription feeds `setHarnessActive`, and `harness.resume()` restarts work recovered from an interrupted turn.
+
+```ts ! session-worker.ts
+	let closing: Promise<void> | undefined;
+	// !mark(1:2)
+	const close = (): Promise<void> => {
+		if (closing) return closing;
+		lifecycle?.close();
+		stopActivity();
+		activity.dispose();
+		services.removeSubscriptions(() => true);
+		for (const request of activeRequests.values()) request.cancel(new Error("Session worker is closing"));
+		activeRequests.clear();
+		closing = closeResources({ runtime, services, releaseOwnership });
+		return closing;
+	};
+	const closeAndExit = (): void => {
+		void close().then(
+			() => process.exit(0),
+			(error: unknown) => {
+				console.error(error);
+				process.exit(1);
+			},
+		);
+	};
+
+	lifecycle = new WorkerLifecycle({
+		initialServerConnectionId: control.initialServerConnectionId,
+		initialDemandGraceMs: lifecycleDelay(SESSION_WORKER_INITIAL_DEMAND_GRACE_ENV, DEFAULT_INITIAL_DEMAND_GRACE_MS),
+		orphanDemandGraceMs: lifecycleDelay(SESSION_WORKER_ORPHAN_DEMAND_GRACE_ENV, DEFAULT_ORPHAN_DEMAND_GRACE_MS),
+		// !mark
+		onRetire: closeAndExit,
+	});
+	// Every live task, background work included, keeps the worker and its Session open.
+	// !mark
+	stopActivity = activity.subscribe((graph) => lifecycle?.setHarnessActive(Object.keys(graph.tasks).length > 0));
+	// Recovered work from an interrupted turn continues now.
+	harness.resume();
+```
+
+## !!steps Running one operation
+
+Each operation gets its own cancellable context, holds off retirement through `beginRequest`, and calls `services.invoke`. Results must be JSON values. Errors are sent back as `operation_error`, keeping a known remote error code when there is one.
+
+In the `finally` block the request is removed from the active map only if it is still the same entry, then retirement is released.
+
+```ts ! session-worker.ts
+	const handleOperation = async (request: WorkerOperationRequest): Promise<void> => {
+		let releaseRequest = (): void => {};
+		// !mark(1:3)
+		const cancellable = withCancel(BACKGROUND_CONTEXT);
+		try {
+			releaseRequest = lifecycle!.beginRequest(request.scope.serverConnectionId, request.scope.attachmentId);
+			activeRequests.set(request.requestId, { scope: request.scope, cancel: cancellable.cancel });
+			const result = await services.invoke(request.call, request.scope, cancellable.context);
+			// !mark
+			if (result !== undefined && !isJsonValue(result)) throw new Error("Service produced a non-JSON result");
+		// ...
+		} catch (error) {
+			let code: RemoteServiceErrorCode | undefined;
+			if (error instanceof RemoteServiceError) {
+				code = error.code;
+			} else if (error instanceof Error && "code" in error) {
+				const candidate = error.code;
+				if (Check(RemoteServiceErrorCodeSchema, candidate)) code = candidate;
+			}
+			await control.send({
+				type: "operation_response",
+				token,
+				sessionKey,
+				response: {
+					type: "operation_error",
+					requestId: request.requestId,
+					scope: request.scope,
+					...(code === undefined ? {} : { code }),
+					message: error instanceof Error ? error.message : String(error),
+				},
+			});
+		} finally {
+			if (activeRequests.get(request.requestId)?.cancel === cancellable.cancel) {
+				activeRequests.delete(request.requestId);
+			}
+			releaseRequest();
+		}
+```
+
+## !!steps Applying demand and handling disconnects
+
+When an attachment goes away, its service subscriptions are removed before the demand is cleared. If the lifecycle throws (stale generation, retiring), the worker answers with `demand_rejected` instead of crashing. A hold on retirement spans the whole handler so the worker cannot exit between applying and acknowledging.
+
+A server disconnect also drops that connection's subscriptions and cancels its in-flight requests.
+
+```ts ! session-worker.ts
+		onDemand: async (command) => {
+			// !mark
+			const releaseRetirement = lifecycle?.holdRetirement() ?? (() => {});
+			try {
+				try {
+					// !mark(1:6)
+					if (!command.attached) {
+						const matches = (scope: WorkerOperationScope): boolean =>
+							scope.serverConnectionId === command.serverConnectionId &&
+							scope.attachmentId === command.attachmentId;
+						services.removeSubscriptions(matches);
+					}
+					lifecycle?.setDemand(command.serverConnectionId, command.attachmentId, command.attached);
+				} catch (error) {
+					// !mark(1:8)
+					await control.send({
+						type: "demand_rejected",
+						token,
+						sessionKey,
+						requestId: command.requestId,
+						message: error instanceof Error ? error.message : String(error),
+					});
+					return;
+				}
+				await control.send({
+					type: "demand_applied",
+					token,
+					sessionKey,
+					requestId: command.requestId,
+					attachmentId: command.attachmentId,
+					attached: command.attached,
+				});
+			} finally {
+				releaseRetirement();
+			}
+```
+
+## !!steps Validating options and failure reporting
+
+The entry function takes exactly one argument, parses it as JSON and checks the schema. It also requires absolute paths and rejects a `provider` without a `model`. Any error is reported to the server as `worker_failed` if a control socket exists, and is then rethrown.
+
+```ts ! session-worker.ts
+		if (args.length !== 1) throw new Error("Session worker requires one options argument");
+		let options: unknown;
+		try {
+			options = JSON.parse(args[0]!);
+		} catch (error) {
+			throw new Error("Session worker received invalid options", { cause: error });
+		}
+		// !mark(1:6)
+		if (
+			!Check(SessionWorkerOptionsSchema, options) ||
+			!isAbsolute(options.sessionDir) ||
+			!isAbsolute(options.metadata.cwd) ||
+			!isAbsolute(options.metadata.path) ||
+			(options.provider !== undefined && options.model === undefined)
+		) {
+			throw new Error("Session worker received invalid options");
+		}
+		await run(options, createHarness);
+```
+
+## !!steps The coding-agent harness and the entrypoint
+
+`createCodingAgentHarness` is the real factory: it opens the SQLite storage, installs the coding registry, and chooses an initial model only when the root conversation does not exist yet, so a restarted session keeps its durable model. On failure it closes the Harness and the execution environments together.
+
+`runSessionWorkerProcess` passes it to `runSessionWorkerWithHarness`. At the bottom, the file runs itself when it is the direct entry and the internal role is session-worker; otherwise it throws.
+
+```ts ! session-worker.ts
+		// !mark(1:2)
+		// The initial model applies only when the root conversation is created; later starts keep its durable model.
+		const created = (await harness.conversation(ROOT_CONVERSATION_ID, TODO_CONTEXT)) === undefined;
+		const initial = created
+			? await findInitialAgentModel(
+					settingsManager,
+					modelRuntime,
+					options.model === undefined ? undefined : { provider: options.provider, model: options.model },
+				)
+			: undefined;
+		const conversation = await harness.root(TODO_CONTEXT, {
+			agent: {
+				cwd,
+				...(initial?.model === undefined ? {} : { model: initial.model }),
+				...(initial?.thinkingLevel === undefined ? {} : { thinkingLevel: initial.thinkingLevel }),
+			},
+		});
+// ...
+export function runSessionWorkerProcess(args: readonly string[]): Promise<void> {
+	return runSessionWorkerWithHarness(args, createCodingAgentHarness);
+}
+
+// !mark(1:3)
+if (isDirectInternalProcessEntry(import.meta.url)) {
+	const role = consumeInternalProcessRole();
+	if (role !== "session-worker") {
+		throw new Error("Session worker entrypoint requires an internal session-worker invocation");
+	}
+	void runSessionWorkerProcess(process.argv.slice(2)).catch(() => process.exit(1));
+}
+```
+
+</Scrollycoding>
+
+The worker is the Session's single writer: the lock, the Harness and the services all live here, while the server and its clients stay stateless between requests. The factory is injectable through `CreateSessionWorkerHarness`, which lets a different Harness be plugged into the same protocol; the vacation demo's own runtime in [runtime.ts](/docs/src/experimental/vacation/runtime.ts) is the single-process alternative. The coding registry and `ExecutionEnvs` come from [harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts), and session locations come from [session-catalog.ts](/docs/src/experimental/session-catalog.ts).

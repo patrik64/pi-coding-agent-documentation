@@ -1,0 +1,117 @@
+---
+title: "bordered-loader.ts"
+description: "A spinner framed by borders, with an abort signal, used for extension and command progress UI"
+source: "src/modes/interactive/components/bordered-loader.ts"
+full: true
+---
+
+`BorderedLoader` wraps a pi-tui loader between two
+[dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts)
+lines so long-running work can be shown in place of the editor. It is used by
+[bug-report.ts](/docs/src/modes/interactive/bug-report.ts) and by extension UI.
+
+It can be cancellable (Esc aborts via an `AbortSignal`) or a plain loader whose
+signal never fires from user input.
+
+<Scrollycoding>
+
+## !!steps Choosing the loader type
+
+By default the loader is a `CancellableLoader`. With `cancellable: false` it is a
+plain `Loader` and the class creates its own `AbortController`.
+
+```ts ! bordered-loader.ts
+export class BorderedLoader extends Container {
+	private loader: CancellableLoader | Loader;
+	private cancellable: boolean;
+	private signalController?: AbortController;
+
+	constructor(tui: TUI, theme: Theme, message: string, options?: { cancellable?: boolean }) {
+		super();
+		this.cancellable = options?.cancellable ?? true;
+		const borderColor = (s: string) => theme.fg("border", s);
+		this.addChild(new DynamicBorder(borderColor));
+		if (this.cancellable) {
+			this.loader = new CancellableLoader(
+				tui,
+				(s) => theme.fg("accent", s),
+				(s) => theme.fg("muted", s),
+				message,
+			);
+		} else {
+			this.signalController = new AbortController();
+			this.loader = new Loader(
+				tui,
+				(s) => theme.fg("accent", s),
+				(s) => theme.fg("muted", s),
+				message,
+			);
+		}
+		this.addChild(this.loader);
+```
+
+## !!steps Layout
+
+Borders on top and bottom, the loader in the middle. Only the cancellable
+variant gets a spacer and a cancel hint from
+[keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+
+```ts ! bordered-loader.ts
+		this.addChild(this.loader);
+		if (this.cancellable) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
+		}
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder(borderColor));
+	}
+```
+
+## !!steps The abort signal
+
+The `signal` getter returns the loader's signal when cancellable. In the
+non-cancellable case it returns the owned controller's signal, which nothing
+aborts. The fallback to a fresh controller only matters if the optional field
+is missing.
+
+```ts ! bordered-loader.ts
+	get signal(): AbortSignal {
+		if (this.cancellable) {
+			return (this.loader as CancellableLoader).signal;
+		}
+		return this.signalController?.signal ?? new AbortController().signal;
+	}
+
+	set onAbort(fn: (() => void) | undefined) {
+		if (this.cancellable) {
+			(this.loader as CancellableLoader).onAbort = fn;
+		}
+	}
+```
+
+## !!steps Input and disposal
+
+Input is forwarded only when cancellable. `dispose` uses duck typing: a loader
+with `dispose` is disposed, otherwise one with `stop` is stopped, so the spinner
+timer does not leak.
+
+```ts ! bordered-loader.ts
+	handleInput(data: string): void {
+		if (this.cancellable) {
+			(this.loader as CancellableLoader).handleInput(data);
+		}
+	}
+
+	dispose(): void {
+		if ("dispose" in this.loader && typeof this.loader.dispose === "function") {
+			this.loader.dispose();
+		} else if ("stop" in this.loader && typeof this.loader.stop === "function") {
+			this.loader.stop();
+		}
+	}
+```
+
+</Scrollycoding>
+
+Callers must call `dispose` when removing the loader; `restoreEditor` in
+bug-report does so.

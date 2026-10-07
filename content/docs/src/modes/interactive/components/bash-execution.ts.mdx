@@ -1,0 +1,260 @@
+---
+title: "bash-execution.ts"
+description: "Live view of a user-run bash command: header, streaming output, collapsed preview and exit status"
+source: "src/modes/interactive/components/bash-execution.ts"
+full: true
+---
+
+`BashExecutionComponent` is what appears when the user runs a shell command from
+the prompt (`!cmd`, or `!!cmd` to exclude it from model context). It shows the
+command, streams output into a bordered box with a spinner, then settles into a
+collapsed preview with exit status and truncation info.
+
+The process itself is run by the interactive mode ([tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts)
+sanitizes binary output before calling `appendOutput`). The truncation limits
+come from [truncate.ts](/docs/src/core/tools/truncate.ts), the same ones the
+bash tool uses, so what is shown matches what the model would see.
+
+<Scrollycoding>
+
+## !!steps State and the preview limit
+
+The component tracks the command, accumulated lines, a four-state status,
+the exit code, and an expanded flag. `PREVIEW_LINES` of 20 matches the tool
+execution preview.
+
+```ts ! bash-execution.ts
+// Preview line limit when not expanded (matches tool execution behavior)
+const PREVIEW_LINES = 20;
+
+export class BashExecutionComponent extends Container {
+	private command: string;
+	private outputLines: string[] = [];
+	private status: "running" | "complete" | "cancelled" | "error" = "running";
+	private exitCode: number | undefined = undefined;
+	private loader: Loader;
+	private truncationResult?: TruncationResult;
+	private fullOutputPath?: string;
+	private expanded = false;
+	private contentContainer: Container;
+
+```
+
+## !!steps Header, loader and borders
+
+Commands run with `!!` get a dim border color instead of the `bashMode` one. The
+constructor builds spacer, top border ([dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts)),
+a content container, and bottom border. The loader text names the cancel key
+from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+
+```ts ! bash-execution.ts
+	constructor(command: string, ui: TUI, excludeFromContext = false) {
+		super();
+		this.command = command;
+
+		// Use dim border for excluded-from-context commands (!! prefix)
+		const colorKey = excludeFromContext ? "dim" : "bashMode";
+		const borderColor = (str: string) => theme.fg(colorKey, str);
+
+		// Add spacer
+		this.addChild(new Spacer(1));
+
+		// Top border
+		this.addChild(new DynamicBorder(borderColor));
+
+		// Content container (holds dynamic content between borders)
+		this.contentContainer = new Container();
+		this.addChild(this.contentContainer);
+
+		// Command header
+		const header = new Text(theme.fg(colorKey, theme.bold(`$ ${command}`)), 1, 0);
+		this.contentContainer.addChild(header);
+
+		// Loader
+		this.loader = new Loader(
+			ui,
+			(spinner) => theme.fg(colorKey, spinner),
+			(text) => theme.fg("muted", text),
+			`Running... (${keyText("tui.select.cancel")} to cancel)`, // Plain text for loader
+		);
+		this.contentContainer.addChild(this.loader);
+
+		// Bottom border
+		this.addChild(new DynamicBorder(borderColor));
+	}
+```
+
+## !!steps Appending streamed chunks
+
+Chunks are stripped of ANSI codes and carriage returns are normalized to
+newlines. Since a chunk can end mid-line, the first piece of a new chunk is
+appended to the last existing line rather than starting a new one. Every chunk
+triggers a full `updateDisplay`.
+
+```ts ! bash-execution.ts
+	appendOutput(chunk: string): void {
+		// Strip ANSI codes and normalize line endings
+		// Note: binary data is already sanitized in tui-renderer.ts executeBashCommand
+		const clean = stripAnsi(chunk).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+		// Append to output lines
+		const newLines = clean.split("\n");
+		if (this.outputLines.length > 0 && newLines.length > 0) {
+			// Append first chunk to last line (incomplete line continuation)
+			this.outputLines[this.outputLines.length - 1] += newLines[0];
+			this.outputLines.push(...newLines.slice(1));
+		} else {
+			this.outputLines.push(...newLines);
+		}
+
+		this.updateDisplay();
+	}
+```
+
+## !!steps Completing
+
+`setComplete` derives the status: cancelled wins, then a nonzero known exit code
+is an error, otherwise complete. It stops the loader and stores any
+truncation result and the path of a full-output file.
+
+```ts ! bash-execution.ts
+	setComplete(
+		exitCode: number | undefined,
+		cancelled: boolean,
+		truncationResult?: TruncationResult,
+		fullOutputPath?: string,
+	): void {
+		this.exitCode = exitCode;
+		this.status = cancelled
+			? "cancelled"
+			: exitCode !== 0 && exitCode !== undefined && exitCode !== null
+				? "error"
+				: "complete";
+		this.truncationResult = truncationResult;
+		this.fullOutputPath = fullOutputPath;
+
+		// Stop loader
+		this.loader.stop();
+
+		this.updateDisplay();
+	}
+```
+
+## !!steps Two layers of truncation
+
+`updateDisplay` first applies the same tail truncation as the bash tool
+(`truncateTail`, keeping the end of the output). Then the collapsed view keeps
+only the last 20 logical lines and counts the hidden ones.
+
+```ts ! bash-execution.ts
+	private updateDisplay(): void {
+		// Apply truncation for LLM context limits (same limits as bash tool)
+		const fullOutput = this.outputLines.join("\n");
+		const contextTruncation = truncateTail(fullOutput, {
+			maxLines: DEFAULT_MAX_LINES,
+			maxBytes: DEFAULT_MAX_BYTES,
+		});
+
+		// Get the lines to potentially display (after context truncation)
+		const availableLines = contextTruncation.content ? contextTruncation.content.split("\n") : [];
+
+		// Apply preview truncation based on expanded state
+		const previewLogicalLines = availableLines.slice(-PREVIEW_LINES);
+		const hiddenLineCount = availableLines.length - previewLogicalLines.length;
+
+		// Rebuild content container
+		this.contentContainer.clear();
+
+		// Command header
+		const header = new Text(theme.fg("bashMode", theme.bold(`$ ${this.command}`)), 1, 0);
+		this.contentContainer.addChild(header);
+```
+
+## !!steps Width-aware preview
+
+In collapsed mode the output is an inline component that caches visual lines per
+terminal width, because wrapped lines can exceed 20 rows. It uses
+`truncateToVisualLines` from [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts).
+Expanded mode simply prints everything.
+
+```ts ! bash-execution.ts
+		// Output
+		if (availableLines.length > 0) {
+			if (this.expanded) {
+				// Show all lines
+				const displayText = availableLines.map((line) => theme.fg("muted", line)).join("\n");
+				this.contentContainer.addChild(new Text(`\n${displayText}`, 1, 0));
+			} else {
+				// Use shared visual truncation utility with width-aware caching
+				const styledOutput = previewLogicalLines.map((line) => theme.fg("muted", line)).join("\n");
+				const styledInput = `\n${styledOutput}`;
+				let cachedWidth: number | undefined;
+				let cachedLines: string[] | undefined;
+				this.contentContainer.addChild({
+					render: (width: number) => {
+						if (cachedLines === undefined || cachedWidth !== width) {
+							const result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, 1);
+							cachedLines = result.visualLines;
+							cachedWidth = width;
+						}
+						return cachedLines ?? [];
+					},
+					invalidate: () => {
+						cachedWidth = undefined;
+						cachedLines = undefined;
+					},
+				});
+			}
+		}
+```
+
+## !!steps Status footer
+
+While running, the loader is shown. Afterwards a footer lists: the expand or
+collapse hint with the hidden line count, "(cancelled)" or "(exit N)", and a
+truncation warning with the path to the full output.
+
+```ts ! bash-execution.ts
+		// Loader or status
+		if (this.status === "running") {
+			this.contentContainer.addChild(this.loader);
+		} else {
+			const statusParts: string[] = [];
+
+			// Show how many lines are hidden (collapsed preview)
+			if (hiddenLineCount > 0) {
+				if (this.expanded) {
+					statusParts.push(
+						`${theme.fg("muted", "(")}${keyHint("app.tools.expand", "to collapse")}${theme.fg("muted", ")")}`,
+					);
+				} else {
+					statusParts.push(
+						`${theme.fg("muted", `... ${hiddenLineCount} more lines (`)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+					);
+				}
+			}
+
+			if (this.status === "cancelled") {
+				statusParts.push(theme.fg("warning", "(cancelled)"));
+			} else if (this.status === "error") {
+				statusParts.push(theme.fg("error", `(exit ${this.exitCode})`));
+			}
+
+			// Add truncation warning (context truncation, not preview truncation)
+			const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
+			if (wasTruncated && this.fullOutputPath) {
+				statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
+			}
+
+			if (statusParts.length > 0) {
+				this.contentContainer.addChild(new Text(`\n${statusParts.join("\n")}`, 1, 0));
+			}
+		}
+```
+
+</Scrollycoding>
+
+`getOutput` and `getCommand` let the host build the stored
+bash-execution message from the component after it finishes. See
+[agent-session.ts](/docs/src/core/agent-session.ts) for how that message is
+recorded in the session.

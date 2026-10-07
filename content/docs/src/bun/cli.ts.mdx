@@ -1,0 +1,38 @@
+---
+title: "cli.ts"
+description: "Entry point for the Bun-compiled binary: runs sandbox and runtime setup before importing the shared CLI"
+source: "src/bun/cli.ts"
+full: true
+---
+
+This four-line file is the entry for the Bun single-file executable build. It exists only to control import order: ES module imports are evaluated in sequence, so the side-effect imports run their setup before the real CLI module is loaded.
+
+The Node build uses [cli.ts](/docs/src/cli.ts) directly; the Bun build wraps it with the two setup modules documented next to this file.
+
+<Scrollycoding>
+
+## !!steps Shebang and ordering
+
+The shebang says `node`, though under Bun this file is compiled into a binary and the line is inert. The first two imports are bare side-effect imports: [sandbox-env-setup.ts](/docs/src/bun/sandbox-env-setup.ts) repairs `process.env`, and [runtime-setup.ts](/docs/src/bun/runtime-setup.ts) wires Bun-specific providers and the embedded WASM path.
+
+```ts ! cli.ts
+#!/usr/bin/env node
+// !mark(1:2)
+import "./sandbox-env-setup.ts";
+import "./runtime-setup.ts";
+import "../cli.ts";
+```
+
+## !!steps Handing off to the shared CLI
+
+Only after the setup has run does `../cli.ts` get imported. That module is the same shim used on Node, and it ends by calling `main()` from [main.ts](/docs/src/main.ts). The order matters because anything in the CLI graph that reads environment variables at import time would otherwise see an empty environment in a sandbox.
+
+```ts ! cli.ts
+import "./runtime-setup.ts";
+// !mark
+import "../cli.ts";
+```
+
+</Scrollycoding>
+
+Nothing is exported. The file is purely a composition root for the Bun build, and it has no tests of its own.

@@ -1,0 +1,115 @@
+---
+title: "prompt.ts"
+description: "Exposes pi's system prompt to the durable Harness as one extension whose sections render per request"
+source: "src/experimental/durable/prompt.ts"
+full: true
+---
+
+The durable Harness builds its system prompt from named sections contributed by extensions. pi already has such a builder, `buildSystemPromptSections` in [system-prompt.ts](/docs/src/core/system-prompt.ts). This file wraps it as an extension called `pi-prompt`.
+
+Because a Harness can host several conversations in different directories, the context files and skills are loaded per working directory and cached, instead of once at startup as in the classic mode. This is experimental code.
+
+<Scrollycoding>
+
+## !!steps Tool contributions and section order
+
+Only four tools contribute prompt text: read, bash, edit and write, each from its own file in [core/tools](/docs/src/core/tools/bash.ts). `KEYS` fixes the order of sections. The comment notes that sections without content are omitted by the builder.
+
+```ts ! prompt.ts
+const CONTRIBUTIONS = {
+	read: readToolSystemPromptContribution,
+	bash: bashToolSystemPromptContribution,
+	edit: editToolSystemPromptContribution,
+	write: writeToolSystemPromptContribution,
+};
+
+/** pi's section order; `buildSystemPromptSections()` omits the ones without content. */
+const KEYS = ["preamble", "tools", "rules", "docs", "project_context", "skills", "cwd"] as const;
+```
+
+## !!steps Loading context once per directory
+
+`load` caches, by cwd, the project context files from [resource-loader.ts](/docs/src/core/resource-loader.ts) and the skills from [skills.ts](/docs/src/core/skills.ts). Skill paths come from the settings manager and default skill locations are included.
+
+The cache is never invalidated, so editing an AGENTS file during a running durable session has no effect until restart.
+
+```ts ! prompt.ts
+export function createPiPrompt(settings: SettingsManager, fallbackCwd: string) {
+	const resources = new Map<string, { contextFiles: { path: string; content: string }[]; skills: Skill[] }>();
+	const load = (cwd: string) => {
+		// !mark(1:3)
+		let found = resources.get(cwd);
+		if (found === undefined) {
+			const agentDir = getAgentDir();
+			found = {
+				contextFiles: loadProjectContextFiles({ cwd, agentDir }),
+				skills: loadSkills({ cwd, agentDir, skillPaths: settings.getSkillPaths(), includeDefaults: true }).skills,
+			};
+			resources.set(cwd, found);
+		}
+		return found;
+	};
+```
+
+## !!steps Building all sections once per request
+
+A request renders every section separately, but the builder produces all of them in one call. `build` memoizes the result in a `WeakMap` keyed by the request's `PromptInput` object, so the work is done once per request and freed with it.
+
+```ts ! prompt.ts
+	// The sections of one request render from one build.
+	const built = new WeakMap<PromptInput, Record<string, string>>();
+	const build = (input: PromptInput): Record<string, string> => {
+		let sections = built.get(input);
+		if (sections === undefined) {
+			sections = buildSections(input);
+			built.set(input, sections);
+		}
+		return sections;
+	};
+```
+
+## !!steps Assembling the builder input
+
+The cwd is taken from the request environment, then the agent's cwd, then the fallback given at construction. The tool names selected for the request decide which snippets and guidelines are passed along, so the prompt only describes tools the model actually has.
+
+```ts ! prompt.ts
+	const buildSections = (input: PromptInput): Record<string, string> => {
+		// !mark
+		const cwd = input.env?.cwd ?? input.agent.cwd ?? fallbackCwd;
+		// !mark
+		const selectedTools = input.agent.tools.map((tool) => tool.name);
+		const snippets: Record<string, string> = {};
+		const guidelines: Record<string, string[]> = {};
+		for (const name of selectedTools) {
+			const contribution = CONTRIBUTIONS[name as keyof typeof CONTRIBUTIONS];
+			if (contribution === undefined) continue;
+			snippets[name] = contribution.snippet;
+			guidelines[name] = [...contribution.guidelines];
+		}
+		return buildSystemPromptSections({
+			cwd,
+			selectedTools,
+			toolSnippets: snippets,
+			toolGuidelines: guidelines,
+			...load(cwd),
+		});
+	};
+```
+
+## !!steps The extension itself
+
+One `section` per key reads its slice from the shared build. `tag: false` stops the Harness from wrapping the text in its own tag because the built sections already contain pi's tags.
+
+```ts ! prompt.ts
+	return defineExtension({
+		name: "pi-prompt",
+		// The built sections carry their own tags.
+		// !mark
+		sections: KEYS.map((key) => section(key, (input) => build(input)[key], { tag: false })),
+	});
+}
+```
+
+</Scrollycoding>
+
+[harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts) installs this extension in `createCodingRegistry`. It is the one place where the durable experiment reuses the classic prompt code unchanged, so the model sees the same instructions in both modes.

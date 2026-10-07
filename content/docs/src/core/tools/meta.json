@@ -1,0 +1,22 @@
+{
+  "title": "tools",
+  "pages": [
+    "renderers",
+    "bash.ts",
+    "edit-diff.ts",
+    "edit.ts",
+    "file-mutation-queue.ts",
+    "find.ts",
+    "grep.ts",
+    "index.ts",
+    "ls.ts",
+    "output-accumulator.ts",
+    "path-utils.ts",
+    "powershell.ts",
+    "read.ts",
+    "render-utils.ts",
+    "tool-definition-wrapper.ts",
+    "truncate.ts",
+    "write.ts"
+  ]
+}

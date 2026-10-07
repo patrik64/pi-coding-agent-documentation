@@ -1,0 +1,12 @@
+{
+  "title": "theme",
+  "pages": [
+    "dark.json",
+    "light.json",
+    "system-theme.ts",
+    "theme-controller.ts",
+    "theme-json.ts",
+    "theme-schema.json",
+    "theme.ts"
+  ]
+}

@@ -1,0 +1,46 @@
+---
+title: "plugin.ts"
+description: "Public entry point for experimental pi plugins: re-exports the controller, presentation UI and slash command service types"
+source: "src/experimental/plugin.ts"
+full: true
+---
+
+This barrel is what plugins import as `@earendil-works/pi-coding-agent/experimental/plugin`. It holds no logic. It re-exports the few service classes and types that a plugin may depend on, so the internal layout under the services folder can change without breaking plugins.
+
+[bundled.ts](/docs/src/experimental/plugins/bundled.ts) maps that import specifier to this very file when it loads plugin bundles. The API is experimental.
+
+<Scrollycoding>
+
+## !!steps Agent control
+
+`AgentController` and its request and response types let a plugin prompt the agent, queue messages and request compaction. They are defined in [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts).
+
+```ts ! plugin.ts
+export {
+	type AgentCompactionRequest,
+	AgentController,
+	type AgentOperationError,
+	type AgentOperationResponse,
+	type AgentPromptRequest,
+	type AgentPromptResult,
+	type AgentQueueResponse,
+} from "./services/agent-controller.ts";
+```
+
+## !!steps Presentation and slash commands
+
+`PresentationUI` from [presentation-ui.ts](/docs/src/experimental/services/presentation-ui.ts) is how a plugin shows UI, and `SlashCommands` from [slash-commands.ts](/docs/src/experimental/services/slash-commands.ts) is how it contributes commands with completion.
+
+```ts ! plugin.ts
+export { type PresentationSelectItem, PresentationUI } from "./services/presentation-ui.ts";
+export {
+	type SlashCommandCompletion,
+	type SlashCommandContribution,
+	type SlashCommandRunResult,
+	SlashCommands,
+} from "./services/slash-commands.ts";
+```
+
+</Scrollycoding>
+
+Classes are exported as values and everything else as types, so plugins get the service tokens they can request but not the implementations. See [plugins.ts](/docs/src/experimental/services/plugins.ts) for how plugins are loaded on the server side.

@@ -1,0 +1,130 @@
+---
+title: "file-mutation-queue.ts"
+description: "A per-file promise queue that serializes concurrent edits and writes to the same file while letting different files run in parallel"
+source: "src/core/tools/file-mutation-queue.ts"
+full: true
+---
+
+The agent can issue several tool calls in one turn and they may run in
+parallel. Two `edit` calls on the same file would each read the old content and
+the second write would silently discard the first. This module prevents that
+with a lock keyed by file: operations on one file run one at a time, in the
+order they asked, while operations on different files do not wait for each other.
+
+Both [edit.ts](/docs/src/core/tools/edit.ts) and
+[write.ts](/docs/src/core/tools/write.ts) wrap their read-modify-write cycle in
+`withFileMutationQueue`, and the function is also exported from the package
+index for extension tools that mutate files.
+
+<Scrollycoding>
+
+## !!steps Module state and the queue key
+
+Two pieces of module-level state: a map from key to the tail promise of that
+file's chain, and a single `registrationQueue` that serializes the bookkeeping
+itself.
+
+The key is the real path, so two different spellings or a symlink and its target
+share one queue. A file that does not exist yet (ENOENT, or ENOTDIR when a
+parent is a file) falls back to the resolved path, so a `write` that creates a
+file is still ordered. Any other error from `realpath` propagates.
+
+```ts ! file-mutation-queue.ts
+const fileMutationQueues = new Map<string, Promise<void>>();
+let registrationQueue = Promise.resolve();
+
+function isMissingPathError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error.code === "ENOENT" || error.code === "ENOTDIR")
+	);
+}
+
+async function getMutationQueueKey(filePath: string): Promise<string> {
+	const resolvedPath = resolve(filePath);
+	try {
+		return await realpath(resolvedPath);
+	} catch (error) {
+		if (isMissingPathError(error)) {
+			return resolvedPath;
+		}
+		throw error;
+	}
+}
+```
+
+## !!steps Registering a place in line
+
+Computing the key is async, so two callers could otherwise compute keys, read the
+map and set it in an interleaved order and lose their position. Running
+registration inside `registrationQueue.then(...)` makes the read-then-set of the
+map atomic across callers.
+
+Each caller creates a promise `nextQueue` that it will resolve when done, and
+chains it after the previous tail. The new tail is stored in the map straight
+away, so the next caller will wait on this one.
+
+```ts ! file-mutation-queue.ts
+export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+	const registration = registrationQueue.then(async () => {
+		const key = await getMutationQueueKey(filePath);
+		const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
+
+		let releaseNext!: () => void;
+		const nextQueue = new Promise<void>((resolveQueue) => {
+			releaseNext = resolveQueue;
+		});
+		const chainedQueue = currentQueue.then(() => nextQueue);
+		fileMutationQueues.set(key, chainedQueue);
+
+		return { key, currentQueue, chainedQueue, releaseNext };
+	});
+```
+
+## !!steps Keeping the registry alive after a failure
+
+The registration chain swallows both outcomes with a pair of handlers returning
+`undefined`. If one registration threw, for example from a failing `realpath`,
+later callers still proceed instead of inheriting a rejected promise forever.
+The failing caller itself still sees the error, because it awaits
+`registration` directly.
+
+```ts ! file-mutation-queue.ts
+	registrationQueue = registration.then(
+		() => undefined,
+		() => undefined,
+	);
+
+	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	await currentQueue;
+```
+
+## !!steps Run, release, clean up
+
+After the previous holder finishes, `fn` runs. The `finally` block releases the
+next waiter whether `fn` succeeded or threw, so an error in one edit never
+blocks the queue. The map entry is deleted only if it still points at this
+caller's own tail; if another caller has already queued behind, the entry now
+belongs to them and must stay.
+
+```ts ! file-mutation-queue.ts
+	try {
+		return await fn();
+	} finally {
+		releaseNext();
+		// !mark(1:3)
+		if (fileMutationQueues.get(key) === chainedQueue) {
+			fileMutationQueues.delete(key);
+		}
+	}
+}
+```
+
+</Scrollycoding>
+
+The lock protects only callers in this process that go through the queue.
+Another process, or a tool such as [bash.ts](/docs/src/core/tools/bash.ts)
+modifying files from a shell command, is not covered. Because the map entry is
+removed when the queue drains, the map does not grow over a long session.

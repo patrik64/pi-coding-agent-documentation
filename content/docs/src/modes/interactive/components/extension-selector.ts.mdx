@@ -1,0 +1,173 @@
+---
+title: "extension-selector.ts"
+description: "A boxed single-choice list for extensions, with vim-style navigation and an optional auto-cancel countdown"
+source: "src/modes/interactive/components/extension-selector.ts"
+full: true
+---
+
+When an extension asks the user to pick one string from a list, this component is what appears. It is a `Container` of themed children: border, title, optional description, the option list, a key hint line and a closing border.
+
+Two details stand out. The list is rebuilt from scratch on each selection change instead of mutating rows, and an optional timeout turns the dialog into a countdown that cancels itself. It reuses [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) for the frame, [countdown-timer.ts](/docs/src/modes/interactive/components/countdown-timer.ts) for the timeout and [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for the footer.
+
+<Scrollycoding>
+
+## !!steps Options and constructor state
+
+`ExtensionSelectorOptions` carries four optional extras: a `tui` handle (needed only for the countdown), a `timeout` in seconds, a description line, and a callback for toggling tool output expansion. The component stores the option strings, the two callbacks and the base title, which the countdown will later decorate.
+
+```ts ! extension-selector.ts
+// !mark
+export interface ExtensionSelectorOptions {
+	tui?: TUI;
+	timeout?: number;
+	onToggleToolsExpanded?: () => void;
+	description?: string;
+}
+
+export class ExtensionSelectorComponent extends Container {
+// !mark
+	private options: string[];
+// !mark
+	private selectedIndex = 0;
+	private listContainer: Container;
+	private onSelectCallback: (option: string) => void;
+	private onCancelCallback: () => void;
+	private titleText: Text;
+	private baseTitle: string;
+	private countdown: CountdownTimer | undefined;
+	private onToggleToolsExpanded: (() => void) | undefined;
+
+	constructor(
+		title: string,
+		options: string[],
+		onSelect: (option: string) => void,
+		onCancel: () => void,
+		opts?: ExtensionSelectorOptions,
+	) {
+		super();
+
+		this.options = options;
+		this.onSelectCallback = onSelect;
+		this.onCancelCallback = onCancel;
+		this.onToggleToolsExpanded = opts?.onToggleToolsExpanded;
+		this.baseTitle = title;
+```
+
+## !!steps Building the frame
+
+The constructor stacks the visual pieces in order: border, spacer, bold accent title, optional description, then a spacer. The title `Text` is kept in a field because the countdown rewrites it. Padding arguments `1, 0` give one column of horizontal padding and none vertical.
+
+```ts ! extension-selector.ts
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+
+// !mark
+		this.titleText = new Text(theme.fg("accent", theme.bold(title)), 1, 0);
+		this.addChild(this.titleText);
+		if (opts?.description) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(theme.fg("text", opts.description), 1, 0));
+		}
+		this.addChild(new Spacer(1));
+```
+
+## !!steps The countdown
+
+A countdown exists only when the timeout is positive and a `tui` was provided, since the timer needs the TUI to request re-renders. On every tick it rewrites the title with the remaining seconds, and when it reaches zero it calls the cancel callback, so a timed-out dialog behaves exactly like the user pressing the cancel key.
+
+```ts ! extension-selector.ts
+// !mark
+		if (opts?.timeout && opts.timeout > 0 && opts.tui) {
+			this.countdown = new CountdownTimer(
+				opts.timeout,
+				opts.tui,
+				(s) => this.titleText.setText(theme.fg("accent", theme.bold(`${this.baseTitle} (${s}s)`))),
+				() => this.onCancelCallback(),
+			);
+		}
+```
+
+## !!steps List container and hint line
+
+The options live in their own `listContainer` so that they can be cleared and refilled without disturbing the frame. The hint combines a raw arrow hint with two configured keys for confirm and cancel. The constructor ends by calling `updateList` once to draw the first state.
+
+```ts ! extension-selector.ts
+// !mark
+		this.listContainer = new Container();
+		this.addChild(this.listContainer);
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Text(
+// !mark
+				rawKeyHint("↑↓", "navigate") +
+					"  " +
+					keyHint("tui.select.confirm", "select") +
+					"  " +
+					keyHint("tui.select.cancel", "cancel"),
+				1,
+				0,
+			),
+		);
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder());
+
+// !mark
+		this.updateList();
+	}
+```
+
+## !!steps Drawing the list
+
+`updateList` empties the container and appends one `Text` per option. The selected row gets an accent arrow and accent text, the others two spaces of indent and the plain text color. Rebuilding is cheap for the short lists extensions pass in and keeps the code free of per-row state.
+
+```ts ! extension-selector.ts
+	private updateList(): void {
+// !mark
+		this.listContainer.clear();
+		for (let i = 0; i < this.options.length; i++) {
+			const isSelected = i === this.selectedIndex;
+// !mark(1:3)
+			const text = isSelected
+				? theme.fg("accent", "→ ") + theme.fg("accent", this.options[i])
+				: `  ${theme.fg("text", this.options[i])}`;
+			this.listContainer.addChild(new Text(text, 1, 0));
+		}
+	}
+```
+
+## !!steps Handling keys
+
+Input is matched against named actions from the keybinding registry, with `k` and `j` hardcoded as extra up and down keys, and a raw newline accepted as confirm in addition to the bound key. Selection clamps at both ends rather than wrapping. The tools-expand binding is forwarded to the host callback so the user can still expand tool output while a prompt is open. Confirm guards against an empty list by only calling back when an option exists.
+
+```ts ! extension-selector.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+// !mark
+		if (kb.matches(keyData, "app.tools.expand")) {
+			this.onToggleToolsExpanded?.();
+// !mark
+		} else if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.updateList();
+		} else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
+			this.selectedIndex = Math.min(this.options.length - 1, this.selectedIndex + 1);
+			this.updateList();
+// !mark(1:3)
+		} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
+			const selected = this.options[this.selectedIndex];
+			if (selected) this.onSelectCallback(selected);
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
+			this.onCancelCallback();
+		}
+	}
+
+// !mark
+	dispose(): void {
+		this.countdown?.dispose();
+	}
+}
+```
+
+</Scrollycoding>
+
+[bug-report.ts](/docs/src/modes/interactive/bug-report.ts) is one in-repo user: it shows the component as an overlay and calls `dispose` when hiding it, which is required, otherwise a running countdown would keep ticking. The class is also re-exported from the package entry [index.ts](/docs/src/index.ts) for extensions. Structurally it is a sibling of [extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts): same frame, same countdown wiring, different middle section. The extension API types for these prompts live in [types.ts](/docs/src/core/extensions/types.ts).

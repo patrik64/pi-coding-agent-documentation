@@ -1,0 +1,10 @@
+{
+  "title": "modes",
+  "pages": [
+    "interactive",
+    "rpc",
+    "index.ts",
+    "json-event.ts",
+    "print-mode.ts"
+  ]
+}

@@ -1,0 +1,53 @@
+---
+title: "cli.ts"
+description: "Root of the experimental command tree: an `experimental` command that dispatches to `server` and `client`"
+source: "src/cli/experimental/cli.ts"
+full: true
+---
+
+This is experimental code. It assembles the command tree for `pi experimental ...` from the small framework in [command.ts](/docs/src/cli/experimental/command.ts) and the two real commands, [server.ts](/docs/src/cli/experimental/commands/server.ts) and [client.ts](/docs/src/cli/experimental/commands/client.ts).
+
+The exported `cli` object is consumed by the experimental entry code, which parses `argv` against it and supplies the context object that actually starts a server or client; see [commands.ts](/docs/src/experimental/commands.ts).
+
+<Scrollycoding>
+
+## !!steps Imports and the group type
+
+Each subcommand module exports its command value and a context type describing the side effects it needs. The group invocation type has only the literal `command: "experimental"`.
+
+```ts ! cli.ts
+import { Command } from "./command.ts";
+import { type ClientCommandContext, clientCommand } from "./commands/client.ts";
+import { type ServerCommandContext, serverCommand } from "./commands/server.ts";
+
+interface ExperimentalCommandGroup {
+	readonly command: "experimental";
+}
+```
+
+## !!steps Combined context
+
+The context needed to run any command is the intersection of the subcommand contexts, so the host supplies one object implementing every action (for example `runClient`).
+
+```ts ! cli.ts
+// !mark
+export type CliContext = ServerCommandContext & ClientCommandContext;
+```
+
+## !!steps The fallback builder and registration
+
+If no subcommand matches, the group's own builder runs and returns a failed parse with a helpful message. Subcommands are chained with `.command(...)`, which also widens the context and invocation types.
+
+```ts ! cli.ts
+const experimentalCommand = new Command<ExperimentalCommandGroup, CliContext>("experimental").build(() => ({
+	ok: false,
+	errors: ["Expected experimental command: server or client"],
+}));
+
+// !mark
+export const cli = experimentalCommand.command(serverCommand).command(clientCommand);
+```
+
+</Scrollycoding>
+
+The group has no action of its own, so it can never execute without a subcommand: parsing always fails first.

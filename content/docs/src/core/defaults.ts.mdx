@@ -1,0 +1,50 @@
+---
+title: "defaults.ts"
+description: "The default reasoning level and the ordered list of selectable thinking levels"
+source: "src/core/defaults.ts"
+full: true
+---
+
+A tiny constants module for model reasoning effort. It imports the `ThinkingLevel` type from the agent core package and pins down two values: what a fresh session uses, and the ordered list that UI pickers and settings validation iterate over.
+
+Keeping these here avoids having [settings-manager.ts](/docs/src/core/settings-manager.ts), [sdk.ts](/docs/src/core/sdk.ts) and [agent-session.ts](/docs/src/core/agent-session.ts) each hard-code their own copy.
+
+<Scrollycoding>
+
+## !!steps The type import
+
+`ThinkingLevel` is defined upstream in the agent core package, so this file only constrains its constants to that union.
+
+```ts ! defaults.ts
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+```
+
+## !!steps Default level
+
+New sessions start at `medium`, a middle setting between no reasoning and the heaviest budgets.
+
+```ts ! defaults.ts
+// ...
+export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";
+```
+
+## !!steps Ordered options
+
+The array runs from `off` to `max`, lowest to highest. The order matters because cycling through levels in the UI walks this list. It is typed `readonly` so callers cannot mutate the shared array. Individual models may support only some of these levels; this list is the superset.
+
+```ts ! defaults.ts
+// ...
+export const THINKING_LEVEL_OPTIONS: readonly ThinkingLevel[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
+```
+
+</Scrollycoding>
+
+Both constants are consumed through [index.ts](/docs/src/core/index.ts) and by the interactive UI. There is no logic here, so there is nothing to test beyond the values themselves.

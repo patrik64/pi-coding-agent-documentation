@@ -1,0 +1,93 @@
+---
+title: "show-images-selector.ts"
+description: "Bordered yes/no picker for the show-images setting, preselecting the current value"
+source: "src/modes/interactive/components/show-images-selector.ts"
+full: true
+---
+
+A tiny modal component: two options, "Yes" and "No", framed by borders. It asks whether images should render inline in the terminal or be replaced by a text placeholder.
+
+It is one of several near-identical select dialogs in this folder, such as [theme-selector.ts](/docs/src/modes/interactive/components/theme-selector.ts). The pattern is always the same: a `Container` holding a [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts), a `SelectList`, and another border.
+
+<Scrollycoding>
+
+## !!steps Layout constants and imports
+
+The list layout pins the primary (label) column between 12 and 32 cells, the same numbers every selector in this folder uses. Colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) via `getSelectListTheme`.
+
+```ts ! show-images-selector.ts
+import { Container, type SelectItem, SelectList, type SelectListLayoutOptions } from "@earendil-works/pi-tui";
+import { getSelectListTheme } from "../theme/theme.ts";
+import { DynamicBorder } from "./dynamic-border.ts";
+
+// !mark(1:4)
+const SHOW_IMAGES_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
+	minPrimaryColumnWidth: 12,
+	maxPrimaryColumnWidth: 32,
+};
+```
+
+## !!steps Two fixed items
+
+The options are hard-coded. Values are the strings `yes` and `no` rather than booleans because `SelectItem.value` is a string; the constructor converts back at the end.
+
+```ts ! show-images-selector.ts
+export class ShowImagesSelectorComponent extends Container {
+	private selectList: SelectList;
+
+	constructor(currentValue: boolean, onSelect: (show: boolean) => void, onCancel: () => void) {
+		super();
+
+		// !mark(1:4)
+		const items: SelectItem[] = [
+			{ value: "yes", label: "Yes", description: "Show images inline in terminal" },
+			{ value: "no", label: "No", description: "Show text placeholder instead" },
+		];
+```
+
+## !!steps Preselect and wire callbacks
+
+The current boolean picks the initial index (0 for yes, 1 for no). Selecting converts the string back to a boolean for `onSelect`; cancel is forwarded unchanged.
+
+```ts ! show-images-selector.ts
+		// Add top border
+		this.addChild(new DynamicBorder());
+
+		// Create selector
+		this.selectList = new SelectList(items, 5, getSelectListTheme(), SHOW_IMAGES_SELECT_LIST_LAYOUT);
+
+		// Preselect current value
+		// !mark
+		this.selectList.setSelectedIndex(currentValue ? 0 : 1);
+
+		// !mark(1:2)
+		this.selectList.onSelect = (item) => {
+			onSelect(item.value === "yes");
+		};
+
+		this.selectList.onCancel = () => {
+			onCancel();
+		};
+```
+
+## !!steps Borders and accessor
+
+Borders are added before and after the list. `getSelectList` lets the owner route key input directly to the inner list. There is no input handler of its own, so the host focuses the list.
+
+```ts ! show-images-selector.ts
+		this.addChild(this.selectList);
+
+		// Add bottom border
+		this.addChild(new DynamicBorder());
+	}
+
+	// !mark(1:3)
+	getSelectList(): SelectList {
+		return this.selectList;
+	}
+}
+```
+
+</Scrollycoding>
+
+Nothing inside the package instantiates this component: it is only re-exported from the components barrel and the package index, so it is part of the public surface for extensions. The settings dialog does not use it. A close cousin is [settings-selector.ts](/docs/src/modes/interactive/components/settings-selector.ts), which offers the same toggle inline as a `true`/`false` cycle; this dialog is the standalone variant.

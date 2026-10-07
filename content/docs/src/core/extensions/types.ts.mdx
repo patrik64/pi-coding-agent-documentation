@@ -1,0 +1,301 @@
+---
+title: "types.ts"
+description: "The extension contract: UI and session contexts, tool definitions, every lifecycle event and its result type, the ExtensionAPI surface, and the loaded-extension records"
+source: "src/core/extensions/types.ts"
+full: true
+---
+
+This is the largest file in the extension system and almost entirely types. It is the public contract between pi and anything that extends it. An extension author reads it to learn what `pi.on(...)` accepts and what each handler may return, and the core reads it to know what it has to provide.
+
+It is organized in layers. Contexts come first (what a handler can touch), then tool definitions, then events and results, then the `ExtensionAPI` itself, then provider registration, and finally the internal records that connect the loader and runner. Runtime values are few: `defineTool`, the type guards for tool events, and nothing else.
+
+The two implementations of this contract are [loader.ts](/docs/src/core/extensions/loader.ts), which builds the `ExtensionAPI` handed to factories, and [runner.ts](/docs/src/core/extensions/runner.ts), which builds the contexts and dispatches events.
+
+<Scrollycoding>
+
+## !!steps The UI context
+
+`ExtensionUIContext` is how an extension talks to a person. It covers dialogs (`select`, `confirm`, `input`, `editor`), passive output (`notify`, `setStatus`, widgets, footer, header, title) and raw hooks such as `onTerminalInput` and custom components with keyboard focus.
+
+Each mode implements it differently. The interactive TUI does everything, while RPC and print modes supply cut-down versions. When no UI exists, the runner substitutes a no-op object. Dialogs accept an `AbortSignal` and a timeout through `ExtensionUIDialogOptions`.
+
+The theme type comes from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+```ts ! types.ts
+export interface ExtensionUIContext {
+	/** Show a selector and return the user's choice. */
+	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
+
+	/** Show a confirmation dialog. */
+	confirm(title: string, message: string, opts?: ExtensionUIDialogOptions): Promise<boolean>;
+
+	/** Show a text input dialog. */
+	input(title: string, placeholder?: string, opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
+
+	/** Show a notification to the user. */
+	notify(message: string, type?: "info" | "warning" | "error"): void;
+
+	/** Listen to raw terminal input (interactive mode only). Returns an unsubscribe function. */
+	onTerminalInput(handler: TerminalInputHandler): () => void;
+```
+
+## !!steps Three nested contexts
+
+Handlers receive an `ExtensionContext`: UI, mode, working directory, a read-only session manager, the model and registry, idle and abort controls, `compact`, and the effective system prompt. A `mode` of `tui`, `rpc`, `json` or `print` lets extensions guard terminal-only features.
+
+`ExtensionToolContext` adds `tools` and `executeTool`, which runs another tool through the same validation, hooks and permission checks as a model call. `ExtensionCommandContext` is for user-initiated commands only and adds session control, `newSession`, `fork`, `navigateTree`, `switchSession`, `reload`. Those are unsafe inside arbitrary event handlers because they replace the session underneath.
+
+`ReplacedSessionContext` is the fresh context passed to `withSession` callbacks after replacement.
+
+```ts ! types.ts
+export interface ExtensionCommandContext extends ExtensionContext {
+	/** Get the current base system-prompt construction options. */
+	getSystemPromptOptions(): BuildSystemPromptOptions;
+
+	/** Wait for the agent to finish streaming */
+	waitForIdle(): Promise<void>;
+
+	/** Start a new session, optionally with initialization. */
+	newSession(options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	}): Promise<{ cancelled: boolean }>;
+```
+
+## !!steps How a tool is exposed to the model
+
+`ToolExposure` separates "declared to the model" from "callable by other tools". `direct` tools are both. `model-only` ones are declared but never callable. `codemode` and `deferred` tools are callable from scripts but not declared unless activated. `hidden` ones are unreachable. Only `direct` and `model-only` tools activate on registration.
+
+This is what lets a large MCP toolset exist without bloating every request. The comment on the type also pins down that the active tool set is exactly the set declared to the model. The built-in tools behind these definitions live under [tools/index.ts](/docs/src/core/tools/index.ts).
+
+```ts ! types.ts
+/**
+ * How the model reaches a tool. "Callable" means callable from other tools through
+ * `ctx.executeTool()`, as the `codemode` tool does.
+ *
+ * - `direct`: declared to the model while active, and callable while active.
+ * - `model-only`: declared to the model while active, never callable. Use it for orchestrating or
+ *   interactive tools.
+ * - `codemode`: callable whenever registered. Not declared to the model unless explicitly
+ *   activated. Codemode tools list it in their description.
+ * - `deferred`: like `codemode`, but codemode tools do not list it; tool search can find it.
+ * - `hidden`: registered but unreachable. Activating it has no effect.
+ *
+ * `direct` and `model-only` tools are activated when they are registered; the others are not.
+ * The active tool set (`getActiveTools`/`setActiveTools`) is the set declared to the model.
+ */
+export type ToolExposure = "direct" | "model-only" | "codemode" | "deferred" | "hidden";
+```
+
+## !!steps ToolDefinition and defineTool
+
+`ToolDefinition` is what `registerTool` takes. Beyond the usual name, label, description and TypeBox `parameters`, it carries prompt text for the default system prompt, an optional `prepareArguments` shim that runs before schema validation, an `outputSchema`, an `executionMode` override and custom `renderCall` and `renderResult` functions.
+
+`defineTool` is an identity function whose purpose is purely typing. It preserves parameter inference when a tool is stored in a variable or array, where contextual typing would otherwise widen `params` to `unknown`.
+
+```ts ! types.ts
+export function defineTool<TParams extends TSchema, TDetails = unknown, TState = any>(
+	tool: ToolDefinition<TParams, TDetails, TState>,
+	// !mark
+): ToolDefinition<TParams, TDetails, TState> & AnyToolDefinition {
+	return tool as ToolDefinition<TParams, TDetails, TState> & AnyToolDefinition;
+}
+```
+
+## !!steps Session events: cancellable and notifying
+
+Session events come in "before" and "after" pairs. The `before` ones, `session_before_switch`, `session_before_fork`, `session_before_compact` and `session_before_tree`, can be cancelled, and the runner's `emit` treats them specially.
+
+The compaction event is the richest. It carries the `CompactionPreparation` from [compaction.ts](/docs/src/core/compaction/compaction.ts), the branch entries, the `reason` (manual, threshold or overflow) and whether the aborted turn will be retried. A handler may answer with its own `CompactionResult`. After success, `session_compact` reports whether the compaction came from an extension, and `session_compact_failed` reports errors or aborts.
+
+```ts ! types.ts
+/** Fired before context compaction (can be cancelled or customized) */
+export interface SessionBeforeCompactEvent {
+	type: "session_before_compact";
+	preparation: CompactionPreparation;
+	branchEntries: SessionEntry[];
+	customInstructions?: string;
+	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+	reason: "manual" | "threshold" | "overflow";
+	/** True when the aborted turn is retried after this compaction (overflow recovery) */
+	willRetry: boolean;
+	signal: AbortSignal;
+}
+```
+
+## !!steps Events around the LLM request
+
+Several events sit right at the model call. `context` sees only the conversation and Pi puts the prompt and tool state back afterwards. `context_with_system` sees everything and owns the result. `before_provider_request` can replace the raw payload. `before_provider_headers` mutates headers in place, and a `null` value deletes a header.
+
+`before_agent_start` runs after the user submits a prompt. Its `systemPrompt` is read-only and rendered on demand, while `systemPromptOptions` is the mutable source that later handlers also see.
+
+```ts ! types.ts
+/**
+ * Fired before each LLM call. Can modify messages.
+ *
+ * `messages` holds the conversation without system messages. The prompt and tool state
+ * belong to Pi: it restores them after the handler returns, so a handler cannot drop
+ * them and does not need to preserve them.
+ */
+export interface ContextEvent {
+	type: "context";
+	messages: AgentMessage[];
+}
+```
+
+## !!steps Boundary events and drafted entries
+
+`turn_end` and `agent_before_settle` share `BoundaryState`: the draft entries so far, a `continue` flag, a `BoundaryContextPreview` of the resulting transcript and the outcome. Handlers return a `BoundaryResult` with new entries and whether to continue.
+
+The drafts are a closed union: custom entries, custom messages, context edits and compactions. A compaction draft with a null `firstKeptEntryId` creates a self-retaining compaction that keeps nothing before it. The runner validates drafts by trying to build the preview, as seen in `emitBoundary`.
+
+```ts ! types.ts
+export interface CompactionEntryDraft {
+	type: "compaction";
+	summary: string;
+	/** Null creates a self-retaining compaction that keeps no preceding entries. */
+	firstKeptEntryId: string | null;
+	details?: unknown;
+	usage?: Usage;
+}
+
+export type SessionBoundaryDraft =
+	| CustomEntryDraft
+	| CustomMessageEntryDraft
+	| ContextEditEntryDraft
+	| CompactionEntryDraft;
+```
+
+## !!steps Tool events and their type guards
+
+Tool events are discriminated by tool name, with one variant per built-in tool whose input and details types come from the tool modules, and a catch-all with `string` and `Record<string, unknown>`. That catch-all is why plain `event.toolName === "bash"` does not narrow, as the doc comment explains.
+
+`isToolCallEventType` solves that with overloads. Built-in names narrow automatically. For custom tools the caller supplies explicit type parameters. The runtime body is a plain string comparison, and the overloads exist purely for the compiler.
+
+```ts ! types.ts
+export function isToolCallEventType(toolName: "bash", event: ToolCallEvent): event is BashToolCallEvent;
+export function isToolCallEventType(toolName: "powershell", event: ToolCallEvent): event is PowerShellToolCallEvent;
+export function isToolCallEventType(toolName: "read", event: ToolCallEvent): event is ReadToolCallEvent;
+// ...
+export function isToolCallEventType<TName extends string, TInput extends Record<string, unknown>>(
+	toolName: TName,
+	event: ToolCallEvent,
+): event is ToolCallEvent & { toolName: TName; input: TInput };
+export function isToolCallEventType(toolName: string, event: ToolCallEvent): boolean {
+	return event.toolName === toolName;
+}
+```
+
+## !!steps Result types encode each event's merge rule
+
+Each event that accepts a response has a result type, and the shape tells you the semantics. `ToolCallEventResult` has `block`, which stops execution, plus `terminate`, a hint that the agent should stop after the batch. `ToolResultEventResult` lists optional replacements, and its comment states the structured-content rule that the runner implements. `BeforeAgentStartEventResult` can inject a message and replace the whole prompt.
+
+Reading these next to `emitToolResult` and `emitBeforeAgentStart` in [runner.ts](/docs/src/core/extensions/runner.ts) shows how little behavior the types leave implicit.
+
+```ts ! types.ts
+/**
+ * Changes a `tool_result` handler makes. Omitted fields stay as they are, except that replacing
+ * `content` without returning `structuredContent` drops the structured content, because it may no
+ * longer match. Return it along with `content` to keep it.
+ */
+export interface ToolResultEventResult {
+	content?: (TextContent | ImageContent)[];
+	details?: unknown;
+	structuredContent?: JsonValue;
+	isError?: boolean;
+	usage?: Usage;
+}
+```
+
+## !!steps The ExtensionAPI surface
+
+`ExtensionAPI` is the `pi` object. It begins with a long list of `on` overloads, one per event name, which pair each event with its handler and result type. After that come registration (tools, commands, shortcuts, flags, renderers), actions (send messages, append entries, set session name, `exec`, tool and model control) and registries for providers, MCP servers and virtual models.
+
+All of the actions are routed to the runtime state, as seen in [loader.ts](/docs/src/core/extensions/loader.ts). The `events` property is the shared bus from [event-bus.ts](/docs/src/core/event-bus.ts), so extensions can talk to each other.
+
+```ts ! types.ts
+	on(event: "context", handler: ExtensionHandler<ContextEvent, ContextEventResult>): () => void;
+	on(event: "context_with_system", handler: ExtensionHandler<ContextWithSystemEvent, ContextEventResult>): () => void;
+	on(
+		event: "cache_warming_decision",
+		handler: ExtensionHandler<CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult>,
+	): () => void;
+	on(
+		event: "before_provider_request",
+		handler: ExtensionHandler<BeforeProviderRequestEvent, BeforeProviderRequestEventResult>,
+	): () => void;
+	on(event: "before_provider_headers", handler: ExtensionHandler<BeforeProviderHeadersEvent>): () => void;
+```
+
+## !!steps Registering providers and virtual models
+
+`ProviderConfig` is how an extension adds a model provider: a base URL, an API key (a literal, an environment reference or a leading `!command`), a custom `streamSimple` for non-standard APIs, models, optional OAuth for `/login` and a `refreshModels` hook. Models are a union of chat, image and classifier configurations, discriminated by `type`.
+
+Virtual models are registered through `ExtensionVirtualModel`, which is the router definition from [virtual-models.ts](/docs/src/core/virtual-models.ts) with a `route` function that also receives an `ExtensionContext`. The loader wraps it so the context is created per request.
+
+```ts ! types.ts
+/** Virtual model registered via pi.registerVirtualModel(). */
+export interface ExtensionVirtualModel<TState = unknown> extends Omit<VirtualModelDefinition<TState>, "route"> {
+	/** Like `VirtualModelDefinition.route`, with an extension context. */
+	route(request: ModelRouteRequest<TState>, ctx: ExtensionContext): ModelRoute<TState> | Promise<ModelRoute<TState>>;
+}
+
+/** Configuration for registering a provider via pi.registerProvider(). */
+export interface ProviderConfig {
+	/** Display name for the provider in UI. */
+	name?: string;
+	/** Base URL for the API endpoint. Required when defining models. */
+	baseUrl?: string;
+```
+
+## !!steps Inline extensions and built-ins
+
+`ExtensionFactory` is the entry point type: a function that takes the API and may be async. `InlineExtension` extends it for factories embedded in the host rather than loaded from files. An inline extension can have a display name, be `hidden` from the startup list, be `replaceable`, or be marked `builtin`.
+
+`replaceable` is the mechanism by which an extension that registers `/mcp` can displace pi's built-in MCP support without a conflict error. `builtin` extensions behave like extension resources: they load by default, can be disabled in settings, and load after project trust is resolved so they cannot handle `project_trust`.
+
+```ts ! types.ts
+/** Extension factory function type. Supports both sync and async initialization. */
+export type ExtensionFactory = (pi: ExtensionAPI) => void | Promise<void>;
+
+export type InlineExtension =
+	| ExtensionFactory
+	| {
+			/**
+			 * Display name shown as `<inline:name>` in the startup Extensions list and errors. With
+			 * `builtin`, the extension is named `builtin:name` in errors and diagnostics.
+			 */
+			name: string;
+			factory: ExtensionFactory;
+```
+
+## !!steps Runtime state, actions and the loaded Extension
+
+The last section holds the internal records. `ExtensionRuntimeState` is state shared by every extension: flag values, queued provider registrations, the MCP registry and the stale-check hooks. `ExtensionActions` are the session-bound functions. `ExtensionRuntime` is simply their intersection. The loader creates it with stubs, and the runner fills it in.
+
+`Extension` is the record produced per loaded module: handler lists keyed by event name, tools, commands, flags, shortcuts and renderers, plus the `sourceInfo` from [source-info.ts](/docs/src/core/source-info.ts) that tells the UI where each thing came from.
+
+```ts ! types.ts
+/**
+ * Full runtime = state + actions.
+ * Created by loader with throwing action stubs, completed by runner.initialize().
+ */
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+
+/** Loaded extension with all registered items. */
+export interface Extension {
+	path: string;
+	resolvedPath: string;
+	hidden?: boolean;
+	/** See {@link InlineExtension}. */
+	replaceable?: boolean;
+	sourceInfo: SourceInfo;
+	handlers: Map<string, HandlerFn[]>;
+```
+
+</Scrollycoding>
+
+Almost every file that touches extensions imports from here. The barrel [index.ts](/docs/src/core/extensions/index.ts) re-exports it for the public SDK, [wrapper.ts](/docs/src/core/extensions/wrapper.ts) adapts `ToolDefinition` to the agent's tool type, and [agent-session.ts](/docs/src/core/agent-session.ts) provides the actions the contexts delegate to.
+
+One structural note: the contract is wide because pi's own features, such as MCP, codemode and tool search, are themselves implemented as extensions against it, so the API has to be capable enough to replace built-in behavior.

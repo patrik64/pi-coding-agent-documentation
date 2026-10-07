@@ -1,0 +1,76 @@
+---
+title: "sessions.ts"
+description: "Service contracts for the server's session directory (replicated list) and session management (create, remove, attach, detach) (experimental)"
+source: "src/experimental/services/sessions.ts"
+full: true
+---
+
+A server hosts many sessions, and a client needs two things from it: a live list of them and a way to create, delete and enter one. This file declares both as chord services.
+
+The implementation sits in [server.ts](/docs/src/experimental/services/server.ts), which builds the replicated directory and wires the management calls to the real session machinery.
+
+<Scrollycoding>
+
+## !!steps Addressing a session
+
+A session is addressed by a server id plus a session id, because a client may talk to several servers. `SessionSummary` adds the creation time, and `SessionCreateOptions` lets the caller choose an id, otherwise one is generated on the server.
+
+```ts ! sessions.ts
+import { type Context, defineService, type ReplicatedState } from "@earendil-works/chord";
+import type { ServerId } from "@earendil-works/pi-protocol";
+
+export interface SessionAddress {
+	serverId: ServerId;
+	sessionId: string;
+}
+
+export interface SessionSummary extends SessionAddress {
+	createdAt: number;
+}
+
+export interface SessionCreateOptions {
+	id?: string;
+}
+```
+
+## !!steps The directory is replicated state with a revision
+
+`SessionDirectoryState` is a revision number plus the full list. The server bumps the revision each time it refreshes the list, so clients can detect change cheaply.
+
+The service itself exposes only `state`. There are no methods: a client reads and subscribes, and all changes go through management.
+
+```ts ! sessions.ts
+export interface SessionDirectoryState {
+	revision: number;
+	sessions: SessionSummary[];
+}
+
+export interface SessionDirectory {
+	readonly state: ReplicatedState<SessionDirectoryState>;
+}
+
+// !mark
+export const SessionDirectory = defineService<SessionDirectory>("pi.session-directory");
+```
+
+## !!steps Management is stateful per client
+
+`create` and `remove` act on the directory, while `attach` and `detach` take no server id and `detach` takes no session id at all. That is because a client is attached to at most one session at a time, and the server tracks which one.
+
+Each interface is paired with a same-named `defineService` constant, using the names `pi.session-directory` and `pi.session-management`.
+
+```ts ! sessions.ts
+export interface SessionManagement {
+	create(options: SessionCreateOptions, context: Context): Promise<SessionSummary>;
+	remove(sessionId: string, context: Context): Promise<void>;
+	// !mark(1:2)
+	attach(sessionId: string, context: Context): Promise<void>;
+	detach(context: Context): Promise<void>;
+}
+
+export const SessionManagement = defineService<SessionManagement>("pi.session-management");
+```
+
+</Scrollycoding>
+
+Both services are served per client attachment in [server.ts](/docs/src/experimental/services/server.ts). The session ids and the on-disk side of the catalog are handled by [session-catalog.ts](/docs/src/experimental/session-catalog.ts).

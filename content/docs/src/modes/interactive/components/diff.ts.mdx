@@ -1,0 +1,138 @@
+---
+title: "diff.ts"
+description: "Renders a line-numbered unified diff string as colored terminal lines with word-level highlights for single-line edits"
+source: "src/modes/interactive/components/diff.ts"
+full: true
+---
+
+The edit tool produces a text diff with a compact format: a prefix character (`+`, `-` or space), a padded line number, then the line content. This file turns that text into themed terminal lines. Context lines are dimmed, removals are red and additions are green.
+
+Its one clever feature is intra-line highlighting: when exactly one line was replaced by exactly one line, the changed words are shown in inverse video using the `diff` package's word diff. The diff text itself comes from [edit-diff.ts](/docs/src/core/tools/edit-diff.ts) and is displayed by the edit renderer in [edit.ts](/docs/src/core/tools/renderers/edit.ts); colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+<Scrollycoding>
+
+## !!steps Parsing a diff line
+
+The regex captures the prefix, an optional run of spaces and digits for the line number, and the rest as content. A line that does not match (for example a separator such as an ellipsis line) returns `null` and is later printed as plain context. `replaceTabs` swaps each tab for three spaces so alignment is stable in the terminal.
+
+```ts ! diff.ts
+function parseDiffLine(line: string): { prefix: string; lineNum: string; content: string } | null {
+	const match = line.match(/^([+-\s])(\s*\d*)\s(.*)$/);
+	if (!match) return null;
+	return { prefix: match[1], lineNum: match[2], content: match[3] };
+}
+
+/**
+ * Replace tabs with spaces for consistent rendering.
+ */
+function replaceTabs(text: string): string {
+	return text.replace(/\t/g, "   ");
+}
+```
+
+## !!steps Word-level diff for one changed line
+
+`renderIntraLineDiff` runs `diffWords` on the old and new content and builds two strings. Unchanged parts go to both, removed parts only to the old line, added parts only to the new one. Changed parts are wrapped in `theme.inverse`.
+
+```ts ! diff.ts
+function renderIntraLineDiff(oldContent: string, newContent: string): { removedLine: string; addedLine: string } {
+	const wordDiff = Diff.diffWords(oldContent, newContent);
+
+	let removedLine = "";
+	let addedLine = "";
+	let isFirstRemoved = true;
+	let isFirstAdded = true;
+
+	for (const part of wordDiff) {
+		if (part.removed) {
+			let value = part.value;
+```
+
+## !!steps Keeping indentation unhighlighted
+
+For the first removed part and the first added part, leading whitespace is split off and appended without inverse. Without this, an indentation change would paint the whole margin. Only the first part of each kind gets this treatment. The unchanged branch at the end appends text to both lines.
+
+```ts ! diff.ts
+			// Strip leading whitespace from the first removed part
+			if (isFirstRemoved) {
+				// !mark
+				const leadingWs = value.match(/^(\s*)/)?.[1] || "";
+				value = value.slice(leadingWs.length);
+				removedLine += leadingWs;
+				isFirstRemoved = false;
+			}
+			if (value) {
+				removedLine += theme.inverse(value);
+			}
+		} else if (part.added) {
+```
+
+## !!steps The main loop and context lines
+
+`renderDiff` walks the lines with an index. Unparseable lines are emitted with the context color. Parsed lines whose prefix is neither plus nor minus are context and keep their number.
+
+```ts ! diff.ts
+export function renderDiff(diffText: string, _options: RenderDiffOptions = {}): string {
+	const lines = diffText.split("\n");
+	const result: string[] = [];
+
+	let i = 0;
+	while (i < lines.length) {
+		const line = lines[i];
+		const parsed = parseDiffLine(line);
+
+		if (!parsed) {
+			result.push(theme.fg("toolDiffContext", line));
+			i++;
+			continue;
+		}
+```
+
+## !!steps Grouping removed and added runs
+
+On a removal the loop gathers the whole run of consecutive removed lines and then the whole run of added lines that follows. This is how a replaced block is recognized.
+
+```ts ! diff.ts
+		if (parsed.prefix === "-") {
+			// Collect consecutive removed lines
+			const removedLines: { lineNum: string; content: string }[] = [];
+			while (i < lines.length) {
+				const p = parseDiffLine(lines[i]);
+				if (!p || p.prefix !== "-") break;
+				removedLines.push({ lineNum: p.lineNum, content: p.content });
+				i++;
+			}
+
+			// Collect consecutive added lines
+			const addedLines: { lineNum: string; content: string }[] = [];
+			while (i < lines.length) {
+				const p = parseDiffLine(lines[i]);
+				if (!p || p.prefix !== "+") break;
+				addedLines.push({ lineNum: p.lineNum, content: p.content });
+				i++;
+			}
+```
+
+## !!steps When to highlight inside the line
+
+Intra-line highlighting is only used for a one-for-one swap. For bigger blocks, word diffs between arbitrary pairs would be misleading, so all removals are printed first, then all additions. Standalone additions and context lines follow the same format.
+
+```ts ! diff.ts
+			if (removedLines.length === 1 && addedLines.length === 1) {
+				const removed = removedLines[0];
+				const added = addedLines[0];
+
+				const { removedLine, addedLine } = renderIntraLineDiff(
+					replaceTabs(removed.content),
+					replaceTabs(added.content),
+				);
+
+				result.push(theme.fg("toolDiffRemoved", `-${removed.lineNum} ${removedLine}`));
+				result.push(theme.fg("toolDiffAdded", `+${added.lineNum} ${addedLine}`));
+			} else {
+				// Show all removed lines first, then all added lines
+```
+
+</Scrollycoding>
+
+The function is pure string-in, string-out apart from reading the global theme, which makes it easy to test. Two small oddities: the exported options type carries a `filePath` that is explicitly unused, and the second parameter of `renderDiff` is named with an underscore for the same reason.

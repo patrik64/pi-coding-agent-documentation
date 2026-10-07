@@ -1,0 +1,107 @@
+---
+title: "sessions.ts"
+description: "Session directory selection for the vacation demo: a per-cwd folder of timestamped session directories, each guarded by a lock file"
+source: "src/experimental/vacation/sessions.ts"
+full: true
+---
+
+Each vacation session is a directory holding one `session.sqlite` file. This module decides which directory to use: a fresh one, or the newest existing one for `--continue`. It also takes an exclusive lock so two processes cannot drive the same session.
+
+[runtime.ts](/docs/src/experimental/vacation/runtime.ts) calls `selectSession` first when opening, and releases the lock on close. The location type it returns is also what feeds the session fields the TUI shows.
+
+<Scrollycoding>
+
+## !!steps What a location contains
+
+`SessionLocation` bundles the id (the directory's name), the directory, the database path, the real working directory, whether the session was just created, and a `release` function for the lock. The `created` flag matters later: the runtime only picks an initial model for a new session.
+
+```ts ! sessions.ts
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, realpath } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import lockfile from "proper-lockfile";
+import { getAgentDir } from "../../config.ts";
+
+/** One session directory holding `session.sqlite`, locked by this process. */
+export interface SessionLocation {
+	id: string;
+	directory: string;
+	database: string;
+	cwd: string;
+	// !mark(1:2)
+	created: boolean;
+	release(): Promise<void>;
+}
+```
+
+## !!steps One folder per working directory
+
+The working directory is resolved to its real path, so symlinks do not split sessions, then hashed with SHA-256 and truncated to 24 hex characters. The folder lives under pi's agent directory from [config.ts](/docs/src/config.ts), in `experimental/vacation-sessions`.
+
+```ts ! sessions.ts
+/** A new session for `cwd`, or its newest one with `continueSession`. */
+export async function selectSession(cwdInput: string, continueSession: boolean): Promise<SessionLocation> {
+	// !mark
+	const cwd = await realpath(resolve(cwdInput));
+	const root = join(
+		getAgentDir(),
+		"experimental",
+		// !mark(1:2)
+		"vacation-sessions",
+		createHash("sha256").update(cwd).digest("hex").slice(0, 24),
+	);
+	await mkdir(root, { recursive: true });
+```
+
+## !!steps New session or newest session
+
+A new session is named with a 13-digit zero-padded millisecond timestamp and a UUID, so a plain string sort is also chronological order. `--continue` filters the folder to names matching that exact pattern, sorts, and takes the last. If none exists, it throws.
+
+```ts ! sessions.ts
+	let directory: string;
+	let created = false;
+	if (continueSession) {
+		const entries = await readdir(root, { withFileTypes: true });
+		const newest = entries
+			// !mark
+			.filter((entry) => entry.isDirectory() && /^\d{13}-[0-9a-f-]{36}$/u.test(entry.name))
+			.map((entry) => entry.name)
+			// !mark(1:2)
+			.sort()
+			.at(-1);
+		if (!newest) throw new Error(`No vacation session exists for ${cwd}`);
+		directory = join(root, newest);
+	} else {
+		// !mark
+		directory = join(root, `${String(Date.now()).padStart(13, "0")}-${randomUUID()}`);
+		await mkdir(directory);
+		created = true;
+	}
+```
+
+## !!steps Locking the directory
+
+The lock is taken on the directory with `proper-lockfile`. A lock left behind by a crashed process becomes stale after the library's default window, and the code retries once a second for twelve attempts to outwait it. After that it reports that the session is open elsewhere, keeping the original error as the cause.
+
+The returned object ties everything together, including the `release` function.
+
+```ts ! sessions.ts
+	let release: () => Promise<void>;
+	try {
+		// A lock left by a crashed process goes stale after 10 s; wait that long before giving up.
+		// !mark(1:4)
+		release = await lockfile.lock(directory, {
+			realpath: false,
+			retries: { retries: 12, minTimeout: 1000, maxTimeout: 1000 },
+		});
+	} catch (error) {
+		// !mark
+		throw new Error(`Session is already open in another process: ${directory}`, { cause: error });
+	}
+	return { id: basename(directory), directory, database: join(directory, "session.sqlite"), cwd, created, release };
+}
+```
+
+</Scrollycoding>
+
+The durable coding agent has its own counterpart in [sessions.ts](/docs/src/experimental/durable/sessions.ts) with the same shape. One detail: the comment says the lock goes stale after 10 s, but the code passes no `stale` option, so it relies on the library default (10 s at the time of writing); the retry loop of twelve one-second waits is sized to that assumption.

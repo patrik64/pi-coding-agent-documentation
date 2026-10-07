@@ -1,0 +1,380 @@
+---
+title: "footer-data-provider.ts"
+description: "Supplies the footer with the current git branch, extension status texts and provider count, watching git metadata for changes"
+source: "src/core/footer-data-provider.ts"
+full: true
+---
+
+The footer needs information that no other API exposes: which git branch the working directory is on, status strings that extensions set with `ctx.ui.setStatus()`, and how many providers have models available. `FooterDataProvider` owns that data, and a read-only view of it is handed to extensions that render custom footers.
+
+The branch is the hard part. Instead of polling `git`, the class finds the repository's HEAD file, watches it with the helpers from [fs-watch.ts](/docs/src/utils/fs-watch.ts), and re-reads on change. It copes with worktrees, reftable repositories, detached HEADs and Windows-mounted paths under WSL. The UI side is [footer.ts](/docs/src/modes/interactive/components/footer.ts).
+
+<Scrollycoding>
+
+## !!steps Locating the git directory
+
+`findGitPaths` walks up from the working directory. A `.git` directory is a normal repo. A `.git` file is a worktree or submodule whose `gitdir:` line points at the real directory, and a `commondir` file there leads to the shared git directory.
+
+It returns the repo directory, the common git directory and the path of HEAD, or `null` if HEAD is missing or anything throws.
+
+```ts ! footer-data-provider.ts
+export function findGitPaths(cwd: string): GitPaths | null {
+	let dir = cwd;
+	while (true) {
+		const gitPath = join(dir, ".git");
+		if (existsSync(gitPath)) {
+			try {
+				const stat = statSync(gitPath);
+				if (stat.isFile()) {
+					// !mark(1:3)
+					const content = readFileSync(gitPath, "utf8").trim();
+					if (content.startsWith("gitdir: ")) {
+						const gitDir = resolve(dir, content.slice(8).trim());
+						const headPath = join(gitDir, "HEAD");
+						if (!existsSync(headPath)) return null;
+						const commonDirPath = join(gitDir, "commondir");
+						const commonGitDir = existsSync(commonDirPath)
+							? resolve(gitDir, readFileSync(commonDirPath, "utf8").trim())
+							: gitDir;
+						return { repoDir: dir, commonGitDir, headPath };
+					}
+				// !mark(1:4)
+				} else if (stat.isDirectory()) {
+					const headPath = join(gitPath, "HEAD");
+					if (!existsSync(headPath)) return null;
+					return { repoDir: dir, commonGitDir: gitPath, headPath };
+				}
+			} catch {
+				return null;
+			}
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+```
+
+## !!steps Asking git when HEAD is ambiguous
+
+Both resolvers run `git symbolic-ref` with `--no-optional-locks`, so the footer never contends with the user's own git commands for the index lock. They return `null` on failure or detached HEAD. One is synchronous for the first render, the other asynchronous for refreshes.
+
+```ts ! footer-data-provider.ts
+/** Ask git for the current branch. Returns null on detached HEAD or if git is unavailable. */
+function resolveBranchWithGitSync(repoDir: string): string | null {
+	// !mark
+	const result = spawnSync("git", ["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"], {
+		cwd: repoDir,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	const branch = result.status === 0 ? result.stdout.trim() : "";
+	return branch || null;
+}
+
+/** Ask git for the current branch asynchronously. Returns null on detached HEAD or if git is unavailable. */
+function resolveBranchWithGitAsync(repoDir: string): Promise<string | null> {
+	return new Promise((resolvePromise) => {
+		execFile(
+			"git",
+			// !mark
+			["--no-optional-locks", "symbolic-ref", "--quiet", "--short", "HEAD"],
+			{
+				cwd: repoDir,
+				encoding: "utf8",
+			},
+			(error: ExecFileException | null, stdout: string) => {
+				if (error) {
+					resolvePromise(null);
+					return;
+				}
+				const branch = stdout.trim();
+				resolvePromise(branch || null);
+			},
+		);
+	});
+}
+```
+
+## !!steps When to poll instead of watch
+
+Native file watching does not work across the WSL boundary for repositories on a Windows drive. The check is two parts: running under WSL, and the repo path matching `/mnt/<letter>`. Only then does the provider add a polling watcher.
+
+```ts ! footer-data-provider.ts
+function isWslEnvironment(): boolean {
+	// !mark
+	return process.platform === "linux" && !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+}
+
+function isWindowsMountedRepoPath(repoDir: string): boolean {
+	// !mark
+	return /^\/mnt\/[a-z](?:\/|$)/i.test(repoDir);
+}
+
+function shouldPollGitHead(repoDir: string): boolean {
+	// !mark
+	return isWslEnvironment() && isWindowsMountedRepoPath(repoDir);
+}
+```
+
+## !!steps The provider's state
+
+The fields show the design. `cachedBranch` is three-valued: `undefined` means not yet read, `null` means no repo, and a string is the branch. There are separate handles for the HEAD watcher, an optional HEAD poller and two reftable watchers, plus timers and flags for debouncing.
+
+The constructor finds the git paths and starts watching straight away.
+
+```ts ! footer-data-provider.ts
+export class FooterDataProvider {
+	private cwd: string;
+	private static readonly WATCH_DEBOUNCE_MS = 500;
+
+	private extensionStatuses = new Map<string, string>();
+	// !mark
+	private cachedBranch: string | null | undefined = undefined;
+	private gitPaths: GitPaths | null | undefined = undefined;
+	private headWatcher: FSWatcher | null = null;
+	private headWatchFilePath: string | null = null;
+	private headWatchFileListener: ((current: Stats, previous: Stats) => void) | null = null;
+	private reftableWatcher: FSWatcher | null = null;
+	private reftableTablesListWatcher: FSWatcher | null = null;
+	private reftableTablesListPath: string | null = null;
+	// !mark(1:2)
+	private branchChangeCallbacks = new Set<() => void>();
+	private availableProviderCount = 0;
+	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private gitWatcherRetryTimer: ReturnType<typeof setTimeout> | null = null;
+	private refreshInFlight = false;
+	private refreshPending = false;
+	private disposed = false;
+
+	constructor(cwd: string) {
+		this.cwd = cwd;
+		this.gitPaths = findGitPaths(cwd);
+		this.setupGitWatcher();
+	}
+```
+
+## !!steps Branch reads and status plumbing
+
+`getGitBranch` resolves synchronously only on the first call and then serves the cache. The extension-status methods are a plain map, where `undefined` text deletes the key. `onBranchChange` returns an unsubscribe function.
+
+`setCwd` tears everything down and rebuilds for the new directory, then notifies listeners even if the branch happens to be the same.
+
+```ts ! footer-data-provider.ts
+	/** Current git branch, null if not in repo, "detached" if detached HEAD */
+	// !mark(1:2)
+	getGitBranch(): string | null {
+		if (this.cachedBranch === undefined) {
+			this.cachedBranch = this.resolveGitBranchSync();
+		}
+		return this.cachedBranch;
+	}
+// ...
+	// !mark(1:4)
+	setCwd(cwd: string): void {
+		if (this.cwd === cwd) {
+			return;
+		}
+
+		this.cwd = cwd;
+		if (this.refreshTimer) {
+			clearTimeout(this.refreshTimer);
+			this.refreshTimer = null;
+		}
+		this.clearGitWatchers();
+		this.cachedBranch = undefined;
+		this.gitPaths = findGitPaths(cwd);
+		this.setupGitWatcher();
+		this.notifyBranchChange();
+	}
+```
+
+## !!steps Debounced, coalesced refresh
+
+Filesystem events fire in bursts, so `scheduleRefresh` waits 500 ms and ignores calls while a timer is already pending. If a refresh is in flight, it records `refreshPending` instead and reschedules afterward.
+
+`refreshGitBranchAsync` only notifies when the branch actually changed from a known value. The first resolution after startup updates the cache silently.
+
+```ts ! footer-data-provider.ts
+	private scheduleRefresh(): void {
+		// !mark(1:2)
+		if (this.disposed || this.refreshTimer) return;
+		if (this.refreshInFlight) {
+			this.refreshPending = true;
+			return;
+		}
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = null;
+			void this.refreshGitBranchAsync();
+		}, FooterDataProvider.WATCH_DEBOUNCE_MS);
+	}
+
+	private async refreshGitBranchAsync(): Promise<void> {
+		if (this.disposed) return;
+		if (this.refreshInFlight) {
+			this.refreshPending = true;
+			return;
+		}
+
+		this.refreshInFlight = true;
+		try {
+			const nextBranch = await this.resolveGitBranchAsync();
+			if (this.disposed) return;
+			// !mark(1:5)
+			if (this.cachedBranch !== undefined && this.cachedBranch !== nextBranch) {
+				this.cachedBranch = nextBranch;
+				this.notifyBranchChange();
+				return;
+			}
+			this.cachedBranch = nextBranch;
+		} finally {
+			this.refreshInFlight = false;
+			if (this.refreshPending && !this.disposed) {
+				this.refreshPending = false;
+				this.scheduleRefresh();
+			}
+		}
+	}
+```
+
+## !!steps Reading HEAD
+
+HEAD content `ref: refs/heads/NAME` yields the branch name. The special name `.invalid` is what reftable repositories write, so the code then asks git. Any other content means a detached HEAD and returns the string `detached`. Errors give `null`.
+
+The sync and async versions are line-for-line twins apart from the git call. That duplication is deliberate but easy to let drift.
+
+```ts ! footer-data-provider.ts
+	private resolveGitBranchSync(): string | null {
+		try {
+			if (!this.gitPaths) return null;
+			const content = readFileSync(this.gitPaths.headPath, "utf8").trim();
+			// !mark(1:3)
+			if (content.startsWith("ref: refs/heads/")) {
+				const branch = content.slice(16);
+				return branch === ".invalid" ? (resolveBranchWithGitSync(this.gitPaths.repoDir) ?? "detached") : branch;
+			}
+			// !mark
+			return "detached";
+		} catch {
+			return null;
+		}
+	}
+
+	private async resolveGitBranchAsync(): Promise<string | null> {
+		try {
+			if (!this.gitPaths) return null;
+			const content = readFileSync(this.gitPaths.headPath, "utf8").trim();
+			if (content.startsWith("ref: refs/heads/")) {
+				const branch = content.slice(16);
+				return branch === ".invalid"
+					? ((await resolveBranchWithGitAsync(this.gitPaths.repoDir)) ?? "detached")
+					: branch;
+			}
+			return "detached";
+		} catch {
+			return null;
+		}
+	}
+```
+
+## !!steps Watching HEAD's directory, not the file
+
+The comment is the key detail. Git replaces HEAD atomically by renaming a temp file over it, which changes the inode, and `fs.watch` on the file stops firing. So the watcher is on the containing directory and filters for the filename `HEAD`.
+
+On WSL Windows mounts, a `watchFile` poller at one-second intervals runs too, comparing mtime, ctime and size.
+
+```ts ! footer-data-provider.ts
+	private setupGitWatcher(): void {
+		this.clearGitWatchers();
+		if (!this.gitPaths) return;
+
+		const pollGitHead = shouldPollGitHead(this.gitPaths.repoDir);
+
+		// Watch the directory containing HEAD, not HEAD itself.
+		// Git uses atomic writes (write temp, rename over HEAD), which changes the inode.
+		// fs.watch on a file stops working after the inode changes.
+		// !mark
+		this.headWatcher = watchWithErrorHandler(
+			dirname(this.gitPaths.headPath),
+			// !mark(1:3)
+			(_eventType, filename) => {
+				if (!filename || filename === "HEAD") {
+					this.scheduleRefresh();
+				}
+			},
+			() => this.handleGitWatcherError(),
+		);
+		if (pollGitHead) {
+			this.headWatchFilePath = this.gitPaths.headPath;
+			this.headWatchFileListener = (current, previous) => {
+				if (
+					current.mtimeMs !== previous.mtimeMs ||
+					current.ctimeMs !== previous.ctimeMs ||
+					current.size !== previous.size
+				) {
+					this.scheduleRefresh();
+				}
+			};
+			// !mark
+			watchFile(this.headWatchFilePath, { interval: 1000 }, this.headWatchFileListener);
+		}
+```
+
+## !!steps Reftable repositories
+
+Reftable repos update tables in a `reftable` directory instead of HEAD. If it exists, it is watched, and so is `tables.list`, with both a watcher and a 250 ms poll. Any watcher failure calls `handleGitWatcherError`, which clears everything and retries after a delay, using `FS_WATCH_RETRY_DELAY_MS`.
+
+```ts ! footer-data-provider.ts
+		// In reftable repos, branch switches update files in the reftable directory
+		// instead of HEAD. Watch it separately so the footer picks up those changes.
+		// !mark(1:2)
+		const reftableDir = join(this.gitPaths.commonGitDir, "reftable");
+		if (existsSync(reftableDir)) {
+			this.reftableWatcher = watchWithErrorHandler(
+				reftableDir,
+				() => {
+					this.scheduleRefresh();
+				},
+				() => this.handleGitWatcherError(),
+			);
+			if (!this.reftableWatcher) {
+				return;
+			}
+
+			// !mark(1:2)
+			const tablesListPath = join(reftableDir, "tables.list");
+			if (existsSync(tablesListPath)) {
+// ...
+				if (!this.reftableTablesListWatcher) {
+					return;
+				}
+				watchFile(tablesListPath, { interval: 250 }, (current, previous) => {
+					if (
+						current.mtimeMs !== previous.mtimeMs ||
+						current.ctimeMs !== previous.ctimeMs ||
+						current.size !== previous.size
+					) {
+						this.scheduleRefresh();
+					}
+				});
+			}
+		}
+	}
+```
+
+## !!steps The read-only view
+
+Extensions get `ReadonlyFooterDataProvider`, a `Pick` of four methods. Mutators such as `setExtensionStatus` and `dispose` stay internal, so extensions cannot overwrite each other's status or stop the watchers.
+
+```ts ! footer-data-provider.ts
+/** Read-only view for extensions - excludes setExtensionStatus, setAvailableProviderCount and dispose */
+// !mark(1:4)
+export type ReadonlyFooterDataProvider = Pick<
+	FooterDataProvider,
+	"getGitBranch" | "getExtensionStatuses" | "getAvailableProviderCount" | "onBranchChange"
+>;
+```
+
+</Scrollycoding>
+
+The class is created by the interactive mode, which passes the read-only type to extension footer factories (see [types.ts](/docs/src/core/extensions/types.ts)). One structural note: the reftable branch of `setupGitWatcher` has several early `return` statements that leave partially created watchers in place, which is safe only because `clearGitWatchers` always runs first on the next setup.

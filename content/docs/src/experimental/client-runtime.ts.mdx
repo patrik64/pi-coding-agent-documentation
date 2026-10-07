@@ -1,0 +1,225 @@
+---
+title: "client-runtime.ts"
+description: "Opens connections to experimental pi servers over Unix sockets or Radius and wraps them in service facades shared by the TUI and headless clients"
+source: "src/experimental/client-runtime.ts"
+full: true
+---
+
+Both experimental clients, the headless [client.ts](/docs/src/experimental/client.ts) and the full-screen [client-tui.ts](/docs/src/experimental/client-tui.ts), need the same plumbing: find servers, connect, and expose typed services. This file is that shared layer. It is experimental code.
+
+There are two stages. `openClientRuntime` validates the command line, resolves routes, connects, and builds per-server service sources. `activateBuiltinClientServices` then opens the concrete service facades on one of those servers. The services themselves are declared under [services](/docs/src/experimental/services/README.md).
+
+<Scrollycoding>
+
+## !!steps Routes, servers, and what activation adds
+
+A route is either a local Unix socket (with a discovered path) or a Radius route that carries only a server id. A `ClientRuntimeServer` pairs a route with a connected `Client` and two service sources, one scoped to the server and one to the attached session. The activated variant adds the concrete services: directory, management, plugins, models, agent, and transcript.
+
+```ts ! client-runtime.ts
+export type ClientRuntimeRoute =
+	| ({ readonly transport: "unix" } & UnixServerRoute)
+	| { readonly transport: "radius"; readonly serverId: ServerId };
+
+export interface ClientRuntimeServer {
+	readonly route: ClientRuntimeRoute;
+	readonly client: Client;
+	readonly server: ServerServiceSource;
+	readonly session: SessionServiceSource;
+}
+
+export interface ActivatedClientRuntimeServer extends ClientRuntimeServer {
+	readonly directory: SessionDirectory;
+	readonly management: SessionManagement;
+	readonly plugins: PresentationPlugins;
+	readonly models: Models;
+	readonly agent: AgentController;
+	readonly transcript: Transcript;
+}
+```
+
+## !!steps Rejecting incompatible options up front
+
+Before any connection, several combinations are refused: auth without a Radius connection, a provider without a model, a model together with `--connect`, and plugin packages with Radius. The model rules reflect that a model can only be chosen when a new server is being started by this client.
+
+```ts ! client-runtime.ts
+export async function openClientRuntime(
+	command: ClientCommand,
+	options: OpenClientRuntimeOptions = {},
+): Promise<ClientRuntime> {
+	// !mark(1:3)
+	if (command.auth !== undefined && command.connect?.transport !== "radius") {
+		throw new Error("Authentication is only supported for experimental Radius connections");
+	}
+	if (command.provider !== undefined && command.model === undefined) {
+		throw new Error("Server model provider requires a model");
+	}
+	if (command.connect && command.model !== undefined) {
+		throw new Error("Model selection is only valid when automatically activating a new server");
+	}
+```
+
+## !!steps Choosing routes, starting a server if none exists
+
+With `--connect` there is exactly one route, taken from an explicit socket path or a Radius server id. Without it, the runtime scans the server directory. If servers exist and a model was requested the call fails; if none exist, `activateServer` from [server.ts](/docs/src/experimental/server.ts) starts one, and its already-connected client is remembered so it is not connected twice.
+
+```ts ! client-runtime.ts
+	const directory = resolveServerDirectory(options.directory);
+	let routes: ClientRuntimeRoute[];
+	let activatedClient: Client | undefined;
+	if (command.connect) {
+		routes = [
+			command.connect.transport === "radius"
+				? { transport: "radius", serverId: command.connect.serverId }
+				: { transport: "unix", ...routeFromExplicitPath(command.connect.path) },
+		];
+	} else {
+		routes = (await discoverUnixServers({ directory })).map((route) => ({ transport: "unix", ...route }));
+		// ...
+		if (routes.length === 0) {
+			const activated = await activateServer({
+				directory,
+				requestedServerId: process.env[ENV_SERVER_ID],
+				sessionDir: resolveSessionDirectory(),
+				provider: command.provider,
+				model: command.model,
+			});
+			routes = [{ transport: "unix", ...activated.route }];
+			activatedClient = activated.client;
+		}
+	}
+```
+
+## !!steps Disposal that never loses an error
+
+`dispose` is idempotent. It tears down in a fixed order, reconnectors first, then service sources, then clients, using `allSettled` so one failure does not skip the rest. A single error is rethrown as is, and several become an `AggregateError`.
+
+```ts ! client-runtime.ts
+	let disposed = false;
+	const dispose = async (): Promise<void> => {
+		if (disposed) return;
+		disposed = true;
+		const reconnectResults = await Promise.allSettled(reconnectors.map((reconnector) => reconnector.dispose()));
+		const sourceResults = await Promise.allSettled(
+			serviceSources.map((source) => source.dispose(BACKGROUND_CONTEXT)),
+		);
+		const clientResults = await Promise.allSettled(clients.map((client) => client.dispose()));
+		const errors = [...reconnectResults, ...sourceResults, ...clientResults].flatMap((result) =>
+			result.status === "rejected" ? [result.reason] : [],
+		);
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Failed to dispose experimental client runtime");
+	};
+```
+
+## !!steps Connecting each route, with a version fallback
+
+Each route gets a transport factory: a Unix socket one, or a Radius one that resolves credentials through [radius-auth.ts](/docs/src/experimental/radius-auth.ts) and connects via [radius-relay.ts](/docs/src/experimental/radius-relay.ts). One failure is treated specially. If a discovered local server rejects the connection with a `version` error, and the user did not pass `--connect`, the stale server is replaced by activating a fresh one for the same server id. Any other error is rethrown.
+
+```ts ! client-runtime.ts
+			let client = activatedClient;
+			if (client === undefined) {
+				try {
+					client = await Client.connect({
+						serverId: route.serverId,
+						transportFactory:
+							route.transport === "unix"
+								? createUnixTransportFactory({ path: route.path })
+								: createRadiusClientTransportFactory({
+										serverId: route.serverId,
+										auth: new RadiusRelayAuthResolver(command.auth),
+									}),
+					});
+				} catch (error) {
+					if (
+						command.connect !== undefined ||
+						route.transport !== "unix" ||
+						!(error instanceof ServerError) ||
+						error.code !== "version"
+					) {
+						throw error;
+					}
+```
+
+## !!steps Radius reconnection re-attaches the session
+
+For Radius routes only, a `RadiusClientReconnect` is registered. When the relay connection returns, its callback waits for the management service to be ready and re-attaches the same session id. Local Unix connections have no equivalent. Then the session-scoped source is created and the server is recorded.
+
+```ts ! client-runtime.ts
+			if (route.transport === "radius") {
+				const reconnectServices = server.open({
+					services: [SessionManagement],
+					assertAccess() {},
+					onError() {},
+				});
+				const reconnectManagement = reconnectServices.use(SessionManagement);
+				reconnectors.push(
+					new RadiusClientReconnect(client, async (sessionId) => {
+						await reconnectServices.ready(BACKGROUND_CONTEXT);
+						await reconnectManagement.attach(sessionId, BACKGROUND_CONTEXT);
+					}),
+				);
+			}
+			const session = createSessionServiceSource(client);
+			serviceSources.push(session);
+			servers.push({ route, client, server, session });
+```
+
+## !!steps Opening the built-in services
+
+Server-scoped services (directory, management, plugins) and session-scoped ones (models, agent, transcript) are opened separately, then awaited together. `assertAccess` and `onError` are passed as empty functions, so access checks and service errors are ignored at this layer.
+
+```ts ! client-runtime.ts
+export async function activateBuiltinClientServices(
+	server: ClientRuntimeServer,
+): Promise<ActivatedClientRuntimeServer> {
+	const serverServices = server.server.open({
+		services: [SessionDirectory, SessionManagement, PresentationPlugins],
+		assertAccess() {},
+		onError() {},
+	});
+	const sessionServices = server.session.open({
+		services: [Models, AgentController, Transcript],
+		assertAccess() {},
+		onError() {},
+	});
+```
+
+## !!steps Management that waits for the attachment
+
+The remote `attach` and `detach` return before the session-scoped services exist or disappear. The wrapper therefore also awaits `whenAttached` or `whenDetached`, so callers can use `agent` and `transcript` right after `attach` resolves. `remove` waits for detach only when the removed session is the current attachment.
+
+```ts ! client-runtime.ts
+	const management: SessionManagement = {
+		create: (options, context) => remoteManagement.create(options, context),
+		async remove(sessionId, context) {
+			const removesCurrentAttachment = server.client.attachment?.sessionId === sessionId;
+			await remoteManagement.remove(sessionId, context);
+			if (removesCurrentAttachment) await server.session.whenDetached(context);
+		},
+		async attach(sessionId, context) {
+			await remoteManagement.attach(sessionId, context);
+			await server.session.whenAttached(sessionId, context);
+		},
+		async detach(context) {
+			await remoteManagement.detach(context);
+			await server.session.whenDetached(context);
+		},
+	};
+```
+
+## !!steps Parsing an explicit socket path
+
+A `--connect` path must be named `<uuidv4-server-id>.sock`. The server id is recovered from the filename and validated, which is how an explicit path becomes a route without a directory scan.
+
+```ts ! client-runtime.ts
+function routeFromExplicitPath(path: string): UnixServerRoute {
+	const name = basename(path);
+	const serverId = name.endsWith(".sock") ? name.slice(0, -".sock".length) : "";
+	if (!isServerId(serverId)) throw new Error("--connect path must end with <uuidv4-server-id>.sock");
+	return { serverId, path };
+}
+```
+
+</Scrollycoding>
+
+The service classes come from [sessions.ts](/docs/src/experimental/services/sessions.ts), [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts), [connection.ts](/docs/src/experimental/services/connection.ts), [transcript.ts](/docs/src/experimental/services/transcript.ts) and [plugins.ts](/docs/src/experimental/services/plugins.ts). The two consumers, [client.ts](/docs/src/experimental/client.ts) and [client-tui.ts](/docs/src/experimental/client-tui.ts), both finish by calling `runtime.dispose()`.

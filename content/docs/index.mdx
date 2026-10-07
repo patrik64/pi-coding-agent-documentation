@@ -1,0 +1,37 @@
+---
+title: Overview
+description: Annotated source tour of the pi coding-agent, file by file
+---
+
+**pi coding-agent** is the terminal coding agent of the
+[pi monorepo](https://github.com/patrik64/pi-mono): a minimal, extensible
+agent harness with `read`, `bash`, `edit` and `write` tools, persistent
+tree-shaped sessions, context compaction, an extension system, and four ways to
+drive it — interactive TUI, print and JSON mode, RPC over stdin and stdout, and
+an in-process TypeScript SDK. The source lives in
+[`packages/coding-agent`](https://github.com/patrik64/pi-mono/tree/main/packages/coding-agent).
+
+This site documents that package **file by file**: the sidebar mirrors the
+project's directory tree, and every page corresponds to one source file.
+
+## How to read these docs
+
+- **Walkthrough pages** step through a file with a scroll-driven code panel
+  (Code Hike *scrollycoding*): as you scroll the explanation on the left, the
+  code on the right follows along and highlights what the text refers to. Start
+  with [agent-session.ts](/docs/src/core/agent-session.ts),
+  [session-manager.ts](/docs/src/core/session-manager.ts),
+  [compaction.ts](/docs/src/core/compaction/compaction.ts) or
+  [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+- **Every file has a walkthrough.** Small files get a few steps, large ones
+  a dozen or more; each excerpt is quoted verbatim from the source and checked
+  by `pnpm check`.
+- Every page has a **View source on GitHub** button linking to the exact file
+  in the repository.
+- The [Code Graph](/docs/code-graph) draws every documented file as a node and
+  every link between two pages as an edge.
+
+For the big picture — how the session, the tools, the extension runner and the
+modes fit together — read the [Architecture](/docs/architecture) page first.
+For using Pi rather than reading it, see the
+[user documentation](https://github.com/patrik64/pi-mono/tree/main/packages/coding-agent/docs).

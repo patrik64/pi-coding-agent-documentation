@@ -1,0 +1,281 @@
+---
+title: "bug-report.ts"
+description: "Builds a redacted bug report bundle: environment metadata, failure diagnostics, optional session transcript, and an optional model-written summary"
+source: "src/core/bug-report.ts"
+full: true
+---
+
+When a user files a bug, pi needs enough information to reproduce it without
+leaking credentials. This file collects that information and makes it safe. It
+produces a `BugReportBundle` with up to four files: `report.json`,
+`diagnostics.json`, and optionally `session.jsonl` and `summary.md`.
+
+The delivery halves are separate: [bug-report-upload.ts](/docs/src/core/bug-report-upload.ts)
+posts the files, and the zip export uses [zip.ts](/docs/src/utils/zip.ts). Crash
+records come from [crash-log.ts](/docs/src/core/crash-log.ts), and the summary
+is generated with the helpers in
+[compaction.ts](/docs/src/core/compaction/compaction.ts).
+
+<Scrollycoding>
+
+## !!steps Redaction rules
+
+Everything leaving the machine goes through two functions. `isSensitiveKey`
+splits camelCase into words first, then matches names such as api key, token,
+password or cookie as whole words, so `apiKey` and `x-auth-token` match but
+`monkey` does not. `redactUrl` strips user and password and replaces sensitive
+query values, and handles nested URLs such as `git+https://...`.
+
+```ts ! bug-report.ts
+const REDACTED = "<redacted>";
+const SENSITIVE_KEY = /(?:^|[-_])(api[-_]?key|secret|token|password|passwd|credential|authorization|cookie)(?:$|[-_])/i;
+
+function isSensitiveKey(key: string): boolean {
+	return SENSITIVE_KEY.test(key.replace(/([a-z0-9])([A-Z])/g, "$1_$2"));
+}
+
+/** Strip credentials and secret-looking query parameters from a URL. */
+export function redactUrl(value: string): string {
+	const nested = /^([a-z][a-z0-9+.-]*:)([a-z][a-z0-9+.-]*:\/\/.*)$/i.exec(value);
+	if (nested) return `${nested[1]}${redactUrl(nested[2])}`;
+	try {
+		const url = new URL(value);
+		let changed = false;
+		if (url.username || url.password) {
+			url.username = "";
+			url.password = "";
+			changed = true;
+		}
+```
+
+## !!steps Redacting JSON values
+
+`redactJsonValue` deep-copies through `JSON.stringify` with a replacer. Any
+non-null value whose key looks sensitive becomes the placeholder, and every
+string value is passed through `redactUrl`. Settings additionally drop the
+tracking id and device id entirely.
+
+```ts ! bug-report.ts
+export function redactJsonValue(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	return JSON.parse(
+		JSON.stringify(value, (key, child: unknown) => {
+			// !mark
+			if (child !== null && child !== undefined && isSensitiveKey(key)) return REDACTED;
+			return typeof child === "string" ? redactUrl(child) : child;
+		}),
+	);
+}
+
+function redactSettings(settings: Settings): Settings {
+	const { trackingId: _trackingId, deviceId: _deviceId, ...rest } = settings;
+	return redactJsonValue(rest) as Settings;
+}
+```
+
+## !!steps Describing the environment
+
+Only facts that help reproduce a problem are recorded: version, runtime,
+platform, shell name (not path), terminal and CI flags. For environment
+variables only the names of those starting with `PI_` are kept, never the
+values, as the comment says.
+
+```ts ! bug-report.ts
+function collectEnvironment() {
+	const env = (name: string): string | null => process.env[name] || null;
+	return {
+		version: VERSION,
+		userAgent: getPiUserAgent(VERSION),
+		runtime: process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`,
+		platform: process.platform,
+		arch: process.arch,
+		osRelease: os.release(),
+		osVersion: os.version(),
+		shell: process.env.SHELL?.split(/[\\/]/).pop() || null,
+		// ...
+		// Names help diagnose configuration; values never leave the machine.
+		piEnvironmentVariables: Object.keys(process.env)
+			.filter((name) => name.startsWith("PI_"))
+			.sort(),
+	};
+}
+```
+
+## !!steps Describing model, provider and extensions
+
+The same principle applies to configuration. A model's base URL is redacted,
+its sampling and compat settings go through JSON redaction, and headers are
+reported by name only. Providers add their auth types and status from
+[model-runtime.ts](/docs/src/core/model-runtime.ts), and extensions are listed
+with source and scope (see [types.ts](/docs/src/core/extensions/types.ts)).
+
+```ts ! bug-report.ts
+function describeModel(model: Model<Api>) {
+	return {
+		provider: model.provider,
+		id: model.id,
+		name: model.name,
+		api: model.api,
+		baseUrl: redactUrl(model.baseUrl),
+		reasoning: model.reasoning,
+		input: model.input,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+		samplingParams: model.samplingParams ? redactJsonValue(model.samplingParams) : null,
+		compat: model.compat ? redactJsonValue(model.compat) : null,
+		thinkingLevelMap: model.thinkingLevelMap ?? null,
+		headerNames: Object.keys(model.headers ?? {}).sort(),
+	};
+}
+```
+
+## !!steps The metadata record
+
+`collectBugReportMetadata` assembles those pieces under a schema version, a
+uuid v7 id and a timestamp. The session's working directory is added only if
+the user chose to include the session; otherwise just the id and message count
+are present. Global and project settings are both redacted.
+
+```ts ! bug-report.ts
+export function collectBugReportMetadata(options: CollectBugReportMetadataOptions) {
+	const hint = options.hint?.trim() || null;
+	const provider = options.model ? options.modelRuntime.getProvider(options.model.provider) : undefined;
+	return {
+		schemaVersion: BUG_REPORT_SCHEMA_VERSION,
+		id: options.id ?? uuidv7(),
+		createdAt: new Date().toISOString(),
+		hint,
+		environment: collectEnvironment(),
+		session: {
+			id: options.sessionId,
+			included: options.includeSession,
+			summaryIncluded: options.includeSummary,
+			messageCount: options.messageCount,
+			...(options.includeSession ? { cwd: options.cwd } : {}),
+		},
+```
+
+## !!steps Diagnostics without conversation content
+
+`collectBugReportDiagnostics` walks the session and keeps only assistant turns
+that went wrong: ones with diagnostics, an error or aborted stop reason, or an
+error message. It records ids, model, stop reasons and error text, but never
+message content. Crash records are added with their internal `notified` flag
+removed.
+
+```ts ! bug-report.ts
+		assistantMessageCount++;
+		const message = entry.message;
+		const diagnostics = message.diagnostics ?? [];
+		if (
+			diagnostics.length === 0 &&
+			message.stopReason !== "error" &&
+			message.stopReason !== "aborted" &&
+			!message.errorMessage
+		) {
+			continue;
+		}
+		assistant.push({
+			entryId: entry.id,
+			timestamp: entry.timestamp,
+			provider: message.provider,
+			model: message.model,
+			api: message.api,
+```
+
+## !!steps One file list for both delivery paths
+
+`bugReportFiles` is the single source of truth: `report.json` and
+`diagnostics.json` always, `session.jsonl` and `summary.md` only when present.
+Zip export and upload both call it, so they cannot drift apart. Summaries get a
+trailing newline added if missing.
+
+```ts ! bug-report.ts
+export function bugReportFiles(bundle: BugReportBundle): BugReportFile[] {
+	const files: BugReportFile[] = [
+		{ name: "report.json", contentType: "application/json", data: `${JSON.stringify(bundle.metadata, null, 2)}\n` },
+		{
+			name: "diagnostics.json",
+			contentType: "application/json",
+			data: `${JSON.stringify(bundle.diagnostics, null, 2)}\n`,
+		},
+	];
+	if (bundle.sessionJsonl !== undefined) {
+		files.push({ name: "session.jsonl", contentType: "application/x-ndjson", data: bundle.sessionJsonl });
+	}
+```
+
+## !!steps Keeping the newest messages within budget
+
+When the user declines to share the transcript, the session model writes a
+summary instead. `selectMessages` walks from newest to oldest and stops when
+the token budget is exceeded, but always keeps at least one message even if it
+alone is over budget. The result is reversed back into chronological order.
+
+```ts ! bug-report.ts
+function selectMessages(messages: readonly AgentMessage[], tokenBudget: number): AgentMessage[] {
+	const selected: AgentMessage[] = [];
+	let tokens = 0;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		const next = estimateTokens(message);
+		if (selected.length > 0 && tokens + next > tokenBudget) break;
+		selected.push(message);
+		tokens += next;
+	}
+	return selected.reverse();
+}
+```
+
+## !!steps Generating the summary
+
+The budget is 60 percent of the context window (128000 when unknown). The
+prompt wraps the serialized conversation and any user hint in tags and adds
+fixed instructions asking for four sections and no file contents or secrets.
+Output is capped at 4096 tokens, and reasoning is only requested when the model
+supports it and the level is not off.
+
+```ts ! bug-report.ts
+	const { model } = options;
+	const contextWindow = model.contextWindow > 0 ? model.contextWindow : 128_000;
+	const messages = selectMessages(options.messages, Math.floor(contextWindow * 0.6));
+	const hint = options.hint?.trim();
+	const prompt = [
+		messages.length < options.messages.length
+			? `Note: only the last ${messages.length} of ${options.messages.length} messages are shown.`
+			: undefined,
+		`<conversation>\n${serializeConversation(convertToLlm(messages))}\n</conversation>`,
+		hint ? `<user-report>\n${hint}\n</user-report>` : undefined,
+		BUG_SUMMARY_INSTRUCTIONS,
+	]
+		.filter((part) => part !== undefined)
+		.join("\n\n");
+```
+
+## !!steps Rejecting bad responses
+
+The response is validated before it is trusted: cancellation, a summarization
+failure, any tool call, or empty text each throw a specific error. Tool calls
+are rejected because the model is told only to write a report, and acting on
+one would be wrong.
+
+```ts ! bug-report.ts
+	if (response.stopReason === "aborted") throw new Error("Bug report summary was cancelled");
+	const failure = getSummarizationFailure(response, "Bug report summary");
+	if (failure) throw new Error(failure);
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error("Bug report summary attempted to call a tool");
+	}
+	const text = contentText(response.content).trim();
+	if (!text) throw new Error("Bug report summary was empty");
+	return text;
+}
+```
+
+</Scrollycoding>
+
+The consumers are the bug report command and dialog in interactive mode, which
+store a `BugReportSessionEntryData` custom entry under the
+`pi.bug-report` type. Structurally the file mixes three jobs (redaction,
+collection, summary generation), but each is a self-contained group of
+functions.

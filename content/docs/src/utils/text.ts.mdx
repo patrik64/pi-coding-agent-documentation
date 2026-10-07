@@ -1,0 +1,38 @@
+---
+title: "text.ts"
+description: "Helpers for splitting and stripping a leading UTF-8 byte order mark from decoded text"
+source: "src/utils/text.ts"
+full: true
+---
+
+Two functions for dealing with a BOM (`U+FEFF`) at the start of file contents. Files written by some Windows editors carry one, and it must be removed before parsing but ideally restored when writing back so the file is not silently changed.
+
+Consumers include [edit.ts](/docs/src/core/tools/edit.ts), [settings-manager.ts](/docs/src/core/settings-manager.ts) and [auth-storage.ts](/docs/src/core/auth-storage.ts), which parse files that may start with a BOM.
+
+<Scrollycoding>
+
+## !!steps Split keeps the BOM
+
+`splitBom` returns the BOM and the remaining text separately. Callers that rewrite a file can prepend `bom` again so the original encoding marker is preserved.
+
+```ts ! text.ts
+/** Split a leading UTF-8 byte order mark from decoded text. */
+export function splitBom(content: string): { bom: string; text: string } {
+	return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
+}
+```
+
+## !!steps Strip discards it
+
+`stripBom` is the convenience form for read-only uses, built on `splitBom`.
+
+```ts ! text.ts
+/** Remove a leading UTF-8 byte order mark from decoded text. */
+export function stripBom(content: string): string {
+	return splitBom(content).text;
+}
+```
+
+</Scrollycoding>
+
+Only a single leading BOM is handled, and only after the bytes were decoded to a string, so UTF-16 files are not covered here.

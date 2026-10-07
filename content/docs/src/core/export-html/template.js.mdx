@@ -1,0 +1,385 @@
+---
+title: "template.js"
+description: "The client-side application inside every exported session page: decodes the data, builds the branch tree and renders messages"
+source: "src/core/export-html/template.js"
+full: true
+---
+
+This is the whole front end of an exported session, in one self-invoking function. [index.ts](/docs/src/core/export-html/index.ts) inlines it into [template.html](/docs/src/core/export-html/template.html) together with the session data, so the exported file is a standalone viewer with no server.
+
+It does four jobs: decode the embedded entries, turn the flat list into a tree of branches, render the chosen path as HTML strings, and wire up interaction (search, filters, resizable sidebar, keyboard shortcuts, deep links). Entries follow the structure written by [session-manager.ts](/docs/src/core/session-manager.ts), where each has an id and a parent id, so a session with several branches is a tree and the page shows one root-to-leaf path at a time.
+
+<Scrollycoding>
+
+## !!steps Decoding the embedded session
+
+The data element holds base64, not JSON. It is decoded to bytes and then through `TextDecoder` as UTF-8, because plain `atob` yields a Latin-1 string and would corrupt non-ASCII text. The decoded object carries the header, the entries, a default leaf id, the system prompt, tool definitions, and `renderedTools`, the HTML produced by [tool-renderer.ts](/docs/src/core/export-html/tool-renderer.ts).
+
+```js ! template.js
+      const base64 = document.getElementById('session-data').textContent;
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const data = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+      const { header, entries, leafId: defaultLeafId, systemPrompt, tools, renderedTools } = data;
+```
+
+## !!steps Deep links choose the branch
+
+Two query parameters control the view: `leafId` selects which branch to display and `targetId` selects the message to scroll to. When the page is loaded in an iframe via `srcdoc`, there is no real query string, so a `pi-url-params` meta element carries the parameters instead. Without a `leafId`, the session's own default leaf is used.
+
+```js ! template.js
+      // Parse URL parameters for deep linking: leafId and targetId
+      // Check for injected params (when loaded in iframe via srcdoc) or use window.location
+      const injectedParams = document.querySelector('meta[name="pi-url-params"]');
+      const searchString = injectedParams ? injectedParams.content : window.location.search.substring(1);
+      const urlParams = new URLSearchParams(searchString);
+      const urlLeafId = urlParams.get('leafId');
+      const urlTargetId = urlParams.get('targetId');
+      // Use URL leafId if provided, otherwise fall back to session default
+      const leafId = urlLeafId || defaultLeafId;
+```
+
+## !!steps Lookup tables built once
+
+Entries are indexed by id, tool calls by tool call id, and labels by the entry they point at. Labels are separate entries of type `label` whose `targetId` names the entry being labeled, so the page has to join them up front. The tool call map lets a result entry recover the name and arguments of the call it answers.
+
+```js ! template.js
+        byId.set(entry.id, entry);
+      }
+
+      // Tool call lookup (toolCallId -> {name, arguments})
+      const toolCallMap = new Map();
+      for (const entry of entries) {
+        if (entry.type === 'message' && entry.message.role === 'assistant') {
+          const content = entry.message.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block.type === 'toolCall') {
+                toolCallMap.set(block.id, { name: block.name, arguments: block.arguments });
+              }
+            }
+          }
+        }
+      }
+
+      // Label lookup (entryId -> label string)
+      // Labels are stored in 'label' entries that reference their target via targetId
+      const labelMap = new Map();
+      // ...
+        if (entry.type === 'label' && entry.targetId && entry.label) {
+          labelMap.set(entry.targetId, entry.label);
+        }
+      }
+
+      // ============================================================
+      // TREE DATA PREPARATION (no DOM, pure data)
+```
+
+## !!steps From a flat list to a tree
+
+Each entry becomes a node, then is attached to the node of its `parentId`. A missing parent, a self-parent, or a null parent all make the node a root, so a session with a pruned or damaged history still renders. Children are sorted by timestamp so older branches appear first.
+
+```js ! template.js
+        // Build parent-child relationships
+        for (const entry of entries) {
+          const node = nodeMap.get(entry.id);
+          if (entry.parentId === null || entry.parentId === undefined || entry.parentId === entry.id) {
+            roots.push(node);
+          } else {
+            const parent = nodeMap.get(entry.parentId);
+            if (parent) {
+              parent.children.push(node);
+            } else {
+              roots.push(node);
+            }
+          }
+        }
+
+        // Sort children by timestamp
+        function sortChildren(node) {
+          node.children.sort((a, b) =>
+            new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
+          );
+          node.children.forEach(sortChildren);
+        }
+        roots.forEach(sortChildren);
+
+        return roots;
+      }
+```
+
+## !!steps Filtering the tree
+
+The sidebar filter always keeps the current leaf visible. Assistant messages that contain only tool calls are hidden unless they ended in an error or abort. The settings-like entry types (label, custom, context edit, model change, thinking level change) are what the default and no-tools modes drop, and search requires every whitespace-separated token to appear in the entry text. Afterwards the visual structure is recomputed so hidden entries do not leave gaps in the indentation.
+
+```js ! template.js
+          const label = flatNode.node.label;
+          const isCurrentLeaf = entry.id === currentLeafId;
+
+          // Always show current leaf
+          if (isCurrentLeaf) return true;
+
+          // Hide assistant messages with only tool calls (no text) unless error/aborted
+          if (entry.type === 'message' && entry.message.role === 'assistant') {
+            const msg = entry.message;
+            const hasText = hasTextContent(msg.content);
+            const isErrorOrAborted = msg.stopReason && msg.stopReason !== 'stop' && msg.stopReason !== 'toolUse';
+            if (!hasText && !isErrorOrAborted) return false;
+          }
+
+          // Apply filter mode
+          const isSettingsEntry = ['label', 'custom', 'context_edit', 'model_change', 'thinking_level_change'].includes(entry.type);
+          let passesFilter = true;
+
+          switch (filterMode) {
+            case 'user-only':
+              passesFilter = entry.type === 'message' && entry.message.role === 'user';
+              break;
+            case 'no-tools':
+              passesFilter = !isSettingsEntry && !(entry.type === 'message' && entry.message.role === 'toolResult');
+              break;
+            case 'labeled-only':
+              passesFilter = label !== undefined;
+              break;
+            case 'all':
+              passesFilter = true;
+              break;
+```
+
+## !!steps Escaping and URL safety
+
+All dynamic strings go through `escapeHtml` because the page builds HTML by string concatenation. Markdown links additionally pass a scheme allow-list (http, https, mailto, tel, ftp) after control characters are stripped, since browsers ignore such characters inside schemes and `java\tscript:` style tricks would otherwise slip through.
+
+```js ! template.js
+      function escapeHtml(text) {
+        return String(text)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
+      function sanitizeMarkdownUrl(value) {
+        const href = String(value || '').trim().replace(/[\x00-\x1f\x7f]/g, '');
+        if (!href) return href;
+
+        const scheme = href.match(/^([A-Za-z][A-Za-z0-9+.-]*):/);
+        if (scheme && !/^(https?|mailto|tel|ftp)$/i.test(scheme[1])) {
+          return null;
+        }
+
+        return href;
+      }
+
+      /**
+       * Truncate string to maxLen chars, append "..." if truncated.
+```
+
+## !!steps Expandable tool output
+
+Long output shows a limited number of lines with a hint, plus a hidden full copy. Clicking toggles an `expanded` class, but the handler returns early when text is selected, so selecting output to copy does not collapse it. When a language is known, highlight.js is used and a failure falls back to escaped plain text.
+
+```js ! template.js
+      function formatExpandableOutput(text, maxLines, lang) {
+        text = replaceTabs(text);
+        const lines = text.split('\n');
+        const displayLines = lines.slice(0, maxLines);
+        const remaining = lines.length - maxLines;
+
+        if (lang) {
+          let highlighted;
+          try {
+            highlighted = hljs.highlight(text, { language: lang }).value;
+          } catch {
+            highlighted = escapeHtml(text);
+          }
+
+          if (remaining > 0) {
+            const previewCode = displayLines.join('\n');
+            let previewHighlighted;
+            try {
+              previewHighlighted = hljs.highlight(previewCode, { language: lang }).value;
+            } catch {
+              previewHighlighted = escapeHtml(previewCode);
+            }
+
+            return `<div class="tool-output expandable" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
+              <div class="output-preview"><pre><code class="hljs">${previewHighlighted}</code></pre>
+              <div class="expand-hint">... (${remaining} more lines)</div></div>
+              <div class="output-full"><pre><code class="hljs">${highlighted}</code></pre></div></div>`;
+          }
+
+          return `<div class="tool-output"><pre><code class="hljs">${highlighted}</code></pre></div>`;
+        }
+
+        // Plain text output
+        if (remaining > 0) {
+```
+
+## !!steps Custom tools use the pre-rendered HTML
+
+Built-in tools have their own cases in `renderToolCall`. The default case looks up `renderedTools` by call id. If the call, collapsed result or expanded result exists it is used: the expandable block is built only when collapsed and expanded differ, and otherwise the expanded HTML is shown directly. Tools with nothing pre-rendered get a JSON dump of their arguments.
+
+```js ! template.js
+          default: {
+            // Check for pre-rendered custom tool HTML
+            const rendered = renderedTools?.[call.id];
+            if (rendered?.callHtml || rendered?.resultHtmlCollapsed || rendered?.resultHtmlExpanded) {
+              // Custom tool with pre-rendered HTML from TUI renderer
+              if (rendered.callHtml) {
+                html += `<div class="tool-header ansi-rendered">${rendered.callHtml}</div>`;
+              } else {
+                html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
+              }
+
+              if (rendered.resultHtmlCollapsed && rendered.resultHtmlExpanded && rendered.resultHtmlCollapsed !== rendered.resultHtmlExpanded) {
+                // Both collapsed and expanded differ - render expandable section
+                html += `<div class="tool-output expandable ansi-rendered" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
+                  <div class="output-preview">${rendered.resultHtmlCollapsed}</div>
+                  <div class="output-full">${rendered.resultHtmlExpanded}</div>
+                </div>`;
+              } else if (rendered.resultHtmlExpanded) {
+                // Only expanded exists (or collapsed is identical) - show directly
+                html += `<div class="tool-output ansi-rendered">${rendered.resultHtmlExpanded}</div>`;
+              } else if (result) {
+                // No pre-rendered result HTML - fallback to JSON
+                const output = getResultText();
+                if (output) html += formatExpandableOutput(output, 10);
+              }
+```
+
+## !!steps Rendering a branch with cached nodes
+
+`navigateTo` re-renders the header and the message list for a chosen leaf. Each entry is rendered to a DOM node once and cached; later visits clone the cached node, which keeps switching between branches cheap. Because cloned nodes carry their initial look, the viewer's toggle states are reapplied afterwards.
+
+```js ! template.js
+      function renderEntryToNode(entry) {
+        // Check cache first
+        if (entryCache.has(entry.id)) {
+          return entryCache.get(entry.id).cloneNode(true);
+        }
+
+        // Render to HTML string, then parse to node
+        const html = renderEntry(entry);
+        if (!html) return null;
+
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        const node = template.content.firstElementChild;
+
+        // Cache the node
+        if (node) {
+          entryCache.set(entry.id, node.cloneNode(true));
+        }
+      // ...
+      function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null) {
+        currentLeafId = targetId;
+        currentTargetId = scrollToEntryId || targetId;
+      // ...
+      // !mark
+        messagesEl.innerHTML = '';
+        messagesEl.appendChild(fragment);
+
+        // Cached nodes contain their initial presentation; reapply the viewer's toggle states.
+        setThinkingExpanded(thinkingExpanded);
+        setToolOutputsExpanded(toolOutputsExpanded);
+```
+
+## !!steps Marked configured to match the terminal
+
+HTML in markdown is deliberately not rendered: the `html` and `tag` tokenizers return undefined, so tags show as text, like the terminal markdown renderer. Strikethrough uses a stricter pattern than the default, and links use the sanitizer above.
+
+```js ! template.js
+      // Configure marked with syntax highlighting and TUI-compatible HTML handling
+      const strictStrikethroughRegex = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
+
+      marked.use({
+        breaks: true,
+        gfm: true,
+        tokenizer: {
+          // Treat HTML-like input as plain text so tags are shown verbatim,
+          // matching the TUI markdown renderer.
+          html() {
+            return undefined;
+          },
+          tag() {
+            return undefined;
+          },
+          del(src) {
+```
+
+## !!steps Sidebar width and the mobile drawer
+
+Width is clamped between a minimum and a maximum that leaves at least 320px for content, and stored in `localStorage` under a versioned key. Every storage access is wrapped in a try and catch, so private browsing modes simply lose persistence. The mobile layout uses the same 900px breakpoint as the stylesheet.
+
+```js ! template.js
+      const SIDEBAR_WIDTH_STORAGE_KEY = 'pi-share:v1:sidebar-width';
+      const MIN_CONTENT_WIDTH = 320;
+
+      function isMobileLayout() {
+        return window.matchMedia('(max-width: 900px)').matches;
+      }
+
+      function getSidebarBounds() {
+        const rootStyles = getComputedStyle(document.documentElement);
+        const minWidth = parseFloat(rootStyles.getPropertyValue('--sidebar-min-width')) || 240;
+        const maxWidth = parseFloat(rootStyles.getPropertyValue('--sidebar-max-width')) || 720;
+        const viewportMaxWidth = window.innerWidth - MIN_CONTENT_WIDTH;
+        return {
+          minWidth,
+          maxWidth: Math.max(minWidth, Math.min(maxWidth, viewportMaxWidth))
+        };
+      }
+
+      function clampSidebarWidth(width) {
+        const { minWidth, maxWidth } = getSidebarBounds();
+        return Math.max(minWidth, Math.min(maxWidth, width));
+      }
+
+      function applySidebarWidth(width) {
+        document.documentElement.style.setProperty('--sidebar-width', `${Math.round(clampSidebarWidth(width))}px`);
+      }
+```
+
+## !!steps Keyboard shortcuts and first render
+
+Escape clears the search and returns to the leaf. The letters t, o and h toggle thinking, tool output and hidden messages, but only when no modifier is held and focus is not in an input, textarea, select or button. The last lines choose the initial view: deep link target, default leaf, or the final entry.
+
+```js ! template.js
+        if (e.ctrlKey || e.metaKey || e.altKey || isEditableTarget(document.activeElement)) {
+          return;
+        }
+
+        const key = e.key.toLowerCase();
+        if (key === 't') {
+          e.preventDefault();
+          setThinkingExpanded(!thinkingExpanded);
+        } else if (key === 'o') {
+          e.preventDefault();
+          setToolOutputsExpanded(!toolOutputsExpanded);
+        } else if (key === 'h') {
+          e.preventDefault();
+          setHiddenMessagesVisible(!showHiddenMessages);
+        }
+      });
+      // ...
+      if (leafId) {
+        if (urlTargetId && byId.has(urlTargetId)) {
+          // Deep link: navigate to leaf and scroll to target message
+          navigateTo(leafId, 'target', urlTargetId);
+        } else {
+          navigateTo(leafId, 'none');
+        }
+      } else if (entries.length > 0) {
+        // Fallback: use last entry if no leafId
+        navigateTo(entries[entries.length - 1].id, 'none');
+      }
+```
+
+</Scrollycoding>
+
+The file depends on the names produced by the exporter in [index.ts](/docs/src/core/export-html/index.ts), in particular the `renderedTools` map and the entry shapes, and on the classes in [template.css](/docs/src/core/export-html/template.css). It is plain browser JavaScript, not TypeScript, so none of those contracts are type checked; the entry shapes mirror what [session-manager.ts](/docs/src/core/session-manager.ts) persists. Structurally, nearly everything is a function inside one closure sharing mutable state such as the current leaf, search query and filter mode.

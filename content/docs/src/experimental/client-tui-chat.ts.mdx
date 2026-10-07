@@ -1,0 +1,177 @@
+---
+title: "client-tui-chat.ts"
+description: "Turns a replicated durable conversation view into pi's interactive chat components: transcript, tool cards, queue and status line"
+source: "src/experimental/client-tui-chat.ts"
+full: true
+---
+
+The experimental TUI never runs the agent. It receives a `ConversationView` from the durable runtime, a plain data snapshot made of `entries` (the committed transcript) and `docs` (live documents such as `pi.live` and `pi.inbox`). `ExperimentalChatView` renders that snapshot with the same components the regular interactive mode uses.
+
+Its job is reconciliation. Each new snapshot arrives as a whole, but the UI keeps long-lived components, so the class works out what is new, what was replaced, and what is still streaming. It is experimental code, used only by [client-tui.ts](/docs/src/experimental/client-tui.ts).
+
+<Scrollycoding>
+
+## !!steps Three containers and the state behind them
+
+The view exposes three `Container` objects that the TUI mounts in different places: the transcript, the queued-message list and the status line. Internally it tracks tool cards twice. `#tools` maps a call id to its newest card, while `#cards` keeps every card, because providers can reuse a call id in a later turn.
+
+```ts ! client-tui-chat.ts
+export class ExperimentalChatView {
+	static readonly #renderers: Record<string, ToolRenderers> = createAllToolRenderers();
+
+	readonly transcript = new Container();
+	readonly pendingMessages = new Container();
+	readonly status = new Container();
+	readonly #ui: TUI;
+	readonly #cwd: string;
+	/** The newest card per call ID; provider call IDs may repeat across turns. */
+	readonly #tools = new Map<string, ToolExecutionComponent>();
+	/** Every card shown, also older ones whose call ID a later turn reused. */
+	readonly #cards: ToolExecutionComponent[] = [];
+	/** Call IDs whose cards the streaming answer created; its entry takes them over. */
+	readonly #streamingCalls = new Set<string>();
+	#renderedEntryIds: number[] = [];
+	#streaming: AssistantMessageComponent | undefined;
+```
+
+## !!steps apply: one pass per snapshot
+
+`apply` is the whole contract. It syncs committed entries first, then the in-flight assistant message from `pi.live`, then tool slots, the inbox queue and the status text. If a streaming component exists but the live message is gone, the partial was dropped (for example by a retry), so the transcript is rebuilt from entries rather than left showing stale text.
+
+Tool slots that are still `pending` are skipped. A `running` slot marks its card as started and shows its partial output.
+
+```ts ! client-tui-chat.ts
+	apply(view: ConversationView): void {
+		const live = liveOf(view);
+		this.#syncTranscript(view.entries);
+		const message = live.generation?.message as AssistantMessage | undefined;
+		// A partial without its entry was dropped, for example by a retry: render the transcript again.
+		// !mark
+		if (message === undefined && this.#streaming !== undefined) this.#rebuild(view.entries);
+		if (message !== undefined) this.#syncStreaming(message);
+		for (const slot of live.tools ?? []) {
+			if (slot.status === "pending") continue;
+			const component = this.#tool(slot.name, slot.callId);
+			component.setArgsComplete();
+			if (slot.status !== "running") continue;
+			component.markExecutionStarted();
+```
+
+## !!steps Appending only what is new
+
+Entries are append-only, so the view remembers the ids it already rendered and adds just the tail. But compaction and resets replace the head of the transcript. If any remembered id differs from the entry at the same index, the whole thing is rebuilt from scratch.
+
+```ts ! client-tui-chat.ts
+	#syncTranscript(entries: readonly EntryRecord[]): void {
+		// Compaction and resets replace the head of the active transcript.
+		// !mark
+		if (this.#renderedEntryIds.some((id, index) => entries[index]?.id !== id)) this.#rebuild(entries);
+		for (const entry of entries.slice(this.#renderedEntryIds.length)) {
+			this.#addEntry(entry);
+			this.#renderedEntryIds.push(entry.id);
+		}
+	}
+
+	#rebuild(entries: readonly EntryRecord[]): void {
+		this.transcript.clear();
+		this.#discardTools();
+		this.#renderedEntryIds = [];
+		this.#streaming = undefined;
+```
+
+## !!steps Mapping entry kinds to components
+
+Each committed entry becomes a component by its `kind`: user messages, assistant messages, tool results, compaction summaries and context resets. A finished assistant entry reuses the streaming component if there is one, so the text does not flicker when the partial becomes permanent.
+
+Tool cards are only created for a finished answer when it actually ran its calls. If the answer stopped for any reason other than `toolUse`, calls that were never streamed are skipped, and streamed ones are marked as an error card reading "Not run".
+
+```ts ! client-tui-chat.ts
+	#addEntry(entry: EntryRecord): void {
+		const message = entry.model?.[0];
+		if (entry.kind === "pi.user" && message?.role === "user") {
+			this.transcript.addChild(new Spacer(1));
+			this.transcript.addChild(new UserMessageComponent(userText(message.content)));
+		} else if (entry.kind === "pi.assistant" && message?.role === "assistant") {
+			const component = this.#streaming ?? new AssistantMessageComponent();
+			if (this.#streaming === undefined) this.transcript.addChild(component);
+			this.#streaming = undefined;
+			component.updateContent(message, false);
+			// Only a tool-calling answer runs its calls; an aborted, failed, or truncated one never does.
+			// !mark
+			const ran = message.stopReason === "toolUse";
+			for (const content of message.content) {
+				if (content.type !== "toolCall") continue;
+				const streamed = this.#streamingCalls.has(content.id);
+				if (!ran && !streamed) continue;
+```
+
+## !!steps Streaming answers and reused call ids
+
+While an answer streams, `#syncStreaming` creates one assistant component, updates it in place, and creates cards for each tool call as its arguments arrive, recording them in `#streamingCalls`. `#tool` looks cards up by call id, but `fresh` forces a new one, which is what stops a repeated provider call id from overwriting an earlier turn's card.
+
+```ts ! client-tui-chat.ts
+	#syncStreaming(message: AssistantMessage): void {
+		if (this.#streaming === undefined) {
+			this.#streaming = new AssistantMessageComponent();
+			this.transcript.addChild(this.#streaming);
+		}
+		this.#streaming.updateContent(message, true);
+		for (const content of message.content) {
+			if (content.type !== "toolCall") continue;
+			this.#tool(content.name, content.id, content.arguments, !this.#streamingCalls.has(content.id));
+			this.#streamingCalls.add(content.id);
+		}
+	}
+
+	/** The card of a call; `fresh` starts a new one for a call ID an earlier turn used. */
+	#tool(toolName: string, toolCallId: string, args?: unknown, fresh = false): ToolExecutionComponent {
+		const existing = fresh ? undefined : this.#tools.get(toolCallId);
+```
+
+## !!steps The status line
+
+Status text has a fixed priority: a retry, then a deferred response, then compaction, then a running tool, then a generic "Working" while a run is active. The indicator is replaced only when the text changes, so the spinner animation is not restarted by every snapshot.
+
+```ts ! client-tui-chat.ts
+		let text = "";
+		if (generation?.retry !== undefined) {
+			text = `Retrying (attempt ${generation.attempt + 1}): ${generation.retry.error}`;
+		} else if (generation?.deferred !== undefined) text = "Waiting for deferred response...";
+		else if (compaction !== undefined) {
+			text = compaction.retry
+				? `Retrying ${compaction.reason} compaction (attempt ${compaction.attempt + 1})...`
+				: `Compacting (${compaction.reason})...`;
+		} else if (runningTool !== undefined) text = `Running ${runningTool.name}... (esc to abort)`;
+		else if (live.run !== undefined) text = "Working... (esc to abort)";
+		// !mark
+		if (text === this.#statusText) return;
+```
+
+## !!steps The queue and cleaning up cards
+
+The inbox document becomes one truncated muted line per queued item, labelled with its mode. Disposal matters because a running bash card holds a timer: `#discardTools` gives every card a final empty result so the timer stops.
+
+```ts ! client-tui-chat.ts
+	/** Finish every card: a running bash card keeps a timer until it gets a final result. */
+	#discardTools(): void {
+		for (const component of this.#cards) component.updateResult({ content: [], isError: false }, false);
+		this.#cards.length = 0;
+		this.#tools.clear();
+		this.#streamingCalls.clear();
+	}
+
+	#syncQueue(inbox: InboxState): void {
+		this.pendingMessages.clear();
+		for (const item of inbox.items) {
+			const text =
+				item.mode === "write"
+					? `<${String(item.entry.kind)}>`
+					: userText(item.content as UserMessage["content"]).replace(/\s+/g, " ");
+			this.pendingMessages.addChild(new TruncatedText(theme.fg("muted", `[${item.mode}] ${text}`), 1, 0));
+		}
+	}
+```
+
+</Scrollycoding>
+
+The components rendered here are the regular ones from interactive mode: [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts), [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts), [user-message.ts](/docs/src/modes/interactive/components/user-message.ts) and [status-indicator.ts](/docs/src/modes/interactive/components/status-indicator.ts). The durable side that produces the view is described in the [durable README](/docs/src/experimental/durable/README.md).

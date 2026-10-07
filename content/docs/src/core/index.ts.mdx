@@ -1,0 +1,101 @@
+---
+title: "index.ts"
+description: "Core barrel exporting the session, runtime, services, event bus and a trimmed extension API shared by all run modes"
+source: "src/core/index.ts"
+full: true
+---
+
+Interactive, print and RPC modes all sit on the same core. This file is the curated list of what they, and the public package entry, may import from `core` without reaching into individual modules.
+
+It exports sessions and runtimes, the service factories, the bash executor, the event bus, and a subset of the extension API re-exported from [extensions/index.ts](/docs/src/core/extensions/index.ts). Types dominate; there are only a handful of values.
+
+<Scrollycoding>
+
+## !!steps Sessions and runtimes
+
+[agent-session.ts](/docs/src/core/agent-session.ts) contributes the `AgentSession` class with its config, event and stats types. [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) adds the runtime that can swap sessions, with its factory function.
+
+```ts ! index.ts
+/**
+ * Core modules shared between all run modes.
+ */
+
+export {
+	// !mark
+	AgentSession,
+	type AgentSessionConfig,
+	type AgentSessionEvent,
+	type AgentSessionEventListener,
+	type ModelCycleResult,
+	type PromptOptions,
+	type SessionStats,
+} from "./agent-session.ts";
+export {
+	// !mark
+	AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	type CreateAgentSessionRuntimeResult,
+	createAgentSessionRuntime,
+} from "./agent-session-runtime.ts";
+```
+
+## !!steps Service factories and small helpers
+
+[agent-session-services.ts](/docs/src/core/agent-session-services.ts) exports the functions that build the shared services and then a session from them. The next lines add the bash executor from [bash-executor.ts](/docs/src/core/bash-executor.ts), cache warming types from [cache-warmer.ts](/docs/src/core/cache-warmer.ts), `CompactionResult`, the event bus and the experimental-features flag from [experimental.ts](/docs/src/core/experimental.ts).
+
+```ts ! index.ts
+export {
+	type AgentSessionRuntimeDiagnostic,
+	type AgentSessionServices,
+	type CreateAgentSessionFromServicesOptions,
+	type CreateAgentSessionServicesOptions,
+	// !mark(1:2)
+	createAgentSessionFromServices,
+	createAgentSessionServices,
+} from "./agent-session-services.ts";
+// !mark
+export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
+export type { CacheWarmingDecision, CacheWarmingStatus } from "./cache-warmer.ts";
+export type { CompactionResult } from "./compaction/index.ts";
+export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
+export { areExperimentalFeaturesEnabled } from "./experimental.ts";
+```
+
+## !!steps A subset of the extension API
+
+Only part of the extension surface is re-exported here, which is why the list is shorter than in [extensions/index.ts](/docs/src/core/extensions/index.ts). It includes `defineTool`, `discoverAndLoadExtensions`, the runner class and the main event types.
+
+```ts ! index.ts
+// Extensions system
+export {
+// ...
+	// !mark(1:2)
+	defineTool,
+	discoverAndLoadExtensions,
+// ...
+	// !mark
+	ExtensionRunner,
+```
+
+## !!steps The tail of the list
+
+The block ends with the session event types and tool-call types, plus `WorkingIndicatorOptions`. The very last line exports `createSyntheticSourceInfo` from [source-info.ts](/docs/src/core/source-info.ts), a value helper for code that needs a source record without a real file.
+
+```ts ! index.ts
+	type ToolCallEvent,
+	type ToolCallEventResult,
+	type ToolDefinition,
+	type ToolRenderResultOptions,
+	type ToolResultEvent,
+	type TurnEndEvent,
+	type TurnEndEventResult,
+	type TurnStartEvent,
+	type WorkingIndicatorOptions,
+} from "./extensions/index.ts";
+// !mark
+export { createSyntheticSourceInfo } from "./source-info.ts";
+```
+
+</Scrollycoding>
+
+Consumers import from this file instead of individual modules, so moving code between core files does not break them. One structural point: it is a hand-maintained subset, so a type added to [extensions/types.ts](/docs/src/core/extensions/types.ts) is not public from here until someone adds it.

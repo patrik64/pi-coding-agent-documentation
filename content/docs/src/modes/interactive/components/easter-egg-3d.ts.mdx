@@ -1,0 +1,575 @@
+---
+title: "easter-egg-3d.ts"
+description: "Fullscreen 3D easter egg: the screen dissolves into braille dust while the pi logo or Armin spins as ray-cast blocks that play a sliding puzzle"
+source: "src/modes/interactive/components/easter-egg-3d.ts"
+full: true
+---
+
+This is a self-contained, purely decorative animation. It is reached by clicking the header logo or running the Armin command, and it plays as a fullscreen overlay. The current screen is captured, dissolves into braille dust, and a small bitmap (the pi logo or the Armin figure from [armin.ts](/docs/src/modes/interactive/components/armin.ts)) spins in the center, built from one 3D block per pixel. Leaving plays the timeline backwards so the original screen reassembles.
+
+It is an easter egg and not part of the agent loop, so the file is a large amount of rendering code with no dependency on sessions or tools. It does its own software 3D: blocks are rotated, their visible faces are ray-cast per braille dot, shaded, and packed into 2x4-dot braille characters. It is loaded lazily by [easter-egg-3d.lazy.ts](/docs/src/modes/interactive/components/easter-egg-3d.lazy.ts), which [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) calls, so none of this code is loaded until someone triggers it.
+
+<Scrollycoding>
+
+## !!steps Data shapes and the idea
+
+The header comment is the best summary. A braille cell holds 2x4 roughly square dots, so a half-block pixel is exactly 2x2 dots, and the header logo (4x2 cells) is 8x8 dots. That is why the logo can lift off the header without changing size. `ScreenCell` records each captured terminal glyph with its colors and a `delay`, the moment it turns to dust, and `ink`, how many braille dots it becomes.
+
+```ts ! easter-egg-3d.ts
+/**
+ * Fullscreen 3D easter eggs: the pi logo (header logo click) and Armin (/arminsayshi). Both are bitmaps built from
+ * one block per pixel. The current screen dissolves into braille dust while the model spins in the center and its
+ * blocks play a sliding puzzle. Leaving plays the same timeline backwards, so the screen reassembles.
+ *
+ * The pi logo lifts off the header, flies to the center, and grows; the dust spreads out from the header logo.
+ * Armin grows out of a speck at the center; the dust spreads out from the center.
+ *
+ * The blocks are ray cast per braille dot. A braille cell holds 2x4 roughly square dots, so one pixel of a
+ * half-block bitmap is exactly 2x2 dots, and the header logo (4x2 cells) is 8x8 dots when it lifts off.
+ */
+
+// !mark
+type Rgb = readonly [number, number, number];
+
+// !mark
+interface ScreenCell {
+	text: string;
+	/** 1 or 2 for a grapheme, 0 for the second column of a wide grapheme. */
+	width: number;
+	fg: Rgb;
+	/** Undefined when the cell uses the terminal's default background. */
+	bg: Rgb | undefined;
+	/** Seconds until the cell turns into braille dust. */
+// !mark
+	delay: number;
+	/** Number of braille dots the glyph turns into. */
+// !mark
+	ink: number;
+	seed: number;
+}
+```
+
+## !!steps Turning a bitmap into blocks
+
+`createModel` walks the bitmap and makes one block per pixel that has a color, all on depth layer 0. The model also precomputes its `radius`, the farthest distance of a block corner from the center including the outer depth layers, which later determines how large it can be drawn on screen. `puzzleMoves` is injected so each model chooses how aggressive its shuffle is. The pi logo moves one or two blocks per step, Armin moves a few percent of his many blocks.
+
+```ts ! easter-egg-3d.ts
+function createModel(
+	columns: number,
+	rows: number,
+	pixel: (column: number, row: number) => Rgb | undefined,
+// !mark
+	options: Pick<Model, "cameraDistance" | "widthShare" | "origin"> & {
+		puzzleMoves: (random: number, blockCount: number) => number;
+	},
+): Model {
+// !mark
+	const blocks: Model["blocks"] = [];
+	for (let row = 0; row < rows; row++) {
+		for (let column = 0; column < columns; column++) {
+			const color = pixel(column, row);
+// !mark
+			if (color) blocks.push({ home: [column, row, 0], color });
+		}
+	}
+	return {
+		columns,
+		rows,
+		blocks,
+		cameraDistance: options.cameraDistance,
+// !mark
+		radius: Math.hypot(columns / 2, rows / 2, 1 + DEPTH / 2),
+		widthShare: options.widthShare,
+		puzzleMoves: (random) => options.puzzleMoves(random, blocks.length),
+		origin: options.origin,
+	};
+}
+```
+
+## !!steps The puzzle timeline
+
+After the model has spun for three seconds, a cycle begins: twelve shuffle steps of 0.3 seconds, a one second return in which every block flies home, and a 0.6 second hold. `PUZZLE_MOVES` lists the allowed slides: four directions in the plane (listed twice, so they are twice as likely as depth moves) and one step forward or backward through the three depth layers.
+
+```ts ! easter-egg-3d.ts
+// The sliding puzzle: after the model spun for a while, blocks slide into free neighboring cells, a few at a time.
+// Each cycle shuffles, flies every block back home, and holds the model briefly.
+// !mark
+const PUZZLE_START = FLY_START + FLY_DURATION + 3;
+const PUZZLE_STEP = 0.3;
+const PUZZLE_STEPS = 12;
+const PUZZLE_RETURN = 1;
+const PUZZLE_HOLD = 0.6;
+// !mark
+const PUZZLE_CYCLE = PUZZLE_STEP * PUZZLE_STEPS + PUZZLE_RETURN + PUZZLE_HOLD;
+// !mark
+const PUZZLE_MOVES: Cell3[] = [
+	[1, 0, 0],
+	[-1, 0, 0],
+	[0, 1, 0],
+	[0, -1, 0],
+	[1, 0, 0],
+	[-1, 0, 0],
+	[0, 1, 0],
+	[0, -1, 0],
+	[0, 0, 1],
+	[0, 0, -1],
+];
+```
+
+## !!steps A deterministic shuffle
+
+`shuffleSteps` returns the block positions after every step of one cycle. It seeds a hash-based random sequence from the cycle number, so a given cycle always produces the same shuffle, which matters because the animation recomputes state from time rather than storing it. A block can only slide into an unoccupied cell inside the bitmap bounds and the three layers. Blocks that moved in the previous step are avoided when possible, so the motion does not look like a single jittering block.
+
+```ts ! easter-egg-3d.ts
+/** Block positions after each step of one shuffle cycle, starting at home. Deterministic per cycle. */
+function shuffleSteps(model: Model, cycle: number): Cell3[][] {
+	const { columns, rows } = model;
+	let positions: Cell3[] = model.blocks.map((block) => block.home);
+	const steps = [positions];
+	const lastMoved = new Set<number>();
+// !mark(1:2)
+	let random = cycle * 7_919 + 1;
+	const next = () => hash(random++);
+	const key = ([x, y, z]: Cell3) => ((z + 1) * rows + y) * columns + x;
+	for (let step = 0; step < PUZZLE_STEPS; step++) {
+		const occupied = new Set(positions.map(key));
+		const nextPositions = [...positions];
+		const moved = new Set<number>();
+// ...
+			const candidates: Array<{ block: number; target: Cell3 }> = [];
+			for (let block = 0; block < positions.length; block++) {
+				if (moved.has(block)) continue;
+				const [x, y, z] = positions[block]!;
+				for (const [dx, dy, dz] of PUZZLE_MOVES) {
+					const target: Cell3 = [x + dx, y + dy, z + dz];
+					if (target[0] < 0 || target[0] >= columns || target[1] < 0 || target[1] >= rows) continue;
+					if (target[2] < -1 || target[2] > 1 || occupied.has(key(target))) continue;
+					candidates.push({ block, target });
+				}
+			}
+			// Prefer blocks that did not just move, so the puzzle does not look like one block jittering.
+// !mark(1:2)
+			const fresh = candidates.filter((candidate) => !lastMoved.has(candidate.block));
+			const pool = fresh.length > 0 ? fresh : candidates;
+			const choice = pool[Math.floor(next() * pool.length)];
+			if (!choice) break;
+			occupied.add(key(choice.target));
+// !mark
+			nextPositions[choice.block] = choice.target;
+			moved.add(choice.block);
+		}
+		lastMoved.clear();
+		for (const block of moved) lastMoved.add(block);
+```
+
+## !!steps Capturing the screen as cells
+
+`parseScreen` converts the already-rendered ANSI lines into `ScreenCell`s with resolved colors. It handles SGR codes for 16-color, 256-color and truecolor foregrounds and backgrounds, inverse and dim, and it segments text with `Intl.Segmenter` so wide graphemes become two cells. The second cell of a wide glyph has width 0 so it can share timing with its first half. Dim is emulated by mixing toward the background.
+
+```ts ! easter-egg-3d.ts
+/** Parse rendered lines into cells with resolved colors. Other escape sequences (OSC, APC, cursor) are skipped. */
+function parseScreen(
+	lines: readonly string[],
+	width: number,
+	foreground: Rgb,
+	background: Rgb,
+): Array<Array<ScreenCell>> {
+	const palette = (index: number): Rgb => toRgb(indexedColor(index));
+	return lines.map((line) => {
+		const cells: ScreenCell[] = [];
+		let fg: Rgb | undefined;
+		let bg: Rgb | undefined;
+		let dim = false;
+		let inverse = false;
+// ...
+		const pushText = (text: string) => {
+			for (const { segment } of segmenter.segment(text)) {
+				const glyphWidth = visibleWidth(segment);
+// !mark
+				if (glyphWidth === 0 || cells.length + glyphWidth > width) continue;
+				let cellFg = fg ?? foreground;
+				let cellBg = bg;
+// !mark
+				if (inverse) {
+					cellFg = bg ?? background;
+					cellBg = fg ?? foreground;
+				}
+// !mark
+				if (dim) cellFg = mix(cellFg, cellBg ?? background, 0.4);
+				const cell = { text: segment, width: glyphWidth, fg: cellFg, bg: cellBg, delay: 0, ink: 0, seed: 0 };
+				cells.push(cell);
+				if (glyphWidth === 2) cells.push({ ...cell, text: "", width: 0 });
+			}
+		};
+```
+
+## !!steps A spin locked to the puzzle
+
+The camera spin is arranged so that the model faces front exactly during each hold. The base phase accelerates from rest with the integral of a quintic smoothstep and then turns at one revolution per puzzle cycle. `SPIN_ALIGNMENT` adds extra rotation during the fly-in to make the phase a whole number of turns at the first front view, and `spinAngle` subtracts a sine term so the logo lingers face-on.
+
+```ts ! easter-egg-3d.ts
+// The spin is locked to the puzzle: one turn per cycle, facing the camera in the middle of each hold.
+const SPIN_RAMP = 1.4;
+// !mark
+const SPIN_SPEED = (Math.PI * 2) / PUZZLE_CYCLE;
+// How much the spin slows down while facing the camera (and speeds up while facing away), from 0 to 1.
+const SPIN_LINGER = 0.6;
+const FIRST_FRONT_VIEW = PUZZLE_START + PUZZLE_STEP * PUZZLE_STEPS + PUZZLE_RETURN + PUZZLE_HOLD / 2;
+
+/** Uniform spin that accelerates from rest over SPIN_RAMP, then turns at SPIN_SPEED. */
+function baseSpinPhase(time: number): number {
+	const elapsed = time - FLY_START;
+	if (elapsed <= 0) return 0;
+	const u = elapsed / SPIN_RAMP;
+	// Integral of the quintic smoothstep ramp.
+	if (u < 1) return SPIN_SPEED * SPIN_RAMP * (u ** 6 - 3 * u ** 5 + 2.5 * u ** 4);
+	return SPIN_SPEED * (SPIN_RAMP * 0.5 + elapsed - SPIN_RAMP);
+}
+
+// Extra rotation added during the flight, so the phase is a whole number of turns at every assembled front view.
+// !mark
+const SPIN_ALIGNMENT = Math.PI * 2 - (baseSpinPhase(FIRST_FRONT_VIEW) % (Math.PI * 2));
+
+/** Spin phase: whole turns exactly when the reassembled logo faces the camera. */
+function spinPhase(time: number): number {
+	return baseSpinPhase(time) + SPIN_ALIGNMENT * smooth((time - FLY_START) / FLY_DURATION);
+}
+
+/** Yaw of the logo. It matches the phase at whole turns but lingers there, so the logo reads from the front. */
+function spinAngle(time: number): number {
+	const phase = spinPhase(time);
+// !mark
+	return phase - SPIN_LINGER * Math.sin(phase);
+}
+```
+
+## !!steps Ray casting faces into dots
+
+`BlockRaster` renders a frame by intersecting a ray per braille dot with each visible face's plane. The ray direction is linear in the dot position, so it is stepped with additions instead of recomputed per dot. A hit counts only if it lands within the face rectangle, and a float depth buffer keeps the nearest face per dot with a parallel face id buffer. Buffers are reused between frames, and only the previous frame's dirty rectangle is cleared.
+
+```ts ! easter-egg-3d.ts
+		for (let faceIndex = 0; faceIndex < faces.length; faceIndex++) {
+			const face = faces[faceIndex]!;
+			const a = face.axis;
+			const u = (a + 1) % 3;
+			const v = (a + 2) % 3;
+			const originA = origin[a]!;
+			const originU = origin[u]!;
+			const originV = origin[v]!;
+// ...
+			for (let dotY = face.minY; dotY <= face.maxY; dotY++) {
+				const sy = (dotY + 0.5 - centerY) / scale;
+				let directionA = m[a]! * sx + m[3 + a]! * sy - m[6 + a]! * cameraDistance;
+				let directionU = m[u]! * sx + m[3 + u]! * sy - m[6 + u]! * cameraDistance;
+				let directionV = m[v]! * sx + m[3 + v]! * sy - m[6 + v]! * cameraDistance;
+				let index = dotY * dotWidth + face.minX;
+				for (let dotX = face.minX; dotX <= face.maxX; dotX++, index++) {
+// !mark(1:2)
+					const t = (face.plane - originA) / directionA;
+					if (t > 0 && t < depth[index]!) {
+						const hitU = originU + t * directionU;
+						const hitV = originV + t * directionV;
+// !mark(1:3)
+						if (hitU >= face.uMin && hitU <= face.uMax && hitV >= face.vMin && hitV <= face.vMax) {
+							depth[index] = t;
+							faceIds[index] = faceIndex + 1;
+						}
+					}
+					directionA += stepA;
+					directionU += stepU;
+					directionV += stepV;
+				}
+			}
+```
+
+## !!steps Choosing and lighting faces
+
+Faces pointing away from the camera are skipped, and so is any face pressed against a neighboring block with a covering rectangle, since it can never be seen. The check compares plane coordinates with strict equality, which works because positions are exact while the blocks rest. Lighting is computed once per face: diffuse plus a rim term. On dark backgrounds a specular highlight is added; on light backgrounds highlights toward white would vanish, so faces only get darker.
+
+```ts ! easter-egg-3d.ts
+		for (const box of boxes) {
+			for (let a = 0; a < 3; a++) {
+				const u = (a + 1) % 3;
+				const v = (a + 2) % 3;
+				for (const side of [-1, 1]) {
+					const plane = side > 0 ? box.max[a]! : box.min[a]!;
+					// Back faces point away from the camera.
+// !mark
+					if ((origin[a]! - plane) * side <= 0) continue;
+					// Faces pressed against a neighboring block are hidden. Positions are exact while blocks rest.
+// !mark
+					const covered = boxes.some(
+						(other) =>
+							other !== box &&
+							(side > 0 ? other.min[a] : other.max[a]) === plane &&
+							other.min[u]! <= box.min[u]! &&
+							other.max[u]! >= box.max[u]! &&
+							other.min[v]! <= box.min[v]! &&
+							other.max[v]! >= box.max[v]!,
+					);
+					if (covered) continue;
+// ...
+					// Faces are flat, so lighting is computed once per face. The normal in camera space is a
+					// column of the rotation matrix.
+					const nx = m[a]! * side;
+					const ny = m[3 + a]! * side;
+					const nz = m[6 + a]! * side;
+// !mark
+					const diffuse = Math.max(0, nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]);
+					const rim = Math.max(0, nx * 0.8 - nz * 0.3);
+					// On light backgrounds, highlights toward white would vanish, so faces only get darker than
+					// the brand colors there.
+// !mark
+					const specular = lightBackground
+						? 0
+						: Math.max(0, nx * HALF_VECTOR[0] + ny * HALF_VECTOR[1] + nz * HALF_VECTOR[2]) ** 24 * 0.6 * 255;
+					const light = lightBackground
+						? Math.min(1, 0.55 + diffuse * 0.45 + rim * 0.1)
+						: 0.45 + diffuse * 0.78 + rim * 0.25;
+```
+
+## !!steps Packing dots into braille cells
+
+Every dot that was hit sets its bit in the 8-bit braille pattern of its cell, increments a count, and adds its RGB, faded slightly toward the background with distance (half as strongly on light backgrounds). The cell's final color is later the average, quantized to steps of five so that neighboring cells often share an escape sequence and the output line stays short. On light backgrounds the same data feeds a blurred halo behind the logo.
+
+```ts ! easter-egg-3d.ts
+		for (let dotY = minY; dotY <= maxY; dotY++) {
+			let index = dotY * dotWidth + minX;
+			for (let dotX = minX; dotX <= maxX; dotX++, index++) {
+				const id = faceIds[index]!;
+				if (id === 0) continue;
+				const face = faces[id - 1]!;
+				// Points farther from the camera fade slightly toward the background for depth.
+// !mark
+				const fog = clamp01(0.15 - cameraDistance * (1 - depth[index]!) * 0.12) * (light ? 0.5 : 1);
+				faceIds[index] = 0;
+				depth[index] = Infinity;
+				const cellX = dotX >> 1;
+				const cellY = dotY >> 2;
+				const cell = cellY * width + cellX;
+// !mark(1:2)
+				bits[cell]! |= DOT_BITS[(dotY & 3) * 2 + (dotX & 1)];
+				counts[cell]!++;
+// !mark(1:3)
+				rgb[cell * 3] += face.red + (background[0] - face.red) * fog;
+				rgb[cell * 3 + 1] += face.green + (background[1] - face.green) * fog;
+				rgb[cell * 3 + 2] += face.blue + (background[2] - face.blue) * fog;
+				if (cellX < cellMinX) cellMinX = cellX;
+				if (cellX > cellMaxX) cellMaxX = cellX;
+				if (cellY < cellMinY) cellMinY = cellY;
+				if (cellY > cellMaxY) cellMaxY = cellY;
+			}
+		}
+```
+
+## !!steps Starting the overlay
+
+`playEasterEgg3d` guards against concurrent plays with a module flag, asks the terminal for its real foreground and background colors (the theme only knows its own), and falls back to dark or light defaults if the query yields nothing. It checks for an existing overlay once more after the await. Armin gets the theme's accent color, the logo its brand colors. The animation is shown as a top-left, full-size overlay that takes focus and returns it when hidden. If the color query rejected, the `playing` flag would stay set because there is no try/finally.
+
+```ts ! easter-egg-3d.ts
+/**
+ * Which easter egg to play. The pi logo lifts off the header logo, whose top-left cell is at `column`, `row`.
+ */
+export type EasterEgg3d = { kind: "pi-logo"; column: number; row: number } | { kind: "armin" };
+
+// !mark
+let playing = false;
+
+/**
+ * Show the animation as a fullscreen overlay until it is dismissed. The overlay takes focus and mouse input and
+ * returns focus when hidden, so the rest of the UI keeps running underneath untouched.
+ */
+export async function playEasterEgg3d(tui: TUI, screen: readonly string[], egg: EasterEgg3d): Promise<void> {
+// !mark
+	if (playing) return;
+	playing = true;
+	// Fading needs the terminal's actual default colors; the theme only knows its own.
+// !mark
+	const reported = await tui.queryTerminalColors({ timeoutMs: 100 });
+	const dark = theme.appearance === "dark";
+	const toRgbTuple = (rgb: { r: number; g: number; b: number } | undefined, fallback: Rgb): Rgb =>
+		rgb ? [rgb.r, rgb.g, rgb.b] : fallback;
+	const colors = {
+		foreground: toRgbTuple(reported.foreground, toRgb(theme.colors.text)),
+		background: toRgbTuple(reported.background, dark ? [0, 0, 0] : [255, 255, 255]),
+	};
+// !mark
+	if (tui.hasOverlay()) {
+		playing = false;
+		return;
+	}
+	const model =
+		egg.kind === "armin" ? arminModel(toRgb(theme.colors.accent)) : piLogoModel({ column: egg.column, row: egg.row });
+	const animation = new EasterEgg3dAnimation(tui, screen, model, colors, () => {
+		playing = false;
+		overlay.hide();
+	});
+// !mark
+	const overlay = tui.showOverlay(animation, { anchor: "top-left", width: "100%", maxHeight: "100%" });
+}
+```
+
+## !!steps Animation lifecycle
+
+The animation owns a 30 fps timer that requests renders, and it stops itself if no render happened for a second, for example when all overlays were hidden on exit. `close` starts the exit by capturing the current time, yaw and block offsets; a second call skips straight to `finish`. Exit rounds the yaw up to the next whole turn so the logo lands face-on. Input closes it on the cancel key, via [keybindings.ts](/docs/src/core/keybindings.ts) names, and on a click.
+
+```ts ! easter-egg-3d.ts
+		this.raster = new BlockRaster(model.cameraDistance);
+		this.foreground = colors.foreground;
+		this.background = colors.background;
+		this.onDone = onDone;
+		this.timer = setInterval(() => {
+			// Also stop when no longer rendered, e.g. when pi hides all overlays on exit.
+// !mark
+			if ((this.exit && this.exitProgress() >= 1) || performance.now() - this.lastRender > 1000) this.finish();
+			else this.tui.requestRender();
+		}, FRAME_MS);
+// !mark
+		this.timer.unref?.();
+	}
+// ...
+	/** Play the exit animation. A second call skips it. */
+	close(): void {
+// !mark
+		if (this.exit) {
+			this.finish();
+			return;
+		}
+		const time = this.elapsed();
+		const yaw = spinAngle(time);
+		const turn = Math.PI * 2;
+		this.exit = {
+			start: performance.now(),
+			time,
+			yaw,
+// !mark
+			targetYaw: Math.ceil(yaw / turn) * turn,
+			offsets: this.blockOffsets(time),
+		};
+	}
+```
+
+## !!steps One frame of the timeline
+
+`render` rebuilds cells and stars only when the terminal size changes. Time then runs forward on entry. On exit it is inverted: dissolve time is scaled by one minus the progress, the pose settles to a flat front view, hint and stars fade out, and block offsets are scaled to zero within the first half so blocks are home before the logo lands. Everything is a pure function of time, which is why reversal works.
+
+```ts ! easter-egg-3d.ts
+		// Dissolve time runs forward on entry and backward on exit, so the screen reassembles in reverse order.
+		let dissolveTime: number;
+		let pose: Pose;
+		let hintAlpha: number;
+		let starAlpha: number;
+		let offsets: Array<[number, number, number]>;
+// !mark
+		if (this.exit) {
+			const progress = this.exitProgress();
+			const landing = clamp01(progress / 0.8);
+			const settle = 1 - smooth(landing);
+// !mark
+			dissolveTime = Math.min(this.exit.time, DISSOLVE_END) * (1 - progress);
+			pose = this.pose(width, height, this.flyProgress(this.exit.time) * settle, this.exit.time);
+// !mark
+			pose.yaw = this.exit.yaw + (this.exit.targetYaw - this.exit.yaw) * easeOut(landing);
+			pose.pitch *= settle;
+			pose.roll *= settle;
+			hintAlpha = this.hintAlpha(this.exit.time) * (1 - smooth(progress / 0.2));
+			starAlpha = this.starAlpha(this.exit.time) * (1 - smooth(progress / 0.3));
+			// Blocks are home well before the logo lands.
+// !mark
+			const gather = 1 - smooth(progress / 0.5);
+			offsets = this.exit.offsets.map(([x, y, z]) => [x * gather, y * gather, z * gather]);
+		} else {
+// !mark
+			const time = this.elapsed();
+			dissolveTime = time;
+			pose = this.pose(width, height, this.flyProgress(time), time);
+			hintAlpha = this.hintAlpha(time);
+			starAlpha = this.starAlpha(time);
+			offsets = this.blockOffsets(time);
+		}
+```
+
+## !!steps Compositing each cell
+
+For every screen cell the priority is: the hint text, then any braille dots from the 3D raster, then the starfield if no screen cell exists, and finally the dissolving screen glyph. A glyph first stays whole (slightly faded) until its delay. Then it becomes `ink` random braille dots which thin out as the dust timer runs. The dot choice is hashed with a frame number that changes about 14 times per second so the dust shimmers.
+
+```ts ! easter-egg-3d.ts
+				const dust = (dissolveTime - cell.delay) / DUST_DURATION;
+// !mark
+				if (dust < 0 && cell.width === 2 && !raster.bits[index + 1]) {
+					emit(cell.text, mix(cell.fg, background, textFade), cellBg);
+					column++;
+					continue;
+				}
+// !mark
+				if (dust < 0 && cell.width === 1) {
+					emit(cell.text, mix(cell.fg, background, textFade), cellBg);
+					continue;
+				}
+// !mark
+				const dotCount = dust < 0 ? cell.ink : Math.round(cell.ink * (1 - clamp01(dust)));
+				if (dotCount <= 0) {
+					const star = starfield(index);
+					emit(star?.text ?? " ", star?.fg, cellBg);
+					continue;
+				}
+				// Pick `dotCount` distinct dots; the choice changes a few times per second so the dust shimmers.
+				let bits = 0;
+				let placed = 0;
+				for (let attempt = 0; placed < dotCount && attempt < 32; attempt++) {
+// !mark
+					const bit = DOT_BITS[Math.floor(hash(cell.seed * 7919 + frame * 131 + attempt) * 8)]!;
+					if (bits & bit) continue;
+					bits |= bit;
+					placed++;
+				}
+// !mark
+				const fade = textFade + (1 - textFade) * clamp01(dust) ** 0.8;
+				emit(BRAILLE[bits]!, mix(cell.fg, background, fade), cellBg);
+```
+
+## !!steps Block positions during the puzzle
+
+`blockOffsets` maps time to each block's displacement from home. Before the puzzle starts all offsets are zero. During the shuffle phase it interpolates between consecutive step positions with a smoothstep. In the return phase every block flies home at once while even and odd blocks arc in opposite depth directions so they do not pass through each other. The cached shuffle is recomputed only when the cycle number changes.
+
+```ts ! easter-egg-3d.ts
+// !mark
+		if (time < PUZZLE_START) return home();
+		const cycle = Math.floor((time - PUZZLE_START) / PUZZLE_CYCLE);
+		const local = time - PUZZLE_START - cycle * PUZZLE_CYCLE;
+// !mark
+		if (this.shuffle?.cycle !== cycle) this.shuffle = { cycle, steps: shuffleSteps(this.model, cycle) };
+		const steps = this.shuffle.steps;
+		const offset = (position: Cell3, index: number): [number, number, number] => {
+			const block = blocks[index]!.home;
+			return [position[0] - block[0], position[1] - block[1], position[2] - block[2]];
+		};
+		const shuffleEnd = PUZZLE_STEP * PUZZLE_STEPS;
+		if (local < shuffleEnd) {
+			const step = Math.floor(local / PUZZLE_STEP);
+// !mark
+			const progress = smooth((local - step * PUZZLE_STEP) / PUZZLE_STEP);
+			return steps[step]!.map((from, index) => {
+				const a = offset(from, index);
+				const b = offset(steps[step + 1]![index]!, index);
+				return [a[0] + (b[0] - a[0]) * progress, a[1] + (b[1] - a[1]) * progress, a[2] + (b[2] - a[2]) * progress];
+			});
+		}
+		if (local < shuffleEnd + PUZZLE_RETURN) {
+			// All blocks fly home at once. Alternating arcs in depth keep them from passing through each other.
+			const u = (local - shuffleEnd) / PUZZLE_RETURN;
+			const remaining = 1 - smooth(u);
+// !mark
+			const arc = Math.sin(Math.PI * clamp01(u)) * 0.8;
+			return steps[PUZZLE_STEPS]!.map((position, index) => {
+				const [x, y, z] = offset(position, index);
+// !mark
+				return [x * remaining, y * remaining, z * remaining + (index % 2 === 0 ? arc : -arc)];
+			});
+		}
+		return home();
+```
+
+</Scrollycoding>
+
+Everything here follows one idea: each frame is computed from the clock alone, with no stored animation state apart from the exit snapshot and the shuffle cache. That keeps the reverse playback trivial. The pose function (not shown) interpolates the fly-in from the header logo's cell to the screen center using geometric zoom, which also uses the theme from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and key labels from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts). A static companion of the logo exists in [pi-logo.ts](/docs/src/modes/interactive/components/pi-logo.ts). Structurally the file is a set of constants and pure helpers, the `BlockRaster` class, then the `EasterEgg3dAnimation` component that composes them.

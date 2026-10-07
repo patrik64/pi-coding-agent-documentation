@@ -1,0 +1,71 @@
+---
+title: "setup.ts"
+description: "The first thing the CLI runs: set the process identity, mark the environment as an agent, silence warnings, and configure HTTP"
+source: "src/cli/setup.ts"
+full: true
+---
+
+A tiny file with one exported function, `setupCli`, meant to run before any
+real work. It does process-wide housekeeping that has to happen before
+provider SDKs or other modules start doing things.
+
+It reads the app name from [config.ts](/docs/src/config.ts) and delegates
+network configuration to [http-dispatcher.ts](/docs/src/core/http-dispatcher.ts).
+The program that calls it is [main.ts](/docs/src/main.ts).
+
+<Scrollycoding>
+
+## !!steps Identify the process
+
+The process title is set to the configured app name, so `ps` and terminal
+titles show the product name (which can be a rebrand) rather than `node`.
+
+```ts ! setup.ts
+export function setupCli(): void {
+	// !mark
+	process.title = APP_NAME;
+	process.env.PI_CODING_AGENT = "true";
+	process.env.AI_AGENT = "pi";
+```
+
+## !!steps Advertise that an agent is running
+
+Two environment variables are exported so child processes (shell commands run
+by tools, for example) can tell they run under this agent. `PI_CODING_AGENT`
+is specific; `AI_AGENT` is a generic convention with the value `pi`.
+
+```ts ! setup.ts
+	process.env.PI_CODING_AGENT = "true";
+	process.env.AI_AGENT = "pi";
+```
+
+## !!steps Silence Node warnings
+
+`process.emitWarning` is replaced with a no-op, so deprecation and experimental
+warnings never print into the terminal UI. This is global and blunt: it hides
+every warning for the lifetime of the process, including ones that might help
+when debugging.
+
+```ts ! setup.ts
+	process.emitWarning = (() => {}) as typeof process.emitWarning;
+```
+
+## !!steps Configure the HTTP dispatcher early
+
+The comment explains the ordering. The undici dispatcher must be configured
+before provider SDKs issue requests, but user settings are not loaded yet, so
+this call only installs the defaults. Settings are applied later, once the
+settings manager has read global and project configuration.
+
+```ts ! setup.ts
+	// Configure undici before provider SDKs issue requests. Settings are applied
+	// once SettingsManager has loaded global/project configuration.
+	configureHttpDispatcher();
+}
+```
+
+</Scrollycoding>
+
+Because it mutates global state, this function is meant to be called exactly
+once at startup. The related flow that deals with settings is in
+[settings-manager.ts](/docs/src/core/settings-manager.ts).

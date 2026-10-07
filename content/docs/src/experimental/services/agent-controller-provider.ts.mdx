@@ -1,0 +1,144 @@
+---
+title: "agent-controller-provider.ts"
+description: "Worker-side implementation of AgentController that maps prompt, steer, follow-up, abort and compact onto the durable Harness and root Conversation."
+source: "src/experimental/services/agent-controller-provider.ts"
+full: true
+---
+
+This file turns the abstract [AgentController](/docs/src/experimental/services/agent-controller.ts) contract into calls on the `@earendil-works/pi-durable` `Harness` and its root `Conversation`. It is built once per Session worker, next to the harness setup described in [harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts), and the result is provided as a service by [worker.ts](/docs/src/experimental/services/worker.ts).
+
+Nothing here throws across the wire for expected failures. Submission errors are converted to `accepted: false` responses, and the only thrown error is for waiting on a prompt id the harness does not know.
+
+<Scrollycoding>
+
+## !!steps One helper for steer and follow-up
+
+`queue` submits an `input` with `whenBusy` set to the requested mode. The returned submission id becomes the public `entryId`. Any error, including a busy conversation, is mapped to a rejected response.
+
+```ts ! agent-controller-provider.ts
+export function createAgentController(harness: Harness, conversation: Conversation): AgentControllerService {
+	const queue = async (
+		whenBusy: "steer" | "followUp",
+		request: AgentPromptRequest,
+		context: Context,
+	): Promise<AgentQueueResponse> => {
+		try {
+// !mark
+			const submission = await conversation.submit({ type: "input", content: toInput(request), whenBusy }, context);
+			return { accepted: true, entryId: String(submission.id), error: null };
+		} catch (error) {
+			return { accepted: false, entryId: null, error: toAgentError(error) };
+		}
+	};
+```
+
+## !!steps Prompt rejects when busy
+
+`prompt` is the same submission with `whenBusy: "reject"`, which is what produces the `busy` error code described in the contract. Steer and follow-up simply reuse `queue`.
+
+```ts ! agent-controller-provider.ts
+	return {
+		async prompt(request, context) {
+			try {
+				const submission = await conversation.submit(
+// !mark
+					{ type: "input", content: toInput(request), whenBusy: "reject" },
+					context,
+				);
+				return { accepted: true, operationId: String(submission.id), error: null };
+			} catch (error) {
+				return { accepted: false, operationId: null, error: toAgentError(error) };
+			}
+		},
+		steer: (request, context) => queue("steer", request, context),
+		followUp: (request, context) => queue("followUp", request, context),
+```
+
+## !!steps Cancelling queued input
+
+`cancelQueued` first validates the id with `parseSubmissionId`, then asks the harness to abort that submission scoped to this conversation. The harness answer is collapsed to three outcomes: `aborted` becomes `cancelled`, `not_found` stays, and everything else is reported as `already_consumed`.
+
+```ts ! agent-controller-provider.ts
+		async cancelQueued(entryId, context) {
+			const id = parseSubmissionId(entryId);
+			if (id === undefined) return { outcome: "not_found" };
+// !mark
+			const result = await harness.abortSubmission(id, context, conversation.id);
+			return {
+// !mark
+				outcome: result === "aborted" ? "cancelled" : result === "not_found" ? "not_found" : "already_consumed",
+			};
+		},
+		abort: (context) => conversation.abort(context),
+```
+
+## !!steps Abort and compact
+
+`abort` delegates directly to the conversation. `compact` converts the nullable instructions to `undefined` for the durable API and returns the id of the compaction task as its `operationId`.
+
+```ts ! agent-controller-provider.ts
+		abort: (context) => conversation.abort(context),
+		async compact(request, context) {
+			try {
+				const id = await conversation.compact(request.customInstructions ?? undefined, context);
+				return { accepted: true, operationId: String(id), error: null };
+			} catch (error) {
+				return { accepted: false, operationId: null, error: toAgentError(error) };
+			}
+		},
+```
+
+## !!steps Waiting for a prompt answer
+
+`waitForPrompt` looks up the submission, waits for it to settle, and returns `unanswered` with the harness reason if no answer was produced. Otherwise it commits a read of the answer entry to get the model message, and joins only the `text` parts of an assistant message. If the entry is not an assistant message the text is an empty string, not an error.
+
+```ts ! agent-controller-provider.ts
+		async waitForPrompt(operationId, context): Promise<AgentPromptResult> {
+			const id = parseSubmissionId(operationId);
+			const submission = id === undefined ? undefined : await harness.submission(id, context);
+// !mark
+			if (submission === undefined) throw new Error(`Unknown prompt: ${operationId}`);
+			const settled = await submission.wait(context);
+// !mark
+			if (settled.status === "unanswered") return { status: "unanswered", text: null, reason: settled.reason };
+			const answer = settled.type === "input" ? settled.answer : undefined;
+			const message =
+// !mark
+				answer === undefined ? undefined : (await harness.commit((tx) => tx.entry(answer), context))?.model?.[0];
+			const text =
+				message?.role === "assistant"
+// !mark
+					? message.content.flatMap((content) => (content.type === "text" ? [content.text] : [])).join("")
+					: "";
+			return { status: "done", text, reason: null };
+		},
+```
+
+## !!steps Id parsing and input conversion
+
+Ids cross the wire as strings. The parser accepts only canonical positive integers (no leading zeros, no signs) that are safe numbers, so a garbage id maps to `not_found` rather than an arbitrary lookup. `toInput` returns a bare string when there are no images, and a content array otherwise. `toAgentError` is the single place that gives `ConversationBusy` the `busy` code.
+
+```ts ! agent-controller-provider.ts
+function parseSubmissionId(value: string): SubmissionId | undefined {
+// !mark
+	const id = Number(value);
+	return /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(id) ? (id as SubmissionId) : undefined;
+}
+
+function toInput(request: AgentPromptRequest): UserInput {
+// !mark
+	if (request.images === null || request.images.length === 0) return request.message;
+	const content: (TextContent | ImageContent)[] = [{ type: "text", text: request.message }, ...request.images];
+	return content;
+}
+
+function toAgentError(error: unknown): AgentOperationError {
+// !mark
+	if (error instanceof ConversationBusy) return { code: "busy", message: error.message };
+	return { code: "operation_failed", message: error instanceof Error ? error.message : String(error) };
+}
+```
+
+</Scrollycoding>
+
+The provider keeps no state of its own; everything is delegated to the harness and the conversation it was given. Its counterpart on the other side of the transport is any consumer of the `AgentController` token, such as the chat TUI in [client-tui.ts](/docs/src/experimental/client-tui.ts).

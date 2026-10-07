@@ -1,0 +1,16 @@
+{
+  "title": "mcp",
+  "pages": [
+    "cli.lazy.ts",
+    "cli.ts",
+    "config.ts",
+    "index.ts",
+    "log.ts",
+    "oauth.ts",
+    "resources.ts",
+    "runtime.lazy.ts",
+    "runtime.ts",
+    "tools.ts",
+    "ui.ts"
+  ]
+}

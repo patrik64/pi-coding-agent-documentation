@@ -1,0 +1,4595 @@
+{
+  "scripts/migrate-sessions.sh": {
+    "total": 93,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 93
+      }
+    ]
+  },
+  "src/bun/cli.ts": {
+    "total": 4,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 1
+      }
+    ]
+  },
+  "src/bun/quickjs-wasm.d.ts": {
+    "total": 5,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 5
+      }
+    ]
+  },
+  "src/bun/restore-sandbox-env.ts": {
+    "total": 36,
+    "top": [
+      {
+        "name": "mdsjip",
+        "lines": 32
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 4
+      }
+    ]
+  },
+  "src/bun/runtime-setup.ts": {
+    "total": 12,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 12
+      }
+    ]
+  },
+  "src/bun/sandbox-env-setup.ts": {
+    "total": 4,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 4
+      }
+    ]
+  },
+  "src/cli.ts": {
+    "total": 6,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 3
+      }
+    ]
+  },
+  "src/cli/args.ts": {
+    "total": 469,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 319
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 59
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 24
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 10
+      },
+      {
+        "name": "Helmut Januschka",
+        "lines": 7
+      }
+    ]
+  },
+  "src/cli/auth-check.ts": {
+    "total": 73,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 73
+      }
+    ]
+  },
+  "src/cli/auth-command.ts": {
+    "total": 126,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 121
+      },
+      {
+        "name": "Anders Bech Mellson",
+        "lines": 5
+      }
+    ]
+  },
+  "src/cli/config-selector.ts": {
+    "total": 61,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 46
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 8
+      },
+      {
+        "name": "Anton Geraschenko",
+        "lines": 6
+      },
+      {
+        "name": "Sam Jones",
+        "lines": 1
+      }
+    ]
+  },
+  "src/cli/credential-print.ts": {
+    "total": 87,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 45
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 38
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 4
+      }
+    ]
+  },
+  "src/cli/experimental/cli.ts": {
+    "total": 16,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 12
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 4
+      }
+    ]
+  },
+  "src/cli/experimental/command-options.ts": {
+    "total": 106,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 70
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 36
+      }
+    ]
+  },
+  "src/cli/experimental/command.ts": {
+    "total": 225,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 195
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 30
+      }
+    ]
+  },
+  "src/cli/experimental/commands/client.ts": {
+    "total": 91,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 63
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 28
+      }
+    ]
+  },
+  "src/cli/experimental/commands/server.ts": {
+    "total": 66,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 48
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 18
+      }
+    ]
+  },
+  "src/cli/file-processor.ts": {
+    "total": 88,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 55
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 24
+      },
+      {
+        "name": "Peter Steinberger",
+        "lines": 8
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 1
+      }
+    ]
+  },
+  "src/cli/initial-message.ts": {
+    "total": 43,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 42
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/cli/list-models.ts": {
+    "total": 115,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 109
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 5
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/cli/project-trust.ts": {
+    "total": 62,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 62
+      }
+    ]
+  },
+  "src/cli/session-picker.ts": {
+    "total": 55,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 39
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 10
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 4
+      },
+      {
+        "name": "Thomas Mustier",
+        "lines": 2
+      }
+    ]
+  },
+  "src/cli/setup.ts": {
+    "total": 13,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 13
+      }
+    ]
+  },
+  "src/cli/startup-ui.ts": {
+    "total": 253,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 168
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 84
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 1
+      }
+    ]
+  },
+  "src/client/index.ts": {
+    "total": 1,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 1
+      }
+    ]
+  },
+  "src/config.ts": {
+    "total": 656,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 412
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 192
+      },
+      {
+        "name": "Daniel Fu",
+        "lines": 22
+      },
+      {
+        "name": "Andres Araujo",
+        "lines": 6
+      },
+      {
+        "name": "George Zhang",
+        "lines": 5
+      }
+    ]
+  },
+  "src/core/agent-session-runtime.ts": {
+    "total": 447,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 378
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 48
+      },
+      {
+        "name": "wutongyuonce",
+        "lines": 13
+      },
+      {
+        "name": "Thomas Mustier",
+        "lines": 3
+      },
+      {
+        "name": "Sviatoslav Abakumov",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/agent-session-services.ts": {
+    "total": 233,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 213
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 20
+      }
+    ]
+  },
+  "src/core/agent-session.ts": {
+    "total": 4383,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 2691
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 947
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 193
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 109
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 90
+      }
+    ]
+  },
+  "src/core/auth-guidance.ts": {
+    "total": 25,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 24
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/auth-storage.ts": {
+    "total": 506,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 295
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 203
+      },
+      {
+        "name": "cursive",
+        "lines": 6
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/bash-executor.ts": {
+    "total": 152,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 145
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 7
+      }
+    ]
+  },
+  "src/core/bug-report-upload.ts": {
+    "total": 37,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 37
+      }
+    ]
+  },
+  "src/core/bug-report.ts": {
+    "total": 375,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 374
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/cache-stats.ts": {
+    "total": 174,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 171
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/cache-warmer.ts": {
+    "total": 453,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 453
+      }
+    ]
+  },
+  "src/core/compaction/branch-summarization.ts": {
+    "total": 382,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 336
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 19
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 14
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 11
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/compaction/compaction.ts": {
+    "total": 1119,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 869
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 85
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 81
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 61
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 15
+      }
+    ]
+  },
+  "src/core/compaction/index.ts": {
+    "total": 7,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 4
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/compaction/utils.ts": {
+    "total": 163,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 143
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 14
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 6
+      }
+    ]
+  },
+  "src/core/crash-log.ts": {
+    "total": 170,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 170
+      }
+    ]
+  },
+  "src/core/defaults.ts": {
+    "total": 12,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 9
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/diagnostics.ts": {
+    "total": 15,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 15
+      }
+    ]
+  },
+  "src/core/event-bus.ts": {
+    "total": 33,
+    "top": [
+      {
+        "name": "Nico Bailon",
+        "lines": 31
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/exec.ts": {
+    "total": 107,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 100
+      },
+      {
+        "name": "Duncan Ogilvie",
+        "lines": 6
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/experimental.ts": {
+    "total": 3,
+    "top": [
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/export-html/ansi-to-html.ts": {
+    "total": 258,
+    "top": [
+      {
+        "name": "Aliou Diallo",
+        "lines": 257
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/export-html/index.ts": {
+    "total": 316,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 210
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 87
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 19
+      }
+    ]
+  },
+  "src/core/export-html/template.css": {
+    "total": 1076,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 867
+      },
+      {
+        "name": "lockmeister",
+        "lines": 54
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 48
+      },
+      {
+        "name": "Dillon Mulroy",
+        "lines": 43
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 30
+      }
+    ]
+  },
+  "src/core/export-html/template.html": {
+    "total": 55,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 54
+      },
+      {
+        "name": "Dillon Mulroy",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/export-html/template.js": {
+    "total": 1918,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 1221
+      },
+      {
+        "name": "warren",
+        "lines": 134
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 110
+      },
+      {
+        "name": "Dillon Mulroy",
+        "lines": 107
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 106
+      }
+    ]
+  },
+  "src/core/export-html/tool-renderer.ts": {
+    "total": 172,
+    "top": [
+      {
+        "name": "Aliou Diallo",
+        "lines": 90
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 74
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 8
+      }
+    ]
+  },
+  "src/core/extensions/index.ts": {
+    "total": 223,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 147
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 26
+      },
+      {
+        "name": "G",
+        "lines": 10
+      },
+      {
+        "name": "Sumeet Agarwal",
+        "lines": 8
+      },
+      {
+        "name": "Kao Félix",
+        "lines": 5
+      }
+    ]
+  },
+  "src/core/extensions/jiti-loader.ts": {
+    "total": 3,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/extensions/jiti-static-loader.ts": {
+    "total": 3,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/extensions/loader.ts": {
+    "total": 876,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 427
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 209
+      },
+      {
+        "name": "yaogangqiang",
+        "lines": 101
+      },
+      {
+        "name": "Prateek Sunal",
+        "lines": 55
+      },
+      {
+        "name": "Ted",
+        "lines": 23
+      }
+    ]
+  },
+  "src/core/extensions/runner.ts": {
+    "total": 1560,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 1033
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 256
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 51
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 33
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 31
+      }
+    ]
+  },
+  "src/core/extensions/types.ts": {
+    "total": 2262,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 1289
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 450
+      },
+      {
+        "name": "G",
+        "lines": 93
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 63
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 55
+      }
+    ]
+  },
+  "src/core/extensions/virtual-modules.ts": {
+    "total": 38,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 38
+      }
+    ]
+  },
+  "src/core/extensions/wrapper.ts": {
+    "total": 29,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 20
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 9
+      }
+    ]
+  },
+  "src/core/footer-data-provider.ts": {
+    "total": 388,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 195
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 79
+      },
+      {
+        "name": "Aaron Soules",
+        "lines": 61
+      },
+      {
+        "name": "Pavel Soukenik",
+        "lines": 36
+      },
+      {
+        "name": "Denis Badurina",
+        "lines": 13
+      }
+    ]
+  },
+  "src/core/http-dispatcher.ts": {
+    "total": 113,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 72
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 34
+      },
+      {
+        "name": "muyiyr",
+        "lines": 5
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/index.ts": {
+    "total": 97,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 80
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 13
+      },
+      {
+        "name": "Douglas Stephen",
+        "lines": 2
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 1
+      },
+      {
+        "name": "Victor Araújo",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/keybindings.ts": {
+    "total": 401,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 250
+      },
+      {
+        "name": "Marek Pazik",
+        "lines": 65
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 41
+      },
+      {
+        "name": "Helmut Januschka",
+        "lines": 26
+      },
+      {
+        "name": "warren",
+        "lines": 12
+      }
+    ]
+  },
+  "src/core/mcp-servers.ts": {
+    "total": 346,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 346
+      }
+    ]
+  },
+  "src/core/messages.ts": {
+    "total": 196,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 194
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/model-config.ts": {
+    "total": 346,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 269
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 32
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 27
+      },
+      {
+        "name": "Duncan Ogilvie",
+        "lines": 15
+      },
+      {
+        "name": "AppleDannyClegg",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/model-registry.ts": {
+    "total": 244,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 123
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 75
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 17
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 16
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 11
+      }
+    ]
+  },
+  "src/core/model-resolver.ts": {
+    "total": 783,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 395
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 140
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 88
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 43
+      },
+      {
+        "name": "Scott",
+        "lines": 31
+      }
+    ]
+  },
+  "src/core/model-runtime.ts": {
+    "total": 1032,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 708
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 256
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 61
+      },
+      {
+        "name": "a-yeyang",
+        "lines": 4
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/models-store.ts": {
+    "total": 147,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 92
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 55
+      }
+    ]
+  },
+  "src/core/nested-tool-calls.ts": {
+    "total": 261,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 261
+      }
+    ]
+  },
+  "src/core/output-guard.ts": {
+    "total": 108,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 55
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 53
+      }
+    ]
+  },
+  "src/core/package-manager.ts": {
+    "total": 2760,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 2148
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 351
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 66
+      },
+      {
+        "name": "Duncan Ogilvie",
+        "lines": 60
+      },
+      {
+        "name": "badlogic",
+        "lines": 31
+      }
+    ]
+  },
+  "src/core/pi-manifest.ts": {
+    "total": 35,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 33
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/project-trust.ts": {
+    "total": 96,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 94
+      },
+      {
+        "name": "Anders Bech Mellson",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/prompt-templates.ts": {
+    "total": 320,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 199
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 60
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 18
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 12
+      },
+      {
+        "name": "Zeno Jiricek",
+        "lines": 11
+      }
+    ]
+  },
+  "src/core/provider-attribution.ts": {
+    "total": 97,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 97
+      }
+    ]
+  },
+  "src/core/provider-composer.ts": {
+    "total": 732,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 494
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 201
+      },
+      {
+        "name": "Duncan Ogilvie",
+        "lines": 24
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 13
+      }
+    ]
+  },
+  "src/core/radius.ts": {
+    "total": 11,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 11
+      }
+    ]
+  },
+  "src/core/remote-catalog-provider.ts": {
+    "total": 158,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 81
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 74
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 2
+      },
+      {
+        "name": "Petr Houška",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/resolve-config-value.ts": {
+    "total": 287,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 163
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 80
+      },
+      {
+        "name": "badlogic",
+        "lines": 39
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 5
+      }
+    ]
+  },
+  "src/core/resource-loader.ts": {
+    "total": 1283,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 890
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 242
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 33
+      },
+      {
+        "name": "Arunprasad Rajkumar",
+        "lines": 32
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 32
+      }
+    ]
+  },
+  "src/core/runtime-credentials.ts": {
+    "total": 52,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 52
+      }
+    ]
+  },
+  "src/core/sdk.ts": {
+    "total": 468,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 304
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 118
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 15
+      },
+      {
+        "name": "Josh",
+        "lines": 10
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 8
+      }
+    ]
+  },
+  "src/core/session-cwd.ts": {
+    "total": 59,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 59
+      }
+    ]
+  },
+  "src/core/session-export.ts": {
+    "total": 45,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 45
+      }
+    ]
+  },
+  "src/core/session-manager.ts": {
+    "total": 2013,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 1337
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 438
+      },
+      {
+        "name": "Thomas Mustier",
+        "lines": 51
+      },
+      {
+        "name": "Rafał Krzyważnia",
+        "lines": 40
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 35
+      }
+    ]
+  },
+  "src/core/settings-diagnostics.ts": {
+    "total": 25,
+    "top": [
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 25
+      }
+    ]
+  },
+  "src/core/settings-manager.ts": {
+    "total": 1533,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 888
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 264
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 130
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 60
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 39
+      }
+    ]
+  },
+  "src/core/skills.ts": {
+    "total": 514,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 397
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 51
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 34
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 28
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/slash-commands.ts": {
+    "total": 44,
+    "top": [
+      {
+        "name": "warren",
+        "lines": 25
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 7
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 3
+      },
+      {
+        "name": "Helmut Januschka",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/source-info.ts": {
+    "total": 57,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 39
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 18
+      }
+    ]
+  },
+  "src/core/system-prompt.ts": {
+    "total": 229,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 184
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 38
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 7
+      }
+    ]
+  },
+  "src/core/telemetry.ts": {
+    "total": 13,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 12
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/timings.ts": {
+    "total": 50,
+    "top": [
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 33
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 17
+      }
+    ]
+  },
+  "src/core/tools/bash.ts": {
+    "total": 442,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 229
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 150
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 29
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 11
+      },
+      {
+        "name": "Vytautas",
+        "lines": 8
+      }
+    ]
+  },
+  "src/core/tools/edit-diff.ts": {
+    "total": 556,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 329
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 135
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 89
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 2
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/tools/edit.ts": {
+    "total": 220,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 147
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 21
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 20
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 12
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 10
+      }
+    ]
+  },
+  "src/core/tools/file-mutation-queue.ts": {
+    "total": 61,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 61
+      }
+    ]
+  },
+  "src/core/tools/find.ts": {
+    "total": 318,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 266
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 25
+      },
+      {
+        "name": "Petr Houška",
+        "lines": 13
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 6
+      },
+      {
+        "name": "badlogic",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/tools/grep.ts": {
+    "total": 323,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 307
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 6
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 5
+      },
+      {
+        "name": "Vytautas",
+        "lines": 2
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/tools/index.ts": {
+    "total": 224,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 138
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 55
+      },
+      {
+        "name": "G",
+        "lines": 31
+      }
+    ]
+  },
+  "src/core/tools/ls.ts": {
+    "total": 175,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 161
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 6
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      },
+      {
+        "name": "G",
+        "lines": 2
+      },
+      {
+        "name": "Vytautas",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/tools/output-accumulator.ts": {
+    "total": 257,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 248
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 9
+      }
+    ]
+  },
+  "src/core/tools/path-utils.ts": {
+    "total": 118,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 91
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 23
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      },
+      {
+        "name": "Jack Rose",
+        "lines": 1
+      }
+    ]
+  },
+  "src/core/tools/powershell.ts": {
+    "total": 67,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 67
+      }
+    ]
+  },
+  "src/core/tools/read.ts": {
+    "total": 224,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 161
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 51
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 7
+      },
+      {
+        "name": "G",
+        "lines": 2
+      },
+      {
+        "name": "Vytautas",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/tools/render-utils.ts": {
+    "total": 112,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 60
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 29
+      },
+      {
+        "name": "Marek Pazik",
+        "lines": 23
+      }
+    ]
+  },
+  "src/core/tools/renderers/bash.ts": {
+    "total": 146,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 122
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 15
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 9
+      }
+    ]
+  },
+  "src/core/tools/renderers/edit.ts": {
+    "total": 238,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 238
+      }
+    ]
+  },
+  "src/core/tools/renderers/find.ts": {
+    "total": 77,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 77
+      }
+    ]
+  },
+  "src/core/tools/renderers/grep.ts": {
+    "total": 82,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 82
+      }
+    ]
+  },
+  "src/core/tools/renderers/index.ts": {
+    "total": 63,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 61
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/tools/renderers/ls.ts": {
+    "total": 70,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 70
+      }
+    ]
+  },
+  "src/core/tools/renderers/read.ts": {
+    "total": 176,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 173
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 3
+      }
+    ]
+  },
+  "src/core/tools/renderers/write.ts": {
+    "total": 181,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 181
+      }
+    ]
+  },
+  "src/core/tools/tool-definition-wrapper.ts": {
+    "total": 58,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 38
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 18
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/tools/truncate.ts": {
+    "total": 314,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 276
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 38
+      }
+    ]
+  },
+  "src/core/tools/write.ts": {
+    "total": 97,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 79
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 7
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 5
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 2
+      },
+      {
+        "name": "G",
+        "lines": 2
+      }
+    ]
+  },
+  "src/core/trust-manager.ts": {
+    "total": 246,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 134
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 112
+      }
+    ]
+  },
+  "src/core/usage-totals.ts": {
+    "total": 97,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 42
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 28
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 27
+      }
+    ]
+  },
+  "src/core/virtual-models.ts": {
+    "total": 238,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 238
+      }
+    ]
+  },
+  "src/experimental/cli.ts": {
+    "total": 12,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 12
+      }
+    ]
+  },
+  "src/experimental/client-runtime.ts": {
+    "total": 230,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 230
+      }
+    ]
+  },
+  "src/experimental/client-tui-chat.ts": {
+    "total": 228,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 131
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 97
+      }
+    ]
+  },
+  "src/experimental/client-tui.ts": {
+    "total": 809,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 778
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 29
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 2
+      }
+    ]
+  },
+  "src/experimental/client.ts": {
+    "total": 86,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 49
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 32
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 5
+      }
+    ]
+  },
+  "src/experimental/commands.ts": {
+    "total": 98,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 96
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 2
+      }
+    ]
+  },
+  "src/experimental/coordinator-entry.ts": {
+    "total": 10,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 10
+      }
+    ]
+  },
+  "src/experimental/coordinator.ts": {
+    "total": 612,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 338
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 274
+      }
+    ]
+  },
+  "src/experimental/durable/harness-setup.ts": {
+    "total": 123,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 123
+      }
+    ]
+  },
+  "src/experimental/durable/main.ts": {
+    "total": 20,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 20
+      }
+    ]
+  },
+  "src/experimental/durable/prompt.ts": {
+    "total": 74,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 74
+      }
+    ]
+  },
+  "src/experimental/durable/README.md": {
+    "total": 66,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 66
+      }
+    ]
+  },
+  "src/experimental/durable/runtime.ts": {
+    "total": 367,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 367
+      }
+    ]
+  },
+  "src/experimental/durable/sessions.ts": {
+    "total": 56,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 56
+      }
+    ]
+  },
+  "src/experimental/durable/subagent.ts": {
+    "total": 55,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 55
+      }
+    ]
+  },
+  "src/experimental/durable/tui.ts": {
+    "total": 655,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 655
+      }
+    ]
+  },
+  "src/experimental/plugin.ts": {
+    "total": 16,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 15
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 1
+      }
+    ]
+  },
+  "src/experimental/plugins/bundled.ts": {
+    "total": 55,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 55
+      }
+    ]
+  },
+  "src/experimental/plugins/package.ts": {
+    "total": 171,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 171
+      }
+    ]
+  },
+  "src/experimental/process.ts": {
+    "total": 106,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 76
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 30
+      }
+    ]
+  },
+  "src/experimental/radius-auth.ts": {
+    "total": 67,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 67
+      }
+    ]
+  },
+  "src/experimental/radius-relay.ts": {
+    "total": 724,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 724
+      }
+    ]
+  },
+  "src/experimental/server.ts": {
+    "total": 770,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 512
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 229
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 29
+      }
+    ]
+  },
+  "src/experimental/services/agent-controller-provider.ts": {
+    "total": 95,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 65
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 30
+      }
+    ]
+  },
+  "src/experimental/services/agent-controller.ts": {
+    "total": 57,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 40
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 17
+      }
+    ]
+  },
+  "src/experimental/services/connection.ts": {
+    "total": 399,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 398
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 1
+      }
+    ]
+  },
+  "src/experimental/services/models-provider.ts": {
+    "total": 173,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 87
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 86
+      }
+    ]
+  },
+  "src/experimental/services/models.ts": {
+    "total": 35,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 31
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 4
+      }
+    ]
+  },
+  "src/experimental/services/plugins.ts": {
+    "total": 19,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 19
+      }
+    ]
+  },
+  "src/experimental/services/presentation-ui.ts": {
+    "total": 20,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 20
+      }
+    ]
+  },
+  "src/experimental/services/README.md": {
+    "total": 45,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 20
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 16
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 9
+      }
+    ]
+  },
+  "src/experimental/services/server.ts": {
+    "total": 151,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 147
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 4
+      }
+    ]
+  },
+  "src/experimental/services/sessions.ts": {
+    "total": 35,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 35
+      }
+    ]
+  },
+  "src/experimental/services/slash-commands-provider.ts": {
+    "total": 225,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 223
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 2
+      }
+    ]
+  },
+  "src/experimental/services/slash-commands.ts": {
+    "total": 30,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 30
+      }
+    ]
+  },
+  "src/experimental/services/transcript-provider.ts": {
+    "total": 15,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 8
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 7
+      }
+    ]
+  },
+  "src/experimental/services/transcript.ts": {
+    "total": 9,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 3
+      }
+    ]
+  },
+  "src/experimental/services/worker.ts": {
+    "total": 157,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 145
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 12
+      }
+    ]
+  },
+  "src/experimental/session-catalog.ts": {
+    "total": 87,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 87
+      }
+    ]
+  },
+  "src/experimental/session-worker-manager.ts": {
+    "total": 848,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 718
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 120
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 10
+      }
+    ]
+  },
+  "src/experimental/session-worker.ts": {
+    "total": 840,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 531
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 229
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 80
+      }
+    ]
+  },
+  "src/experimental/source-resolver.ts": {
+    "total": 86,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 86
+      }
+    ]
+  },
+  "src/experimental/vacation/harness-setup.ts": {
+    "total": 89,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 89
+      }
+    ]
+  },
+  "src/experimental/vacation/main.ts": {
+    "total": 20,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 20
+      }
+    ]
+  },
+  "src/experimental/vacation/README.md": {
+    "total": 53,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 53
+      }
+    ]
+  },
+  "src/experimental/vacation/runtime.ts": {
+    "total": 363,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 363
+      }
+    ]
+  },
+  "src/experimental/vacation/sessions.ts": {
+    "total": 56,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 56
+      }
+    ]
+  },
+  "src/experimental/vacation/tui.ts": {
+    "total": 655,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 655
+      }
+    ]
+  },
+  "src/experimental/vacation/vacation.ts": {
+    "total": 142,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 142
+      }
+    ]
+  },
+  "src/extensions/codemode/execute.lazy.ts": {
+    "total": 2,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/extensions/codemode/execute.ts": {
+    "total": 675,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 675
+      }
+    ]
+  },
+  "src/extensions/codemode/index.ts": {
+    "total": 48,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 48
+      }
+    ]
+  },
+  "src/extensions/codemode/renderer.ts": {
+    "total": 150,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 150
+      }
+    ]
+  },
+  "src/extensions/codemode/tool.ts": {
+    "total": 419,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 419
+      }
+    ]
+  },
+  "src/extensions/codemode/worker.ts": {
+    "total": 6,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      }
+    ]
+  },
+  "src/extensions/index.ts": {
+    "total": 14,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 11
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 3
+      }
+    ]
+  },
+  "src/extensions/llama/client.ts": {
+    "total": 348,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 332
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 9
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 7
+      }
+    ]
+  },
+  "src/extensions/llama/huggingface.ts": {
+    "total": 158,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 158
+      }
+    ]
+  },
+  "src/extensions/llama/index.ts": {
+    "total": 230,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 228
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 2
+      }
+    ]
+  },
+  "src/extensions/llama/provider.ts": {
+    "total": 299,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 121
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 83
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 72
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 21
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 1
+      }
+    ]
+  },
+  "src/extensions/llama/ui.ts": {
+    "total": 542,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 542
+      }
+    ]
+  },
+  "src/extensions/mcp/cli.lazy.ts": {
+    "total": 2,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/extensions/mcp/cli.ts": {
+    "total": 614,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 614
+      }
+    ]
+  },
+  "src/extensions/mcp/config.ts": {
+    "total": 242,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 242
+      }
+    ]
+  },
+  "src/extensions/mcp/index.ts": {
+    "total": 1225,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 1225
+      }
+    ]
+  },
+  "src/extensions/mcp/log.ts": {
+    "total": 69,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 69
+      }
+    ]
+  },
+  "src/extensions/mcp/oauth.ts": {
+    "total": 532,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 532
+      }
+    ]
+  },
+  "src/extensions/mcp/resources.ts": {
+    "total": 339,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 339
+      }
+    ]
+  },
+  "src/extensions/mcp/runtime.lazy.ts": {
+    "total": 2,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/extensions/mcp/runtime.ts": {
+    "total": 491,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 491
+      }
+    ]
+  },
+  "src/extensions/mcp/tools.ts": {
+    "total": 335,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 335
+      }
+    ]
+  },
+  "src/extensions/mcp/ui.ts": {
+    "total": 252,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 252
+      }
+    ]
+  },
+  "src/extensions/tool-search/index.ts": {
+    "total": 18,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 18
+      }
+    ]
+  },
+  "src/extensions/tool-search/tool.ts": {
+    "total": 247,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 247
+      }
+    ]
+  },
+  "src/index.ts": {
+    "total": 494,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 318
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 86
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 18
+      },
+      {
+        "name": "G",
+        "lines": 16
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 15
+      }
+    ]
+  },
+  "src/main.ts": {
+    "total": 999,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 555
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 258
+      },
+      {
+        "name": "Rafał Krzyważnia",
+        "lines": 47
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 25
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 20
+      }
+    ]
+  },
+  "src/migrations.ts": {
+    "total": 315,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 256
+      },
+      {
+        "name": "Jake",
+        "lines": 50
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 7
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/index.ts": {
+    "total": 16,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 11
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 4
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/bug-report.ts": {
+    "total": 298,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 294
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/chat-viewport.ts": {
+    "total": 46,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 41
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 4
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/armin.ts": {
+    "total": 384,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 383
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/assistant-message.ts": {
+    "total": 202,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 141
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 36
+      },
+      {
+        "name": "Markus Ylisiurunen",
+        "lines": 8
+      },
+      {
+        "name": "Thomas Mustier",
+        "lines": 8
+      },
+      {
+        "name": "Michael Renner",
+        "lines": 7
+      }
+    ]
+  },
+  "src/modes/interactive/components/auth-url.ts": {
+    "total": 39,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 39
+      }
+    ]
+  },
+  "src/modes/interactive/components/bash-execution.ts": {
+    "total": 220,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 209
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      },
+      {
+        "name": "Jian Zhang",
+        "lines": 3
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/components/bordered-loader.ts": {
+    "total": 68,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 63
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 5
+      }
+    ]
+  },
+  "src/modes/interactive/components/branch-summary-message.ts": {
+    "total": 67,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 53
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 7
+      },
+      {
+        "name": "Michael Renner",
+        "lines": 4
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/components/compaction-summary-message.ts": {
+    "total": 68,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 55
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 6
+      },
+      {
+        "name": "Michael Renner",
+        "lines": 4
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/components/config-selector.ts": {
+    "total": 951,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 546
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 352
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 28
+      },
+      {
+        "name": "Sam Jones",
+        "lines": 11
+      },
+      {
+        "name": "Umberto B.",
+        "lines": 9
+      }
+    ]
+  },
+  "src/modes/interactive/components/countdown-timer.ts": {
+    "total": 39,
+    "top": [
+      {
+        "name": "Nico Bailon",
+        "lines": 31
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 8
+      }
+    ]
+  },
+  "src/modes/interactive/components/custom-editor.ts": {
+    "total": 148,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 56
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 36
+      },
+      {
+        "name": "Helmut Januschka",
+        "lines": 28
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 14
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/components/custom-entry.ts": {
+    "total": 62,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 62
+      }
+    ]
+  },
+  "src/modes/interactive/components/custom-message.ts": {
+    "total": 113,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 87
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 15
+      },
+      {
+        "name": "Michael Renner",
+        "lines": 8
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/components/diff.ts": {
+    "total": 147,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 146
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/dynamic-border.ts": {
+    "total": 25,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 24
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/earendil-announcement.ts": {
+    "total": 53,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 50
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/components/easter-egg-3d.lazy.ts": {
+    "total": 27,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 27
+      }
+    ]
+  },
+  "src/modes/interactive/components/easter-egg-3d.ts": {
+    "total": 1292,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 1280
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 12
+      }
+    ]
+  },
+  "src/modes/interactive/components/extension-editor.ts": {
+    "total": 141,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 74
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 24
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 17
+      },
+      {
+        "name": "Zhou Rui",
+        "lines": 11
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 8
+      }
+    ]
+  },
+  "src/modes/interactive/components/extension-input.ts": {
+    "total": 94,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 57
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 26
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 11
+      }
+    ]
+  },
+  "src/modes/interactive/components/extension-selector.ts": {
+    "total": 117,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 63
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 34
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 11
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 9
+      }
+    ]
+  },
+  "src/modes/interactive/components/first-time-setup.ts": {
+    "total": 148,
+    "top": [
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 135
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 13
+      }
+    ]
+  },
+  "src/modes/interactive/components/footer.ts": {
+    "total": 302,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 138
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 74
+      },
+      {
+        "name": "Prateek Sunal",
+        "lines": 22
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 19
+      },
+      {
+        "name": "Sviatoslav Abakumov",
+        "lines": 17
+      }
+    ]
+  },
+  "src/modes/interactive/components/index.ts": {
+    "total": 37,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 29
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 5
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 2
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/keybinding-hints.ts": {
+    "total": 48,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 33
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 14
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/login-dialog.ts": {
+    "total": 238,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 197
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 21
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 18
+      },
+      {
+        "name": "Danila Poyarkov",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/components/markdown-transform.ts": {
+    "total": 29,
+    "top": [
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 29
+      }
+    ]
+  },
+  "src/modes/interactive/components/mermaid.ts": {
+    "total": 89,
+    "top": [
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 89
+      }
+    ]
+  },
+  "src/modes/interactive/components/model-selector.ts": {
+    "total": 421,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 321
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 57
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 15
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 7
+      },
+      {
+        "name": "butelo",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/components/oauth-selector.ts": {
+    "total": 224,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 134
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 90
+      }
+    ]
+  },
+  "src/modes/interactive/components/pi-logo.ts": {
+    "total": 40,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 40
+      }
+    ]
+  },
+  "src/modes/interactive/components/radius-login-selector.ts": {
+    "total": 114,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 114
+      }
+    ]
+  },
+  "src/modes/interactive/components/scoped-models-selector.ts": {
+    "total": 401,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 229
+      },
+      {
+        "name": "thomasmhr",
+        "lines": 97
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 22
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 22
+      },
+      {
+        "name": "Marek Pazik",
+        "lines": 19
+      }
+    ]
+  },
+  "src/modes/interactive/components/session-selector-search.ts": {
+    "total": 194,
+    "top": [
+      {
+        "name": "Can Celik",
+        "lines": 169
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 23
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      },
+      {
+        "name": "Petr Baudis",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/interactive/components/session-selector.ts": {
+    "total": 1045,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 305
+      },
+      {
+        "name": "warren",
+        "lines": 225
+      },
+      {
+        "name": "Sergii Kozak",
+        "lines": 158
+      },
+      {
+        "name": "Petr Baudis",
+        "lines": 149
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 73
+      }
+    ]
+  },
+  "src/modes/interactive/components/settings-selector.ts": {
+    "total": 993,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 395
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 359
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 148
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 28
+      },
+      {
+        "name": "Colin Mason",
+        "lines": 14
+      }
+    ]
+  },
+  "src/modes/interactive/components/settings-submenu.ts": {
+    "total": 258,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 258
+      }
+    ]
+  },
+  "src/modes/interactive/components/show-images-selector.ts": {
+    "total": 50,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 42
+      },
+      {
+        "name": "Markus Ylisiurunen",
+        "lines": 6
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/components/skill-invocation-message.ts": {
+    "total": 64,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 61
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/components/status-indicator.ts": {
+    "total": 123,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 110
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 9
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/components/theme-selector.ts": {
+    "total": 67,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 59
+      },
+      {
+        "name": "Markus Ylisiurunen",
+        "lines": 6
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/components/themed-text.ts": {
+    "total": 32,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 32
+      }
+    ]
+  },
+  "src/modes/interactive/components/thinking-selector.ts": {
+    "total": 154,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 92
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 26
+      },
+      {
+        "name": "theBucky",
+        "lines": 16
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 14
+      },
+      {
+        "name": "Markus Ylisiurunen",
+        "lines": 5
+      }
+    ]
+  },
+  "src/modes/interactive/components/tool-execution.ts": {
+    "total": 393,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 332
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 32
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 16
+      },
+      {
+        "name": "Aljosa Asanovic",
+        "lines": 13
+      }
+    ]
+  },
+  "src/modes/interactive/components/tree-selector.ts": {
+    "total": 1435,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 953
+      },
+      {
+        "name": "warren",
+        "lines": 181
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 150
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 63
+      },
+      {
+        "name": "Sviatoslav Abakumov",
+        "lines": 46
+      }
+    ]
+  },
+  "src/modes/interactive/components/trust-selector.ts": {
+    "total": 134,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 88
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 44
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/components/user-message-selector.ts": {
+    "total": 155,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 138
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 13
+      },
+      {
+        "name": "butelo",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/components/user-message.ts": {
+    "total": 71,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 51
+      },
+      {
+        "name": "Alexey Zaytsev",
+        "lines": 15
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 5
+      }
+    ]
+  },
+  "src/modes/interactive/components/visual-truncate.ts": {
+    "total": 98,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 53
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 45
+      }
+    ]
+  },
+  "src/modes/interactive/external-editor.ts": {
+    "total": 46,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 44
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/modes/interactive/interactive-mode.ts": {
+    "total": 7072,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 3912
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1664
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 221
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 144
+      },
+      {
+        "name": "Helmut Januschka",
+        "lines": 142
+      }
+    ]
+  },
+  "src/modes/interactive/model-catalog-refresh.ts": {
+    "total": 51,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 51
+      }
+    ]
+  },
+  "src/modes/interactive/model-search.ts": {
+    "total": 21,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 11
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 10
+      }
+    ]
+  },
+  "src/modes/interactive/session-share.ts": {
+    "total": 217,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 213
+      },
+      {
+        "name": "wutongyuonce",
+        "lines": 4
+      }
+    ]
+  },
+  "src/modes/interactive/theme/dark.json": {
+    "total": 78,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 63
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 15
+      }
+    ]
+  },
+  "src/modes/interactive/theme/light.json": {
+    "total": 78,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 61
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 17
+      }
+    ]
+  },
+  "src/modes/interactive/theme/system-theme.ts": {
+    "total": 655,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 631
+      },
+      {
+        "name": "Maximilian Blazek",
+        "lines": 24
+      }
+    ]
+  },
+  "src/modes/interactive/theme/theme-controller.ts": {
+    "total": 253,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 227
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 26
+      }
+    ]
+  },
+  "src/modes/interactive/theme/theme-json.ts": {
+    "total": 148,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 140
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 5
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/interactive/theme/theme-schema.json": {
+    "total": 361,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 312
+      },
+      {
+        "name": "scutifer",
+        "lines": 23
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 20
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 6
+      }
+    ]
+  },
+  "src/modes/interactive/theme/theme.ts": {
+    "total": 1160,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 666
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 394
+      },
+      {
+        "name": "Sergii Kozak",
+        "lines": 48
+      },
+      {
+        "name": "Sviatoslav Abakumov",
+        "lines": 36
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 10
+      }
+    ]
+  },
+  "src/modes/interactive/tui-renderer.ts": {
+    "total": 81,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 78
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 3
+      }
+    ]
+  },
+  "src/modes/json-event.ts": {
+    "total": 61,
+    "top": [
+      {
+        "name": "Christian Klotz",
+        "lines": 61
+      }
+    ]
+  },
+  "src/modes/print-mode.ts": {
+    "total": 169,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 148
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 12
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 8
+      },
+      {
+        "name": "Juan Ibiapina",
+        "lines": 1
+      }
+    ]
+  },
+  "src/modes/rpc/jsonl.ts": {
+    "total": 58,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 58
+      }
+    ]
+  },
+  "src/modes/rpc/rpc-client.ts": {
+    "total": 617,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 475
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 69
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 19
+      },
+      {
+        "name": "Anton Geraschenko",
+        "lines": 17
+      },
+      {
+        "name": "Daniel Nouri",
+        "lines": 15
+      }
+    ]
+  },
+  "src/modes/rpc/rpc-mode.ts": {
+    "total": 819,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 531
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 62
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 50
+      },
+      {
+        "name": "Daniel Nouri",
+        "lines": 42
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 20
+      }
+    ]
+  },
+  "src/modes/rpc/rpc-types.ts": {
+    "total": 303,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 207
+      },
+      {
+        "name": "Daniel Nouri",
+        "lines": 29
+      },
+      {
+        "name": "Anton Geraschenko",
+        "lines": 17
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 11
+      },
+      {
+        "name": "Nico Bailon",
+        "lines": 10
+      }
+    ]
+  },
+  "src/package-manager-cli.ts": {
+    "total": 1141,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 816
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 283
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 22
+      },
+      {
+        "name": "Raj",
+        "lines": 8
+      },
+      {
+        "name": "Petr Houška",
+        "lines": 5
+      }
+    ]
+  },
+  "src/rpc-entry.ts": {
+    "total": 13,
+    "top": [
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 12
+      },
+      {
+        "name": "Renaud Hartert",
+        "lines": 1
+      }
+    ]
+  },
+  "src/utils/abort.ts": {
+    "total": 48,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 48
+      }
+    ]
+  },
+  "src/utils/ansi.ts": {
+    "total": 60,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 60
+      }
+    ]
+  },
+  "src/utils/changelog.ts": {
+    "total": 196,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 98
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 98
+      }
+    ]
+  },
+  "src/utils/child-process.ts": {
+    "total": 137,
+    "top": [
+      {
+        "name": "Duncan Ogilvie",
+        "lines": 80
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 28
+      },
+      {
+        "name": "Joseph Mearman",
+        "lines": 23
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      }
+    ]
+  },
+  "src/utils/clipboard-command.ts": {
+    "total": 44,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 44
+      }
+    ]
+  },
+  "src/utils/clipboard-image.ts": {
+    "total": 240,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 115
+      },
+      {
+        "name": "Zhou Rui",
+        "lines": 77
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 48
+      }
+    ]
+  },
+  "src/utils/clipboard.ts": {
+    "total": 144,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 106
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 27
+      },
+      {
+        "name": "Christian Klotz",
+        "lines": 9
+      },
+      {
+        "name": "Markus Ylisiurunen",
+        "lines": 1
+      },
+      {
+        "name": "Ogulcan Celik",
+        "lines": 1
+      }
+    ]
+  },
+  "src/utils/deprecation.ts": {
+    "total": 14,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 14
+      }
+    ]
+  },
+  "src/utils/exif-orientation.ts": {
+    "total": 182,
+    "top": [
+      {
+        "name": "Melih Mucuk",
+        "lines": 180
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 1
+      },
+      {
+        "name": "wutongyuonce",
+        "lines": 1
+      }
+    ]
+  },
+  "src/utils/frontmatter.ts": {
+    "total": 40,
+    "top": [
+      {
+        "name": "Richard Gill",
+        "lines": 38
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 2
+      }
+    ]
+  },
+  "src/utils/fs-watch.ts": {
+    "total": 30,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 30
+      }
+    ]
+  },
+  "src/utils/git.ts": {
+    "total": 226,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 140
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 57
+      },
+      {
+        "name": "Markus Ekholm",
+        "lines": 29
+      }
+    ]
+  },
+  "src/utils/highlight-js.d.ts": {
+    "total": 36,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 36
+      }
+    ]
+  },
+  "src/utils/html.ts": {
+    "total": 51,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 51
+      }
+    ]
+  },
+  "src/utils/image-convert.ts": {
+    "total": 89,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 68
+      },
+      {
+        "name": "Mario Zechner",
+        "lines": 21
+      }
+    ]
+  },
+  "src/utils/image-process.ts": {
+    "total": 119,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 119
+      }
+    ]
+  },
+  "src/utils/image-resize-core.ts": {
+    "total": 164,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 164
+      }
+    ]
+  },
+  "src/utils/image-resize-worker.ts": {
+    "total": 42,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 42
+      }
+    ]
+  },
+  "src/utils/image-resize.ts": {
+    "total": 123,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 96
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 24
+      },
+      {
+        "name": "Can Bölük",
+        "lines": 3
+      }
+    ]
+  },
+  "src/utils/json.ts": {
+    "total": 6,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 6
+      }
+    ]
+  },
+  "src/utils/management-http.ts": {
+    "total": 78,
+    "top": [
+      {
+        "name": "Petr Houška",
+        "lines": 54
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 21
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 3
+      }
+    ]
+  },
+  "src/utils/mime.ts": {
+    "total": 116,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 100
+      },
+      {
+        "name": "Peter Steinberger",
+        "lines": 15
+      },
+      {
+        "name": "David Brailovsky",
+        "lines": 1
+      }
+    ]
+  },
+  "src/utils/open-browser.ts": {
+    "total": 24,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 24
+      }
+    ]
+  },
+  "src/utils/output-files.ts": {
+    "total": 34,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 34
+      }
+    ]
+  },
+  "src/utils/paths.ts": {
+    "total": 140,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 110
+      },
+      {
+        "name": "Aliou Diallo",
+        "lines": 30
+      }
+    ]
+  },
+  "src/utils/photon.ts": {
+    "total": 139,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 139
+      }
+    ]
+  },
+  "src/utils/pi-user-agent.ts": {
+    "total": 4,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 4
+      }
+    ]
+  },
+  "src/utils/shell.ts": {
+    "total": 218,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 115
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 51
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 26
+      },
+      {
+        "name": "Vaclav Synacek",
+        "lines": 22
+      },
+      {
+        "name": "Daniel Nouri",
+        "lines": 4
+      }
+    ]
+  },
+  "src/utils/sleep.ts": {
+    "total": 18,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 18
+      }
+    ]
+  },
+  "src/utils/syntax-highlight.ts": {
+    "total": 219,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 213
+      },
+      {
+        "name": "Ramiz Wachtler",
+        "lines": 6
+      }
+    ]
+  },
+  "src/utils/text.ts": {
+    "total": 9,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 9
+      }
+    ]
+  },
+  "src/utils/tool-result-images.ts": {
+    "total": 67,
+    "top": [
+      {
+        "name": "Jeremy Gayed",
+        "lines": 60
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 7
+      }
+    ]
+  },
+  "src/utils/tools-manager.ts": {
+    "total": 400,
+    "top": [
+      {
+        "name": "Mario Zechner",
+        "lines": 225
+      },
+      {
+        "name": "Armin Ronacher",
+        "lines": 90
+      },
+      {
+        "name": "Terminator666666",
+        "lines": 42
+      },
+      {
+        "name": "Vegard Stikbakke",
+        "lines": 21
+      },
+      {
+        "name": "Matteo Collina",
+        "lines": 10
+      }
+    ]
+  },
+  "src/utils/version-check.ts": {
+    "total": 109,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 77
+      },
+      {
+        "name": "Petr Houška",
+        "lines": 29
+      },
+      {
+        "name": "Cristina Poncela Cubeiro",
+        "lines": 3
+      }
+    ]
+  },
+  "src/utils/windows-self-update.ts": {
+    "total": 84,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 84
+      }
+    ]
+  },
+  "src/utils/wsl.ts": {
+    "total": 15,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 15
+      }
+    ]
+  },
+  "src/utils/zip.ts": {
+    "total": 72,
+    "top": [
+      {
+        "name": "Armin Ronacher",
+        "lines": 72
+      }
+    ]
+  }
+}

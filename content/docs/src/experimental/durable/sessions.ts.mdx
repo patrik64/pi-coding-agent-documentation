@@ -1,0 +1,100 @@
+---
+title: "sessions.ts"
+description: "Picks or creates a locked session directory for the durable experiment, one SQLite database per session"
+source: "src/experimental/durable/sessions.ts"
+full: true
+---
+
+A durable session is a directory with a `session.sqlite` file in it. This file decides which directory a run uses and makes sure only one process holds it at a time.
+
+Sessions are grouped by the working directory they belong to, using a hash of its real path, under the agent directory from [config.ts](/docs/src/config.ts). This is experimental code and it does not use the classic JSONL sessions from [session-manager.ts](/docs/src/core/session-manager.ts).
+
+<Scrollycoding>
+
+## !!steps What a session location is
+
+`SessionLocation` bundles the id (the directory name), paths for the directory and database, the resolved cwd, whether the session was newly created, and a `release` function that drops the lock.
+
+```ts ! sessions.ts
+/** One session directory holding `session.sqlite`, locked by this process. */
+export interface SessionLocation {
+	id: string;
+	directory: string;
+	database: string;
+	cwd: string;
+	created: boolean;
+	release(): Promise<void>;
+}
+```
+
+## !!steps One folder per project
+
+The cwd goes through `realpath`, so symlinked paths map to the same folder. Its SHA-256, cut to 24 hex characters, names a folder under `experimental/durable-sessions` in the agent directory, created recursively if needed.
+
+```ts ! sessions.ts
+/** A new session for `cwd`, or its newest one with `continueSession`. */
+export async function selectSession(cwdInput: string, continueSession: boolean): Promise<SessionLocation> {
+	// !mark
+	const cwd = await realpath(resolve(cwdInput));
+	// !mark(1:5)
+	const root = join(
+		getAgentDir(),
+		"experimental",
+		"durable-sessions",
+		createHash("sha256").update(cwd).digest("hex").slice(0, 24),
+	);
+	await mkdir(root, { recursive: true });
+```
+
+## !!steps Continue or create
+
+With `--continue` the newest session is the lexicographically last directory name matching 13 digits, a dash and a UUID. Because the 13 digits are a zero-padded millisecond timestamp, string sorting equals chronological sorting, until the year 2286.
+
+Otherwise a fresh name is built from the current time and a random UUID, and the directory is created. If nothing matches, continuing throws.
+
+```ts ! sessions.ts
+	let directory: string;
+	let created = false;
+	if (continueSession) {
+		const entries = await readdir(root, { withFileTypes: true });
+		const newest = entries
+			// !mark
+			.filter((entry) => entry.isDirectory() && /^\d{13}-[0-9a-f-]{36}$/u.test(entry.name))
+			.map((entry) => entry.name)
+			.sort()
+			.at(-1);
+		if (!newest) throw new Error(`No durable session exists for ${cwd}`);
+		directory = join(root, newest);
+	} else {
+		// !mark
+		directory = join(root, `${String(Date.now()).padStart(13, "0")}-${randomUUID()}`);
+		await mkdir(directory);
+		created = true;
+	}
+```
+
+## !!steps Locking the directory
+
+The lock uses `proper-lockfile` on the directory itself. A crashed process leaves a lock that goes stale after 10 seconds, so the code retries 12 times with one second between attempts, which just outlasts it.
+
+Failure is reported as the session being open in another process, with the original error attached as the cause. Note that `created` is already true at that point and the empty directory stays on disk.
+
+```ts ! sessions.ts
+	let release: () => Promise<void>;
+	try {
+		// A lock left by a crashed process goes stale after 10 s; wait that long before giving up.
+		// !mark(1:4)
+		release = await lockfile.lock(directory, {
+			realpath: false,
+			retries: { retries: 12, minTimeout: 1000, maxTimeout: 1000 },
+		});
+	} catch (error) {
+		throw new Error(`Session is already open in another process: ${directory}`, { cause: error });
+	}
+	return { id: basename(directory), directory, database: join(directory, "session.sqlite"), cwd, created, release };
+}
+```
+
+</Scrollycoding>
+
+[runtime.ts](/docs/src/experimental/durable/runtime.ts) calls `selectSession` first, passes the database path to the SQLite storage and calls `release` when closing. [main.ts](/docs/src/experimental/durable/main.ts) supplies the `continueSession` flag.

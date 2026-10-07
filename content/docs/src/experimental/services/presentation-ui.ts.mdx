@@ -1,0 +1,57 @@
+---
+title: "presentation-ui.ts"
+description: "A narrow local-only UI service (select dialog and status line) that presentation facets use to talk to the user (experimental)"
+source: "src/experimental/services/presentation-ui.ts"
+full: true
+---
+
+Slash commands need to ask the user things, such as which model to pick, without knowing which UI is attached. This file defines the smallest possible UI surface for that: a select dialog and a status message.
+
+The service is registered as local, which means it is never exposed over the wire. Whatever client process hosts the facets provides it, and facets in the same process consume it. See [slash-commands-provider.ts](/docs/src/experimental/services/slash-commands-provider.ts) for the only consumer in this folder.
+
+<Scrollycoding>
+
+## !!steps Select items are value, label and description
+
+The `value` is what comes back to the caller, the `label` is what is shown, and `description` is optional secondary text. Everything is `readonly`, so a command can build the list from state without worrying about the UI mutating it.
+
+```ts ! presentation-ui.ts
+export interface PresentationSelectItem {
+	readonly value: string;
+	readonly label: string;
+	readonly description?: string;
+}
+```
+
+## !!steps Two capabilities only
+
+`select` resolves to the chosen value, or `undefined` when the user cancels. Callers such as the model command treat `undefined` as a silent abort. It also takes the currently selected value so the UI can pre-highlight it.
+
+`showStatus` is fire-and-forget and returns nothing, so a status message never blocks command execution.
+
+```ts ! presentation-ui.ts
+/** Narrow process-local UI capabilities available to presentation facets. */
+export interface PresentationUI {
+	// !mark(1:6)
+	select(
+		title: string,
+		items: readonly PresentationSelectItem[],
+		selectedValue: string | undefined,
+		context: Context,
+	): Promise<string | undefined>;
+	showStatus(message: string, context: Context): void;
+}
+```
+
+## !!steps Registered as a local service
+
+The second argument to `defineService` is `{ local: true }`, and the name carries a `pi.local.` prefix that matches. A local service cannot be reached through the remote service endpoint in [server.ts](/docs/src/experimental/services/server.ts) or [worker.ts](/docs/src/experimental/services/worker.ts), which is the right default for something that opens dialogs on one specific terminal.
+
+```ts ! presentation-ui.ts
+// !mark
+export const PresentationUI = defineService<PresentationUI>("pi.local.presentation-ui", { local: true });
+```
+
+</Scrollycoding>
+
+The file has no implementation. Each client (a terminal UI, for example under the experimental client code) supplies its own provider for `pi.local.presentation-ui`, and the built-in commands just `env.use` it.

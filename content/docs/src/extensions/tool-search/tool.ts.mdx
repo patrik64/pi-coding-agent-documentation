@@ -1,0 +1,237 @@
+---
+title: "tool.ts"
+description: "Tool discovery: a BM25 ranker over tool names, descriptions and schemas, shared by the tool_search tool and codemode's searchTools"
+source: "src/extensions/tool-search/tool.ts"
+full: true
+---
+
+When a session has many tools, declaring all of them to the model on every call wastes context. Tools with `deferred` or `codemode` exposure are therefore left out, and this file lets the model find them again by describing what it needs. It contains the search engine itself (tokenizer, document builder, BM25 ranker) and the `tool_search` tool that uses it to activate matches.
+
+The ranker is shared: [execute.ts](/docs/src/extensions/codemode/execute.ts) imports `Bm25Ranker` and `createToolSearchDocument` for its script-side `searchTools()`. The tool is registered by [index.ts](/docs/src/extensions/tool-search/index.ts), and the tool and namespace types come from [types.ts](/docs/src/core/extensions/types.ts). MCP tools reach this path through the exposure mapping in [tools.ts](/docs/src/extensions/mcp/tools.ts).
+
+<Scrollycoding>
+
+## !!steps A pluggable ranker
+
+`ToolRanker` is the seam: given a query and documents, return scored names. BM25 is the only implementation today, and the comment says a hybrid ranker with embeddings could replace it without touching callers. A document is just a name and a text blob.
+
+```ts ! tool.ts
+export const TOOL_SEARCH_TOOL_NAME = "tool_search";
+export const DEFAULT_TOOL_SEARCH_LIMIT = 8;
+
+/** A tool as the ranker sees it: its name and the text built by {@link createToolSearchDocument}. */
+export interface ToolSearchDocument {
+	name: string;
+	text: string;
+}
+
+export interface ToolSearchMatch {
+	name: string;
+	score: number;
+}
+
+/** Ranks tools for a query. BM25 today; a hybrid ranker with embeddings can replace it. */
+export interface ToolRanker {
+	rank(query: string, documents: readonly ToolSearchDocument[], limit: number): ToolSearchMatch[];
+}
+```
+
+## !!steps Tokenizing and stemming
+
+`tokenize` splits camelCase, lowercases, splits on anything that is not a letter or digit, drops stop words, and applies a naive stemmer. The stemmer only handles plurals (`ies`, `ches`, trailing `s`), enough for `issues` to match `issue`. Because queries and documents use the same function, mismatches in the stemmer cancel out.
+
+```ts ! tool.ts
+/** Naive singular form, so `issues` matches `issue` and `searches` matches `search`. */
+function stem(term: string): string {
+	// !mark(1:3)
+	if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
+	if (term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)) return term.slice(0, -2);
+	if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
+	return term;
+}
+
+/** Lowercase terms, split at camelCase boundaries and non-alphanumerics, without stop words. */
+export function tokenize(text: string): string[] {
+	return text
+		// !mark(1:2)
+		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+		.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.filter((term) => term.length > 0 && !STOP_WORDS.has(term))
+		.map(stem);
+}
+```
+
+## !!steps What a tool's searchable text contains
+
+`createToolSearchDocument` concatenates the tool name (also with underscores turned into spaces), its description, every description and property name found recursively in the parameter schema (including `items` and `anyOf`, `oneOf`, `allOf` branches), and the namespace's name, description and instructions. A namespace match therefore lifts all the tools inside it.
+
+```ts ! tool.ts
+/** Schema descriptions and property names, recursively. */
+function schemaText(schema: unknown, parts: string[]): void {
+	if (!isObject(schema)) return;
+	if (typeof schema.description === "string") parts.push(schema.description);
+	if (isObject(schema.properties)) {
+		for (const [name, property] of Object.entries(schema.properties)) {
+			parts.push(name);
+			schemaText(property, parts);
+		}
+	}
+	schemaText(schema.items, parts);
+	for (const key of ["anyOf", "oneOf", "allOf"]) {
+		const variants = schema[key];
+		if (Array.isArray(variants)) for (const variant of variants) schemaText(variant, parts);
+	}
+}
+
+/**
+ * Search text of a tool: the name, the name with `_`
+ * as spaces, the description, schema descriptions and property names, and the namespace with its
+ * description and instructions.
+ */
+export function createToolSearchDocument(
+	tool: Pick<ToolInfo, "name" | "description" | "parameters">,
+	namespace?: ToolNamespace,
+): ToolSearchDocument {
+	// !mark(1:3)
+	const parts = [tool.name, tool.name.replaceAll("_", " "), tool.description];
+	schemaText(tool.parameters, parts);
+	if (namespace) parts.push(namespace.name, namespace.description ?? "", namespace.instructions ?? "");
+	return { name: tool.name, text: parts.filter((part) => part.trim()).join(" ") };
+}
+```
+
+## !!steps BM25 scoring
+
+The ranker counts terms per document, computes average document length, and scores each query term with an inverse document frequency times a length-normalized term frequency, using the usual `k1` of 1.2 and `b` of 0.75. Only positive scores are returned, sorted descending and cut at the limit. Because the sort is stable, ties keep document order.
+
+```ts ! tool.ts
+	rank(query: string, documents: readonly ToolSearchDocument[], limit: number): ToolSearchMatch[] {
+		// !mark(1:2)
+		const queryTerms = [...new Set(tokenize(query))];
+		if (queryTerms.length === 0 || documents.length === 0 || limit <= 0) return [];
+		const termCounts = documents.map((document) => {
+			const counts = new Map<string, number>();
+			for (const term of tokenize(document.text)) counts.set(term, (counts.get(term) ?? 0) + 1);
+			return counts;
+		});
+		const lengths = termCounts.map((counts) => [...counts.values()].reduce((sum, count) => sum + count, 0));
+		const averageLength = lengths.reduce((sum, length) => sum + length, 0) / documents.length || 1;
+		// !mark(1:5)
+		const idf = new Map(
+			queryTerms.map((term) => {
+				const frequency = termCounts.filter((counts) => counts.has(term)).length;
+				return [term, Math.log(1 + (documents.length - frequency + 0.5) / (frequency + 0.5))] as const;
+			}),
+		);
+		const matches: ToolSearchMatch[] = [];
+		documents.forEach((document, index) => {
+			let score = 0;
+			for (const term of queryTerms) {
+				const count = termCounts[index].get(term);
+				if (!count) continue;
+				// !mark(1:2)
+				const norm = this.k1 * (1 - this.b + (this.b * lengths[index]) / averageLength);
+				score += (idf.get(term) ?? 0) * ((count * (this.k1 + 1)) / (count + norm));
+			}
+			if (score > 0) matches.push({ name: document.name, score });
+		});
+		// !mark
+		return matches.sort((a, b) => b.score - a.score).slice(0, limit);
+	}
+}
+```
+
+## !!steps The tool schema and identity check
+
+The tool takes a query and an optional limit. `isToolSearchTool` compares the schema object by reference as well as the name, so another extension that registers a tool with the same name is not mistaken for this one.
+
+```ts ! tool.ts
+export const toolSearchSchema = Type.Object({
+	query: Type.String({ description: "Search query for deferred tools." }),
+	limit: Type.Optional(
+		Type.Number({ description: `Maximum number of tools to return. Defaults to ${DEFAULT_TOOL_SEARCH_LIMIT}.` }),
+	),
+});
+
+export type ToolSearchInput = Static<typeof toolSearchSchema>;
+
+/** Whether the tool is this `tool_search`, not another extension's tool of the same name. */
+export function isToolSearchTool(tool: Pick<ToolInfo, "name" | "parameters">): boolean {
+	// !mark
+	return tool.name === TOOL_SEARCH_TOOL_NAME && tool.parameters === toolSearchSchema;
+}
+```
+
+## !!steps Searching and activating
+
+`searchAndLoad` takes all tools that are searchable (exposure `codemode` or `deferred`) and not already active, ranks them, and calls `setActiveTools` with the old active set plus the matches. Activation goes through the normal tool-change path, so it is recorded in the transcript and survives `/tree`, resume and fork. Without a `tools` option, the tool finds nothing.
+
+```ts ! tool.ts
+/** Whether `tool_search` can load a tool with this exposure. */
+// !mark(1:3)
+function isSearchable(exposure: ToolExposure): boolean {
+	return exposure === "codemode" || exposure === "deferred";
+}
+
+/**
+ * Rank the searchable tools that are not active yet and activate the matches, so the next model
+ * call declares them. Activation is recorded in the transcript like any tool change.
+ */
+function searchAndLoad(
+	tools: NonNullable<ToolSearchToolOptions["tools"]>,
+	query: string,
+	limit: number,
+): ToolSearchResultTool[] {
+	const active = tools.getActiveTools();
+	// !mark
+	const candidates = tools.getAllTools().filter((tool) => isSearchable(tool.exposure) && !active.includes(tool.name));
+	const documents = candidates.map((tool) => createToolSearchDocument(tool, tool.namespace));
+	const matches = new Bm25Ranker().rank(query, documents, limit);
+	// !mark
+	if (matches.length > 0) tools.setActiveTools([...active, ...matches.map((match) => match.name)]);
+	return matches.map((match) => ({
+		name: match.name,
+		description: candidates.find((tool) => tool.name === match.name)?.description ?? "",
+	}));
+}
+```
+
+## !!steps The tool definition
+
+The description deliberately does not list the searchable tools, so it stays constant while tools register, for example as MCP servers connect; a changing description would break prompt caching. The tool is `model-only` because scripts have their own `searchTools()`. `execute` validates the query and limit, then reports the loaded tools with the first line of each description.
+
+```ts ! tool.ts
+export function createToolSearchToolDefinition(
+	options: ToolSearchToolOptions = {},
+): ToolDefinition<typeof toolSearchSchema, ToolSearchToolDetails> {
+	return {
+		name: TOOL_SEARCH_TOOL_NAME,
+		label: TOOL_SEARCH_TOOL_NAME,
+		description: TOOL_SEARCH_DESCRIPTION,
+		promptSnippet: "Search for tools that are not loaded yet and load the matches",
+		parameters: toolSearchSchema,
+		// Searching is not something scripts need; it changes what the model sees.
+		// !mark(1:6)
+		exposure: "model-only",
+		async execute(_toolCallId, { query, limit }) {
+			if (query.trim() === "") throw new Error("query must not be empty");
+			const max = limit ?? DEFAULT_TOOL_SEARCH_LIMIT;
+			if (!Number.isInteger(max) || max <= 0) throw new Error("limit must be a positive integer");
+			const tools = options.tools ? searchAndLoad(options.tools, query, max) : [];
+			const text =
+				tools.length === 0
+					? "No matching tools found."
+					: `Loaded ${tools.length} tool${tools.length === 1 ? "" : "s"}. They are available from your next call:\n${tools
+							.map((tool) => `- ${tool.name}: ${tool.description.trim().split(/\r?\n/)[0]}`)
+							.join("\n")}`;
+			return { content: [{ type: "text", text }], details: { loaded: tools.map((tool) => tool.name) } };
+		},
+	};
+}
+```
+
+</Scrollycoding>
+
+Only `tokenize`, `Bm25Ranker`, `createToolSearchDocument`, the constants and the tool factory are needed from outside. The result of a search is a side effect (the active tool set changes) plus a short text, which is why the model is told the loaded tools are available from its next call, not the current one.

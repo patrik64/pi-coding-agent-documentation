@@ -1,0 +1,109 @@
+---
+title: "radius-auth.ts"
+description: "Resolves Radius gateway credentials for relay connections from an explicit token or file, or from pi's stored login"
+source: "src/experimental/radius-auth.ts"
+full: true
+---
+
+The relay client needs a gateway URL and a bearer token each time it connects. `RadiusRelayAuthResolver` finds them from three places in order: offline mode (no credentials), an explicit token or file given on the command line, and the stored Radius login in the model runtime.
+
+It resolves anew on every attempt, so a token refreshed or replaced between reconnects is picked up. Used by [radius-relay.ts](/docs/src/experimental/radius-relay.ts). Gateway handling is shared with [radius.ts](/docs/src/core/radius.ts).
+
+<Scrollycoding>
+
+## !!steps Construction
+
+The explicit input type comes from [command-options.ts](/docs/src/cli/experimental/command-options.ts). The gateway defaults to `getRadiusGatewayUrl()` and is normalized once. The model runtime is held as a lazy promise.
+
+```ts ! radius-auth.ts
+export interface RadiusRelayAuth {
+	readonly gateway: string;
+	readonly token: string;
+}
+
+/** Resolve explicit or stored Radius credentials anew for every relay connection attempt. */
+export class RadiusRelayAuthResolver {
+	readonly #input: AuthInput | undefined;
+	readonly #gateway: string;
+	#modelRuntime: Promise<ModelRuntime> | undefined;
+
+	// !mark(1:3)
+	constructor(input?: AuthInput, gateway = getRadiusGatewayUrl()) {
+		this.#input = input;
+		this.#gateway = normalizeRadiusGatewayUrl(gateway);
+	}
+
+	get gateway(): string {
+		return this.#gateway;
+	}
+```
+
+## !!steps Offline and explicit tokens
+
+An abort is checked up front. With `PI_OFFLINE` set the resolver either throws, when credentials are required, or returns undefined. An explicit token wins over anything stored, and it is not validated beyond being non-empty.
+
+```ts ! radius-auth.ts
+	async resolve(options: {
+		readonly required: boolean;
+		readonly signal?: AbortSignal;
+	}): Promise<RadiusRelayAuth | undefined> {
+		options.signal?.throwIfAborted();
+		// !mark
+		if (process.env.PI_OFFLINE !== undefined) {
+			if (options.required) throw new Error("Radius relay connections are unavailable in offline mode");
+			return undefined;
+		}
+
+		// !mark(1:2)
+		const explicit = await this.#explicitToken(options.signal);
+		if (explicit !== undefined) return { gateway: this.#gateway, token: explicit };
+
+```
+
+## !!steps Stored credentials
+
+Otherwise a model runtime is created once, with no refresh on creation and no model network access, because only auth is needed. `getAuth` is asked for the radius provider with at least five minutes of OAuth validity so a token does not expire right after connecting.
+
+If still nothing, a required call throws a message that tells the user to run the login command.
+
+```ts ! radius-auth.ts
+		// !mark
+		this.#modelRuntime ??= ModelRuntime.create({ refreshOnCreate: false, allowModelNetwork: false });
+		const runtime = await this.#modelRuntime;
+		options.signal?.throwIfAborted();
+		const token = getAuthCredential(
+			// !mark
+			await runtime.getAuth("radius", { minOAuthValidityMs: 5 * 60_000, signal: options.signal }),
+		);
+		if (token !== undefined && token.length > 0) return { gateway: this.#gateway, token };
+		if (options.required) {
+			// !mark
+			throw new Error("Radius authentication is required; start Pi and run /login radius, then retry");
+		}
+		return undefined;
+	}
+```
+
+## !!steps Reading the explicit input
+
+The input is either a literal token or a path, read with the abort signal and resolved with [paths.ts](/docs/src/utils/paths.ts). The value is trimmed, and an empty result is an error rather than a silent fall-through to stored credentials.
+
+```ts ! radius-auth.ts
+	async #explicitToken(signal: AbortSignal | undefined): Promise<string | undefined> {
+		if (this.#input === undefined) return undefined;
+		// !mark(1:4)
+		const value =
+			this.#input.type === "token"
+				? this.#input.token
+				: await readFile(resolvePath(this.#input.path), { encoding: "utf8", signal });
+		const token = value.trim();
+		// !mark
+		if (token.length === 0) throw new Error("Radius authentication token must not be empty");
+		return token;
+	}
+}
+```
+
+</Scrollycoding>
+
+The class reuses [model-runtime.ts](/docs/src/core/model-runtime.ts) and [auth-command.ts](/docs/src/cli/auth-command.ts) instead of reading auth files itself. It also re-exports `ENV_RADIUS_GATEWAY` so relay code has one import point.

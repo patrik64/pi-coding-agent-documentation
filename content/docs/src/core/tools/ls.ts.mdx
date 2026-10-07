@@ -1,0 +1,184 @@
+---
+title: "ls.ts"
+description: "The ls tool: lists a directory alphabetically with a trailing slash on subdirectories, capped by entry count and bytes"
+source: "src/core/tools/ls.ts"
+full: true
+---
+
+`ls` is the simplest of the read-only exploration tools. It resolves a
+directory, reads its entries, sorts them, marks directories, and returns the
+text with notices when a cap was hit. The filesystem calls go through a small
+`LsOperations` interface so a remote backend, such as SSH, can replace them.
+
+The factory returns a `ToolDefinition` as described in
+[extensions/types.ts](/docs/src/core/extensions/types.ts), and `createLsTool`
+wraps it with [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts)
+for the agent loop. Truncation helpers come from
+[truncate.ts](/docs/src/core/tools/truncate.ts), path resolution from
+[path-utils.ts](/docs/src/core/tools/path-utils.ts), and display from
+[renderers/ls.ts](/docs/src/core/tools/renderers/ls.ts).
+
+<Scrollycoding>
+
+## !!steps Schema and prompt contribution
+
+Both parameters are optional: the path defaults to the current directory and
+the limit to 500 entries. The system prompt gets only a one-line snippet and no
+extra guidelines.
+
+```ts ! ls.ts
+const lsSchema = Type.Object({
+	path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of entries to return (default: 500)" })),
+});
+
+export const lsToolSystemPromptContribution = {
+	snippet: "List directory contents",
+	guidelines: [],
+} as const;
+
+export type LsToolInput = Static<typeof lsSchema>;
+
+const DEFAULT_LIMIT = 500;
+```
+
+## !!steps Pluggable operations
+
+`LsOperations` has exactly three calls: exists, stat and readdir. Tools that
+run in a container or over SSH supply their own implementation through
+`options.operations`. The defaults are the local `pathExists` and Node's
+promise-based `stat` and `readdir`.
+
+```ts ! ls.ts
+export interface LsOperations {
+	/** Check if path exists */
+	exists: (absolutePath: string) => Promise<boolean> | boolean;
+	/** Get file or directory stats. Throws if not found. */
+	stat: (absolutePath: string) => Promise<{ isDirectory: () => boolean }> | { isDirectory: () => boolean };
+	/** Read directory entries */
+	readdir: (absolutePath: string) => Promise<string[]> | string[];
+}
+
+const defaultLsOperations: LsOperations = {
+	exists: pathExists,
+	stat: fsStat,
+	readdir: fsReaddir,
+};
+```
+
+## !!steps Abort handling around the work
+
+`execute` wraps the work in a manual promise so that an abort signal can reject
+immediately. It checks the signal up front, then registers a one-shot listener.
+The path is resolved against `ctx.cwd` when the extension context provides one,
+otherwise the cwd given to the factory.
+
+```ts ! ls.ts
+			return new Promise((resolve, reject) => {
+				if (signal?.aborted) {
+					reject(new Error("Operation aborted"));
+					return;
+				}
+
+				const onAbort = () => reject(new Error("Operation aborted"));
+				signal?.addEventListener("abort", onAbort, { once: true });
+
+				(async () => {
+					try {
+						const dirPath = resolveToCwd(path || ".", ctx?.cwd || cwd);
+						const effectiveLimit = limit ?? DEFAULT_LIMIT;
+```
+
+An abort only rejects the outer promise; the async body keeps running and
+cannot be cancelled because the operations take no signal.
+
+## !!steps Validation with specific errors
+
+Three failure modes get their own messages: the path does not exist, it is not
+a directory, or reading it failed. The model sees these as tool errors and can
+correct the path.
+
+```ts ! ls.ts
+						// Check if path exists.
+						if (!(await ops.exists(dirPath))) {
+							reject(new Error(`Path not found: ${dirPath}`));
+							return;
+						}
+
+						// Check if path is a directory.
+						const stat = await ops.stat(dirPath);
+						if (!stat.isDirectory()) {
+							reject(new Error(`Not a directory: ${dirPath}`));
+							return;
+						}
+```
+
+## !!steps Sorting, limiting and marking directories
+
+Entries are sorted case-insensitively. The loop stops once `effectiveLimit`
+results exist and records that the limit was reached. Each entry costs one extra
+`stat` to decide on the trailing `/`; an entry that cannot be stat-ed, such as a
+broken symlink target that errors, is silently dropped from the output.
+
+```ts ! ls.ts
+						// Sort alphabetically, case-insensitive.
+						entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
+						// Format entries with directory indicators.
+						const results: string[] = [];
+						let entryLimitReached = false;
+						for (const entry of entries) {
+							if (results.length >= effectiveLimit) {
+								entryLimitReached = true;
+								break;
+							}
+
+							const fullPath = nodePath.join(dirPath, entry);
+							let suffix = "";
+							try {
+								const entryStat = await ops.stat(fullPath);
+								if (entryStat.isDirectory()) suffix = "/";
+							} catch {
+								// Skip entries we cannot stat.
+								continue;
+							}
+							results.push(entry + suffix);
+						}
+```
+
+## !!steps Byte truncation and notices
+
+An empty result returns the text `(empty directory)`. Otherwise the output goes
+through `truncateHead` with the line limit disabled, since the entry cap already
+bounds the number of lines. Notices are appended in brackets and tell the model
+how to get more, for instance doubling `limit`. `details` is only set when
+something was truncated, so the renderer can show a warning.
+
+```ts ! ls.ts
+						const rawOutput = results.join("\n");
+						// Apply byte truncation. There is no separate line limit because entry count is already capped.
+						const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+						let output = truncation.content;
+						const details: LsToolDetails = {};
+						// Build actionable notices for truncation and entry limits.
+						const notices: string[] = [];
+						if (entryLimitReached) {
+							notices.push(`${effectiveLimit} entries limit reached. Use limit=${effectiveLimit * 2} for more`);
+							details.entryLimitReached = effectiveLimit;
+						}
+						if (truncation.truncated) {
+							notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+							details.truncation = truncation;
+						}
+						if (notices.length > 0) {
+							output += `\n\n[${notices.join(". ")}]`;
+						}
+```
+
+</Scrollycoding>
+
+The same shape, schema then operations then execute with limit notices, repeats
+in [find.ts](/docs/src/core/tools/find.ts) and [grep.ts](/docs/src/core/tools/grep.ts).
+In `ls`, the abort listener is removed only on the success and catch paths; the
+early rejections for a missing path or a non-directory leave a one-shot
+listener attached to the signal.

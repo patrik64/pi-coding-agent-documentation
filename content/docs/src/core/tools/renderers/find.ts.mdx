@@ -1,0 +1,97 @@
+---
+title: "find.ts"
+description: "Terminal presentation for the find tool: a pattern-in-path header and a 20-line result list with truncation warnings"
+source: "src/core/tools/renderers/find.ts"
+full: true
+---
+
+This file renders calls and results of the find tool implemented in [tools/find.ts](/docs/src/core/tools/find.ts). It is kept apart from the implementation so a render-only process does not load the tool's execution code or parameter schema, and the tool spreads `findRenderers` into its definition.
+
+It is almost identical in shape to [renderers/grep.ts](/docs/src/core/tools/renderers/grep.ts) and [renderers/ls.ts](/docs/src/core/tools/renderers/ls.ts); only labels, the preview line count and the limit warnings differ.
+
+<Scrollycoding>
+
+## !!steps The call header
+
+The header reads `find <pattern> in <path>` with an optional `(limit N)`. Both `pattern` and `path` pass through `str` from [render-utils.ts](/docs/src/core/tools/render-utils.ts), so a wrongly typed argument renders as `[invalid arg]` rather than crashing. An empty path displays as `.`.
+
+```ts ! find.ts
+function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
+	const pattern = str(args?.pattern);
+	const rawPath = str(args?.path);
+	// !mark
+	const path = rawPath !== null ? shortenPath(rawPath || ".") : null;
+	const limit = args?.limit;
+	const invalidArg = invalidArgText(theme);
+	let text =
+		theme.fg("toolTitle", theme.bold("find")) +
+		" " +
+		(pattern === null ? invalidArg : theme.fg("accent", pattern || "")) +
+		theme.fg("toolOutput", ` in ${path === null ? invalidArg : path}`);
+	if (limit !== undefined) {
+		text += theme.fg("toolOutput", ` (limit ${limit})`);
+	}
+	return text;
+}
+```
+
+## !!steps Previewing the file list
+
+Collapsed results show the first 20 lines and a muted hint with the number of remaining lines and the expand key ([keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts)). Expanded shows everything. Unlike the shell renderer, which keeps the end of the output, a file list is read from the top.
+
+```ts ! find.ts
+	const output = getTextOutput(result, showImages).trim();
+	let text = "";
+	if (output) {
+		const lines = output.split("\n");
+		// !mark
+		const maxLines = options.expanded ? lines.length : 20;
+		const displayLines = lines.slice(0, maxLines);
+		const remaining = lines.length - maxLines;
+		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+		if (remaining > 0) {
+			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+		}
+	}
+```
+
+## !!steps Two kinds of truncation
+
+The details object can carry `resultLimitReached`, meaning the tool stopped at its result count limit, and a `truncation` record meaning the output exceeded the byte cap from [truncate.ts](/docs/src/core/tools/truncate.ts). Either, or both, produce one bracketed warning line.
+
+```ts ! find.ts
+	const resultLimit = result.details?.resultLimitReached;
+	const truncation = result.details?.truncation;
+	if (resultLimit || truncation?.truncated) {
+		const warnings: string[] = [];
+		// !mark(1:2)
+		if (resultLimit) warnings.push(`${resultLimit} results limit`);
+		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
+	}
+	return text;
+```
+
+## !!steps The exported renderer pair
+
+Both hooks reuse the previous `Text` component when one is provided and just replace its text, which avoids allocating a new component on every streaming update. The renderer pair is typed as the `renderCall` and `renderResult` slice of `ToolDefinition` from [extensions/types.ts](/docs/src/core/extensions/types.ts).
+
+```ts ! find.ts
+export const findRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
+	renderCall(args, theme, context) {
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		text.setText(formatFindCall(args as any, theme));
+		return text;
+	},
+	renderResult(result, options, theme, context) {
+		// !mark
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		text.setText(formatFindResult(result as any, options, theme, context.showImages));
+		return text;
+	},
+};
+```
+
+</Scrollycoding>
+
+The renderer is registered under the name `find` in [renderers/index.ts](/docs/src/core/tools/renderers/index.ts). It is stateless: everything it needs arrives through the arguments and the render context.

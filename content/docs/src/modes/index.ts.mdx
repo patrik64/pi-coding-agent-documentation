@@ -1,0 +1,49 @@
+---
+title: "index.ts"
+description: "Barrel for the run modes: interactive TUI, print, JSON events and RPC server and client"
+source: "src/modes/index.ts"
+full: true
+---
+
+The agent can run in several modes, and this barrel gathers their public surface in one import. A mode decides how input arrives and how output leaves: a terminal UI, a one-shot print, a streamed JSON feed, or a JSON-RPC style server driven by another program.
+
+It only re-exports; nothing runs here. [main.ts](/docs/src/main.ts) picks the mode from the command line and uses these exports.
+
+<Scrollycoding>
+
+## !!steps Interactive and print modes
+
+`InteractiveMode` from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) is the full terminal application. `runPrintMode` from [print-mode.ts](/docs/src/modes/print-mode.ts) runs a prompt non-interactively and prints the result. The JSON event type from [json-event.ts](/docs/src/modes/json-event.ts) describes the session events emitted in JSON output.
+
+```ts ! index.ts
+export { InteractiveMode, type InteractiveModeOptions } from "./interactive/interactive-mode.ts";
+export type { JsonAgentSessionEvent } from "./json-event.ts";
+export { type PrintModeOptions, runPrintMode } from "./print-mode.ts";
+```
+
+## !!steps RPC server and client
+
+The RPC mode lets another process drive the agent over a protocol. `runRpcMode` in [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) is the server side; `RpcClient` in [rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts) is a typed client for it, including the model info and listener types.
+
+```ts ! index.ts
+export { type ModelInfo, RpcClient, type RpcClientOptions, type RpcEventListener } from "./rpc/rpc-client.ts";
+export { runRpcMode } from "./rpc/rpc-mode.ts";
+```
+
+## !!steps Protocol types
+
+The shared protocol shapes live in [rpc-types.ts](/docs/src/modes/rpc/rpc-types.ts): commands, responses, session state, and the extension UI request and response pair that lets an RPC host answer extension dialogs. They are exported as types only.
+
+```ts ! index.ts
+export type {
+	RpcCommand,
+	RpcExtensionUIRequest,
+	RpcExtensionUIResponse,
+	RpcResponse,
+	RpcSessionState,
+} from "./rpc/rpc-types.ts";
+```
+
+</Scrollycoding>
+
+Both the server and client are exported from the same barrel, so an SDK user can embed the agent or control one from the same package. The `type` modifiers on most names keep the barrel from pulling runtime code in where only types are needed.

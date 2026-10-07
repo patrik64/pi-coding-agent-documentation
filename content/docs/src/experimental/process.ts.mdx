@@ -1,0 +1,159 @@
+---
+title: "process.ts"
+description: "Spawning and identifying the detached internal processes (coordinator, server, session worker) of the experimental architecture"
+source: "src/experimental/process.ts"
+full: true
+---
+
+The experimental architecture runs several cooperating processes: a coordinator, a server and session workers. This file is the shared toolkit for starting them and for a process to learn which role it was started in.
+
+The role travels through an environment variable. The code also has to work in three execution modes: TypeScript source under Node, bundled Node and compiled Bun, and it is the only place that knows the differences. Compare [coordinator.ts](/docs/src/experimental/coordinator.ts), [server.ts](/docs/src/experimental/server.ts) and [session-worker.ts](/docs/src/experimental/session-worker.ts).
+
+<Scrollycoding>
+
+## !!steps Roles and direct execution
+
+`isDirectInternalProcessEntry` tells a module whether it was launched directly as the entry script, as opposed to being imported or inside a bundle or Bun binary. It compares the resolved `argv[1]` with the module's own file path.
+
+```ts ! process.ts
+export const INTERNAL_PROCESS_ENV = "__PI_INTERNAL_SPAWN";
+
+export type InternalProcessRole = "coordinator" | "server" | "session-worker";
+
+/** Detect a directly executed source or unbundled internal-process module. */
+export function isDirectInternalProcessEntry(moduleUrl: string): boolean {
+	return (
+		!isBunBinary &&
+		!isBundledNode &&
+		process.argv[1] !== undefined &&
+		resolve(process.argv[1]) === fileURLToPath(moduleUrl)
+	);
+}
+```
+
+## !!steps Reading the role
+
+The role is validated against the three known values and an unknown value throws. `consumeInternalProcessRole` also deletes the variable, so grandchildren do not inherit the role and mistake themselves for it.
+
+```ts ! process.ts
+/** Read and validate an internal process role without consuming it. */
+export function getInternalProcessRole(): InternalProcessRole | undefined {
+	const role = process.env[INTERNAL_PROCESS_ENV];
+	if (role === undefined) return undefined;
+	if (role === "coordinator" || role === "server" || role === "session-worker") return role;
+	throw new Error(`Unsupported internal process role: ${role}`);
+}
+
+/** Read, validate, and remove the role so descendants do not inherit it. */
+export function consumeInternalProcessRole(): InternalProcessRole | undefined {
+	const role = getInternalProcessRole();
+	// !mark
+	delete process.env[INTERNAL_PROCESS_ENV];
+	return role;
+}
+```
+
+## !!steps Spawning
+
+A compiled Bun binary re-runs itself with the arguments and cannot take an external entry. Under source mode a `--import` of [source-resolver.ts](/docs/src/experimental/source-resolver.ts) is added so the child can load TypeScript, and it is passed as a URL because a raw path breaks on Windows drives and on special characters.
+
+The child is detached, has no stdio, hides its window on Windows and is unreferenced, so it outlives the parent.
+
+```ts ! process.ts
+/** Spawn a detached Pi-owned process consistently across Node and compiled Bun. */
+export function spawnInternalProcess(
+	role: InternalProcessRole,
+	args: readonly string[],
+	options: InternalProcessSpawnOptions = {},
+): ChildProcess {
+	// !mark(1:2)
+	if (isBunBinary && options.entryUrl) {
+		throw new Error("A compiled Bun executable cannot launch an external internal-process entrypoint");
+	}
+	const entryUrl = defaultEntryUrl(role, options.entryUrl);
+	// --import takes a module specifier; a raw path breaks on Windows drives and on `#`, `?`, or `%` in the path.
+	const sourceRuntimeArgs = import.meta.url.endsWith(".ts")
+		? ["--import", new URL("source-resolver.ts", import.meta.url).href]
+		: [];
+	const child = spawn(
+		process.execPath,
+		// !mark
+		isBunBinary ? [...args] : [...sourceRuntimeArgs, fileURLToPath(entryUrl), ...args],
+		{
+			cwd: process.cwd(),
+			// !mark
+			detached: true,
+			env: {
+				...process.env,
+				...options.env,
+				[INTERNAL_PROCESS_ENV]: role,
+			},
+			stdio: "ignore",
+			windowsHide: true,
+		},
+	);
+	// !mark
+	child.unref();
+	return child;
+}
+```
+
+## !!steps Terminating
+
+Termination sends SIGKILL and waits for exit or error. A child that has no pid or has already exited returns immediately. The comment names the point: after this, the child can no longer take ownership of anything.
+
+```ts ! process.ts
+/** Force a spawned internal process to exit and wait until it can no longer take ownership. */
+export async function terminateInternalProcess(child: ChildProcess): Promise<void> {
+	if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+	const terminated = new Promise<void>((resolve) => {
+		child.once("exit", () => resolve());
+		child.once("error", () => resolve());
+	});
+	// !mark
+	child.kill("SIGKILL");
+	await terminated;
+}
+```
+
+## !!steps Finding the entry file
+
+An explicit URL wins. Bundled Node uses the coordinator bundle for the coordinator and the main CLI bundle for the other roles, so those start through `cli.js` with the role variable selecting behavior. Otherwise the file next to this module is used, with the extension matching how this module was loaded.
+
+```ts ! process.ts
+function defaultEntryUrl(role: InternalProcessRole, override: URL | undefined): URL {
+	if (override) return override;
+	if (isBundledNode) {
+		// !mark
+		const entry = role === "coordinator" ? "coordinator.js" : "cli.js";
+		return pathToFileURL(join(getPackageDir(), "dist", "bundle", entry));
+	}
+	// !mark
+	const javaScript = import.meta.url.endsWith(".js");
+	if (role === "coordinator") {
+		return new URL(javaScript ? "coordinator.js" : "coordinator.ts", import.meta.url);
+	}
+	if (role === "server") {
+		return new URL(javaScript ? "server.js" : "server.ts", import.meta.url);
+	}
+	return new URL(javaScript ? "session-worker.js" : "session-worker.ts", import.meta.url);
+}
+```
+
+## !!steps Control messages
+
+Control channels use newline-delimited JSON. `encodeControlLine` refuses a message larger than 128 MiB, which keeps one bad message from filling memory on the receiving side.
+
+```ts ! process.ts
+export const MAX_CONTROL_LINE_BYTES = 128 * 1024 * 1024;
+
+export function encodeControlLine(message: unknown): string {
+	const line = `${JSON.stringify(message)}\n`;
+	if (Buffer.byteLength(line) > MAX_CONTROL_LINE_BYTES) throw new Error("Internal control message is too large");
+	return line;
+}
+```
+
+</Scrollycoding>
+
+Every internal process module calls into this file at startup, and the parent processes use `spawnInternalProcess`. Path and bundle facts come from [config.ts](/docs/src/config.ts).

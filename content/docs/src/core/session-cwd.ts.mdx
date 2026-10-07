@@ -1,0 +1,126 @@
+---
+title: "session-cwd.ts"
+description: "Detects when a resumed session's stored working directory no longer exists and builds the error or prompt text for it"
+source: "src/core/session-cwd.ts"
+full: true
+---
+
+A session file records the directory it was started in. If the user deletes or
+moves that directory and later resumes the session, tools that run relative to
+the cwd would fail in confusing ways. This small file centralizes the check and
+the wording of the resulting message.
+
+It does not decide what to do about the problem. It returns a description of
+the issue, and callers choose between throwing (non-interactive modes) or
+asking the user whether to continue in the current directory. The session data
+comes from [session-manager.ts](/docs/src/core/session-manager.ts), and the
+runtime that creates and replaces sessions lives in
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts).
+
+<Scrollycoding>
+
+## !!steps A structural source instead of the real SessionManager
+
+The issue type carries the stored directory, the fallback, and the session file
+when there is one. The input is typed as a two-method interface rather than the
+full session manager, so the check can be tested with a plain object and does
+not import the heavy module.
+
+```ts ! session-cwd.ts
+import { existsSync } from "node:fs";
+
+export interface SessionCwdIssue {
+	sessionFile?: string;
+	sessionCwd: string;
+	fallbackCwd: string;
+}
+
+interface SessionCwdSource {
+	getCwd(): string;
+	getSessionFile(): string | undefined;
+}
+```
+
+## !!steps Three ways to report no problem
+
+`getMissingSessionCwdIssue` returns `undefined` in three cases. An in-memory
+session has no session file, so there is nothing stored to be stale. An empty
+stored cwd is treated as absent. And a directory that exists is fine.
+
+Only the last branch, where a non-empty cwd fails `existsSync`, produces an
+issue object.
+
+```ts ! session-cwd.ts
+export function getMissingSessionCwdIssue(
+	sessionManager: SessionCwdSource,
+	fallbackCwd: string,
+): SessionCwdIssue | undefined {
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) {
+		return undefined;
+	}
+
+	const sessionCwd = sessionManager.getCwd();
+	// !mark
+	if (!sessionCwd || existsSync(sessionCwd)) {
+		return undefined;
+	}
+
+	return {
+		sessionFile,
+		sessionCwd,
+		fallbackCwd,
+	};
+}
+```
+
+## !!steps Two renderings of the same issue
+
+The error text is a multi-line message for logs and thrown errors. The prompt
+text is deliberately terse and lowercase, shaped for a confirmation dialog that
+asks whether to continue in the current cwd. Splitting them keeps UI wording
+out of the error path.
+
+```ts ! session-cwd.ts
+export function formatMissingSessionCwdError(issue: SessionCwdIssue): string {
+	const sessionFile = issue.sessionFile ? `\nSession file: ${issue.sessionFile}` : "";
+	return `Stored session working directory does not exist: ${issue.sessionCwd}${sessionFile}\nCurrent working directory: ${issue.fallbackCwd}`;
+}
+
+export function formatMissingSessionCwdPrompt(issue: SessionCwdIssue): string {
+	return `cwd from session file does not exist\n${issue.sessionCwd}\n\ncontinue in current cwd\n${issue.fallbackCwd}`;
+}
+```
+
+## !!steps A typed error and the throwing wrapper
+
+`MissingSessionCwdError` keeps the whole issue on the instance, so a catcher
+can offer the fallback instead of just showing the message. `assertSessionCwdExists`
+is the throwing form of the check for code paths that cannot prompt.
+
+```ts ! session-cwd.ts
+export class MissingSessionCwdError extends Error {
+	readonly issue: SessionCwdIssue;
+
+	constructor(issue: SessionCwdIssue) {
+		super(formatMissingSessionCwdError(issue));
+		this.name = "MissingSessionCwdError";
+		this.issue = issue;
+	}
+}
+
+export function assertSessionCwdExists(sessionManager: SessionCwdSource, fallbackCwd: string): void {
+	const issue = getMissingSessionCwdIssue(sessionManager, fallbackCwd);
+	if (issue) {
+		throw new MissingSessionCwdError(issue);
+	}
+}
+```
+
+</Scrollycoding>
+
+The pattern is detect, then format, then let the caller choose. The startup
+code in [main.ts](/docs/src/main.ts) uses the prompt string with the issue to
+show a selector, while [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts)
+calls the throwing assertion before creating or switching sessions. The file
+touches only `existsSync`, so it is cheap to call early in startup.

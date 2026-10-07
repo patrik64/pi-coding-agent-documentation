@@ -1,0 +1,27 @@
+---
+title: "json.ts"
+description: "One function that strips line comments and trailing commas from JSON text"
+source: "src/utils/json.ts"
+full: true
+---
+
+Some config files are written by hand as JSON with comments, sometimes called JSONC. The function here converts that into strict JSON so `JSON.parse` can handle it. It is six lines, entirely regex based.
+
+<Scrollycoding>
+
+## !!steps Stripping comments and commas
+
+Two passes. Each regex first matches a complete string literal, so anything inside quotes is preserved, and only then falls through to the interesting alternative. The first pass removes `//` comments to end of line. The second removes a comma followed by optional whitespace and a closing brace or bracket, using the captured whitespace and bracket as replacement.
+
+```ts ! json.ts
+/** Strip `//` line comments and trailing commas from JSON, leaving string literals untouched. */
+export function stripJsonComments(input: string): string {
+	return input
+		.replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (m) => (m[0] === '"' ? m : ""))
+		.replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail) => tail ?? (m[0] === '"' ? m : ""));
+}
+```
+
+</Scrollycoding>
+
+Only `//` line comments are handled; block comments are not removed. A `//` inside a string is safe because the string alternative matches first. Comments within the comma lookahead, such as a comma followed by a comment and a bracket, work because comments are stripped in the first pass.

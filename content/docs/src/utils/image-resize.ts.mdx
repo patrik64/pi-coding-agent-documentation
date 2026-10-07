@@ -1,0 +1,171 @@
+---
+title: "image-resize.ts"
+description: "Public resize API that runs Photon in a worker thread and falls back to in-process work"
+source: "src/utils/image-resize.ts"
+full: true
+---
+
+This is the module other code imports to resize an image. It hides the decision of where the work runs. The preferred path is a short-lived worker thread so WASM work does not block the TUI event loop. If a worker cannot start, it quietly computes in-process.
+
+The algorithm is in [image-resize-core.ts](/docs/src/utils/image-resize-core.ts), the worker side is [image-resize-worker.ts](/docs/src/utils/image-resize-worker.ts) and the main consumer is [image-process.ts](/docs/src/utils/image-process.ts).
+
+<Scrollycoding>
+
+## !!steps Copying the input for transfer
+
+Transferring an ArrayBuffer to a worker detaches it from the sender. To keep the caller's bytes usable, a copy is made and that copy is transferred.
+
+```ts ! image-resize.ts
+import { Worker } from "node:worker_threads";
+import { type ImageResizeOptions, type ResizedImage, resizeImageInProcess } from "./image-resize-core.ts";
+
+export type { ImageResizeOptions, ResizedImage } from "./image-resize-core.ts";
+
+interface ResizeImageWorkerResponse {
+	result?: ResizedImage | null;
+	error?: string;
+}
+
+function toTransferableBytes(input: Uint8Array): Uint8Array<ArrayBuffer> {
+	// Transfer detaches the buffer, so transfer a worker-owned copy and leave the
+	// caller's bytes intact.
+	return new Uint8Array(input);
+}
+
+function isResizeImageWorkerResponse(value: unknown): value is ResizeImageWorkerResponse {
+	return value !== null && typeof value === "object";
+}
+
+function createResizeWorker(workerSpecifier: string | URL): Worker {
+	return new Worker(workerSpecifier);
+}
+```
+
+## !!steps Settling exactly once
+
+`resizeImageInWorker` wraps the worker in a promise with `settled` guards, because message, error and exit events can all fire. An error string in the response becomes a rejection, a null result resolves as null, and an exit before any answer is an error.
+
+```ts ! image-resize.ts
+async function resizeImageInWorker(
+	workerSpecifier: string | URL,
+	inputBytes: Uint8Array,
+	mimeType: string,
+	options?: ImageResizeOptions,
+): Promise<ResizedImage | null> {
+	const worker = createResizeWorker(workerSpecifier);
+	try {
+		const inputBytesForWorker = toTransferableBytes(inputBytes);
+		return await new Promise<ResizedImage | null>((resolve, reject) => {
+			let settled = false;
+			const settle = (result: ResizedImage | null): void => {
+				if (settled) return;
+				settled = true;
+				resolve(result);
+			};
+			const fail = (error: Error): void => {
+				if (settled) return;
+				settled = true;
+				reject(error);
+			};
+
+			worker.once("message", (message: unknown) => {
+				if (!isResizeImageWorkerResponse(message)) {
+					fail(new Error("Invalid image resize worker response"));
+					return;
+				}
+				if (message.error) {
+					fail(new Error(message.error));
+					return;
+				}
+				settle(message.result ?? null);
+			});
+			worker.once("error", fail);
+			worker.once("exit", (code) => {
+				if (!settled) {
+					fail(new Error(`Image resize worker exited with code ${code}`));
+				}
+			});
+```
+
+## !!steps Posting the job and terminating
+
+The request is posted with the buffer listed as transferable. The `finally` always terminates the worker, ignoring termination errors.
+
+```ts ! image-resize.ts
+			worker.postMessage(
+				{
+					inputBytes: inputBytesForWorker,
+					mimeType,
+					options,
+				},
+				[inputBytesForWorker.buffer],
+			);
+		});
+	} finally {
+		void worker.terminate().catch(() => undefined);
+	}
+}
+```
+
+## !!steps Choosing the worker file
+
+Running from TypeScript sources uses the `.ts` worker; the built package uses `.js`. Under Bun, compiled executables resolve workers by string path, so that is attempted first and its failure is swallowed.
+
+```ts ! image-resize.ts
+export async function resizeImage(
+	inputBytes: Uint8Array,
+	mimeType: string,
+	options?: ImageResizeOptions,
+): Promise<ResizedImage | null> {
+	const isTypeScriptRuntime = import.meta.url.endsWith(".ts");
+	const workerUrl = new URL(
+		isTypeScriptRuntime ? "./image-resize-worker.ts" : "./image-resize-worker.js",
+		import.meta.url,
+	);
+
+	// Bun compiled executables resolve worker entrypoints by string path, not via
+	// new URL(..., import.meta.url). Try the string path first under Bun so the
+	// release binary uses the embedded worker instead of falling back in-process.
+	if (typeof process.versions.bun === "string") {
+		try {
+			return await resizeImageInWorker("./src/utils/image-resize-worker.ts", inputBytes, mimeType, options);
+		} catch {}
+	}
+```
+
+## !!steps Falling back
+
+If any worker attempt throws, the same resize runs in the main thread. A resize that legitimately returns null does not trigger the fallback, only thrown errors do.
+
+```ts ! image-resize.ts
+
+	try {
+		return await resizeImageInWorker(workerUrl, inputBytes, mimeType, options);
+	} catch {
+		return resizeImageInProcess(inputBytes, mimeType, options);
+	}
+}
+```
+
+## !!steps Telling the model about scaling
+
+`formatDimensionNote` produces a text hint with original and displayed sizes and a multiplier. This matters when the model reports pixel coordinates from the resized image. It returns undefined for images that were not resized.
+
+```ts ! image-resize.ts
+/**
+ * Format a dimension note for resized images.
+ * This helps the model understand the coordinate mapping.
+ */
+export function formatDimensionNote(result: ResizedImage): string | undefined {
+	if (!result.wasResized) {
+		return undefined;
+	}
+
+	const scale = result.originalWidth / result.width;
+	return `[Image: original ${result.originalWidth}x${result.originalHeight}, displayed at ${result.width}x${result.height}. Multiply coordinates by ${scale.toFixed(2)} to map to original image.]`;
+}
+```
+
+</Scrollycoding>
+
+The file therefore combines three concerns: threading, a runtime-specific path quirk for Bun, and a prompt-facing note about scaling.

@@ -1,0 +1,203 @@
+---
+title: "rpc-types.ts"
+description: "The wire contract of RPC mode: command, response, session-state and extension-UI message shapes as TypeScript unions"
+source: "src/modes/rpc/rpc-types.ts"
+full: true
+---
+
+This file is types only, but it is the public protocol of headless pi. A host
+process writes `RpcCommand` objects as JSON lines to stdin and reads
+`RpcResponse` objects, agent events and `RpcExtensionUIRequest` objects from
+stdout. Framing is handled in [jsonl.ts](/docs/src/modes/rpc/jsonl.ts).
+
+Both sides import it: the server in [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts)
+implements every command, and [rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts)
+uses the same unions to type its helper methods. Many payloads reuse types
+from the core, such as `SessionStats` from [agent-session.ts](/docs/src/core/agent-session.ts)
+and `SessionEntry` from [session-manager.ts](/docs/src/core/session-manager.ts).
+
+<Scrollycoding>
+
+## !!steps Commands are a discriminated union on type
+
+Every command carries an optional `id` and a literal `type`. The `id` is
+echoed back on the matching response so a client can correlate replies when
+several requests are in flight. The first group covers prompting: `prompt`,
+`steer`, `follow_up`, `abort`, the queue and new-session control.
+
+`streamingBehavior` on `prompt` only matters while the agent is already
+streaming; it decides whether the message is queued as a steer or a follow-up.
+
+```ts ! rpc-types.ts
+export type RpcCommand =
+	// Prompting
+	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort" }
+	| { id?: string; type: "clear_queue" }
+	| { id?: string; type: "new_session"; parentSession?: string }
+```
+
+## !!steps Model, thinking, queue and compaction commands
+
+The rest of the settings-style commands are small. Model selection needs both a
+provider and a model id, because ids are only unique within a provider. The
+two queue modes control how queued steering or follow-up messages are
+drained: `all` or `one-at-a-time`.
+
+```ts ! rpc-types.ts
+	// Model
+	| { id?: string; type: "set_model"; provider: string; modelId: string }
+	| { id?: string; type: "cycle_model" }
+	| { id?: string; type: "get_available_models" }
+
+	// Thinking
+	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
+	| { id?: string; type: "cycle_thinking_level" }
+	| { id?: string; type: "get_available_thinking_levels" }
+
+	// Queue modes
+	| { id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }
+	| { id?: string; type: "set_follow_up_mode"; mode: "all" | "one-at-a-time" }
+```
+
+## !!steps Bash, session and read-only queries
+
+`bash` runs a shell command through the session, and `excludeFromContext`
+mirrors the `!!` prefix in the interactive editor. The session group includes
+tree navigation (`fork`, `clone`, `get_tree`, `get_entries`) and introspection.
+The last union member, `get_commands`, lists what a prompt can invoke.
+
+```ts ! rpc-types.ts
+	// Bash
+	| { id?: string; type: "bash"; command: string; excludeFromContext?: boolean }
+	| { id?: string; type: "abort_bash" }
+
+	// Session
+	| { id?: string; type: "get_session_stats" }
+	| { id?: string; type: "export_html"; outputPath?: string }
+	| { id?: string; type: "switch_session"; sessionPath: string }
+	| { id?: string; type: "fork"; entryId: string }
+	| { id?: string; type: "clone" }
+	| { id?: string; type: "get_fork_messages" }
+	| { id?: string; type: "get_entries"; since?: string }
+	| { id?: string; type: "get_tree" }
+	| { id?: string; type: "get_last_assistant_text" }
+	| { id?: string; type: "set_session_name"; name: string }
+```
+
+## !!steps Slash commands and session state snapshots
+
+`RpcSlashCommand` is what `get_commands` returns: extension commands, prompt
+templates and skills flattened into one list, each tagged with its `source`.
+`RpcSessionState` is the `get_state` snapshot. Note that `model` is optional,
+since a session can exist before any model is available.
+
+```ts ! rpc-types.ts
+/** A command available for invocation via prompt */
+export interface RpcSlashCommand {
+	/** Command name (without leading slash) */
+	name: string;
+	/** Human-readable description */
+	description?: string;
+	/** What kind of command this is */
+	source: "extension" | "prompt" | "skill";
+	/** Source metadata for the owning resource */
+	sourceInfo: SourceInfo;
+}
+
+// ============================================================================
+// RPC State
+// ============================================================================
+
+export interface RpcSessionState {
+	model?: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	isStreaming: boolean;
+	isCompacting: boolean;
+```
+
+## !!steps Responses mirror commands, one success shape each
+
+`RpcResponse` repeats the command names as a `command` literal, so a client can
+narrow the `data` type by switching on it. `prompt` returns a
+`disposition` rather than the model's reply, because the reply itself arrives
+later as streamed events. Commands with nothing to report omit `data`
+entirely.
+
+```ts ! rpc-types.ts
+export type RpcResponse =
+	// Prompting
+	| { id?: string; type: "response"; command: "prompt"; success: true; data: { disposition: PromptDisposition } }
+	| { id?: string; type: "response"; command: "steer"; success: true; data: { disposition: QueuedInputDisposition } }
+	| {
+			id?: string;
+			type: "response";
+			command: "follow_up";
+			success: true;
+			data: { disposition: QueuedInputDisposition };
+	  }
+	| { id?: string; type: "response"; command: "abort"; success: true }
+```
+
+## !!steps Cancellation is data
+
+Commands that replace the active session, such as `new_session`,
+`switch_session` and `fork`, can be cancelled. That is reported as a
+successful response with `cancelled: true`, not as an error, and `fork` also
+returns the selected message text.
+
+```ts ! rpc-types.ts
+	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "fork"; success: true; data: { text: string; cancelled: boolean } }
+	| { id?: string; type: "response"; command: "clone"; success: true; data: { cancelled: boolean } }
+```
+
+## !!steps Failure is a single catch-all
+
+Real failures use one variant, where `command` is a plain string rather than a
+literal and `success` is `false`. A client therefore checks `success` first and
+only then narrows by command.
+
+```ts ! rpc-types.ts
+	// Error response (any command can fail)
+	| { id?: string; type: "response"; command: string; success: false; error: string };
+```
+
+## !!steps Extension UI as a request and response pair
+
+Extensions can ask the user questions, but in RPC mode there is no terminal.
+Instead the server emits an `extension_ui_request` with a fresh `id`, and the
+host answers with an `extension_ui_response` carrying that id. Dialog methods
+(`select`, `confirm`, `input`, `editor`) expect an answer; the rest are
+fire-and-forget notifications.
+
+```ts ! rpc-types.ts
+/** Emitted when an extension needs user input */
+export type RpcExtensionUIRequest =
+	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
+	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+```
+
+## !!steps Three shapes of answer
+
+The host replies with one of three shapes: a string `value`, a boolean
+`confirmed`, or `cancelled: true` when the user dismissed the dialog.
+
+```ts ! rpc-types.ts
+/** Response to an extension UI request */
+export type RpcExtensionUIResponse =
+	| { type: "extension_ui_response"; id: string; value: string }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; cancelled: true };
+```
+
+</Scrollycoding>
+
+The unions are the only enforcement of the protocol: the server does not
+validate incoming JSON against them, so `handleCommand` in
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) trusts the `type` tag and falls
+through to an `Unknown command` error for anything else. Agent events and
+`extension_error` objects are also written to stdout but are not declared here;
+events come from `toJsonEvent` in [json-event.ts](/docs/src/modes/json-event.ts).

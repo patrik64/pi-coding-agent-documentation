@@ -1,0 +1,210 @@
+---
+title: "models-store.ts"
+description: "Two ModelsStore implementations: in-memory and a lock-protected JSON file that caches dynamically refreshed provider catalogs"
+source: "src/core/models-store.ts"
+full: true
+---
+
+Some providers publish their model lists dynamically, and pi caches the latest catalog per provider id. The `ModelsStore` interface comes from the pi-ai package; this file provides the two implementations the coding agent uses.
+
+`InMemoryCodingAgentModelsStore` is the simple one. `FileModelsStore` writes a JSON file under the agent directory, using the locking backend from [auth-storage.ts](/docs/src/core/auth-storage.ts), and adds read caching with change detection and request coalescing. It is consumed by [model-runtime.ts](/docs/src/core/model-runtime.ts).
+
+<Scrollycoding>
+
+## !!steps Types and the shared read state
+
+Stored data is a map from provider id to entry. `ModelsFileReadState` bundles the cached data, the file revision it came from, and any in-flight reload.
+
+A single module-level slot holds the read state for one path. The comment gives the reason: the common case of one agent directory is fast, without retaining an unbounded set of custom paths.
+
+```ts ! models-store.ts
+// !mark
+type StoredModels = Record<string, ModelsStoreEntry>;
+
+type ModelsFileReload = {
+	controller: AbortController;
+	promise: Promise<StoredModels>;
+	readers: number;
+};
+
+type ModelsFileReadState = {
+	data: StoredModels;
+	revision?: string;
+	reload?: ModelsFileReload;
+};
+
+// !mark(1:2)
+// Optimize the common path without retaining an unbounded set of custom paths.
+let sharedModelsFileReadState: { path: string; readState: ModelsFileReadState } | undefined;
+```
+
+## !!steps The in-memory store
+
+Reads and writes use `structuredClone`, so callers can never mutate stored entries. Each method first calls `throwIfAborted` on the optional signal.
+
+```ts ! models-store.ts
+export class InMemoryCodingAgentModelsStore implements ModelsStore {
+	private readonly entries = new Map<string, ModelsStoreEntry>();
+
+	async read(providerId: string, options?: ModelsStoreOperationOptions): Promise<ModelsStoreEntry | undefined> {
+		// !mark
+		options?.signal?.throwIfAborted();
+		const entry = this.entries.get(providerId);
+		return entry ? structuredClone(entry) : undefined;
+	}
+
+	async write(providerId: string, entry: ModelsStoreEntry, options?: ModelsStoreOperationOptions): Promise<void> {
+		options?.signal?.throwIfAborted();
+		// !mark
+		this.entries.set(providerId, structuredClone(entry));
+	}
+
+	async delete(providerId: string, options?: ModelsStoreOperationOptions): Promise<void> {
+		options?.signal?.throwIfAborted();
+		this.entries.delete(providerId);
+	}
+}
+```
+
+## !!steps The file store constructor
+
+The default path is `models-store.json` in the agent directory from [config.ts](/docs/src/config.ts). The path is normalized and a `FileAuthStorageBackend` provides the locking.
+
+If the shared slot already holds this same path, its read state is reused, so several instances share one cache. Otherwise a fresh state is created, and it takes the slot only if the slot is empty.
+
+```ts ! models-store.ts
+/** Locked JSON-backed storage for dynamically refreshed provider catalogs. */
+export class FileModelsStore implements ModelsStore {
+	private readonly storage: AuthStorageBackend;
+	private readonly path: string;
+	private readonly readState: ModelsFileReadState;
+
+	constructor(path: string = join(getAgentDir(), "models-store.json")) {
+		// !mark(1:4)
+		this.path = normalizePath(path);
+		this.storage = new FileAuthStorageBackend(this.path);
+		this.readState =
+			sharedModelsFileReadState?.path === this.path ? sharedModelsFileReadState.readState : { data: {} };
+		if (!sharedModelsFileReadState) {
+			sharedModelsFileReadState = { path: this.path, readState: this.readState };
+		}
+	}
+```
+
+## !!steps Parsing and reloading under lock
+
+`parse` strips a BOM and returns an empty object for missing content. `reloadFromStorage` takes the file lock, parses, and records the file's revision from `getFileRevision` in [paths.ts](/docs/src/utils/paths.ts), so later reads can skip the lock when nothing changed.
+
+```ts ! models-store.ts
+	private parse(content: string | undefined): StoredModels {
+		// !mark
+		return content ? (JSON.parse(stripBom(content)) as StoredModels) : {};
+	}
+
+	private updateReadState(readState: ModelsFileReadState, data: StoredModels, revision?: string): void {
+		readState.data = data;
+		readState.revision = revision;
+	}
+
+	private reloadFromStorage(
+		readState: ModelsFileReadState,
+		options?: ModelsStoreOperationOptions,
+	): Promise<StoredModels> {
+		return this.storage.withLockAsync(async (content) => {
+			const data = this.parse(content);
+			// !mark
+			this.updateReadState(readState, data, getFileRevision(this.path));
+			return { result: data };
+		}, options);
+	}
+```
+
+## !!steps Cheap reads with coalescing
+
+`readLatest` returns cached data if the file's revision matches. If not, it starts one shared reload that every concurrent reader awaits, so a burst of reads causes one locked file read.
+
+Each reader waits through `raceWithAbortSignal` from [abort.ts](/docs/src/utils/abort.ts), so its own cancellation does not cancel others. The reader count is tracked, and when the last reader leaves, the reload is aborted.
+
+```ts ! models-store.ts
+	private async readLatest(
+		readState: ModelsFileReadState,
+		options?: ModelsStoreOperationOptions,
+	): Promise<StoredModels> {
+		options?.signal?.throwIfAborted();
+		const revision = getFileRevision(this.path);
+		// !mark(1:2)
+		if (revision !== undefined && revision === readState.revision) return readState.data;
+		if (!readState.reload) {
+			const controller = new AbortController();
+			const reload: ModelsFileReload = {
+				controller,
+				promise: this.reloadFromStorage(readState, { signal: controller.signal }),
+				readers: 0,
+			};
+			readState.reload = reload;
+			void reload.promise.then(
+				() => {
+					if (readState.reload === reload) readState.reload = undefined;
+				},
+				() => {
+					if (readState.reload === reload) readState.reload = undefined;
+				},
+			);
+		}
+
+		const reload = readState.reload;
+		reload.readers++;
+		try {
+			return await raceWithAbortSignal(reload.promise, options?.signal);
+		} finally {
+			reload.readers--;
+			// !mark(1:3)
+			if (reload.readers === 0 && readState.reload === reload) {
+				readState.reload = undefined;
+				reload.controller.abort();
+			}
+		}
+	}
+```
+
+## !!steps Reads, writes and deletes
+
+`read` fetches the latest data and clones the entry. `write` and `delete` do read-modify-write inside the lock, so concurrent processes do not lose each other's updates. After the lock is released, the in-memory read state is updated with the data just written.
+
+One detail: that update passes no revision, so the next read sees a mismatch and re-reads the file once. That is conservative and correct, if slightly wasteful.
+
+```ts ! models-store.ts
+	async read(providerId: string, options?: ModelsStoreOperationOptions): Promise<ModelsStoreEntry | undefined> {
+		const entry = (await this.readLatest(this.readState, options))[providerId];
+		options?.signal?.throwIfAborted();
+		return entry ? structuredClone(entry) : undefined;
+	}
+
+	async write(providerId: string, entry: ModelsStoreEntry, options?: ModelsStoreOperationOptions): Promise<void> {
+		let latest: StoredModels | undefined;
+		// !mark(1:4)
+		await this.storage.withLockAsync(async (content) => {
+			const current = this.parse(content);
+			current[providerId] = structuredClone(entry);
+			latest = current;
+			return { result: undefined, next: JSON.stringify(current, null, 2) };
+		}, options);
+		if (latest) this.updateReadState(this.readState, latest);
+	}
+
+	async delete(providerId: string, options?: ModelsStoreOperationOptions): Promise<void> {
+		let latest: StoredModels | undefined;
+		// !mark(1:3)
+		await this.storage.withLockAsync(async (content) => {
+			const current = this.parse(content);
+			delete current[providerId];
+			latest = current;
+			return { result: undefined, next: JSON.stringify(current, null, 2) };
+		}, options);
+		if (latest) this.updateReadState(this.readState, latest);
+	}
+```
+
+</Scrollycoding>
+
+The two stores are interchangeable behind the pi-ai interface, which is how tests and ephemeral runs avoid touching disk. The file store's design is a small copy-on-read cache over a lock, keyed by file revision, with the module-level slot as its one global.

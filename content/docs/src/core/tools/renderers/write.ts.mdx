@@ -1,0 +1,154 @@
+---
+title: "write.ts"
+description: "Terminal presentation for the write tool: streams the file being written with syntax highlighting, using an incremental highlight cache"
+source: "src/core/tools/renderers/write.ts"
+full: true
+---
+
+The write tool's call arguments contain the entire file content, and the model streams them token by token. This renderer shows that content live under the header, syntax-highlighted by language. Re-highlighting a growing file from scratch on every token would be quadratic, so the file is mostly about a cache that updates only the part that changed.
+
+The tool implementation is [tools/write.ts](/docs/src/core/tools/write.ts); renderers live apart so a presentation process avoids loading it. Highlighting comes from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and path and text helpers from [render-utils.ts](/docs/src/core/tools/render-utils.ts).
+
+<Scrollycoding>
+
+## !!steps The highlight cache and call component
+
+The cache remembers the raw content it was built from, the same content with tabs and carriage returns normalized, and the highlighted version of each line. `WriteCallRenderComponent` is a `Text` that carries one cache between renders.
+
+```ts ! write.ts
+type WriteHighlightCache = {
+	rawPath: string | null;
+	lang: string;
+	rawContent: string;
+	normalizedLines: string[];
+	highlightedLines: string[];
+};
+class WriteCallRenderComponent extends Text {
+	cache?: WriteHighlightCache;
+
+	constructor() {
+		super("", 0, 0);
+	}
+}
+```
+
+## !!steps Full rebuild
+
+`rebuildWriteHighlightCacheFull` is the slow path, used when the arguments are complete or the cache cannot be extended. It returns `undefined` when the path has no known language, which makes callers fall back to plain text. Otherwise it normalizes the content and highlights it as one block.
+
+```ts ! write.ts
+function rebuildWriteHighlightCacheFull(rawPath: string | null, fileContent: string): WriteHighlightCache | undefined {
+	const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
+	// !mark
+	if (!lang) return undefined;
+	const displayContent = normalizeDisplayText(fileContent);
+	const normalized = replaceTabs(displayContent);
+	return {
+		rawPath,
+		lang,
+		rawContent: fileContent,
+		normalizedLines: normalized.split("\n"),
+		highlightedLines: highlightCode(normalized, lang),
+	};
+}
+```
+
+## !!steps Incremental update
+
+While content streams, each render passes the longer string. The function validates that the cache still applies: same language and path, and the new content must start with the cached raw content (otherwise the model rewrote earlier text). If the length is unchanged it returns the cache as is.
+
+Otherwise only the appended delta is processed. Its first segment extends the current last line, which is re-highlighted alone; each further segment becomes a new line, highlighted individually.
+
+```ts ! write.ts
+function updateWriteHighlightCacheIncremental(
+	cache: WriteHighlightCache | undefined,
+	rawPath: string | null,
+	fileContent: string,
+): WriteHighlightCache | undefined {
+	const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
+	if (!lang) return undefined;
+	if (!cache) return rebuildWriteHighlightCacheFull(rawPath, fileContent);
+	// !mark(1:3)
+	if (cache.lang !== lang || cache.rawPath !== rawPath) return rebuildWriteHighlightCacheFull(rawPath, fileContent);
+	if (!fileContent.startsWith(cache.rawContent)) return rebuildWriteHighlightCacheFull(rawPath, fileContent);
+	if (fileContent.length === cache.rawContent.length) return cache;
+// ...
+	const segments = deltaNormalized.split("\n");
+	const lastIndex = cache.normalizedLines.length - 1;
+	cache.normalizedLines[lastIndex] += segments[0];
+	cache.highlightedLines[lastIndex] = highlightSingleLine(cache.normalizedLines[lastIndex], cache.lang);
+	for (let i = 1; i < segments.length; i++) {
+		cache.normalizedLines.push(segments[i]);
+		cache.highlightedLines.push(highlightSingleLine(segments[i], cache.lang));
+	}
+	refreshWriteHighlightPrefix(cache);
+	return cache;
+}
+```
+
+## !!steps Re-highlighting the visible prefix
+
+Line-by-line highlighting loses multi-line context, such as an open block comment or template string. The part the user is looking at is the top of the file, so after each update the first 50 lines are highlighted together as a block and written back over the cached lines. Lines beyond the prefix keep the cheap single-line highlight until the final full rebuild when arguments complete.
+
+```ts ! write.ts
+const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
+function highlightSingleLine(line: string, lang: string): string {
+	const highlighted = highlightCode(line, lang);
+	return highlighted[0] ?? "";
+}
+function refreshWriteHighlightPrefix(cache: WriteHighlightCache): void {
+	const prefixCount = Math.min(WRITE_PARTIAL_FULL_HIGHLIGHT_LINES, cache.normalizedLines.length);
+	if (prefixCount === 0) return;
+	// !mark(1:5)
+	const prefixSource = cache.normalizedLines.slice(0, prefixCount).join("\n");
+	const prefixHighlighted = highlightCode(prefixSource, cache.lang);
+	for (let i = 0; i < prefixCount; i++) {
+		cache.highlightedLines[i] =
+			prefixHighlighted[i] ?? highlightSingleLine(cache.normalizedLines[i] ?? "", cache.lang);
+	}
+}
+```
+
+## !!steps Formatting the call
+
+The header is `write <path>`. An invalid content argument shows an error line. Otherwise content is shown from the cache when there is one, or highlighted on the spot, or split raw for unknown languages. Collapsed shows ten lines and a hint that includes the total line count; expanded shows all.
+
+```ts ! write.ts
+	if (fileContent === null) {
+		text += `\n\n${theme.fg("error", "[invalid content arg - expected string]")}`;
+	} else if (fileContent) {
+		const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
+		const renderedLines = lang
+			// !mark
+			? (cache?.highlightedLines ?? highlightCode(replaceTabs(normalizeDisplayText(fileContent)), lang))
+			: normalizeDisplayText(fileContent).split("\n");
+		const lines = trimTrailingEmptyLines(renderedLines);
+		const totalLines = lines.length;
+		const maxLines = options.expanded ? lines.length : 10;
+		const displayLines = lines.slice(0, maxLines);
+		const remaining = lines.length - maxLines;
+		text += `\n\n${displayLines.map((line) => (lang ? line : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
+```
+
+## !!steps Choosing full or incremental, and the result
+
+`renderCall` picks the strategy from `context.argsComplete`: a full rebuild once the arguments are final (so the finished view has exact highlighting), incremental while streaming. A non-string content clears the cache.
+
+`renderResult` is nearly empty on success: it returns an empty container, because the call component already shows the content. Only an error produces text, in red.
+
+```ts ! write.ts
+		const component =
+			(context.lastComponent as WriteCallRenderComponent | undefined) ?? new WriteCallRenderComponent();
+		if (fileContent !== null) {
+			// !mark(1:3)
+			component.cache = context.argsComplete
+				? rebuildWriteHighlightCacheFull(rawPath, fileContent)
+				: updateWriteHighlightCacheIncremental(component.cache, rawPath, fileContent);
+		} else {
+			component.cache = undefined;
+		}
+```
+
+</Scrollycoding>
+
+The pair is registered by [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) and typed through [extensions/types.ts](/docs/src/core/extensions/types.ts). Structurally, this is the only renderer besides [renderers/edit.ts](/docs/src/core/tools/renderers/edit.ts) that keeps mutable state on its component, and both use it to avoid repeating expensive work as arguments stream. A duplicated helper: `trimTrailingEmptyLines` is defined identically here and in [renderers/read.ts](/docs/src/core/tools/renderers/read.ts).

@@ -1,0 +1,67 @@
+---
+title: "wrapper.ts"
+description: "Adapts extension-registered tools into agent tools that receive the extension runner's context"
+source: "src/core/extensions/wrapper.ts"
+full: true
+---
+
+Extensions register tools as `RegisteredTool` definitions. The agent loop wants `AgentTool` objects. This small file bridges the two by delegating to [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts) and supplying a context factory from the [runner.ts](/docs/src/core/extensions/runner.ts) instance.
+
+The header comment is explicit about scope: these wrappers only adapt execution. Intercepting tool calls and results is handled elsewhere, in [agent-session.ts](/docs/src/core/agent-session.ts) through agent-core hooks.
+
+<Scrollycoding>
+
+## !!steps Imports and the stated scope
+
+The imports show the three collaborators: the generic definition wrapper, the runner (type only), and the registered-tool type from [types.ts](/docs/src/core/extensions/types.ts).
+
+```ts ! wrapper.ts
+/**
+ * Tool wrappers for extension-registered tools.
+ *
+// !mark(1:2)
+ * These wrappers only adapt tool execution so extension tools receive the runner context.
+ * Tool call and tool result interception is handled by AgentSession via agent-core hooks.
+ */
+
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { wrapToolDefinition } from "../tools/tool-definition-wrapper.ts";
+import type { ExtensionRunner } from "./runner.ts";
+import type { RegisteredTool } from "./types.ts";
+```
+
+## !!steps Wrapping one tool
+
+A per-call context is created from the tool call id and abort signal. Routing it through `runner.createToolContext` means a tool sees the same context shape an event handler would see.
+
+```ts ! wrapper.ts
+/**
+ * Wrap a RegisteredTool into an AgentTool.
+ * Uses the runner's createToolContext() for consistent context across tools and event handlers.
+ */
+export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
+	// !mark(1:2)
+	return wrapToolDefinition(registeredTool.definition, (toolCallId, signal) =>
+		runner.createToolContext(toolCallId, signal),
+	);
+}
+```
+
+## !!steps Wrapping a list
+
+The plural form is a plain map. There is no filtering or de-duplication here, so name conflicts must be resolved before tools reach this function.
+
+```ts ! wrapper.ts
+/**
+ * Wrap all registered tools into AgentTools.
+ * Uses the runner's createToolContext() for consistent context across tools and event handlers.
+ */
+export function wrapRegisteredTools(registeredTools: RegisteredTool[], runner: ExtensionRunner): AgentTool[] {
+	// !mark
+	return registeredTools.map((tool) => wrapRegisteredTool(tool, runner));
+}
+```
+
+</Scrollycoding>
+
+Both functions are re-exported from [index.ts](/docs/src/core/extensions/index.ts). The file contains no state, which is why the runner is passed in per call.

@@ -1,0 +1,68 @@
+---
+title: "restore-sandbox-env.ts"
+description: "Workaround that rebuilds process.env from /proc/self/environ when a Bun binary runs in a sandbox with an empty environment"
+source: "src/bun/restore-sandbox-env.ts"
+full: true
+---
+
+Bun compiled binaries can start with an empty `process.env` when run inside certain sandboxes (the file's header cites the upstream Bun issue 27802). Without the environment, API keys and other configuration silently vanish.
+
+This module exports one function that recovers the variables on Linux by parsing `/proc/self/environ`. It is called from [sandbox-env-setup.ts](/docs/src/bun/sandbox-env-setup.ts), which is imported first by [cli.ts](/docs/src/bun/cli.ts).
+
+<Scrollycoding>
+
+## !!steps The documented contract
+
+The header comment names the upstream bug and a coupling: the same lookup is duplicated in the `ai` package for consumers that bypass this entrypoint, so the two must be kept in sync by hand. There is no shared import, which is a maintenance risk.
+
+```ts ! restore-sandbox-env.ts
+/**
+ * Workaround for https://github.com/oven-sh/bun/issues/27802
+ *
+ * Bun compiled binaries have an empty `process.env` when running inside
+ * sandbox environments (e.g. nono on Linux/macOS). On Linux we can recover
+ * the environment from `/proc/self/environ`.
+ *
+ * Keep this in sync with getBunSandboxEnvValue() in
+ * packages/ai/src/utils/provider-env.ts. The ai package duplicates the lookup
+ * for direct consumers that do not go through this coding-agent entrypoint.
+ */
+```
+
+## !!steps Guard clauses
+
+It does nothing outside Bun, and nothing when `process.env` already has any entry. Only a fully empty environment triggers recovery, so a partially populated one is never touched.
+
+```ts ! restore-sandbox-env.ts
+export function restoreSandboxEnv(): void {
+	// !mark(1:5)
+	if (!process.versions?.bun) return;
+
+	// If process.env already has entries, nothing to fix.
+	if (Object.keys(process.env).length > 0) return;
+
+	try {
+```
+
+## !!steps Parsing the NUL-separated block
+
+`/proc/self/environ` holds `KEY=value` entries separated by NUL bytes. Each entry is split at the first `=`; entries with no `=` or an empty name (`idx > 0`) are ignored. Any read failure is swallowed, so the worst case is the same empty environment as before.
+
+```ts ! restore-sandbox-env.ts
+	try {
+		const data = readFileSync("/proc/self/environ", "utf-8");
+		// !mark(1:5)
+		for (const entry of data.split("\0")) {
+			const idx = entry.indexOf("=");
+			if (idx > 0) {
+				process.env[entry.slice(0, idx)] = entry.slice(idx + 1);
+			}
+		}
+	} catch {
+		// /proc/self/environ may not be readable; ignore.
+	}
+```
+
+</Scrollycoding>
+
+Although the header mentions macOS sandboxes, `/proc` does not exist there, so on macOS the function quietly does nothing and the environment stays empty. The file has no tests.

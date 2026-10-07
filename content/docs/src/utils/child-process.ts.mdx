@@ -1,0 +1,181 @@
+---
+title: "child-process.ts"
+description: "Cross-platform spawn wrappers and a waitForChildProcess that never loses output or hangs on inherited pipes"
+source: "src/utils/child-process.ts"
+full: true
+---
+
+`child-process.ts` centralises how the agent starts subprocesses. On Windows it uses `cross-spawn`, which resolves `.cmd` shims and quotes arguments correctly; elsewhere it uses Node's own `spawn`. The second half is `waitForChildProcess`, a careful replacement for waiting on `close`.
+
+It is used by [package-manager.ts](/docs/src/core/package-manager.ts), [exec.ts](/docs/src/core/exec.ts), [config.ts](/docs/src/config.ts), [paths.ts](/docs/src/utils/paths.ts) and [package-manager-cli.ts](/docs/src/package-manager-cli.ts).
+
+<Scrollycoding>
+
+## !!steps Platform-aware spawn
+
+`spawnProcess` has two overloads: with a null/pipe/pipe stdio tuple it returns a child whose stdout and stderr are typed as readable streams, otherwise a plain `ChildProcess`. The implementation picks `cross-spawn` on win32 and `nodeSpawn` otherwise.
+
+```ts ! child-process.ts
+const EXIT_STDIO_GRACE_MS = 100;
+
+export function spawnProcess(
+	command: string,
+	args: string[],
+	options: SpawnOptionsWithStdioTuple<StdioNull, StdioPipe, StdioPipe>,
+): ChildProcessByStdio<null, Readable, Readable>;
+export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+export function spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+	// !mark
+	return process.platform === "win32" ? crossSpawn(command, args, options) : nodeSpawn(command, args, options);
+}
+```
+
+## !!steps Synchronous variant
+
+`spawnProcessSync` follows the same rule but is typed for string encoding only, so `stdout` and `stderr` are strings.
+
+```ts ! child-process.ts
+export function spawnProcessSync(
+	command: string,
+	args: string[],
+	options: SpawnSyncOptionsWithStringEncoding,
+): SpawnSyncReturns<string> {
+	// !mark(1:3)
+	return process.platform === "win32"
+		? crossSpawn.sync(command, args, options)
+		: nodeSpawnSync(command, args, options);
+}
+```
+
+## !!steps Why waiting is tricky
+
+The doc comment records the bug being fixed (earendil-works/pi#5303). A child may exit while a detached descendant still holds the pipes open, so `close` may never fire. A fixed deadline after `exit` would truncate late output. The design is to wait for the pipes to go idle.
+
+```ts ! child-process.ts
+/**
+ * Wait for a child process to terminate without hanging on inherited stdio handles.
+ *
+ * A short-lived child can `exit` while a detached descendant keeps its stdout/stderr
+ * pipe open. We must not resolve and destroy the streams on a fixed deadline measured
+ * from `exit`, or output still being written past that deadline is silently lost
+ * (earendil-works/pi#5303). Instead, after `exit` we wait for the pipes to fall idle:
+ * the grace timer is re-armed on every chunk, so an actively writing descendant keeps
+ * us reading, while a quiet inherited handle (e.g. a Windows daemonized descendant
+ * that never lets `close` fire) still releases us after the grace elapses.
+ */
+export function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+```
+
+## !!steps State and cleanup
+
+Local flags track whether the child exited and whether stdout and stderr ended. A stream that is `null` counts as already ended. `cleanup` removes every listener and the timer so nothing leaks after resolution.
+
+```ts ! child-process.ts
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let exited = false;
+		let exitCode: number | null = null;
+		let postExitTimer: NodeJS.Timeout | undefined;
+		// !mark(1:2)
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+
+		const cleanup = () => {
+			if (postExitTimer) {
+				clearTimeout(postExitTimer);
+				postExitTimer = undefined;
+			}
+			child.removeListener("error", onError);
+			child.removeListener("exit", onExit);
+			child.removeListener("close", onClose);
+			child.stdout?.removeListener("end", onStdoutEnd);
+			child.stderr?.removeListener("end", onStderrEnd);
+			child.stdout?.removeListener("data", onData);
+			child.stderr?.removeListener("data", onData);
+		};
+```
+
+## !!steps Settling once
+
+`finalize` resolves at most once, cleans up and destroys both streams so the pipes are released. `maybeFinalizeAfterExit` finalizes only when the child has exited and both streams ended.
+
+```ts ! child-process.ts
+		const finalize = (code: number | null) => {
+			// !mark
+			if (settled) return;
+			settled = true;
+			cleanup();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolve(code);
+		};
+
+		const maybeFinalizeAfterExit = () => {
+			if (!exited || settled) return;
+			// !mark
+			if (stdoutEnded && stderrEnded) {
+				finalize(exitCode);
+			}
+		};
+```
+
+## !!steps The idle timer
+
+`armIdleTimer` restarts a 100 ms timer. `onData` re-arms it only after exit, so a descendant that keeps writing keeps the reader alive, while a quiet inherited handle is released after the grace period.
+
+```ts ! child-process.ts
+		// !mark(1:3)
+		const armIdleTimer = () => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS);
+		};
+
+		const onData = () => {
+			// Output is still arriving after exit; defer finalizing so we don't
+			// destroy the stream mid-write and truncate the tail.
+			// !mark
+			if (exited && !settled) armIdleTimer();
+		};
+```
+
+## !!steps Wiring the events
+
+`onExit` records the code, tries to finalize at once and otherwise starts the idle timer. `close` finalizes immediately with its own code. `onError` rejects instead of resolving. Listeners are attached with `once` for the lifecycle events and `on` for data.
+
+```ts ! child-process.ts
+		// !mark
+		const onError = (err: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(err);
+		};
+
+		// !mark(1:3)
+		const onExit = (code: number | null) => {
+			exited = true;
+			exitCode = code;
+			maybeFinalizeAfterExit();
+			if (!settled) {
+				armIdleTimer();
+			}
+		};
+
+		// !mark(1:2)
+		const onClose = (code: number | null) => {
+			finalize(code);
+		};
+
+		child.stdout?.once("end", onStdoutEnd);
+		child.stderr?.once("end", onStderrEnd);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.once("error", onError);
+		child.once("exit", onExit);
+		child.once("close", onClose);
+	});
+```
+
+</Scrollycoding>
+
+Callers in [bash.ts](/docs/src/core/tools/bash.ts) and [exec.ts](/docs/src/core/exec.ts) rely on the promise resolving with the exit code without losing trailing output. One quirk: a child killed by a signal has a null exit code, which resolves as `null` rather than rejecting.

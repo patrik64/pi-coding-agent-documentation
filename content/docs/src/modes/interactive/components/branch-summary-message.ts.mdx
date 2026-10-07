@@ -1,0 +1,105 @@
+---
+title: "branch-summary-message.ts"
+description: "Collapsible message box showing the summary created when navigating to another branch of the session tree"
+source: "src/modes/interactive/components/branch-summary-message.ts"
+full: true
+---
+
+When the user switches branches in the session tree, the abandoned path can be summarized. This component displays that summary inside the conversation. The message type comes from [messages.ts](/docs/src/core/messages.ts), and the keybinding label from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+
+<Scrollycoding>
+
+## !!steps Class setup
+
+The component extends pi-tui's `Box` with one cell of padding and the shared
+custom-message background, so it looks like other injected messages such as
+[custom-message.ts](/docs/src/modes/interactive/components/custom-message.ts).
+It is collapsed by default and renders immediately in the constructor.
+
+```ts ! branch-summary-message.ts
+/**
+ * Component that renders a branch summary message with collapsed/expanded state.
+ * Uses same background color as custom messages for visual consistency.
+ */
+export class BranchSummaryMessageComponent extends Box {
+	private expanded = false;
+	private message: BranchSummaryMessage;
+	private markdownTheme: MarkdownTheme;
+
+	constructor(message: BranchSummaryMessage, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
+		super(1, 1, (t) => theme.bg("customMessageBg", t));
+		this.message = message;
+		this.markdownTheme = markdownTheme;
+		this.updateDisplay();
+	}
+```
+
+## !!steps Expanding and re-rendering
+
+`setExpanded` flips the flag and rebuilds. `invalidate` also rebuilds, so a
+theme change picks up new colors. Rebuilding always starts with `clear()`.
+
+```ts ! branch-summary-message.ts
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+		this.updateDisplay();
+	}
+
+	override invalidate(): void {
+		super.invalidate();
+		this.updateDisplay();
+	}
+```
+
+## !!steps Collapsed versus expanded content
+
+Collapsed it shows one line telling the user which key expands it. Expanded it renders the summary as markdown under a bold heading, in the custom message text color. The label `[branch]` is always bold.
+
+```ts ! branch-summary-message.ts
+	private updateDisplay(): void {
+		this.clear();
+		const content = new Container();
+
+		const label = theme.fg("customMessageLabel", `\x1b[1m[branch]\x1b[22m`);
+		content.addChild(new Text(label, 0, 0));
+		content.addChild(new Spacer(1));
+
+		if (this.expanded) {
+			const header = "**Branch Summary**\n\n";
+			content.addChild(
+				new Markdown(header + this.message.summary, 0, 0, this.markdownTheme, {
+					color: (text: string) => theme.fg("customMessageText", text),
+				}),
+			);
+		} else {
+			content.addChild(
+				new Text(
+					theme.fg("customMessageText", "Branch summary (") +
+						theme.fg("dim", keyText("app.tools.expand")) +
+						theme.fg("customMessageText", " to expand)"),
+					0,
+					0,
+				),
+			);
+		}
+```
+
+## !!steps Click to toggle
+
+The content is wrapped in a `MouseRegion`; a left click toggles the expanded
+state. Other events return `undefined` so they are not consumed.
+
+```ts ! branch-summary-message.ts
+		this.addChild(
+			new MouseRegion(content, (event) => {
+				if (event.type !== "click" || event.button !== "left") return undefined;
+				this.setExpanded(!this.expanded);
+				return { handled: true };
+			}),
+		);
+	}
+```
+
+</Scrollycoding>
+
+Its sibling is [compaction-summary-message.ts](/docs/src/modes/interactive/components/compaction-summary-message.ts), which is nearly identical. The tree UI is in [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts).

@@ -1,0 +1,155 @@
+---
+title: "utils.ts"
+description: "Helpers shared by compaction and branch summarization: file-operation tracking, conversation serialization and the summarizer system prompt"
+source: "src/core/compaction/utils.ts"
+full: true
+---
+
+Both [compaction.ts](/docs/src/core/compaction/compaction.ts) and [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts) turn a stretch of conversation into a short summary by asking a model. They need the same three ingredients, and this file provides them: a record of which files were touched, a flat text rendering of messages, and a system prompt that stops the model from answering the conversation instead of summarizing it.
+
+The functions are pure except for mutating the `FileOperations` sets passed in. They work on message shapes from [messages.ts](/docs/src/core/messages.ts) and the underlying AI packages.
+
+<Scrollycoding>
+
+## !!steps Tracking file operations
+
+Three sets record paths the agent read, wrote and edited. Sets make repeated operations on the same file collapse automatically.
+
+```ts ! utils.ts
+export interface FileOperations {
+	read: Set<string>;
+	written: Set<string>;
+	edited: Set<string>;
+}
+
+export function createFileOps(): FileOperations {
+	return {
+		read: new Set(),
+		written: new Set(),
+		edited: new Set(),
+	};
+}
+```
+
+## !!steps Extracting from messages
+
+Two sources are handled. A tool result can carry `nestedCalls`, which are calls made from inside a codemode script, so the script's file touches still count. Assistant messages are scanned for `toolCall` blocks. Anything malformed is skipped with defensive checks instead of throwing, since this runs over arbitrary stored history.
+
+```ts ! utils.ts
+export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
+	if (message.role === "toolResult") {
+		// Calls made from codemode scripts are recorded on the script's result.
+		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
+		return;
+	}
+	if (message.role !== "assistant") return;
+	if (!("content" in message) || !Array.isArray(message.content)) return;
+
+	for (const block of message.content) {
+		if (typeof block !== "object" || block === null) continue;
+		if (!("type" in block) || block.type !== "toolCall") continue;
+		if (!("arguments" in block) || !("name" in block)) continue;
+		addFileOp(block.name, block.arguments as Record<string, unknown> | undefined, fileOps);
+	}
+}
+```
+
+## !!steps Classifying by tool name
+
+Only tools named `read`, `write` and `edit` with a string `path` argument count. Other tools, including `bash`, never contribute, so a file changed through a shell command is invisible to the summary.
+
+```ts ! utils.ts
+function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
+	const path = typeof args?.path === "string" ? args.path : undefined;
+	if (!path) return;
+	switch (toolName) {
+		case "read":
+			fileOps.read.add(path);
+			break;
+		case "write":
+			fileOps.written.add(path);
+			break;
+		case "edit":
+			fileOps.edited.add(path);
+			break;
+	}
+}
+```
+
+## !!steps Final lists and XML output
+
+A file that was read and then modified is listed only as modified. Both lists are sorted so the summary is stable. The formatter emits `read-files` and `modified-files` XML-style sections, or an empty string when there is nothing to report, with a leading blank line so it can be appended to a summary.
+
+```ts ! utils.ts
+export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
+	const modified = new Set([...fileOps.edited, ...fileOps.written]);
+	const readOnly = [...fileOps.read].filter((f) => !modified.has(f)).sort();
+	const modifiedFiles = [...modified].sort();
+	return { readFiles: readOnly, modifiedFiles };
+}
+
+// ...
+export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
+	const sections: string[] = [];
+	if (readFiles.length > 0) {
+		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+	}
+	if (modifiedFiles.length > 0) {
+		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
+	}
+	if (sections.length === 0) return "";
+	return `\n\n${sections.join("\n\n")}`;
+}
+```
+
+## !!steps Truncating tool results
+
+Tool output can be enormous, and a summarizer does not need all of it. Results are cut to 2000 characters, keeping the beginning and noting how many characters were dropped.
+
+```ts ! utils.ts
+/** Maximum characters for a tool result in serialized summaries. */
+const TOOL_RESULT_MAX_CHARS = 2000;
+
+// ...
+function truncateForSummary(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	const truncatedChars = text.length - maxChars;
+	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+}
+```
+
+## !!steps Serializing the conversation
+
+Messages become tagged plain text such as `[User]:` and `[Assistant]:`. The docstring explains why: sending real chat turns would make the model continue the dialogue, whereas a transcript reads as material to summarize. Thinking, text and tool calls from one assistant message are emitted as separate parts, and tool calls are rendered as `name(key=json, ...)`.
+
+```ts ! utils.ts
+export function serializeConversation(messages: Message[]): string {
+	const parts: string[] = [];
+
+	for (const msg of messages) {
+		if (msg.role === "user") {
+			const content = contentText(msg.content, "");
+			if (content) parts.push(`[User]: ${content}`);
+		} else if (msg.role === "assistant") {
+			const thinkingParts: string[] = [];
+			const toolCalls: string[] = [];
+
+			for (const block of msg.content) {
+				if (block.type === "thinking") {
+					thinkingParts.push(block.thinking);
+				} else if (block.type === "toolCall") {
+```
+
+## !!steps The system prompt
+
+The prompt repeats the instruction twice, once positive and once negative, because a summarizer given a conversation tends to reply to its last question. Prompts that define the summary layout itself live in the callers.
+
+```ts ! utils.ts
+export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+```
+
+</Scrollycoding>
+
+Everything here is re-exported through [index.ts](/docs/src/core/compaction/index.ts). Callers must run `convertToLlm()` first, as the serializer only understands standard roles and silently drops others.

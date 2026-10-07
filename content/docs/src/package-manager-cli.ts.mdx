@@ -1,0 +1,643 @@
+---
+title: "package-manager-cli.ts"
+description: "Implements the install, remove, update, list and config subcommands, including self-update and managed installs"
+source: "src/package-manager-cli.ts"
+full: true
+---
+
+`package-manager-cli.ts` handles every non-interactive subcommand that manages Pi itself or its packages: `install`, `remove` (alias `uninstall`), `update`, `list` and `config`. Each handler returns true when it recognised and handled the command, so [main.ts](/docs/src/main.ts) can fall through to the normal agent startup otherwise.
+
+The heavy lifting for packages is in [package-manager.ts](/docs/src/core/package-manager.ts); this file parses arguments, decides project trust through [trust-manager.ts](/docs/src/core/trust-manager.ts) and [project-trust.ts](/docs/src/core/project-trust.ts), and orchestrates self-update. Self-update has two flavours: a managed install that keeps versioned releases in a directory, and a classic npm or pnpm global install.
+
+Model catalogs for `update --models` are refreshed through [model-runtime.ts](/docs/src/core/model-runtime.ts), and the `config` command opens the TUI from [config-selector.ts](/docs/src/cli/config-selector.ts).
+
+<Scrollycoding>
+
+## !!steps Command types and managed install detection
+
+The file defines the command union and the update target union (`all`, `self`, `extensions` or `models`). `getActiveManagedInstallRoot` reads `PI_MANAGED_INSTALL_ROOT`, but only believes it if the running package lives under that root's `releases` directory, because child processes inherit the variable. It then validates a marker file and throws if it is missing or wrong.
+
+```ts ! package-manager-cli.ts
+export type PackageCommand = "install" | "remove" | "update" | "list";
+
+type UpdateTarget = { type: "all" } | { type: "self" } | { type: "extensions"; source?: string } | { type: "models" };
+// ...
+function getActiveManagedInstallRoot(): string | undefined {
+	const configuredRoot = process.env.PI_MANAGED_INSTALL_ROOT?.trim();
+	if (!configuredRoot) return undefined;
+
+	const managedRoot = resolve(configuredRoot);
+	const releasesDir = canonicalizePath(join(managedRoot, "releases"));
+	// The launcher environment is inherited by child processes. Do not classify a
+	// source checkout or another Pi installation launched from managed Pi as managed.
+	// !mark
+	if (getCwdRelativePath(canonicalizePath(getPackageDir()), releasesDir) === undefined) return undefined;
+
+	const markerPath = join(managedRoot, MANAGED_INSTALL_MARKER);
+	try {
+		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as {
+			kind?: unknown;
+			layout?: unknown;
+			schemaVersion?: unknown;
+		};
+		// !mark
+		if (marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") {
+			throw new Error();
+		}
+	} catch {
+		throw new Error(`Managed install marker is missing or invalid: ${markerPath}`);
+	}
+
+	return managedRoot;
+}
+```
+
+## !!steps Staging a managed release
+
+A release is staged by downloading `package.json` and `package-lock.json` from the installer API and running `npm ci` with scripts disabled, dev dependencies omitted and optional ones included. Pinning to the lockfile is the point of a managed install.
+
+```ts ! package-manager-cli.ts
+async function fetchInstallerArtifact(url: string, label: string): Promise<string> {
+	const response = await fetch(url, { headers: { "User-Agent": getPiUserAgent(VERSION) } });
+	if (!response.ok) {
+		throw new Error(`Could not download managed installer ${label} from ${url}: HTTP ${response.status}`);
+	}
+	return await response.text();
+}
+
+async function runManagedNpmCi(stageDir: string): Promise<void> {
+	// !mark(1:2)
+	const args = [
+		"ci",
+		"--ignore-scripts",
+		"--min-release-age=0",
+		"--omit=dev",
+		"--include=optional",
+		"--no-fund",
+		"--no-audit",
+		"--loglevel=error",
+		"--progress=false",
+	];
+	const code = await waitForChildProcess(spawnProcess("npm", args, { cwd: stageDir, stdio: "inherit" }));
+	if (code !== 0) throw new Error(`npm ${args.join(" ")} exited with code ${code ?? "unknown"}`);
+}
+```
+
+## !!steps Verify, activate and prune
+
+`verifyManagedRelease` runs the installed binary with `--version` and compares. Activation writes `current-version` through a temporary file and `renameSync`, which makes the switch atomic. Pruning keeps the active release and the one running now so open sessions and rollback still work.
+
+```ts ! package-manager-cli.ts
+function verifyManagedRelease(releaseDir: string, expectedVersion: string): void {
+	const binPath = join(
+		releaseDir,
+		"node_modules",
+		".bin",
+		process.platform === "win32" ? `${APP_NAME}.cmd` : APP_NAME,
+	);
+	const result = spawnProcessSync(binPath, ["--version"], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	if (result.error || result.status !== 0) {
+		const reason = result.error?.message || result.stderr.trim() || `exit code ${result.status ?? "unknown"}`;
+		throw new Error(`Could not verify managed Pi ${expectedVersion}: ${reason}`);
+	}
+	const installedVersion = result.stdout.trim();
+	// !mark(1:3)
+	if (installedVersion !== expectedVersion) {
+		throw new Error(`Managed Pi smoke test returned version ${installedVersion}; expected ${expectedVersion}.`);
+	}
+}
+
+function activateManagedRelease(managedRoot: string, version: string): void {
+	const currentPath = join(managedRoot, "current-version");
+	const temporaryPath = join(managedRoot, `current-version.tmp.${process.pid}-${Date.now()}`);
+	try {
+		// !mark(1:2)
+		writeFileSync(temporaryPath, `${version}\n`);
+		renameSync(temporaryPath, currentPath);
+	} finally {
+		rmSync(temporaryPath, { force: true });
+	}
+}
+```
+
+## !!steps Pruning and staging cleanup
+
+Only directories whose names look like semver versions are deleted, and failures (files in use on Windows) are retried on the next update. Stale `update-` staging directories are removed too.
+
+```ts ! package-manager-cli.ts
+// Keep the active release and the one running this update, which other open
+// sessions likely still use and which allows rolling back by editing current-version.
+function pruneManagedReleases(managedRoot: string, activeVersion: string): void {
+	const releasesRoot = join(managedRoot, "releases");
+	let entries: string[];
+	try {
+		entries = readdirSync(releasesRoot);
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		// !mark
+		if (entry === activeVersion || entry === VERSION || !MANAGED_RELEASE_VERSION_RE.test(entry)) continue;
+		try {
+			rmSync(join(releasesRoot, entry), { force: true, recursive: true });
+		} catch {
+			// Files may be in use (e.g. loaded native modules on Windows); retry on the next update.
+		}
+	}
+}
+
+function cleanupManagedStaging(managedRoot: string): void {
+	const stagingRoot = join(managedRoot, "staging");
+	try {
+		for (const entry of readdirSync(stagingRoot)) {
+			// !mark
+			if (entry.startsWith("update-")) {
+				rmSync(join(stagingRoot, entry), { force: true, recursive: true });
+			}
+		}
+	} catch {
+		// The staging directory does not exist yet or is not writable.
+	}
+}
+```
+
+## !!steps The update lock
+
+`runManagedSelfUpdate` validates the version string, then takes a `proper-lockfile` lock. An `ELOCKED` error becomes a friendly message. `cleanupManagedInstall` is the exported variant used at startup: it takes the lock synchronously and silently gives up if an update is live.
+
+```ts ! package-manager-cli.ts
+export function cleanupManagedInstall(): void {
+	let managedRoot: string | undefined;
+	try {
+		managedRoot = getActiveManagedInstallRoot();
+	} catch {
+		return;
+	}
+	if (!managedRoot) return;
+
+	try {
+		// !mark
+		const releaseLock = lockfile.lockSync(join(managedRoot, "update"), { realpath: false });
+		try {
+			cleanupManagedStaging(managedRoot);
+		} finally {
+			releaseLock();
+		}
+	} catch {
+		// A live update owns the staging directory, or cleanup is unavailable.
+	}
+}
+
+async function runManagedSelfUpdate(managedRoot: string, version: string): Promise<void> {
+	if (!MANAGED_RELEASE_VERSION_RE.test(version)) {
+		throw new Error(`Invalid managed release version: ${version}`);
+	}
+
+	// !mark
+	let releaseLock: () => Promise<void>;
+	try {
+		releaseLock = await lockfile.lock(join(managedRoot, "update"), { realpath: false });
+	} catch (error: unknown) {
+		// !mark(1:3)
+		if (error instanceof Error && "code" in error && error.code === "ELOCKED") {
+			throw new Error("Another managed Pi update is already running.");
+		}
+		throw error;
+	}
+```
+
+## !!steps The managed update itself
+
+If the release directory already exists it is verified and activated. Otherwise it is staged in a temp directory, installed, verified, renamed into `releases` and activated, and the stage directory is always removed in the `finally` block. The installer base URL can be overridden by `PI_INSTALLER_API_BASE`.
+
+```ts ! package-manager-cli.ts
+
+	let stageDir: string | undefined;
+	try {
+		cleanupManagedStaging(managedRoot);
+		// !mark
+		const installerApiBase = (process.env.PI_INSTALLER_API_BASE?.trim() || DEFAULT_INSTALLER_API_BASE).replace(
+			/\/+$/,
+			"",
+		);
+		const releaseUrl = `${installerApiBase}/${encodeURIComponent(version)}`;
+		const stagingRoot = join(managedRoot, "staging");
+		const releasesRoot = join(managedRoot, "releases");
+		mkdirSync(releasesRoot, { recursive: true });
+		const releaseDir = join(releasesRoot, version);
+		// !mark
+		if (existsSync(releaseDir)) {
+			verifyManagedRelease(releaseDir, version);
+			activateManagedRelease(managedRoot, version);
+			pruneManagedReleases(managedRoot, version);
+			return;
+		}
+
+		mkdirSync(stagingRoot, { recursive: true });
+		stageDir = mkdtempSync(join(stagingRoot, "update-"));
+		const [packageJsonContent, packageLockContent] = await Promise.all([
+			fetchInstallerArtifact(`${releaseUrl}/package.json`, "package.json"),
+			fetchInstallerArtifact(`${releaseUrl}/package-lock.json`, "package-lock.json"),
+		]);
+		writeFileSync(join(stageDir, "package.json"), packageJsonContent);
+		writeFileSync(join(stageDir, "package-lock.json"), packageLockContent);
+
+		// !mark(1:4)
+		await runManagedNpmCi(stageDir);
+		verifyManagedRelease(stageDir, version);
+		renameSync(stageDir, releaseDir);
+		activateManagedRelease(managedRoot, version);
+		pruneManagedReleases(managedRoot, version);
+	} finally {
+		if (stageDir) rmSync(stageDir, { force: true, recursive: true });
+		await releaseLock();
+	}
+}
+```
+
+## !!steps Parsing flags
+
+`parsePackageCommand` maps `uninstall` to `remove` and collects flags. Errors are not thrown but recorded (`invalidOption`, `missingOptionValue`, `conflictingOptions`), keeping the first of each, so the handler can report them in a fixed order. `-l` is valid only for install and remove; `--self`, `--extensions`, `--models`, `--all` and `--force` only for update.
+
+```ts ! package-manager-cli.ts
+function parsePackageCommand(args: string[]): PackageCommandOptions | undefined {
+	const [rawCommand, ...rest] = args;
+	let command: PackageCommand | undefined;
+	if (rawCommand === "uninstall") {
+		command = "remove";
+	} else if (rawCommand === "install" || rawCommand === "remove" || rawCommand === "update" || rawCommand === "list") {
+		command = rawCommand;
+	}
+	if (!command) {
+		return undefined;
+	}
+
+	let local = false;
+	let force = false;
+	let projectTrustOverride: boolean | undefined;
+	let help = false;
+	let invalidOption: string | undefined;
+	let invalidArgument: string | undefined;
+	let missingOptionValue: string | undefined;
+	let conflictingOptions: string | undefined;
+	let source: string | undefined;
+	let selfFlag = false;
+	let extensionsFlag = false;
+	let modelsFlag = false;
+	let allFlag = false;
+	let extensionFlagSource: string | undefined;
+
+	for (let index = 0; index < rest.length; index++) {
+		const arg = rest[index];
+		if (arg === "-h" || arg === "--help") {
+			help = true;
+			continue;
+		}
+
+		// !mark
+		if (arg === "-l" || arg === "--local") {
+// ...
+		// !mark
+		if (arg === "--approve" || arg === "-a") {
+			projectTrustOverride = true;
+			continue;
+		}
+
+		if (arg === "--no-approve" || arg === "-na") {
+			projectTrustOverride = false;
+			continue;
+		}
+
+		if (arg === "--force") {
+			if (command === "update") {
+				force = true;
+			} else {
+				invalidOption = invalidOption ?? arg;
+			}
+			continue;
+		}
+```
+
+## !!steps Choosing the update target
+
+Conflicts are detected before a target is chosen. `--models` and `--extension` win over other flags, a positional source of `self` or `pi` selects self, and any other positional source selects one extension. With no arguments the target is `self` and a note says extensions were skipped.
+
+```ts ! package-manager-cli.ts
+	let updateTarget: UpdateTarget | undefined;
+	let showExtensionsSkippedNote = false;
+	if (command === "update") {
+		if (allFlag && (selfFlag || extensionsFlag || modelsFlag || extensionFlagSource)) {
+			conflictingOptions =
+				conflictingOptions ?? "--all cannot be combined with --self, --extensions, --models, or --extension";
+		}
+		if (allFlag && source) {
+			conflictingOptions = conflictingOptions ?? "--all cannot be combined with a positional source";
+		}
+
+		// !mark
+		if (modelsFlag) {
+			if (selfFlag || extensionsFlag || allFlag || extensionFlagSource) {
+				conflictingOptions =
+					conflictingOptions ?? "--models cannot be combined with --self, --extensions, --all, or --extension";
+			}
+			if (source) {
+				conflictingOptions = conflictingOptions ?? "--models cannot be combined with a positional source";
+			}
+			updateTarget = { type: "models" };
+		} else if (extensionFlagSource) {
+			if (selfFlag || extensionsFlag || allFlag) {
+				conflictingOptions =
+					conflictingOptions ?? "--extension cannot be combined with --self, --extensions, or --all";
+			}
+			if (source) {
+				conflictingOptions = conflictingOptions ?? "--extension cannot be combined with a positional source";
+			}
+			updateTarget = { type: "extensions", source: extensionFlagSource };
+		// !mark(1:3)
+		} else if (source) {
+			const sourceIsSelf = source === "self" || source === "pi";
+			if (sourceIsSelf) {
+				updateTarget = extensionsFlag ? { type: "all" } : { type: "self" };
+			} else {
+				if (extensionsFlag || selfFlag || allFlag) {
+					conflictingOptions =
+						conflictingOptions ??
+						"positional update targets cannot be combined with --self, --extensions, or --all";
+				}
+				updateTarget = { type: "extensions", source };
+			}
+		} else if (allFlag) {
+			updateTarget = { type: "all" };
+		} else if (selfFlag && extensionsFlag) {
+			updateTarget = { type: "all" };
+		} else if (selfFlag) {
+			updateTarget = { type: "self" };
+		} else if (extensionsFlag) {
+			updateTarget = { type: "extensions" };
+		// !mark(1:3)
+		} else {
+			updateTarget = { type: "self" };
+			showExtensionsSkippedNote = true;
+		}
+	}
+```
+
+## !!steps Project trust for commands
+
+`createCommandSettingsManager` starts untrusted. For `update` only the saved decision (or an explicit override) is used. Otherwise, if the project has resources that need trust, the project-trust extensions are loaded and [resource-loader.ts](/docs/src/core/resource-loader.ts) and `resolveProjectTrusted` decide, prompting only when a TTY is present.
+
+```ts ! package-manager-cli.ts
+function getCommandAppMode(): AppMode {
+	// !mark
+	return process.stdin.isTTY && process.stdout.isTTY ? "interactive" : "print";
+}
+
+function reportProjectTrustWarnings(warnings: readonly string[]): void {
+	for (const warning of warnings) {
+		console.error(chalk.yellow(`Warning: ${warning}`));
+	}
+}
+
+async function createCommandSettingsManager(options: {
+	cwd: string;
+	agentDir: string;
+	projectTrustOverride?: boolean;
+	useSavedProjectTrustOnly?: boolean;
+	extensionFactories?: InlineExtension[];
+}): Promise<CommandSettingsResult> {
+	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted: false });
+	const projectTrustWarnings: string[] = [];
+	const trustStore = new ProjectTrustStore(options.agentDir);
+	// !mark(1:5)
+	if (options.useSavedProjectTrustOnly) {
+		const savedProjectTrusted = trustStore.get(options.cwd) === true;
+		settingsManager.setProjectTrusted(options.projectTrustOverride ?? savedProjectTrusted);
+		return { settingsManager, projectTrustWarnings };
+	}
+
+	const appMode = getCommandAppMode();
+	const extensionsResult =
+		options.projectTrustOverride === undefined && hasTrustRequiringProjectResources(options.cwd)
+			? await new DefaultResourceLoader({
+					cwd: options.cwd,
+					agentDir: options.agentDir,
+					settingsManager,
+					extensionFactories: options.extensionFactories,
+				}).loadProjectTrustExtensions()
+			: undefined;
+	for (const error of extensionsResult?.errors ?? []) {
+		projectTrustWarnings.push(`Failed to load extension "${error.path}": ${error.error}`);
+	}
+
+	// !mark
+	const projectTrusted = await resolveProjectTrusted({
+		cwd: options.cwd,
+		trustStore,
+		trustOverride: options.projectTrustOverride,
+		defaultProjectTrust: settingsManager.getDefaultProjectTrust(),
+		extensionsResult,
+		projectTrustContext: createProjectTrustContext({
+			cwd: options.cwd,
+			mode: appMode,
+			settingsManager,
+			hasUI: appMode === "interactive",
+		}),
+		onExtensionError: (message) => projectTrustWarnings.push(message),
+	});
+	settingsManager.setProjectTrusted(projectTrusted);
+	return { settingsManager, projectTrustWarnings };
+}
+```
+
+## !!steps Dispatching install, remove and list
+
+`handlePackageCommand` reports parse errors first, then handles `update --models` without needing settings. Installing or removing locally requires a trusted project. Each command delegates to `DefaultPackageManager`; `list` prints user and project packages separately and marks filtered ones.
+
+```ts ! package-manager-cli.ts
+	// !mark
+	if (options.command === "update" && options.updateTarget?.type === "models") {
+		try {
+			await refreshModelCatalogs(getAgentDir());
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : "Unknown model catalog refresh error";
+			console.error(chalk.red(`Error: ${message}`));
+			process.exitCode = 1;
+		}
+		return true;
+	}
+
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const writesProjectPackageConfig = (options.command === "install" || options.command === "remove") && options.local;
+	const { settingsManager, projectTrustWarnings } = await createCommandSettingsManager({
+		cwd,
+		agentDir,
+		projectTrustOverride: options.projectTrustOverride,
+		useSavedProjectTrustOnly: options.command === "update",
+		extensionFactories: runtimeOptions.extensionFactories,
+	});
+	reportProjectTrustWarnings(projectTrustWarnings);
+	// !mark
+	if (!settingsManager.isProjectTrusted() && writesProjectPackageConfig) {
+		console.error(chalk.red("Project is not trusted. Use --approve to modify local package config."));
+		process.exitCode = 1;
+		return true;
+	}
+	reportSettingsErrors(settingsManager, "package command");
+	const selfUpdateNpmCommand = settingsManager.getGlobalSettings().npmCommand;
+
+	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+
+	packageManager.setProgressCallback((event) => {
+		if (event.type === "start") {
+			process.stdout.write(chalk.dim(`${event.message}\n`));
+		}
+	});
+
+	try {
+		switch (options.command) {
+			case "install":
+				// !mark
+				await packageManager.installAndPersist(source!, { local: options.local });
+				console.log(chalk.green(`Installed ${source}`));
+				return true;
+
+			case "remove": {
+```
+
+## !!steps Self-update with a managed install
+
+The `update` case updates extensions first, then self. A managed install rejects `--force`, shows the release note, runs the managed update and reports the version change. Errors set `process.exitCode` rather than throwing.
+
+```ts ! package-manager-cli.ts
+				if (updateTargetIncludesExtensions(target)) {
+					const updateSource = target.type === "extensions" ? target.source : undefined;
+					await packageManager.update(updateSource);
+					if (updateSource) {
+						console.log(chalk.green(`Updated ${updateSource}`));
+					} else {
+						console.log(chalk.green("Updated packages"));
+					}
+				}
+				if (updateTargetIncludesSelf(target)) {
+					const managedInstallRoot = getActiveManagedInstallRoot();
+					// !mark
+					if (managedInstallRoot && options.force) {
+						console.error(
+							chalk.red(
+								`Managed ${APP_NAME} installations do not support --force; rerun the installer to repair this installation.`,
+							),
+						);
+						process.exitCode = 1;
+						return true;
+					}
+					// !mark(1:3)
+					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
+					if (!selfUpdatePlan.shouldRun) {
+						return true;
+					}
+					if (managedInstallRoot) {
+						if (selfUpdatePlan.note) {
+							printSelfUpdateNote(selfUpdatePlan.note);
+						}
+						try {
+							console.log(chalk.dim(`Updating managed ${APP_NAME} installation...`));
+							// !mark
+							await runManagedSelfUpdate(managedInstallRoot, selfUpdatePlan.version);
+						} catch (error: unknown) {
+							const message = error instanceof Error ? error.message : "Unknown managed update error";
+							console.error(chalk.red(`Error: ${message}`));
+							process.exitCode = 1;
+							return true;
+						}
+						console.log(chalk.green(`Updated ${APP_NAME} from ${VERSION} to ${selfUpdatePlan.version}`));
+						return true;
+					}
+```
+
+## !!steps Self-update for npm and pnpm installs
+
+Windows is limited to npm and pnpm installs. The command comes from [config.ts](/docs/src/config.ts), which returns undefined when the install cannot self-update. For npm on Windows the native dependencies are quarantined first (see [windows-self-update.ts](/docs/src/utils/windows-self-update.ts)); steps run through `spawnProcess` in [child-process.ts](/docs/src/utils/child-process.ts) with inherited stdio.
+
+```ts ! package-manager-cli.ts
+					const installMethod = detectInstallMethod();
+					// !mark
+					if (process.platform === "win32" && installMethod !== "npm" && installMethod !== "pnpm") {
+						console.error(
+							chalk.red(`${APP_NAME} self-update on Windows is only supported for npm and pnpm installs.`),
+						);
+						console.error(chalk.dim(`Detected install method: ${installMethod}. Update ${APP_NAME} manually.`));
+						process.exitCode = 1;
+						return true;
+					}
+					const selfUpdateTarget = {
+						packageName: selfUpdatePlan.packageName,
+						installSpec: selfUpdatePlan.installSpec,
+					};
+					// !mark
+					const selfUpdateCommand = getSelfUpdateCommand(PACKAGE_NAME, selfUpdateNpmCommand, selfUpdateTarget);
+					if (!selfUpdateCommand) {
+						printSelfUpdateUnavailable(selfUpdateNpmCommand, selfUpdateTarget);
+						process.exitCode = 1;
+						return true;
+					}
+					if (selfUpdatePlan.note) {
+						printSelfUpdateNote(selfUpdatePlan.note);
+					}
+					try {
+						// !mark(1:3)
+						if (installMethod === "npm") {
+							prepareWindowsNpmSelfUpdate();
+						}
+						await runSelfUpdate(selfUpdateCommand);
+					} catch (error: unknown) {
+						const message = error instanceof Error ? error.message : "Unknown package command error";
+						console.error(chalk.red(`Error: ${message}`));
+						if (installMethod === "pnpm") {
+							printPnpmSelfUpdateMetadataHint();
+						}
+						printSelfUpdateFallback(selfUpdateCommand);
+						process.exitCode = 1;
+						return true;
+					}
+					console.log(chalk.green(`Updated ${APP_NAME} from ${VERSION} to ${selfUpdatePlan.version}`));
+```
+
+## !!steps Migration hint
+
+After a successful npm update, the user is told the install does not pin dependencies and shown the installer command to migrate. The comment notes pnpm, yarn and bun are not migrated.
+
+```ts ! package-manager-cli.ts
+					// The pi.dev installer migrates global npm installs to a managed install
+					// that pins all dependencies. It does not migrate pnpm, yarn, or bun installs.
+					// !mark
+					if (installMethod === "npm") {
+						const installerCommand =
+							process.platform === "win32"
+								? 'powershell -c "irm https://pi.dev/install.ps1 | iex"'
+								: "curl -fsSL https://pi.dev/install.sh | sh";
+						console.log();
+						console.log(chalk.yellow(`This npm installation of ${APP_NAME} does not pin its dependencies.`));
+						console.log(chalk.yellow("Run the installer to migrate to a managed installation that does:"));
+						console.log();
+						console.log(`  ${chalk.bold(installerCommand)}`);
+					}
+				}
+				return true;
+			}
+		}
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : "Unknown package command error";
+		console.error(chalk.red(`Error: ${message}`));
+		process.exitCode = 1;
+		return true;
+	}
+}
+```
+
+</Scrollycoding>
+
+The latest-release lookup uses [version-check.ts](/docs/src/utils/version-check.ts) and the user-agent comes from [pi-user-agent.ts](/docs/src/utils/pi-user-agent.ts). Design note: nearly all failures become a message plus `process.exitCode = 1` and a returned true, so the entry point never has to catch. The `config` handler (`handleConfigCommand`) is the exception, ending with `process.exit(0)` after the TUI closes.

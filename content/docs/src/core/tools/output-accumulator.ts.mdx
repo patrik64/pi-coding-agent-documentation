@@ -1,0 +1,211 @@
+---
+title: "output-accumulator.ts"
+description: "Bounded-memory collector for streaming command output: keeps a tail for display and spills to a temp file when output gets large"
+source: "src/core/tools/output-accumulator.ts"
+full: true
+---
+
+A shell command can print gigabytes. The model only needs the end of it, the
+terminal only needs enough to show a live preview, but the user may still want
+the whole thing afterwards. `OutputAccumulator` serves all three: it counts
+everything, keeps a bounded decoded tail in memory, and writes the raw bytes to
+a temp file once output exceeds the limits.
+
+The only consumer in the source tree is [bash.ts](/docs/src/core/tools/bash.ts),
+which creates one per command. Truncation rules come from
+[truncate.ts](/docs/src/core/tools/truncate.ts) and the temp file from
+`createOutputFileStream` in [output-files.ts](/docs/src/utils/output-files.ts).
+
+<Scrollycoding>
+
+## !!steps What the accumulator tracks
+
+The state splits into counters (raw bytes, decoded bytes, lines, current line
+length), the rolling tail, and the optional temp file. `rawChunks` holds the
+original buffers only until a temp file exists. `maxRollingBytes` is twice
+`maxBytes`, giving the tail slack so a snapshot can still be cut to the limit
+by line boundaries.
+
+```ts ! output-accumulator.ts
+export class OutputAccumulator {
+	private readonly maxLines: number;
+	private readonly maxBytes: number;
+	private readonly maxRollingBytes: number;
+	private readonly tempFilePrefix: string;
+	private readonly decoder = new TextDecoder();
+
+	private rawChunks: Buffer[] = [];
+	private tailText = "";
+	private tailBytes = 0;
+	private tailStartsAtLineBoundary = true;
+	private totalRawBytes = 0;
+	private totalDecodedBytes = 0;
+	private completedLines = 0;
+	private totalLines = 0;
+	private currentLineBytes = 0;
+	private hasOpenLine = false;
+	private finished = false;
+```
+
+## !!steps Appending chunks
+
+A single `TextDecoder` is used with `stream: true`, so a multi-byte character
+split across two chunks decodes correctly. The raw buffer is kept separately for
+the file. As soon as the limits are crossed, `ensureTempFile` is called and
+every later chunk is written straight to the stream; before that, chunks are
+buffered in memory.
+
+```ts ! output-accumulator.ts
+	append(data: Buffer): void {
+		if (this.finished) {
+			throw new Error("Cannot append to a finished output accumulator");
+		}
+
+		this.totalRawBytes += data.length;
+		this.appendDecodedText(this.decoder.decode(data, { stream: true }));
+
+		if (this.tempFileStream || this.shouldUseTempFile()) {
+			this.ensureTempFile();
+			this.tempFileStream?.write(data);
+		} else if (data.length > 0) {
+			this.rawChunks.push(data);
+		}
+	}
+```
+
+## !!steps Counting lines without storing them
+
+`appendDecodedText` counts newlines in the new text, remembers the length of
+the unfinished last line, and computes `totalLines` as completed lines plus one
+if a partial line is open. It also appends to the tail and calls `trimTail` once
+the tail grows past twice the rolling limit.
+
+```ts ! output-accumulator.ts
+	private appendDecodedText(text: string): void {
+		if (text.length === 0) {
+			return;
+		}
+
+		const bytes = byteLength(text);
+		this.totalDecodedBytes += bytes;
+		this.tailText += text;
+		this.tailBytes += bytes;
+		if (this.tailBytes > this.maxRollingBytes * 2) {
+			this.trimTail();
+		}
+
+		let newlines = 0;
+		let lastNewline = -1;
+		for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
+			newlines++;
+			lastNewline = i;
+		}
+```
+
+## !!steps Trimming the tail on character boundaries
+
+`trimTail` works on the UTF-8 bytes: it keeps the last `maxRollingBytes` and
+then advances past any continuation bytes (those matching the bit pattern
+`10xxxxxx`) so it never starts in the middle of a character. It also records
+whether the cut landed exactly after a newline, which `getSnapshotText` uses to
+drop a partial first line.
+
+```ts ! output-accumulator.ts
+	private trimTail(): void {
+		const buffer = Buffer.from(this.tailText, "utf-8");
+		if (buffer.length <= this.maxRollingBytes) {
+			this.tailBytes = buffer.length;
+			return;
+		}
+
+		let start = buffer.length - this.maxRollingBytes;
+		while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) {
+			start++;
+		}
+
+		this.tailStartsAtLineBoundary = start === 0 ? this.tailStartsAtLineBoundary : buffer[start - 1] === 0x0a;
+		this.tailText = buffer.subarray(start).toString("utf-8");
+		this.tailBytes = byteLength(this.tailText);
+	}
+```
+
+## !!steps Snapshots for display
+
+`snapshot` runs `truncateTail` over the retained text, then overrides the totals
+with the true counts, because the tail is only a window. `truncated` is based on
+the full counters, not on the window. With `persistIfTruncated` the temp file is
+guaranteed to exist, and the snapshot reports its path so the model can be told
+where the full output went.
+
+```ts ! output-accumulator.ts
+	snapshot(options: { persistIfTruncated?: boolean } = {}): OutputSnapshot {
+		const tailTruncation = truncateTail(this.getSnapshotText(), {
+			maxLines: this.maxLines,
+			maxBytes: this.maxBytes,
+		});
+		const truncated = this.totalLines > this.maxLines || this.totalDecodedBytes > this.maxBytes;
+		const truncatedBy = truncated
+			? (tailTruncation.truncatedBy ?? (this.totalDecodedBytes > this.maxBytes ? "bytes" : "lines"))
+			: null;
+```
+
+## !!steps Spilling to disk
+
+`ensureTempFile` is idempotent. On first call it opens the stream and flushes
+the buffered raw chunks into it, then drops them so memory use stops growing.
+`shouldUseTempFile` triggers on any of three conditions: raw bytes, decoded
+bytes or line count over the limit.
+
+```ts ! output-accumulator.ts
+	private shouldUseTempFile(): boolean {
+		return (
+			this.totalRawBytes > this.maxBytes || this.totalDecodedBytes > this.maxBytes || this.totalLines > this.maxLines
+		);
+	}
+
+	private ensureTempFile(): void {
+		if (this.tempFilePath) {
+			return;
+		}
+		const { path, stream } = createOutputFileStream(this.tempFilePrefix, ".log");
+		this.tempFilePath = path;
+		this.tempFileStream = stream;
+		for (const chunk of this.rawChunks) {
+			this.tempFileStream.write(chunk);
+		}
+		this.rawChunks = [];
+	}
+```
+
+## !!steps Reading everything back, with a cap
+
+`readFullOutput` is for callers that can accept more than the display window. With
+no temp file it decodes the in-memory chunks. With a file under the cap it reads
+it all. Over the cap it reads the first and last half and joins them around an
+omission marker. The tail start skips continuation bytes, and the head uses a
+streaming decode, so neither half contains a broken character.
+
+```ts ! output-accumulator.ts
+			const headBytes = Math.floor(maxBytes / 2);
+			const tailBytes = maxBytes - headBytes;
+			const head = Buffer.alloc(headBytes);
+			const tail = Buffer.alloc(tailBytes);
+			await file.read(head, 0, headBytes, 0);
+			await file.read(tail, 0, tailBytes, size - tailBytes);
+			// Cut at character boundaries: streaming decode holds back an incomplete trailing sequence,
+			// and the tail skips leading continuation bytes.
+			const headText = new TextDecoder().decode(head, { stream: true });
+			let tailStart = 0;
+			while (tailStart < tail.length && (tail[tailStart] & 0xc0) === 0x80) tailStart++;
+			const tailText = new TextDecoder().decode(tail.subarray(tailStart));
+			const omitted = size - headBytes - tailBytes;
+			return { content: `${headText}\n\n[... ${omitted} bytes omitted ...]\n\n${tailText}`, truncated: true };
+```
+
+</Scrollycoding>
+
+The lifecycle that [bash.ts](/docs/src/core/tools/bash.ts) follows is: `append`
+for each chunk, `snapshot` for live updates, `finish` to flush the decoder,
+`closeTempFile` to wait for the stream to end, and then `readFullOutput` if the
+full text is wanted. The `omitted` count slightly overstates what is dropped,
+because the bytes skipped at the tail's start are not subtracted.

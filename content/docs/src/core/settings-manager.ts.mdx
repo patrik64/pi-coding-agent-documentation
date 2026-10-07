@@ -1,0 +1,501 @@
+---
+title: "settings-manager.ts"
+description: "Layered global and project settings with deep merge, file locking, dirty-field tracking and a queued write path"
+source: "src/core/settings-manager.ts"
+full: true
+---
+
+pi reads configuration from two JSON files: a global one in the agent directory and a project one under the working directory's config folder. This file defines the `Settings` shape, merges the two layers, and offers around a hundred typed getters and setters over them.
+
+Most of the code is repetitive accessors. The part worth studying is how writes work: a setter changes only the in-memory global layer and records which keys it touched, and a queued background write then merges just those keys into whatever is currently on disk. That way two running pi instances, or a hand edit of the file, are not clobbered by stale in-memory state.
+
+<Scrollycoding>
+
+## !!steps One interface describes every setting
+
+`Settings` is a flat bag of optional fields, with defaults described in trailing comments. Nested groups such as `compaction`, `retry`, `terminal` and `images` have their own interfaces. Getters apply those defaults at read time, so an absent key and a default value are indistinguishable on disk.
+
+Two fields carry notes about scope. `defaultProjectTrust` and `deviceId` are marked global-only, and `cacheWarming` is global-only because each refresh costs money.
+
+```ts ! settings-manager.ts
+export interface Settings {
+	lastChangelogVersion?: string;
+	defaultProvider?: string;
+	defaultModel?: string;
+	defaultThinkingLevel?: ThinkingLevel;
+	modelThinkingLevels?: Record<string, ThinkingLevel>; // per-model default thinking level overrides keyed by "provider/modelId"
+	transport?: TransportSetting; // default: "auto"
+	steeringMode?: "all" | "one-at-a-time";
+	followUpMode?: "all" | "one-at-a-time";
+	theme?: string;
+	compaction?: CompactionSettings;
+	branchSummary?: BranchSummarySettings;
+	retry?: RetrySettings;
+// ...
+	defaultProjectTrust?: DefaultProjectTrust; // default: "ask"; global setting only
+// ...
+	deviceId?: string; // stable UUID of this installation, created when a login first needs it; global setting only
+// ...
+	cacheWarming?: CacheWarmingMode; // default: "streaming"; global only because each refresh costs money
+```
+
+## !!steps Deep merge with project on top
+
+The effective settings are the global layer with the project layer merged over it. `deepMergeObjects` recurses only into plain objects: arrays and primitives in the override replace the base value, and an override of `undefined` is skipped so an unset field never erases a global one.
+
+So a project `packages` array replaces the global array outright, while a project `compaction.enabled` changes just that one key.
+
+```ts ! settings-manager.ts
+function isMergeableObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function deepMergeObjects(base: Record<string, unknown>, overrides: Record<string, unknown>): Record<string, unknown> {
+	const result = { ...base };
+
+	for (const key of Object.keys(overrides)) {
+		const overrideValue = overrides[key];
+		if (overrideValue === undefined) {
+			continue;
+		}
+
+		const baseValue = base[key];
+		result[key] =
+			isMergeableObject(baseValue) && isMergeableObject(overrideValue)
+				? deepMergeObjects(baseValue, overrideValue)
+				: overrideValue;
+	}
+
+	return result;
+}
+```
+
+## !!steps defaultTools is the exception
+
+Tool lists need to be extendable, so `defaultTools` bypasses the generic merge. A list of plain names replaces the inherited one. A list made only of `+name` and `-name` entries is appended to the inherited list instead, and `resolveDefaultTools` later applies the modifiers in order on top of the built-in read, bash, edit and write set.
+
+If the entries contain no plain names, the built-in defaults are the starting point; an empty list yields no tools at all.
+
+```ts ! settings-manager.ts
+/**
+ * Merge `defaultTools` of two settings layers. A list with plain tool names replaces the inherited
+ * one; a list of only `+name`/`-name` entries is appended, so it modifies the inherited selection.
+ */
+function mergeDefaultTools(base: string[] | undefined, overrides: string[] | undefined): string[] | undefined {
+	if (overrides === undefined) return base;
+	// Settings files are not validated; a malformed value replaces instead of throwing here.
+	if (!Array.isArray(base) || !Array.isArray(overrides) || !overrides.every(isToolModifier)) return overrides;
+	return [...base, ...overrides];
+}
+
+/**
+ * Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
+ * and `-name` removes a tool, in list order.
+ */
+function resolveDefaultTools(entries: string[]): string[] {
+	const plain = entries.filter((entry) => !isToolModifier(entry));
+	const tools = plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES];
+	for (const entry of entries) {
+		if (!isToolModifier(entry)) continue;
+		const name = entry.slice(1);
+		const index = tools.indexOf(name);
+		if (entry.startsWith("+") && index === -1 && name) tools.push(name);
+		else if (entry.startsWith("-") && index !== -1) tools.splice(index, 1);
+	}
+	return tools;
+}
+```
+
+## !!steps Storage behind a small interface
+
+`SettingsStorage` has one method, `withLock`, which gives a callback the current file text and optionally takes new text back. A file-based implementation and an in-memory one (used by `inMemory` and in tests) both satisfy it, so everything else is storage-agnostic.
+
+For files, the lock is taken with `proper-lockfile`, retried up to 10 times at 20 ms intervals when the error is `ELOCKED`. The wait is a busy loop because the whole API is synchronous.
+
+```ts ! settings-manager.ts
+export interface SettingsStorage {
+	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+}
+// ...
+	private acquireLockSyncWithRetry(path: string): () => void {
+		const maxAttempts = 10;
+		const delayMs = 20;
+		let lastError: unknown;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return lockfile.lockSync(path, { realpath: false });
+			} catch (error) {
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				if (code !== "ELOCKED" || attempt === maxAttempts) {
+					throw error;
+				}
+				lastError = error;
+				const start = Date.now();
+				while (Date.now() - start < delayMs) {
+					// Sleep synchronously to avoid changing callers to async.
+				}
+			}
+		}
+```
+
+## !!steps Locking only when needed
+
+`withLock` avoids creating files for reads. If the file exists it locks before reading. If it does not exist, nothing is created unless the callback returns text to write, in which case the directory is created and the lock is taken just before the write. Returning `undefined` from the callback means read-only.
+
+The lock is released in a `finally`, so a throwing callback does not leave the file locked.
+
+```ts ! settings-manager.ts
+	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
+		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const dir = dirname(path);
+
+		let release: (() => void) | undefined;
+		try {
+			// Only create directory and lock if file exists or we need to write
+			const fileExists = existsSync(path);
+			if (fileExists) {
+				release = this.acquireLockSyncWithRetry(path);
+			}
+			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
+			const next = fn(current);
+			if (next !== undefined) {
+				// Only create directory when we actually need to write
+				if (!existsSync(dir)) {
+					mkdirSync(dir, { recursive: true });
+				}
+				if (!release) {
+					release = this.acquireLockSyncWithRetry(path);
+				}
+				writeFileSync(path, next, "utf-8");
+			}
+		} finally {
+			if (release) {
+				release();
+			}
+		}
+	}
+```
+
+## !!steps Loading never throws, and untrusted projects load nothing
+
+`loadFromStorage` returns an empty object for an untrusted project scope without even reading the file. Otherwise it strips a BOM, parses the JSON and runs migration. `tryLoadFromStorage` converts any exception into an `error` field so the manager can still start with that layer empty.
+
+A layer that failed to load is remembered, and writes to it are later skipped so a corrupt file is never overwritten with partial data.
+
+```ts ! settings-manager.ts
+	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
+		if (scope === "project" && !projectTrusted) {
+			return {};
+		}
+
+		let content: string | undefined;
+		storage.withLock(scope, (current) => {
+			content = current;
+			return undefined;
+		});
+
+		if (!content) {
+			return {};
+		}
+		const settings = JSON.parse(stripBom(content));
+		return SettingsManager.migrateSettings(settings);
+	}
+
+	private static tryLoadFromStorage(
+		storage: SettingsStorage,
+		scope: SettingsScope,
+		projectTrusted = true,
+	): { settings: Settings; error: Error | null } {
+		try {
+			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
+		} catch (error) {
+			return { settings: {}, error: error as Error };
+		}
+	}
+```
+
+## !!steps Migrating old formats on read
+
+`migrateSettings` upgrades legacy keys in memory as they are loaded: `queueMode` becomes `steeringMode`, the old `websockets` boolean becomes the `transport` enum, an object-shaped `skills` setting becomes the array form, and `retry.maxDelayMs` moves under `retry.provider.maxRetryDelayMs`.
+
+The file on disk is only rewritten when some later setter happens to persist that scope; the same migration is applied again to the file's contents inside `persistScopedSettings`.
+
+```ts ! settings-manager.ts
+	private static migrateSettings(settings: Record<string, unknown>): Settings {
+		// Migrate queueMode -> steeringMode
+		if ("queueMode" in settings && !("steeringMode" in settings)) {
+			settings.steeringMode = settings.queueMode;
+			delete settings.queueMode;
+		}
+
+		// Migrate legacy websockets boolean -> transport enum
+		if (!("transport" in settings) && typeof settings.websockets === "boolean") {
+			settings.transport = settings.websockets ? "websocket" : "sse";
+			delete settings.websockets;
+		}
+// ...
+			if (
+				typeof retrySettings.maxDelayMs === "number" &&
+				(providerSettings?.maxRetryDelayMs === undefined || providerSettings?.maxRetryDelayMs === null)
+			) {
+				retrySettings.provider = {
+					...(providerSettings ?? {}),
+					maxRetryDelayMs: retrySettings.maxDelayMs,
+				};
+			}
+			delete retrySettings.maxDelayMs;
+		}
+```
+
+## !!steps Setters touch the global layer and track what changed
+
+A setter writes to `globalSettings`, calls `markModified` with the field (and, for nested groups, the nested key), then calls `save`. Tracking the nested key means that changing `compaction.enabled` does not take ownership of the user's other compaction fields on disk.
+
+Note that setters always target the global layer. Only a handful of path-list setters have project counterparts, covered below.
+
+```ts ! settings-manager.ts
+	setCompactionEnabled(enabled: boolean): void {
+		if (!this.globalSettings.compaction) {
+			this.globalSettings.compaction = {};
+		}
+		this.globalSettings.compaction.enabled = enabled;
+		this.markModified("compaction", "enabled");
+		this.save();
+	}
+// ...
+	private markModified(field: keyof Settings, nestedKey?: string): void {
+		this.modifiedFields.add(field);
+		if (nestedKey) {
+			if (!this.modifiedNestedFields.has(field)) {
+				this.modifiedNestedFields.set(field, new Set());
+			}
+			this.modifiedNestedFields.get(field)!.add(nestedKey);
+		}
+	}
+```
+
+## !!steps Saving is queued, not immediate
+
+`save` recomputes the merged settings, skips writing if the global file failed to load, snapshots the layer and the dirty sets, and hands the write to `enqueueWrite`. That method chains the task onto a promise, so writes run strictly in order; failures are recorded in an error list instead of being thrown, and the dirty set is cleared after a successful write.
+
+Callers who need the file to be current await `flush()`, and `drainErrors()` hands over accumulated failures once.
+
+```ts ! settings-manager.ts
+	private enqueueWrite(scope: SettingsScope, task: () => void): void {
+		this.writeQueue = this.writeQueue
+			.then(() => {
+				if (scope === "project") {
+					this.assertProjectTrustedForWrite();
+				}
+				task();
+				this.clearModifiedScope(scope);
+			})
+			.catch((error) => {
+				this.recordError(scope, error);
+			});
+	}
+// ...
+	private save(): void {
+		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+
+		if (this.globalSettingsLoadError) {
+			return;
+		}
+
+		const snapshotGlobalSettings = structuredClone(this.globalSettings);
+		const modifiedFields = new Set(this.modifiedFields);
+		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedNestedFields);
+
+		this.enqueueWrite("global", () => {
+			this.persistScopedSettings("global", snapshotGlobalSettings, modifiedFields, modifiedNestedFields);
+		});
+	}
+```
+
+## !!steps Merging only the dirty keys into the file
+
+`persistScopedSettings` re-reads the file under the lock and starts from its current contents. For each modified field it copies the in-memory value, except for nested groups, where it copies only the modified nested keys over the file's own nested object.
+
+This is what makes concurrent edits safe: another process that changed an unrelated key in between is preserved.
+
+```ts ! settings-manager.ts
+	private persistScopedSettings(
+		scope: SettingsScope,
+		snapshotSettings: Settings,
+		modifiedFields: Set<keyof Settings>,
+		modifiedNestedFields: Map<keyof Settings, Set<string>>,
+	): void {
+		this.storage.withLock(scope, (current) => {
+			const currentFileSettings = current
+				? SettingsManager.migrateSettings(JSON.parse(stripBom(current)) as Record<string, unknown>)
+				: {};
+			const mergedSettings: Settings = { ...currentFileSettings };
+			for (const field of modifiedFields) {
+				const value = snapshotSettings[field];
+				if (modifiedNestedFields.has(field) && typeof value === "object" && value !== null) {
+					const nestedModified = modifiedNestedFields.get(field)!;
+					const baseNested = (currentFileSettings[field] as Record<string, unknown>) ?? {};
+					const inMemoryNested = value as Record<string, unknown>;
+					const mergedNested = { ...baseNested };
+					for (const nestedKey of nestedModified) {
+						mergedNested[nestedKey] = inMemoryNested[nestedKey];
+					}
+					(mergedSettings as Record<string, unknown>)[field] = mergedNested;
+				} else {
+					(mergedSettings as Record<string, unknown>)[field] = value;
+				}
+			}
+
+			return JSON.stringify(mergedSettings, null, 2);
+		});
+	}
+```
+
+## !!steps Project trust changes what is loaded and writable
+
+An untrusted project must not influence behavior. `setProjectTrusted` clears the project layer immediately when trust is withdrawn, and reloads it from storage when trust is granted. Writes to the project file throw through `assertProjectTrustedForWrite` before anything changes.
+
+The broader trust model lives in [trust-manager.ts](/docs/src/core/trust-manager.ts) and [project-trust.ts](/docs/src/core/project-trust.ts).
+
+```ts ! settings-manager.ts
+	setProjectTrusted(trusted: boolean): void {
+		if (this.projectTrusted === trusted) {
+			return;
+		}
+
+		this.projectTrusted = trusted;
+		this.modifiedProjectFields.clear();
+		this.modifiedProjectNestedFields.clear();
+
+		if (!trusted) {
+			this.projectSettings = {};
+			this.projectSettingsLoadError = null;
+			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+			return;
+		}
+
+		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", trusted);
+		this.projectSettings = projectLoad.settings;
+		this.projectSettingsLoadError = projectLoad.error;
+		if (projectLoad.error) {
+			this.recordError("project", projectLoad.error);
+		}
+		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+	}
+// ...
+	private assertProjectTrustedForWrite(): void {
+		if (!this.projectTrusted) {
+			throw new Error("Project is not trusted; refusing to write project settings");
+		}
+	}
+```
+
+## !!steps Project writes replace the whole project layer
+
+Project setters go through `updateProjectSettings`, which clones the project layer, applies a mutation, marks the field and calls `saveProjectSettings`. That method assigns the clone as the new project layer, re-merges, and enqueues a write using the same dirty-field mechanism as the global path.
+
+Only package, extension, skill, prompt and theme lists have project setters. Everything else is global-only from code, though a user can still write any key into the project file by hand.
+
+```ts ! settings-manager.ts
+	private saveProjectSettings(settings: Settings): void {
+		this.assertProjectTrustedForWrite();
+		this.projectSettings = structuredClone(settings);
+		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+
+		if (this.projectSettingsLoadError) {
+			return;
+		}
+
+		const snapshotProjectSettings = structuredClone(this.projectSettings);
+		const modifiedFields = new Set(this.modifiedProjectFields);
+		const modifiedNestedFields = this.cloneModifiedNestedFields(this.modifiedProjectNestedFields);
+		this.enqueueWrite("project", () => {
+			this.persistScopedSettings("project", snapshotProjectSettings, modifiedFields, modifiedNestedFields);
+		});
+	}
+
+	private updateProjectSettings(field: keyof Settings, update: (settings: Settings) => void): void {
+		this.assertProjectTrustedForWrite();
+		const projectSettings = structuredClone(this.projectSettings);
+		update(projectSettings);
+		this.markProjectModified(field);
+		this.saveProjectSettings(projectSettings);
+	}
+```
+
+## !!steps Validated numeric settings
+
+Compaction token counts are resolved in three steps: a per-model override keyed `provider/modelId`, then the ordinary value, then the built-in default of 16384 reserve and 20000 kept tokens. Unlike most getters, this one throws on a bad value, requiring a non-negative safe integer, because a silently wrong compaction budget could break a session.
+
+The compaction logic that consumes it is in [compaction.ts](/docs/src/core/compaction/compaction.ts).
+
+```ts ! settings-manager.ts
+	private getCompactionTokenSetting(
+		field: keyof CompactionModelOverride,
+		model?: Pick<Model<string>, "provider" | "id">,
+	): number {
+		const compaction = this.settings.compaction;
+		const ordinary = compaction?.[field];
+		if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
+			throw new Error(
+				`Invalid compaction.${field} setting: ${String(ordinary)}. Expected a non-negative safe integer.`,
+			);
+		}
+
+		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
+		const entry = modelKey !== undefined ? compaction?.modelOverrides?.[modelKey] : undefined;
+		if (entry !== undefined && !isMergeableObject(entry)) {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"] setting: ${String(entry)}. Expected an object.`,
+			);
+		}
+		const override = entry?.[field];
+		if (override !== undefined && (typeof override !== "number" || !Number.isSafeInteger(override) || override < 0)) {
+			throw new Error(
+				`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected a non-negative safe integer.`,
+			);
+		}
+		return override ?? ordinary ?? DEFAULT_COMPACTION_TOKEN_SETTINGS[field];
+	}
+```
+
+## !!steps Settings that ignore the project layer
+
+A few getters read `globalSettings` directly instead of the merged view: `getCacheWarmingMode`, `getDefaultProjectTrust` and `getOrCreateDeviceId`. The reasons are cost and safety. A checked-in project file should not be able to turn on paid cache refreshes, loosen trust policy, or give every clone the same device id.
+
+`getOrCreateDeviceId` creates and persists its UUID lazily on first use.
+
+```ts ! settings-manager.ts
+	/** Read from global settings only because warming costs money. */
+	getCacheWarmingMode(): CacheWarmingMode {
+		const mode = this.globalSettings.cacheWarming;
+		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : "streaming";
+	}
+// ...
+	getDefaultProjectTrust(): DefaultProjectTrust {
+		const value = this.globalSettings.defaultProjectTrust;
+		return value === "always" || value === "never" ? value : "ask";
+	}
+// ...
+	/**
+	 * Stable ID of this installation, e.g. sent to OpenAI as its agent host ID.
+	 * Created on first use. Project settings are ignored so a committed project
+	 * settings file cannot give every clone the same ID.
+	 */
+	getOrCreateDeviceId(): string {
+		if (!this.globalSettings.deviceId) {
+			this.globalSettings.deviceId = randomUUID();
+			this.markModified("deviceId");
+			this.save();
+		}
+		return this.globalSettings.deviceId;
+	}
+```
+
+</Scrollycoding>
+
+The manager is built early at startup and shared. [agent-session.ts](/docs/src/core/agent-session.ts) reads retry, compaction and steering settings from it, [resource-loader.ts](/docs/src/core/resource-loader.ts) reads the path lists, and [settings-diagnostics.ts](/docs/src/core/settings-diagnostics.ts) surfaces the errors drained from it. Structurally the file is types and merge helpers first, then storage classes, then one large class whose second half is accessors in no particular order.

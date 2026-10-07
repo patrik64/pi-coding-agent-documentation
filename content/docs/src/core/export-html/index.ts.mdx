@@ -1,0 +1,181 @@
+---
+title: "index.ts"
+description: "Builds a self-contained HTML file from a session by injecting theme colors, session data and vendored scripts into a template"
+source: "src/core/export-html/index.ts"
+full: true
+---
+
+The `/export` command and the CLI export option both produce a single HTML file that can be opened anywhere with no server. This module does the assembly: it reads the template files, computes colors from the active theme, embeds the whole session as base64 JSON, and writes the result.
+
+The rendering itself happens in the browser, in [template.js](/docs/src/core/export-html/template.js), using [template.html](/docs/src/core/export-html/template.html) and [template.css](/docs/src/core/export-html/template.css). Session contents come from [session-manager.ts](/docs/src/core/session-manager.ts), colors from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and custom tool output is pre-rendered through the hook that [tool-renderer.ts](/docs/src/core/export-html/tool-renderer.ts) implements.
+
+<Scrollycoding>
+
+## !!steps Renderer hook and options
+
+`ToolHtmlRenderer` lets the caller turn extension tool calls and results into HTML, with a collapsed and an expanded form for results. Returning `undefined` means the tool has no custom renderer and the template falls back to generic display.
+
+```ts ! index.ts
+export interface ToolHtmlRenderer {
+	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
+	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
+	/** Render a tool result to HTML. Returns collapsed/expanded or undefined if tool has no custom renderer. */
+	renderResult(
+		toolCallId: string,
+		toolName: string,
+		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+		details: unknown,
+		isError: boolean,
+	): { collapsed?: string; expanded?: string } | undefined;
+}
+```
+
+## !!steps Deriving page colors
+
+Themes may define explicit export colors, but many do not. When missing, the page, card and info backgrounds are derived from the theme's user-message background. Luminance above 0.5 counts as a light theme and gets slightly darkened page tones; dark themes get progressively darker ones. An unparseable color falls back to fixed dark values.
+
+```ts ! index.ts
+function deriveExportColors(baseColor: string): { pageBg: string; cardBg: string; infoBg: string } {
+	const parsed = parseColor(baseColor);
+	if (!parsed) {
+		return {
+			pageBg: "rgb(24, 24, 30)",
+			cardBg: "rgb(30, 30, 36)",
+			infoBg: "rgb(60, 55, 40)",
+		};
+	}
+
+	const luminance = getLuminance(parsed.r, parsed.g, parsed.b);
+	const isLight = luminance > 0.5;
+```
+
+## !!steps Theme variables
+
+Every resolved theme color becomes a CSS custom property, followed by the three export-specific ones. Explicit theme values win via the nullish coalescing operator, and `#343541` is the fallback base when the theme has no user-message background.
+
+```ts ! index.ts
+function generateThemeVars(themeName?: string): string {
+	const colors = getResolvedThemeColors(themeName);
+	const lines: string[] = [];
+	for (const [key, value] of Object.entries(colors)) {
+		lines.push(`--${key}: ${value};`);
+	}
+
+	// Use explicit theme export colors if available, otherwise derive from userMessageBg
+	const themeExport = getThemeExportColors(themeName);
+	const userMessageBg = colors.userMessageBg || "#343541";
+	const derivedColors = deriveExportColors(userMessageBg);
+
+	lines.push(`--exportPageBg: ${themeExport.pageBg ?? derivedColors.pageBg};`);
+	lines.push(`--exportCardBg: ${themeExport.cardBg ?? derivedColors.cardBg};`);
+	lines.push(`--exportInfoBg: ${themeExport.infoBg ?? derivedColors.infoBg};`);
+
+	return lines.join("\n      ");
+}
+```
+
+## !!steps Session payload
+
+The payload bundles the header, all entries, the current leaf, and optionally the system prompt, tool definitions and pre-rendered tool HTML. Entries come from `getEntries()` and the `leafId` marks the active position, so the page can reconstruct the tree.
+
+```ts ! index.ts
+interface SessionData {
+	header: ReturnType<SessionManager["getHeader"]>;
+	entries: ReturnType<SessionManager["getEntries"]>;
+	leafId: string | null;
+	systemPrompt?: string;
+	tools?: Array<Pick<ToolDefinition, "name" | "description" | "parameters">>;
+	/** Pre-rendered HTML for custom tool calls/results, keyed by tool call ID */
+	renderedTools?: Record<string, RenderedToolHtml>;
+}
+```
+
+## !!steps Template assembly
+
+Five files are read from the export template directory, including vendored copies of marked and highlight.js, so the output works offline. Session data is base64-encoded to sidestep escaping problems inside a script tag. Placeholders are substituted with string `replace`, which matters: a replacement string containing `$` patterns would be interpreted specially, and each placeholder is replaced only once.
+
+```ts ! index.ts
+	// Base64 encode session data to avoid escaping issues
+	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toString("base64");
+
+	// Build the CSS with theme variables injected
+	const css = templateCss
+		.replace("{{THEME_VARS}}", themeVars)
+		.replace("{{BODY_BG}}", bodyBg)
+		.replace("{{CONTAINER_BG}}", containerBg)
+		.replace("{{INFO_BG}}", infoBg);
+
+	return template
+		.replace("{{CSS}}", css)
+		.replace("{{JS}}", templateJs)
+		.replace("{{SESSION_DATA}}", sessionDataBase64)
+		.replace("{{MARKED_JS}}", markedJs)
+		.replace("{{HIGHLIGHT_JS}}", hljsJs);
+```
+
+## !!steps Pre-rendering custom tools
+
+Built-in tools (`bash`, `read`, `write`, `edit`, `ls`) are drawn by the template itself. Every other tool call is passed to the renderer, and its result is rendered when the call was rendered or the tool is not a built-in. Output is keyed by tool call id so the browser can look it up. The comment on the set mentions the TUI to ANSI to HTML path, which is where [ansi-to-html.ts](/docs/src/core/export-html/ansi-to-html.ts) comes in.
+
+```ts ! index.ts
+/** Tools rendered directly by the HTML template (not pre-rendered via TUI→ANSI→HTML pipeline) */
+const TEMPLATE_RENDERED_TOOLS = new Set(["bash", "read", "write", "edit", "ls"]);
+
+/**
+ * Pre-render custom tools to HTML using their TUI renderers.
+ */
+function preRenderCustomTools(
+	entries: SessionEntry[],
+	toolRenderer: ToolHtmlRenderer,
+): Record<string, RenderedToolHtml> {
+	const renderedTools: Record<string, RenderedToolHtml> = {};
+```
+
+## !!steps Exporting a live session
+
+Two guards run first. An in-memory session has no file and cannot be exported, and a session whose file does not exist yet has nothing in it. The second argument may be a plain string, treated as the output path, or an options object. The default file name is the app name plus the session file basename.
+
+```ts ! index.ts
+export async function exportSessionToHtml(
+	sm: SessionManager,
+	state?: AgentState,
+	options?: ExportOptions | string,
+): Promise<string> {
+	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
+
+	const sessionFile = sm.getSessionFile();
+	if (!sessionFile) {
+		throw new Error("Cannot export in-memory session to HTML");
+	}
+	if (!existsSync(sessionFile)) {
+		throw new Error("Nothing to export yet - start a conversation first");
+	}
+```
+
+## !!steps Exporting from a file
+
+The CLI path opens any session file with `SessionManager.open`. There is no `AgentState` here, so the system prompt and tool list are left undefined and no custom tool rendering happens. Note this function ignores `toolRenderer` even if one is passed in the options.
+
+```ts ! index.ts
+export async function exportFromFile(inputPath: string, options?: ExportOptions | string): Promise<string> {
+	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
+	const resolvedInputPath = resolvePath(inputPath);
+
+	if (!existsSync(resolvedInputPath)) {
+		throw new Error(`File not found: ${resolvedInputPath}`);
+	}
+
+	const sm = SessionManager.open(resolvedInputPath);
+
+	const sessionData: SessionData = {
+		header: sm.getHeader(),
+		entries: sm.getEntries(),
+		leafId: sm.getLeafId(),
+		systemPrompt: undefined,
+		tools: undefined,
+	};
+```
+
+</Scrollycoding>
+
+The two exporters duplicate their output-path logic and options parsing. Both converge on `generateHtml`, so the visual result is identical apart from the extra metadata a live session supplies. `exportSessionToHtml` is called from [agent-session.ts](/docs/src/core/agent-session.ts), and the CLI entry point in [main.ts](/docs/src/main.ts) uses `exportFromFile`.

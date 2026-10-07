@@ -1,0 +1,602 @@
+---
+title: "agent-session.ts"
+description: "AgentSession: the one class every run mode drives, wrapping the low-level Agent with persistence, extensions, compaction, retry, tools and model state"
+source: "src/core/agent-session.ts"
+full: true
+---
+
+The `Agent` from pi-agent-core knows how to run a loop of model calls and tool
+calls. It knows nothing about session files, extensions, context windows or
+which tools the user enabled. `AgentSession` is everything around that loop.
+Interactive, print and RPC modes all hold one and add only their own I/O on top.
+
+At 4,000+ lines it is the largest file in the package, but it is organized in
+labelled sections: event handling and persistence, prompting, model and
+thinking management, compaction, extension binding, retry, bash, tree
+navigation and stats. The constructor installs a set of hooks on the `Agent`
+(tool calls, request preparation, turn boundaries, context transforms), and
+nearly everything interesting happens inside those hooks or in the
+`prompt()` path that feeds the loop.
+
+It is created by [sdk.ts](/docs/src/core/sdk.ts), replaced as a whole by
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts), persists
+through [session-manager.ts](/docs/src/core/session-manager.ts) and talks to
+extensions through [runner.ts](/docs/src/core/extensions/runner.ts).
+
+<Scrollycoding>
+
+## !!steps The event stream modes subscribe to
+
+`AgentSessionEvent` extends the core `AgentEvent` rather than replacing it. Two
+changes: `agent_end` gains `willRetry` (so a UI can keep its spinner while the
+session retries or compacts), and a set of session-level events is added for
+queue changes, compaction, auto-retry, appended entries and bash output.
+
+Tool execution events can carry a `parentToolCallId` when a tool made the call
+through `ctx.executeTool()`. `parseSkillBlock` above it is the inverse of the
+skill expansion done in `_expandSkillCommand`, used by UIs to render a skill
+invocation as a collapsed block.
+
+```ts ! agent-session.ts
+export function parseSkillBlock(text: string): ParsedSkillBlock | null {
+	const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+	if (!match) return null;
+// ...
+/** Session-specific events that extend the core AgentEvent */
+export type AgentSessionEvent =
+	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>
+	// !mark(1:5)
+	| {
+			type: "agent_end";
+			messages: AgentMessage[];
+			willRetry: boolean;
+	  }
+	| { type: "agent_settled" }
+	| {
+			type: "queue_update";
+			steering: readonly string[];
+			followUp: readonly string[];
+	  }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "entry_appended"; entry: SessionEntry }
+```
+
+## !!steps State and the constructor
+
+The field list shows what the class juggles: steering and follow-up queues
+(kept as plain strings for UI display), compaction and retry abort
+controllers, a pending list of custom messages, and many extension-binding
+fields. Most mutable flags exist to answer one question precisely: is the
+session idle?
+
+The constructor subscribes to the agent, installs six hooks, builds the
+runtime (tools, extension runner) and, when no explicit tool list was given,
+restores the tool loadout declared in the transcript.
+
+```ts ! agent-session.ts
+	constructor(config: AgentSessionConfig) {
+		this.agent = config.agent;
+		this.sessionManager = config.sessionManager;
+		this.settingsManager = config.settingsManager;
+// ...
+		// Always subscribe to agent events for internal handling
+		// (session persistence, extensions, auto-compaction, retry logic)
+		// !mark
+		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		// !mark(1:6)
+		this._installAgentToolHooks();
+		this._installAgentNextTurnRefresh();
+		this._installAgentRequestProjection();
+		this._installAgentBoundaryHooks();
+		this._installHiddenDeclarationsProjection();
+		this._installAgentForcedPromptProjection();
+
+		this._buildRuntime({
+			activeToolNames: this._initialActiveToolNames,
+			includeAllExtensionTools: true,
+		});
+		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
+	}
+```
+
+## !!steps Persistence happens in the event handler
+
+`_handleAgentEvent` is the heart of the class. On every event it forwards to
+extensions first, then to public listeners, then persists. Persistence is
+keyed on `message_end`: custom messages become `CustomMessageEntry`, and
+system, user, assistant and tool-result messages become regular message
+entries. The returned entry ID is remembered in a `WeakMap` so later hooks can
+map a message object back to its entry.
+
+Other message kinds (bash executions, compaction summaries, branch summaries)
+are persisted by their own code paths, as the comment says.
+
+```ts ! agent-session.ts
+		// Emit to extensions first, then notify public listeners.
+		await this._emitExtensionEvent(event);
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+
+		// Handle session persistence
+		if (event.type === "message_end") {
+			let entryId: string | undefined;
+			// Check if this is a custom message from extensions
+			if (event.message.role === "custom") {
+// ...
+			} else if (
+				event.message.role === "system" ||
+				event.message.role === "user" ||
+				event.message.role === "assistant" ||
+				event.message.role === "toolResult"
+			) {
+				// Regular LLM message - persist as SessionMessageEntry
+				// !mark
+				entryId = this.sessionManager.appendMessage(event.message);
+			}
+			// !mark
+			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+```
+
+## !!steps Extensions can rewrite a message before it is saved
+
+For `message_end`, `_emitExtensionEvent` asks the runner for a replacement
+message. Because persistence runs afterward using the same `event.message`
+object, the replacement is applied by mutating that object in place: all its
+keys are deleted and the replacement's are assigned. That keeps agent state,
+later turn events, listeners and the saved entry consistent without any of
+them needing to know a replacement happened.
+
+Handlers are untyped at runtime, so a replacement with null content is
+normalized to an empty array before it can reach history.
+
+```ts ! agent-session.ts
+		} else if (event.type === "message_end") {
+			const extensionEvent: MessageEndEvent = {
+				type: "message_end",
+				message: event.message,
+			};
+			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			if (replacement) {
+				// Untyped extension handlers can return messages with null/missing content;
+				// normalize so it never enters agent state or session history.
+				const normalized =
+					(replacement.role === "user" ||
+						replacement.role === "assistant" ||
+						replacement.role === "toolResult" ||
+						replacement.role === "custom") &&
+					// !mark
+					replacement.content == null
+						? ({ ...replacement, content: [] } as AgentMessage)
+						: replacement;
+				this._replaceMessageInPlace(event.message, normalized);
+```
+
+## !!steps Tool hooks replace per-tool wrappers
+
+`beforeToolCall` and `afterToolCall` are installed once on the agent. They
+read `this._extensionRunner` at call time, so reloading extensions swaps the
+runner without reinstalling hooks. `_beforeToolCall` emits `tool_call` and
+lets a handler block execution; a non-Error throw is wrapped so the failure
+always blocks.
+
+`_afterToolCall` emits `tool_result`, which may replace content, details,
+`isError` or usage, then runs image normalization after the hook so images
+injected by extensions are resized too, using the limits of the current model.
+If nothing changed it returns `undefined` and the original result stands.
+
+```ts ! agent-session.ts
+		const content = hookResult?.content ?? result.content ?? [];
+		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
+		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
+		const normalizedContent = await normalizeToolResultImages(content, {
+			autoResizeImages: this.settingsManager.getImageAutoResize(),
+			...(resizeOptions ? { resizeOptions } : {}),
+		});
+
+		// !mark(1:3)
+		if (!hookResult && normalizedContent === content) {
+			return undefined;
+		}
+
+		// The hook result already dropped structured content that replaced content no longer matches.
+		return {
+			content: normalizedContent,
+			details: hookResult?.details,
+			structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
+			isError: hookResult?.isError ?? isError,
+			usage: hookResult?.usage,
+		};
+```
+
+## !!steps Routing a virtual model per request
+
+`prepareRequest` is wrapped so the session can rebuild the context from the
+canonical projection of the session tree (compaction summaries and context
+edits applied) instead of trusting the agent's in-memory array.
+
+If the selected model is virtual, a router decides the real model for just this
+request: the selection stays in agent state. The routing reason is `"retry"`
+when a failed response is being repeated, `"user"` when the last turn starts
+with a user message, otherwise `"continuation"`. Routing state, if it changed,
+is saved as a custom entry. See
+[virtual-models.ts](/docs/src/core/virtual-models.ts) for the model side.
+
+```ts ! agent-session.ts
+			const lastResponse = context.messages.findLastIndex((message) => message.role === "assistant");
+			const userTurn = context.messages.slice(lastResponse + 1).some((message) => message.role === "user");
+			const state = getVirtualModelState(this.sessionManager.getBranch(), model.provider, model.id);
+			const route = await this._modelRuntime.resolveModel(model, convertToLlm(context.messages), {
+				// !mark
+				reason: failed ? "retry" : userTurn ? "user" : "continuation",
+				thinkingLevel,
+				signal,
+				failed,
+				state,
+			});
+			if (route.state !== undefined && route.state !== state) {
+				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
+				const entry = this.sessionManager.getEntry(
+					// !mark
+					this.sessionManager.appendCustomEntry(VIRTUAL_MODEL_STATE_ENTRY, data),
+				);
+				if (entry) this._emit({ type: "entry_appended", entry });
+			}
+```
+
+## !!steps What prompt does before the model is called
+
+`prompt()` is a long gate. Slash commands from extensions run immediately,
+even while streaming. The `input` extension event can swallow or transform the
+text. Skill and template expansion follow. If a run is active, the message is
+queued as a steer or follow-up (and a missing `streamingBehavior` throws).
+
+Otherwise it flushes pending bash and custom messages, requires a model and
+usable auth, checks compaction against the last assistant message, and only then
+emits `before_agent_start`. The comments explain the order: images are
+normalized after that event so an extension that switches model changes the
+resize profile.
+
+```ts ! agent-session.ts
+		// If streaming, queue via steer() or followUp() based on option
+		if (this.isStreaming) {
+			if (!options?.streamingBehavior) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
+// ...
+		// Check if we need to compact before sending (catches aborted responses).
+		// The user's new prompt is sent below, so do not call agent.continue() here.
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) {
+			// !mark
+			await this._checkCompaction(lastAssistant, false);
+		}
+
+		// Emit before_agent_start before normalizing images so extension-driven model
+		// selection determines the resize profile used for the request and history.
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._extensionRunner.emitBeforeAgentStart(
+```
+
+## !!steps The run loop after the agent returns
+
+`_runAgentPrompt` calls `agent.prompt` and then loops. After each agent run,
+`_handlePostAgentRun` decides whether to continue: a retryable error with
+budget left (`_prepareRetry` sleeps with backoff, and the failed response is
+remembered so routing knows it is a retry), a compaction that wants a retry,
+or queued messages. If nothing continues, the `agent_before_settle` boundary
+gives extensions one last chance to keep the run going.
+
+The `finally` block always clears transient state, flushes pending bash and
+custom messages, and emits `agent_settled`, which is what resolves
+`waitForIdle`. A user abort sets a flag checked between each step so
+the loop exits promptly.
+
+```ts ! agent-session.ts
+		try {
+			await this.agent.prompt(messages);
+			// !mark
+			while (!this._agentRunAbortRequested) {
+				if (await this._handlePostAgentRun()) {
+					if (this._agentRunAbortRequested) break;
+					await this.agent.continue();
+					continue;
+				}
+				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+				if (this._agentRunAbortRequested) break;
+				await this.agent.continue();
+			}
+		} finally {
+			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = undefined;
+			this._runSystemPromptOptions = undefined;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			// !mark
+			await this._emitAgentSettled();
+		}
+```
+
+## !!steps Overflow recovery and threshold compaction
+
+`_checkCompaction` handles three cases. A context-overflow error (or a
+truncated response that ended under the model's output limit) triggers
+compaction and a retry, but only once: `_overflowRecoveryAttempted` turns a
+second failure into a `compaction_end` event with an error message. A response
+that completed but overflowed is compacted without retry, because
+`agent.continue()` cannot resume from a finished assistant message. Otherwise
+usage is compared against the threshold.
+
+Two guards prevent false triggers: a message from a different model than the
+current one never counts as overflow, and any message older than the latest
+compaction entry is ignored. Before the retry, the failed attempt is durably
+omitted from the projection with a context-edit entry.
+
+```ts ! agent-session.ts
+		if (contextOverflow || recoverableLength) {
+			const willRetry = assistantMessage.stopReason !== "stop";
+
+			// Case 2: the response completed successfully. Compact, but do not retry because
+			// agent.continue() cannot continue from a completed assistant response.
+			if (!willRetry) {
+				return await this._runAutoCompaction("overflow", false);
+			}
+
+			// !mark
+			if (this._overflowRecoveryAttempted) {
+// ...
+			// Persistently omit the selected final attempt before post-run recovery compaction.
+			// !mark(1:4)
+			this._overflowRecoveryAttempted = true;
+			this._omitRecoveryAttempt(assistantMessage, toolResults);
+			const retry = await this._runAutoCompaction("overflow", willRetry);
+			if (retry) this._failedResponse = assistantMessage;
+			return retry;
+		}
+```
+
+## !!steps Custom messages never split a tool call from its result
+
+`sendCustomMessage` has four delivery cases. While streaming, a message
+becomes a steer or follow-up unless `triggerTurn` is false; then it is put in
+`_pendingCustomMessages` and appended when the turn ends, because appending
+mid-turn could place it between an assistant tool call and the tool result,
+which providers that validate order reject on replay.
+
+If it is called from inside the `agent_settled` emission, starting a turn is
+deferred until the emission finishes, using `_deferredSettledActions`.
+`prompt()` does the same.
+
+```ts ! agent-session.ts
+		if (options?.deliverAs === "nextTurn") {
+			this._pendingNextTurnMessages.push(appMessage);
+		} else if (this.isStreaming && options?.triggerTurn !== false) {
+			if (options?.deliverAs === "followUp") {
+				this.agent.followUp(appMessage);
+			} else {
+				this.agent.steer(appMessage);
+			}
+		} else if (options?.triggerTurn) {
+			// !mark(1:3)
+			if (this._isEmittingAgentSettled) {
+				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				return;
+			}
+			await this._runAgentPrompt(appMessage);
+		} else if (this.isStreaming) {
+```
+
+## !!steps Which tools exist, and which are declared
+
+Tool visibility is layered. `_isAllowedTool` applies `--tools` and
+`--exclude-tools` to decide whether a tool is registered at all, with the rule
+that MCP tools stay registered for codemode and tool search unless the
+allowlist names an MCP tool or is empty. `_isActivatable` decides whether it
+may be declared to the model: an MCP tool kept only for tool search can be
+active only if it is not `direct` and `tool_search` is registered.
+
+Exposure levels (`direct`, `model-only`, `codemode`, `deferred`, `hidden`)
+decide the rest: only `direct` tools that are active, plus every `codemode` or
+`deferred` tool, are callable through `ctx.executeTool()`. See
+[mcp-servers.ts](/docs/src/core/mcp-servers.ts) for the name matcher.
+
+```ts ! agent-session.ts
+	private _isAllowedTool(name: string): boolean {
+		if (this._excludedTools?.(name)) return false;
+		if (!this._allowedTools || this._allowedTools(name)) return true;
+		// !mark
+		return !this._allowlistFiltersMcp && isMcpToolName(name);
+	}
+// ...
+	private _isActivatable(name: string): boolean {
+		if (!this._allowedTools || this._allowedTools(name) || !isMcpToolName(name)) return true;
+		return this._getToolExposure(name) !== "direct" && this._toolRegistry.has("tool_search");
+	}
+// ...
+	private _getCallableTools(active: ReadonlySet<string> = new Set(this.getActiveToolNames())): AgentTool[] {
+		return [...this._toolRegistry.values()].filter((tool) => {
+			const exposure = this._getToolExposure(tool.name);
+			// !mark
+			return exposure === "codemode" || exposure === "deferred" || (exposure === "direct" && active.has(tool.name));
+		});
+	}
+```
+
+## !!steps System prompt as diffs in the transcript
+
+The system prompt is not sent as one fixed string. `_preparePromptAndToolLoadout`
+builds structured sections, diffs them against the sections the model last
+saw (replayed from the transcript with `getCurrentSystemMessage`), and returns a
+`system` message containing only the changes. That message is prepended to the
+turn and persisted, so resuming a session reproduces the exact prompt the
+model had.
+
+A forced prompt from a `before_agent_start` handler is the exception: it is
+projected onto the request head at send time instead of being recorded.
+Prompt building itself lives in
+[system-prompt.ts](/docs/src/core/system-prompt.ts).
+
+```ts ! agent-session.ts
+	private _preparePromptAndToolLoadout(
+		options: NormalizedBuildSystemPromptOptions,
+		messages: AgentMessage[] = this.agent.state.messages,
+	): SystemMessage | undefined {
+		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
+		// !mark(1:4)
+		const sections = diffSystemPromptSections(
+			getCurrentSystemMessage(messages)?.sections ?? {},
+			buildSystemPromptSections(options),
+		);
+		return sections ? { role: "system", content: "", sections, timestamp: Date.now() } : undefined;
+	}
+```
+
+## !!steps Changing model and thinking level
+
+`setModel` checks auth, switches `agent.state.model`, and records a
+`model_change` entry so resume restores it. Persisting to global defaults only
+happens with `persist: true`; otherwise the change is session-only. The
+thinking level for the new model comes from `_getThinkingLevelForModelSwitch`
+(explicit, then per-model setting, then default), and `setThinkingLevel` clamps
+it to what the model supports and appends a transcript entry only if the
+level actually changed.
+
+`cycleModel` uses the scoped models list if present, else all available models.
+
+```ts ! agent-session.ts
+	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
+		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+
+		const previousModel = this.model;
+		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+		// !mark(1:2)
+		this.agent.state.model = model;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+		if (options.persist) {
+			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+			this._addPersistedDefaultToNonEmptyScope(model);
+		}
+// ...
+		this.setThinkingLevel(thinkingLevel);
+
+		await this._emitModelSelect(model, previousModel, "set");
+	}
+```
+
+## !!steps Reloading extensions and settings in place
+
+`reload` emits `session_shutdown` with reason `reload` on the old runner,
+invalidates it, reloads settings and the resource loader, and builds a new
+runtime. Flag values are carried over. The tools that were active become
+pending names, so tools registered later by the new extensions (MCP servers
+still connecting) are activated when they appear.
+
+The `session_start` event with reason `reload` is emitted only when a host has
+bound UI, commands, a shutdown handler or an error listener; a headless
+session skips it.
+
+```ts ! agent-session.ts
+	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		const oldRunner = this._extensionRunner;
+		const previousFlagValues = oldRunner.getFlagValues();
+		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+		// !mark
+		oldRunner.invalidate();
+// ...
+		// Tools the new extensions register later, such as MCP tools, are pending until then.
+		// !mark
+		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
+		this._buildRuntime({
+			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
+			flagValues: previousFlagValues,
+			includeAllExtensionTools: true,
+		});
+```
+
+## !!steps Navigating the session tree
+
+`navigateTree` moves the leaf within the same file (unlike fork, which makes
+a new file). It refuses while streaming or compacting, treats navigation to the
+current leaf as a no-op, and collects the entries on the abandoned branch for
+an optional summary. Extensions can cancel, supply the summary, or override
+instructions and label through `session_before_tree`.
+
+Where the leaf lands depends on the target: for a user or custom message the
+leaf is its parent and the text goes back to the editor, so the user can edit
+and resubmit; any other entry becomes the leaf itself. A summary, if made, is
+attached at the new leaf, then the transcript is refreshed and the tool
+loadout is restored from it.
+
+```ts ! agent-session.ts
+			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
+				// User message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.message.content, "");
+			} else if (targetEntry.type === "custom_message") {
+				// Custom message: leaf = parent (null if root), text goes to editor
+				newLeafId = targetEntry.parentId;
+				editorText = contentText(targetEntry.content, "");
+			} else {
+				// Non-user message: leaf = selected node
+				newLeafId = targetId;
+			}
+// ...
+			// Update finalized context from the canonical session projection.
+			this._refreshFinalizedContext();
+			// !mark
+			this._restoreToolsFromTranscript();
+```
+
+## !!steps Disposing safely
+
+`dispose` is built to always succeed. It aborts retry, compaction, branch
+summary, bash and the agent inside a try block whose errors are swallowed,
+then invalidates the extension runner with a long message explaining that old
+contexts are stale after session replacement, drops listeners, cancels the
+cache warmer and cleans up provider session resources.
+
+`abort` is the graceful variant: it sets the abort flag only if a run is
+active, aborts everything, and waits for idle.
+
+```ts ! agent-session.ts
+	dispose(): void {
+		try {
+			this.abortRetry();
+			this.abortCompaction();
+			this.abortBranchSummary();
+			this.abortBash();
+			this.agent.abort();
+		} catch {
+			// Dispose must succeed even if an abort hook throws.
+		}
+// ...
+		this._disconnectFromAgent();
+		this._eventListeners = [];
+		if (this._cacheWarmer) {
+			this._cacheWarmer.onWarmed = undefined;
+			this._cacheWarmer.cancel();
+		}
+		cleanupSessionResources(this.sessionId);
+	}
+```
+
+</Scrollycoding>
+
+The pieces connect through three channels. Agent hooks (`prepareRequest`,
+`transformContext`, `finishTurn`, tool hooks) shape what the model sees;
+`_handleAgentEvent` persists and relays what it does; and the post-run loop
+decides whether to run again. The compaction mechanics themselves live in
+[compaction.ts](/docs/src/core/compaction/compaction.ts) and
+[branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts),
+and nested tool calls are run by
+[nested-tool-calls.ts](/docs/src/core/nested-tool-calls.ts).
+
+Consumers are the three modes under [modes/index.ts](/docs/src/modes/index.ts),
+the SDK and extension contexts. Structurally the file is one class with a
+large private surface: public methods are thin and the numbered concerns above
+are held together by a handful of boolean and controller fields rather than a
+state machine.

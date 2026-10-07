@@ -1,0 +1,512 @@
+---
+title: "session-manager.ts"
+description: "Append-only tree of session entries stored as JSONL, with context building, branching, migration and session discovery"
+source: "src/core/session-manager.ts"
+full: true
+---
+
+Every conversation in pi lives in a single JSONL file. This file defines the entry types that go into it, the pure functions that turn a list of entries into the context sent to the model, and the `SessionManager` class that reads, appends to and lists those files.
+
+The central idea is that a session is an append-only tree. Each entry has an `id` and a `parentId`; a single `leafId` points at the current position. Appending creates a child of the leaf, and branching just moves the leaf to an earlier entry. Nothing is ever edited or deleted, which is what makes compaction, branch summaries, labels and even edits to earlier context into plain new entries.
+
+<Scrollycoding>
+
+## !!steps The file header and the base entry
+
+Line one of a session file is a `SessionHeader` with a version number, a session id, a creation time, the working directory and, for forks, the path of the parent session. Version 1 files have no `version` field at all.
+
+Every other line extends `SessionEntryBase`: its own `id`, a `parentId` (null for a root) and a timestamp. A message entry just wraps an `AgentMessage` from [messages.ts](/docs/src/core/messages.ts).
+
+```ts ! session-manager.ts
+export const CURRENT_SESSION_VERSION = 3;
+
+export interface SessionHeader {
+	type: "session";
+	version?: number; // v1 sessions don't have this
+	id: string;
+	timestamp: string;
+	cwd: string;
+	parentSession?: string;
+}
+// ...
+// !mark(1:6)
+export interface SessionEntryBase {
+	type: string;
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+}
+export interface SessionMessageEntry extends SessionEntryBase {
+	type: "message";
+	message: AgentMessage;
+}
+```
+
+## !!steps Entry kinds that are not messages
+
+Besides messages, a session records model and thinking-level changes, usage, compaction and branch summaries, extension data, labels and a display name. Two of these are easy to confuse: `CustomEntry` is persisted extension state that never reaches the model, while `CustomMessageEntry` is converted to a user message.
+
+`ContextEditEntry` is the most unusual one. Because history is append-only, replacing or hiding an earlier message is expressed as a new entry that targets it; a null replacement omits the target from context.
+
+```ts ! session-manager.ts
+/** Append-only change to one earlier entry's contribution to model context. */
+export interface ContextEditEntry extends SessionEntryBase {
+	type: "context_edit";
+	targetId: string;
+	/** Null omits the target from model context. A value replaces only its content. */
+	replacement: { content: ContextEditableContent } | null;
+}
+// ...
+// !mark(1:12)
+export type SessionEntry =
+	| SessionMessageEntry
+	| ThinkingLevelChangeEntry
+	| ModelChangeEntry
+	| UsageEntry
+	| CompactionEntry
+	| BranchSummaryEntry
+	| CustomEntry
+	| CustomMessageEntry
+	| ContextEditEntry
+	| LabelEntry
+	| SessionInfoEntry;
+```
+
+## !!steps Versioned files and tolerant parsing
+
+`migrateToCurrentVersion` reads the header version (defaulting to 1) and runs the needed steps in place: v1 to v2 adds ids and parent links, v2 to v3 renames the old `hookMessage` role to `custom`. It returns true when something changed so the caller knows to rewrite the file.
+
+Parsing is deliberately forgiving. A malformed line is skipped rather than failing the load, so one corrupt line in a long session does not lose the rest.
+
+```ts ! session-manager.ts
+function migrateToCurrentVersion(entries: FileEntry[]): boolean {
+	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
+	const version = header?.version ?? 1;
+
+	if (version >= CURRENT_SESSION_VERSION) return false;
+
+	if (version < 2) migrateV1ToV2(entries);
+	if (version < 3) migrateV2ToV3(entries);
+
+	return true;
+}
+// ...
+/** Exported for compaction.test.ts */
+export function parseSessionEntries(content: string): FileEntry[] {
+	const entries: FileEntry[] = [];
+	const lines = content.trim().split("\n");
+
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		try {
+			const entry = JSON.parse(line) as FileEntry;
+			entries.push(entry);
+		} catch {
+			// Skip malformed lines
+		}
+	}
+
+	return entries;
+}
+```
+
+## !!steps Finding sessions without loading them
+
+Discovery needs only the header, so `readSessionHeader` scans at most one mebibyte from the start of the file, and reads in 4 KiB chunks. A non-session first entry or an oversized prefix means the file is not treated as a session during discovery.
+
+`findMostRecentSession` sorts `.jsonl` files by modification time and returns the first whose header matches the working directory (when a directory filter applies). Any filesystem error yields null instead of throwing, since discovery is best-effort.
+
+```ts ! session-manager.ts
+const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
+const SESSION_HEADER_READ_BUFFER_SIZE = 4096;
+/** Bound synchronous header discovery while allowing large cwd and custom metadata fields. */
+const MAX_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
+// ...
+function readSessionHeaderForDiscovery(filePath: string): SessionHeader | null {
+	try {
+		return readSessionHeader(filePath);
+	} catch {
+		// Discovery is best-effort: unreadable or oversized files are not sessions,
+		// and one corrupt file must not prevent other sessions from being found.
+		return null;
+	}
+}
+// ...
+		for (const { path } of files) {
+			const header = readSessionHeaderForDiscovery(path);
+			if (header && (!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd))) return path;
+		}
+		return null;
+```
+
+## !!steps From a leaf to the active path
+
+`buildSessionPath` walks `parentId` links from the leaf back to the root and reverses the result. A `leafId` of exactly null means "before any entry" and returns an empty path; an unknown or undefined leaf falls back to the last entry in the list.
+
+This is the only way the tree becomes a linear history, and everything else in the context pipeline starts from this path.
+
+```ts ! session-manager.ts
+function buildSessionPath(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionEntry[] {
+	const index = buildEntryIndex(entries, byId);
+	let leaf: SessionEntry | undefined;
+	if (leafId === null) {
+		return [];
+	}
+	if (leafId) {
+		leaf = index.get(leafId);
+	}
+	leaf ??= entries[entries.length - 1];
+	if (!leaf) {
+		return [];
+	}
+
+	const path: SessionEntry[] = [];
+	let current: SessionEntry | undefined = leaf;
+	while (current) {
+		path.push(current);
+		current = current.parentId ? index.get(current.parentId) : undefined;
+	}
+	path.reverse();
+	return path;
+}
+```
+
+## !!steps How compaction shortens the path
+
+When the path contains compaction entries, the newest one wins. The result starts with that compaction entry, then every earlier entry from `firstKeptEntryId` onward, then everything after the compaction. Older summarized entries are dropped.
+
+Stored system messages among the kept entries are skipped: the compaction entry carries its own snapshot of the system message, so keeping the old one would duplicate it. The summarization logic itself is in [compaction.ts](/docs/src/core/compaction/compaction.ts).
+
+```ts ! session-manager.ts
+	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
+	if (compactionIdx < 0) {
+		return path;
+	}
+
+	const contextEntries: SessionEntry[] = [compaction];
+	let foundFirstKept = false;
+	for (let i = 0; i < compactionIdx; i++) {
+		const entry = path[i];
+		if (entry.id === compaction.firstKeptEntryId) {
+			foundFirstKept = true;
+		}
+		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
+			contextEntries.push(entry);
+		}
+	}
+	contextEntries.push(...path.slice(compactionIdx + 1));
+	return contextEntries;
+```
+
+## !!steps Turning one entry into messages
+
+`sessionEntryToContextMessages` is the per-entry projection. Message entries pass through, but with a repair: session files are parsed without validation, so a message with null content gets an empty string or array. Custom messages, branch summaries and compactions are converted with the factories in [messages.ts](/docs/src/core/messages.ts); a compaction yields its stored system message followed by the summary.
+
+Everything else (model changes, labels, usage, plain custom entries) contributes nothing to context.
+
+```ts ! session-manager.ts
+export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	if (entry.type === "message") {
+		const message = entry.message;
+		// Session files are parsed without validation; old versions, forks, or
+		// hand-edited files can contain messages with null/missing content.
+		if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
+		if (
+			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
+			message.content == null
+		) {
+			return [{ ...message, content: [] }];
+		}
+		return [message];
+	}
+	if (entry.type === "custom_message") {
+		return [
+			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
+		];
+	}
+	if (entry.type === "branch_summary" && entry.summary) {
+		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
+	}
+	if (entry.type === "compaction") {
+		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		return entry.systemMessage ? [entry.systemMessage, summary] : [summary];
+	}
+	return [];
+}
+```
+
+## !!steps The projection keeps provenance
+
+`buildSessionProjection` returns more than messages: each entry in the projected list remembers its raw `sourceEntry`, which lets UIs map model-visible messages back to the tree. Context edits are collected into a map by target id and applied while projecting.
+
+An older compaction entry can appear in the list when its id falls inside the newest retained range; the check on `index` above zero makes sure only the newest one, at position zero, contributes messages.
+
+```ts ! session-manager.ts
+	const path = buildSessionPath(entries, leafId, byId);
+	const { thinkingLevel, model } = getSessionContextSettings(path);
+	const contextEntries = buildContextEntries(entries, leafId, byId);
+	const edits = new Map<string, ContextEditEntry>();
+	for (const entry of contextEntries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+	}
+	const projectedEntries = contextEntries.map(
+		(sourceEntry, index): ProjectedSessionEntry => ({
+			sourceEntry,
+			// buildContextEntries() may retain an older compaction entry because its
+			// raw ID lies inside the newest retained range. Only the newest compaction
+			// at index zero contributes a checkpoint and summary.
+			messages:
+				sourceEntry.type === "compaction" && index > 0
+					? []
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+		}),
+	);
+	return {
+		entries: projectedEntries,
+		messages: projectedEntries.flatMap((entry) => entry.messages),
+		thinkingLevel,
+		model,
+	};
+}
+```
+
+## !!steps Constructing a manager
+
+The constructor is private; callers use `create`, `open`, `continueRecent`, `inMemory` or `forkFrom`. It resolves the working directory, creates the session directory when persisting, and then takes one of three routes: open a given file, load entries supplied by the caller, or start a fresh session.
+
+In-memory mode passes an empty directory and `persist` false, so nothing ever touches disk.
+
+```ts ! session-manager.ts
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		sessionFile: string | undefined,
+		persist: boolean,
+		newSessionOptions?: NewSessionOptions,
+		preloadedFileEntries?: FileEntry[],
+	) {
+		this.cwd = resolvePath(cwd);
+		this.sessionDir = normalizePath(sessionDir);
+		this.persist = persist;
+		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
+			mkdirSync(this.sessionDir, { recursive: true });
+		}
+
+		if (sessionFile) {
+			this._setSessionFile(sessionFile, preloadedFileEntries);
+		} else if (preloadedFileEntries?.length) {
+			this._loadEntries(preloadedFileEntries, newSessionOptions);
+		} else {
+			this.newSession(newSessionOptions);
+		}
+	}
+```
+
+## !!steps Opening a file safely
+
+`_setSessionFile` distinguishes three cases. A missing path becomes a new session that keeps the requested file name. An existing file that parses is loaded and marked flushed. An existing zero-length file is initialized with a fresh header, but a non-empty file that does not parse as a session throws and is left untouched.
+
+That last rule prevents `--session` from overwriting an unrelated file.
+
+```ts ! session-manager.ts
+	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this.sessionFile = resolvePath(sessionFile);
+		if (existsSync(this.sessionFile)) {
+			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+
+			// If file was empty, initialize it with a valid session header. If it was
+			// non-empty but did not parse as a pi session, fail without modifying it.
+			if (entries.length === 0) {
+				const explicitPath = this.sessionFile;
+				if (statSync(explicitPath).size > 0) {
+					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
+				}
+				this.newSession();
+				this.sessionFile = explicitPath;
+				this._rewriteFile();
+				this.flushed = true;
+				return;
+			}
+
+			this._loadEntries(entries);
+			this.flushed = true;
+		} else {
+			const explicitPath = this.sessionFile;
+			this.newSession();
+			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+		}
+	}
+```
+
+## !!steps Files appear only once there is a conversation
+
+A brand-new session is held in memory until it contains a user or assistant message. Only then does `_persist` write the whole buffered list with the exclusive `wx` flag, and afterward each entry is appended as a single JSON line. Opening and quitting pi without chatting leaves no file.
+
+The comment on `_hasConversation` explains why the trigger is the user message and not the first assistant reply: the prompt must survive if the first turn never completes.
+
+```ts ! session-manager.ts
+	private _hasConversation(): boolean {
+		return this.fileEntries.some(
+			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+		);
+	}
+
+	_persist(entry: SessionEntry): void {
+		if (!this.persist || !this.sessionFile) return;
+
+		if (!this.flushed) {
+			if (!this._hasConversation()) return;
+			const fd = openSync(this.sessionFile, "wx");
+			try {
+				for (const e of this.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				}
+			} finally {
+				closeSync(fd);
+			}
+			this.flushed = true;
+		} else {
+			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+		}
+	}
+```
+
+## !!steps Appending, and compaction snapshots
+
+Every `append` method builds an entry whose `parentId` is the current leaf and goes through `_appendEntry`, which updates the index, advances the leaf and persists. `appendMessage` is typed to refuse summary messages; those must use their own methods so they stay top-level entries.
+
+`appendCompaction` additionally stores the current system message in the entry, re-stamped with the compaction time. When `firstKeptEntryId` is null it defaults to the compaction entry's own id.
+
+```ts ! session-manager.ts
+	private _appendEntry(entry: SessionEntry): void {
+		this.fileEntries.push(entry);
+		this.byId.set(entry.id, entry);
+		this.leafId = entry.id;
+		this._persist(entry);
+	}
+// ...
+// !mark
+		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
+// ...
+		const entry: CompactionEntry<T> = {
+			type: "compaction",
+			id,
+			parentId: this.leafId,
+			timestamp,
+			summary,
+			firstKeptEntryId: firstKeptEntryId ?? id,
+			tokensBefore,
+			details,
+			usage,
+			fromHook,
+			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+```
+
+## !!steps Branching moves a pointer
+
+`branch` only validates the id and sets `leafId`; the next append becomes a child of that entry. `resetLeaf` sets it to null so the next entry is a new root, used when re-editing the first message.
+
+`branchWithSummary` records the abandoned leaf in `fromId` (the string `root` when there was none), moves the leaf, and appends a `branch_summary` entry as a child of the new position. The summary generation is in [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts).
+
+```ts ! session-manager.ts
+	branch(branchFromId: string): void {
+		if (!this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		this.leafId = branchFromId;
+	}
+// ...
+	resetLeaf(): void {
+		this.leafId = null;
+	}
+// ...
+		if (branchFromId !== null && !this.byId.has(branchFromId)) {
+			throw new Error(`Entry ${branchFromId} not found`);
+		}
+		const fromId = this.leafId ?? "root";
+		this.leafId = branchFromId;
+```
+
+## !!steps Extracting one path into its own file
+
+`createBranchedSession` writes a new session file containing only the root-to-leaf path. Label entries sit inside the tree as real nodes, so dropping them would orphan their children; the loop therefore re-chains `parentId` across removed labels and remaps a compaction's `firstKeptEntryId` if it pointed at a label. The labels are then re-added at the end from the resolved label map.
+
+The new header points back through `parentSession`, but only in persisted mode.
+
+```ts ! session-manager.ts
+		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
+		// Because labels are real tree entries, later entries can be children of labels;
+		// removing labels requires re-chaining the retained path to avoid orphaned subtrees.
+		const pathWithoutLabels: SessionEntry[] = [];
+		const replacementByLabelId = new Map<string, string>();
+		const pendingLabelIds: string[] = [];
+		let pathParentId: string | null = null;
+		for (const entry of path) {
+			if (entry.type === "label") {
+				pendingLabelIds.push(entry.id);
+				continue;
+			}
+			for (const labelId of pendingLabelIds) {
+				replacementByLabelId.set(labelId, entry.id);
+			}
+			pendingLabelIds.length = 0;
+			pathWithoutLabels.push(
+				entry.type === "compaction"
+					? {
+							...entry,
+							parentId: pathParentId,
+							firstKeptEntryId:
+								entry.firstKeptEntryId === entry.id
+									? entry.id
+									: (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId),
+						}
+					: { ...entry, parentId: pathParentId },
+			);
+			pathParentId = entry.id;
+		}
+```
+
+## !!steps Listing many sessions with bounded concurrency
+
+Listing parses each file fully (for message counts and search text), which is expensive. `mapWithConcurrency` runs a fixed number of workers over the file list and checks the abort signal before each item. The info loader is limited to 10 files at once and discovery steps to 64, and progress callbacks publish a sorted partial list every 10 sessions for one directory or every 100 for the all-projects listing.
+
+The session picker in the TUI uses this to show results while the scan is still running.
+
+```ts ! session-manager.ts
+const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+const MAX_CONCURRENT_SESSION_DISCOVERY_LOADS = 64;
+const CURRENT_SESSION_LIST_PUBLISH_INTERVAL = 10;
+const ALL_SESSION_LIST_PUBLISH_INTERVAL = 100;
+// ...
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	map: (item: T, index: number) => Promise<R>,
+	signal?: AbortSignal,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let nextIndex = 0;
+	const worker = async (): Promise<void> => {
+		while (nextIndex < items.length) {
+			signal?.throwIfAborted();
+			const index = nextIndex++;
+			results[index] = await map(items[index]!, index);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+	return results;
+}
+```
+
+</Scrollycoding>
+
+[agent-session.ts](/docs/src/core/agent-session.ts) is the main consumer: it appends every message, model change and compaction here and rebuilds model context from the projection. [session-cwd.ts](/docs/src/core/session-cwd.ts) deals with sessions whose recorded directory no longer exists, and [session-export.ts](/docs/src/core/session-export.ts) turns sessions into other formats. Path helpers come from [paths.ts](/docs/src/utils/paths.ts). Structurally the file is a block of types, then free functions for parsing and projection, then the class, then static factories and listing at the bottom.
+

@@ -1,0 +1,108 @@
+---
+title: "windows-self-update.ts"
+description: "Moves loaded native addons aside on Windows so an in-place npm update can replace them"
+source: "src/utils/windows-self-update.ts"
+full: true
+---
+
+On Windows a loaded `.node` or `.dll` file cannot be overwritten or deleted, so when pi updates its own npm package while running, the install fails on native addons that are in use. The workaround is to rename each loaded shared object into a quarantine directory (renaming a loaded file is allowed) and copy it back to the original name. The running process keeps using the renamed file, while the installer can replace the original path.
+
+The quarantine is cleaned up on the next start. Callers are [main.ts](/docs/src/main.ts), which cleans up at startup, and [package-manager-cli.ts](/docs/src/package-manager-cli.ts), which cleans up and then quarantines before updating. It relies on [paths.ts](/docs/src/utils/paths.ts) for containment checks.
+
+<Scrollycoding>
+
+## !!steps Where the quarantine lives
+
+The quarantine directory sits inside the nearest enclosing `node_modules` of the package, named `.pi-native-quarantine`. The walk goes up parent by parent, compares case-insensitively, and returns `undefined` at the filesystem root, which disables the whole mechanism for packages not installed under `node_modules`.
+
+```ts ! windows-self-update.ts
+const QUARANTINE_DIR_NAME = ".pi-native-quarantine";
+
+function normalizePath(path: string): string {
+	return toNamespacedPath(resolve(path));
+}
+
+function getQuarantineRoot(packageDir: string): string | undefined {
+	let current = resolve(packageDir);
+	while (true) {
+		if (basename(current).toLowerCase() === "node_modules") {
+			return join(current, QUARANTINE_DIR_NAME);
+		}
+		const parent = dirname(current);
+		if (parent === current) {
+			return undefined;
+		}
+		current = parent;
+	}
+}
+```
+
+## !!steps Asking Node what is loaded
+
+`process.report.getReport()` includes a `sharedObjects` list of every loaded native library. The function keeps only those under the package directory, comparing lowercase paths because Windows is case-insensitive, and deduplicates them. Containment reuses `getCwdRelativePath`.
+
+```ts ! windows-self-update.ts
+function getLoadedSharedObjectsInPackageDir(packageDir: string): string[] {
+	const sharedObjects = (process.report.getReport() as { sharedObjects?: unknown }).sharedObjects;
+	if (!Array.isArray(sharedObjects)) {
+		return [];
+	}
+
+	const root = normalizePath(packageDir).toLowerCase();
+	const seen = new Set<string>();
+	const loadedFiles: string[] = [];
+	for (const value of sharedObjects) {
+		if (typeof value !== "string") {
+			continue;
+		}
+		const filePath = normalizePath(value);
+		const comparisonPath = filePath.toLowerCase();
+		if (getCwdRelativePath(comparisonPath, root) === undefined || seen.has(comparisonPath)) {
+			continue;
+		}
+		seen.add(comparisonPath);
+		loadedFiles.push(filePath);
+	}
+	return loadedFiles;
+}
+```
+
+## !!steps Cleanup on the next start
+
+The next process deletes the whole quarantine root with `force: true`. Errors are swallowed because a previous pi may still be exiting and holding a native addon, in which case the delete simply happens on a later run.
+
+```ts ! windows-self-update.ts
+export function cleanupWindowsSelfUpdateQuarantine(packageDir: string): void {
+	const quarantineRoot = getQuarantineRoot(packageDir);
+	if (!quarantineRoot) {
+		return;
+	}
+	try {
+		rmSync(quarantineRoot, { recursive: true, force: true });
+	} catch {
+		// A previous pi process may still be exiting and holding a native addon.
+	}
+}
+```
+
+## !!steps Rename away, copy back
+
+Each update run gets its own subdirectory named with timestamp, pid and a UUID, so overlapping runs cannot collide. For every loaded file the relative layout is preserved, the file is renamed into quarantine, and a copy is written back at the original path so the package still looks complete if the update is aborted. Unlike cleanup, this function does not catch errors from the filesystem calls.
+
+```ts ! windows-self-update.ts
+	const quarantineRunDir = join(quarantineRoot, `${Date.now()}-${process.pid}-${randomUUID()}`);
+	for (const loadedFile of loadedFiles) {
+		if (!existsSync(loadedFile)) {
+			continue;
+		}
+		const quarantinePath = join(quarantineRunDir, relative(resolvedPackageDir, loadedFile));
+		mkdirSync(dirname(quarantinePath), { recursive: true });
+		// !mark(1:2)
+		renameSync(loadedFile, quarantinePath);
+		copyFileSync(quarantinePath, loadedFile);
+	}
+```
+
+</Scrollycoding>
+
+The function names say Windows but nothing in the code checks `process.platform`; the callers decide when to invoke it. Because the copy-back recreates the file at its original path, the installer replaces a fresh, unlocked copy.

@@ -1,0 +1,238 @@
+---
+title: "config.ts"
+description: "Loads and edits mcp.json: merges global and project server definitions, supports project overrides, and rewrites files while keeping their formatting."
+source: "src/extensions/mcp/config.ts"
+full: true
+---
+
+MCP servers are configured in an `mcp.json` file using the `mcpServers` shape shared with other MCP clients. This file reads that configuration from two places, the agent directory (global) and the project's config directory (project, only when the project is trusted), and merges them into a list of server entries plus a list of human-readable errors.
+
+It also holds the write side: adding, removing, and patching servers while preserving the file's other content and indentation. Validation of an individual server lives in [mcp-servers.ts](/docs/src/core/mcp-servers.ts); trust is decided by [trust-manager.ts](/docs/src/core/trust-manager.ts). Consumers are the offline command in [cli.ts](/docs/src/extensions/mcp/cli.ts), the in-session UI in [ui.ts](/docs/src/extensions/mcp/ui.ts), and [index.ts](/docs/src/extensions/mcp/index.ts).
+
+<Scrollycoding>
+
+## !!steps The file format and merge rules
+
+The header comment is the specification. Project entries replace global entries with the same name. A project entry with no `command`, `url`, or `type` is an override that can change only `enabled`, `exposure`, and `toolExposure`, which lets a project turn a global server off without copying its credentials.
+
+Project files may not use the `auth` provider setting, so a repository cannot choose where a credential is sent.
+
+```ts ! config.ts
+/**
+ * MCP server configuration.
+ *
+ * Servers are read from `mcp.json` in the agent directory and, for trusted projects, from
+ * `<project>/.pi/mcp.json`. Both use the `mcpServers` shape shared by other MCP clients, so
+ * existing configurations can be copied over. Project entries replace global entries with the
+ * same name.
+ *
+ * A project entry without `command`, `url`, or `type` overrides only `enabled`, `exposure`, and
+ * `toolExposure` of the global server with the same name, for example to turn it off in one project:
+ * `{ "mcpServers": { "internal-tools": { "enabled": false } } }`. The rest of the global entry is kept,
+ * including credentials the project could not set itself.
+ *
+// ...
+ * HTTP servers without an `Authorization` header use OAuth when they answer 401 (sign in with `/mcp`).
+ * `"auth": { "provider": "<provider>" }` sends the token of a `/login` provider instead. Project files
+ * cannot use it, so a repository cannot pick where the credential goes.
+```
+
+## !!steps Entries and the loaded result
+
+`McpServerEntry` pairs a validated config with where it came from. `scope` is `global`, `project`, or `extension` (for servers registered by code, whose changes are not saved), and `override` records the project file that overrode a global server.
+
+`LoadedMcpConfig` returns entries, the `autoEnableCodemode` flag, collected errors, and the project path when the project is trusted. Errors are collected, never thrown, so one bad entry does not hide the others.
+
+```ts ! config.ts
+export interface McpServerEntry {
+	name: string;
+	config: McpServerConfig;
+	/** Config file that defined the entry, or the path of the extension that registered it. */
+	source: string;
+	// ...
+	scope?: "global" | "project" | "extension";
+	/** Project `mcp.json` with an override of this global server's `enabled`, `exposure`, or `toolExposure`. */
+	override?: string;
+}
+
+export interface LoadedMcpConfig {
+	servers: McpServerEntry[];
+	/** Activate the codemode tool when `codemode` servers connect. Default: true. */
+	autoEnableCodemode?: boolean;
+	errors: string[];
+	/** The project `mcp.json` when the project is trusted, where `/mcp` saves project overrides. */
+	projectConfig?: string;
+}
+```
+
+## !!steps Reading one file
+
+`readConfigFile` is tolerant. A missing file is skipped, invalid JSON or a wrong top-level shape becomes an error string prefixed with the path, and `autoEnableCodemode` must be a boolean. Because the state object is shared, reading the project file after the global file lets the project value win.
+
+```ts ! config.ts
+function readConfigFile(path: string, scope: "global" | "project", state: McpConfigState): void {
+	const { servers, errors } = state;
+	if (!existsSync(path)) return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(readFileSync(path, "utf8"));
+	} catch (error) {
+		errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
+		errors.push(`${path}: expected an object with an "mcpServers" object`);
+		return;
+	}
+	// !mark(1:2)
+	if (typeof parsed.autoEnableCodemode === "boolean") state.autoEnableCodemode = parsed.autoEnableCodemode;
+	else if (parsed.autoEnableCodemode !== undefined) errors.push(`${path}: autoEnableCodemode must be a boolean`);
+```
+
+## !!steps Applying a project override
+
+In the project file, an entry that is an override looks up the base server. No base means an error, extra keys mean an error, and otherwise the base config and the override are merged and re-validated before the entry replaces the base. The `override` field remembers the file so the UI can show it.
+
+```ts ! config.ts
+		if (scope === "project" && isRecord(value) && isOverride(value)) {
+			const base = servers.get(name);
+			const extra = Object.keys(value).filter((key) => !OVERRIDE_KEYS.includes(key));
+			if (!base) {
+				errors.push(`${path}: server "${name}" needs "command" or "url", or a global server to override`);
+			} else if (extra.length > 0) {
+				errors.push(`${path}: server "${name}": an override can only set ${OVERRIDE_KEYS.join(", ")}`);
+			} else {
+				// !mark(1:3)
+				const config = validateMcpServerConfig(name, { ...base.config, ...value });
+				if (typeof config === "string") errors.push(`${path}: ${config}`);
+				else servers.set(name, { ...base, config, override: path });
+			}
+			continue;
+		}
+```
+
+## !!steps Name clashes and project restrictions
+
+For a full definition, the config is validated, then checked for a namespace clash: names that differ only in `-` versus `_` map to the same tool namespace through `mcpNamespace`, so the second is rejected. Project HTTP servers with `auth` are rejected as well.
+
+Note the clash test compares against all servers loaded so far, including ones from the same file.
+
+```ts ! config.ts
+		const config = validateMcpServerConfig(name, value);
+		if (typeof config === "string") {
+			errors.push(`${path}: ${config}`);
+			continue;
+		}
+		// Names that differ only in `-` and `_` would share a namespace.
+		// !mark(1:4)
+		const clash = [...servers.keys()].find((other) => other !== name && mcpNamespace(other) === mcpNamespace(name));
+		if (clash) {
+			errors.push(`${path}: server "${name}" conflicts with "${clash}"`);
+			continue;
+		}
+		if (scope === "project" && "url" in config && config.auth) {
+			errors.push(`${path}: server "${name}": auth is only allowed in the global mcp.json`);
+			continue;
+		}
+		servers.set(name, { name, config, source: path, scope });
+```
+
+## !!steps loadMcpConfig
+
+The loader reads the global file first, then the project file only when `projectTrusted` is true. Disabled servers stay in the list with `enabled: false`, so the UI can turn them back on. The project path is returned only for trusted projects, which is where the UI saves overrides.
+
+```ts ! config.ts
+export function loadMcpConfig(options: { agentDir: string; cwd: string; projectTrusted: boolean }): LoadedMcpConfig {
+	const state: McpConfigState = { servers: new Map(), errors: [] };
+	readConfigFile(join(options.agentDir, "mcp.json"), "global", state);
+	// !mark
+	const projectConfig = options.projectTrusted ? join(options.cwd, CONFIG_DIR_NAME, "mcp.json") : undefined;
+	if (projectConfig) readConfigFile(projectConfig, "project", state);
+	return {
+		servers: [...state.servers.values()],
+		...(state.autoEnableCodemode === undefined ? {} : { autoEnableCodemode: state.autoEnableCodemode }),
+		errors: state.errors,
+		...(projectConfig ? { projectConfig } : {}),
+	};
+}
+```
+
+## !!steps Patching a server
+
+`updateMcpServerConfig` changes `enabled` or `exposure` in the file that defines the server. The defaults (`enabled: true`, `exposure: "codemode"`) delete the key for real definitions, which keeps files tidy. For overrides, `keepDefaults` is true, so the value is written explicitly, because the override must be able to say "back to default" against a global server that sets something else.
+
+With the `override` option, a missing entry is created as an empty override.
+
+```ts ! config.ts
+	editMcpServers(path, (servers, parsed) => {
+		let server = servers?.[name];
+		if (server === undefined && options.override) {
+			server = {};
+			parsed.mcpServers = { ...servers, [name]: server };
+		}
+		if (!isRecord(server)) throw new Error(`${path} does not define MCP server "${name}"`);
+		// !mark
+		const keepDefaults = isOverride(server);
+		if (patch.enabled !== undefined) {
+			if (patch.enabled && !keepDefaults) delete server.enabled;
+			else server.enabled = patch.enabled;
+		}
+		if (patch.exposure !== undefined) {
+			if (patch.exposure === "codemode" && !keepDefaults) delete server.exposure;
+			else server.exposure = patch.exposure;
+		}
+		return true;
+	});
+```
+
+## !!steps Add and remove
+
+`addMcpServerConfig` creates the file if needed and replaces an existing entry, returning whether it did. `removeMcpServerConfig` returns false for a missing file or server, and its edit callback returns false in that case so nothing is rewritten.
+
+```ts ! config.ts
+export function addMcpServerConfig(path: string, name: string, config: McpServerConfig): boolean {
+	let replaced = false;
+	editMcpServers(path, (servers, parsed) => {
+		const target = servers ?? {};
+		replaced = target[name] !== undefined;
+		target[name] = config;
+		parsed.mcpServers = target;
+		return true;
+	});
+	return replaced;
+}
+
+/** Remove a server from an `mcp.json`. Returns false when the file does not define it. */
+export function removeMcpServerConfig(path: string, name: string): boolean {
+	if (!existsSync(path)) return false;
+	let removed = false;
+```
+
+## !!steps The shared editor
+
+All writes go through `editMcpServers`. It parses the file (or starts from an empty object), checks the shape, lets the callback mutate it, and writes back only if the callback returned true. The indentation of the first indented line is detected and reused, falling back to two spaces, so editing does not reformat the user's file. Unlike the loader, this function throws on bad content, and callers such as [cli.ts](/docs/src/extensions/mcp/cli.ts) turn that into an error message.
+
+```ts ! config.ts
+function editMcpServers(
+	path: string,
+	edit: (servers: Record<string, unknown> | undefined, parsed: Record<string, unknown>) => boolean,
+): void {
+	const text = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+	const parsed: unknown = text === undefined ? {} : JSON.parse(text);
+	if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
+		throw new Error(`${path}: expected an object with an "mcpServers" object`);
+	}
+	const servers = isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
+	if (!edit(servers, parsed)) return;
+	// !mark
+	const indent = (text && /^([ \t]+)\S/m.exec(text)?.[1]) || "  ";
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(parsed, null, indent)}\n`);
+}
+```
+
+</Scrollycoding>
+
+The file has a clear split: loading is forgiving and collects errors, editing is strict and throws. Types and `getMcpToolExposure` are re-exported from [mcp-servers.ts](/docs/src/core/mcp-servers.ts) so extension code imports everything from one place. The CONFIG_DIR_NAME constant comes from [config.ts](/docs/src/config.ts).
+
+A small asymmetry: the loader recognizes comments or trailing commas as invalid JSON, so a hand-edited `mcp.json` with comments produces a config error rather than being tolerated.

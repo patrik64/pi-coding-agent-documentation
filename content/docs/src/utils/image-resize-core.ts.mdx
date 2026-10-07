@@ -1,0 +1,195 @@
+---
+title: "image-resize-core.ts"
+description: "The in-process Photon algorithm that shrinks an image under dimension and base64 size limits"
+source: "src/utils/image-resize-core.ts"
+full: true
+---
+
+This file is the actual resizing algorithm, free of any threading concerns. It is called directly as a fallback and from the worker entry [image-resize-worker.ts](/docs/src/utils/image-resize-worker.ts); the public wrapper is [image-resize.ts](/docs/src/utils/image-resize.ts).
+
+The goal is a payload that stays below the provider's inline image limit, with a default of 4.5 MB of base64 to leave headroom under a 5 MB cap. Photon comes from [photon.ts](/docs/src/utils/photon.ts).
+
+<Scrollycoding>
+
+## !!steps Options and defaults
+
+Defaults are 2000 by 2000 pixels, 4.5 MB encoded and JPEG quality 80. The limit applies to the base64 string, not the raw bytes.
+
+```ts ! image-resize-core.ts
+export interface ImageResizeOptions {
+	maxWidth?: number; // Default: 2000
+	maxHeight?: number; // Default: 2000
+	maxBytes?: number; // Default: 4.5MB of base64 payload (below Anthropic's 5MB limit)
+	jpegQuality?: number; // Default: 80
+}
+
+export interface ResizedImage {
+	data: string; // base64
+	mimeType: string;
+	originalWidth: number;
+	originalHeight: number;
+	width: number;
+	height: number;
+	wasResized: boolean;
+}
+
+// 4.5MB of base64 payload. Provides headroom below Anthropic's 5MB limit.
+const DEFAULT_MAX_BYTES = 4.5 * 1024 * 1024;
+
+const DEFAULT_OPTIONS: Required<ImageResizeOptions> = {
+	maxWidth: 2000,
+	maxHeight: 2000,
+	maxBytes: DEFAULT_MAX_BYTES,
+	jpegQuality: 80,
+};
+
+interface EncodedCandidate {
+	data: string;
+	encodedSize: number;
+	mimeType: string;
+}
+
+function encodeCandidate(buffer: Uint8Array, mimeType: string): EncodedCandidate {
+	const data = Buffer.from(buffer).toString("base64");
+	return {
+		data,
+		encodedSize: Buffer.byteLength(data, "utf-8"),
+		mimeType,
+	};
+}
+```
+
+## !!steps Early exit
+
+The input is decoded and oriented via [exif-orientation.ts](/docs/src/utils/exif-orientation.ts). The base64 size of the input is estimated from its byte length. If dimensions and size are both within limits, the original bytes are returned untouched with `wasResized` false, avoiding a lossy re-encode.
+
+```ts ! image-resize-core.ts
+	const opts = { ...DEFAULT_OPTIONS, ...options };
+	const inputBase64Size = Math.ceil(inputBytes.byteLength / 3) * 4;
+
+	const photon = await loadPhoton();
+	if (!photon) {
+		return null;
+	}
+
+	let image: ReturnType<typeof photon.PhotonImage.new_from_byteslice> | undefined;
+	try {
+		const rawImage = photon.PhotonImage.new_from_byteslice(inputBytes);
+		image = applyExifOrientation(photon, rawImage, inputBytes);
+		if (image !== rawImage) rawImage.free();
+
+		const originalWidth = image.get_width();
+		const originalHeight = image.get_height();
+		const format = mimeType.split("/")[1] ?? "png";
+
+		// Check if already within all limits (dimensions AND encoded size)
+		if (originalWidth <= opts.maxWidth && originalHeight <= opts.maxHeight && inputBase64Size < opts.maxBytes) {
+			return {
+				data: Buffer.from(inputBytes).toString("base64"),
+				mimeType: mimeType || `image/${format}`,
+				originalWidth,
+				originalHeight,
+				width: originalWidth,
+				height: originalHeight,
+				wasResized: false,
+			};
+		}
+```
+
+## !!steps Fitting dimensions
+
+The target size scales to the width limit first and then the height limit, preserving the aspect ratio.
+
+```ts ! image-resize-core.ts
+		// Calculate initial dimensions respecting max limits
+		let targetWidth = originalWidth;
+		let targetHeight = originalHeight;
+
+		if (targetWidth > opts.maxWidth) {
+			targetHeight = Math.round((targetHeight * opts.maxWidth) / targetWidth);
+			targetWidth = opts.maxWidth;
+		}
+		if (targetHeight > opts.maxHeight) {
+			targetWidth = Math.round((targetWidth * opts.maxHeight) / targetHeight);
+			targetHeight = opts.maxHeight;
+		}
+```
+
+## !!steps Trying encodings
+
+`tryEncodings` resizes with Lanczos3 and encodes a PNG plus a JPEG at each quality. The temporary resized image is always freed. The quality list is de-duplicated with a `Set`, so a default of 80 yields 80, 85, 70, 55 and 40.
+
+```ts ! image-resize-core.ts
+		function tryEncodings(width: number, height: number, jpegQualities: number[]): EncodedCandidate[] {
+			const resized = photon!.resize(image!, width, height, photon!.SamplingFilter.Lanczos3);
+
+			try {
+				const candidates: EncodedCandidate[] = [encodeCandidate(resized.get_bytes(), "image/png")];
+				for (const quality of jpegQualities) {
+					candidates.push(encodeCandidate(resized.get_bytes_jpeg(quality), "image/jpeg"));
+				}
+				return candidates;
+			} finally {
+				resized.free();
+			}
+		}
+
+		const qualitySteps = Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]));
+```
+
+## !!steps Shrinking loop
+
+The first candidate under the limit wins; PNG is tried first, then the JPEGs in order, so the winner is not necessarily the smallest. If none fit, both sides are multiplied by 0.75 and the loop repeats, down to 1 by 1, after which the function gives up.
+
+```ts ! image-resize-core.ts
+		while (true) {
+			const candidates = tryEncodings(currentWidth, currentHeight, qualitySteps);
+			for (const candidate of candidates) {
+				if (candidate.encodedSize < opts.maxBytes) {
+					return {
+						data: candidate.data,
+						mimeType: candidate.mimeType,
+						originalWidth,
+						originalHeight,
+						width: currentWidth,
+						height: currentHeight,
+						wasResized: true,
+					};
+				}
+			}
+
+			if (currentWidth === 1 && currentHeight === 1) {
+				break;
+			}
+
+			const nextWidth = currentWidth === 1 ? 1 : Math.max(1, Math.floor(currentWidth * 0.75));
+			const nextHeight = currentHeight === 1 ? 1 : Math.max(1, Math.floor(currentHeight * 0.75));
+			if (nextWidth === currentWidth && nextHeight === currentHeight) {
+				break;
+			}
+
+			currentWidth = nextWidth;
+			currentHeight = nextHeight;
+		}
+
+		return null;
+```
+
+## !!steps Cleanup and failure
+
+Any exception yields null. The `finally` block frees the Photon image, which is essential since WASM memory is outside the JavaScript heap.
+
+```ts ! image-resize-core.ts
+	} catch {
+		return null;
+	} finally {
+		if (image) {
+			image.free();
+		}
+	}
+}
+```
+
+</Scrollycoding>
+
+Everything returns null on failure rather than throwing, which the wrapper and [image-process.ts](/docs/src/utils/image-process.ts) rely on.

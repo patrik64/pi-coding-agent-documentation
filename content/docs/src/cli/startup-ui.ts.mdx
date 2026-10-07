@@ -1,0 +1,250 @@
+---
+title: "startup-ui.ts"
+description: "Short-lived terminal dialogs shown before the main TUI exists: selector, text input, and the first-time setup screen"
+source: "src/cli/startup-ui.ts"
+full: true
+---
+
+Some questions must be asked before the real interactive mode is running: which
+session to resume, whether to trust a project, whether this is a first launch.
+This file creates a temporary TUI for each such question, shows one component,
+and tears it down once it has an answer.
+
+All of them share the same setup: load themes, apply terminal capability
+overrides, create a screen, and wait for the terminal to report its colors. The
+callers are [session-picker.ts](/docs/src/cli/session-picker.ts) and
+[project-trust.ts](/docs/src/cli/project-trust.ts); the components shown live in
+[modes/interactive/components](/docs/src/modes/interactive/components/index.ts).
+
+<Scrollycoding>
+
+## !!steps Only official builds run first-time setup
+
+Forks and rebrands are detected by comparing package name, app name and config
+directory to the official values, which come from [config.ts](/docs/src/config.ts).
+A rebranded build never shows the setup screen.
+
+```ts ! startup-ui.ts
+const OFFICIAL_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+const OFFICIAL_APP_NAME = "pi";
+const OFFICIAL_CONFIG_DIR_NAME = ".pi";
+
+interface DistributionMetadata {
+	packageName: string;
+	appName: string;
+	configDirName: string;
+}
+
+function isOfficialDistribution({ packageName, appName, configDirName }: DistributionMetadata): boolean {
+	return (
+		packageName === OFFICIAL_PACKAGE_NAME &&
+		appName === OFFICIAL_APP_NAME &&
+		configDirName === OFFICIAL_CONFIG_DIR_NAME
+	);
+}
+```
+
+## !!steps Loading themes without trusting the project
+
+Custom themes must be available for the dialog, but the project is not yet
+trusted, so a fresh in-memory settings manager is built from the global
+settings only, with `projectTrusted: false`. The package manager resolves theme
+resources with a prompt callback that always answers "skip", so nothing is
+installed during startup.
+
+```ts ! startup-ui.ts
+async function loadStartupThemes(settingsManager: SettingsManager): Promise<Theme[]> {
+	const globalSettingsManager = SettingsManager.inMemory(settingsManager.getGlobalSettings(), {
+		projectTrusted: false,
+	});
+	const packageManager = new DefaultPackageManager({
+		cwd: process.cwd(),
+		agentDir: getAgentDir(),
+		settingsManager: globalSettingsManager,
+	});
+	const resolvedPaths = await packageManager.resolve(async () => "skip");
+	return loadThemes(resolvedPaths.themes);
+}
+```
+
+## !!steps Tolerating broken themes
+
+`loadThemes` skips disabled resources, drops duplicate theme names (first wins)
+and swallows load errors. The comment gives the reason: a prompt must not fail
+because of a bad theme file; the regular resource loader reports it later.
+
+```ts ! startup-ui.ts
+function loadThemes(resources: ResolvedResource[]): Theme[] {
+	const themes: Theme[] = [];
+	const seen = new Set<string>();
+	for (const resource of resources) {
+		if (!resource.enabled) continue;
+		try {
+			const loadedTheme = loadThemeFromPath(resource.path);
+			if (loadedTheme.name) {
+				if (seen.has(loadedTheme.name)) continue;
+				seen.add(loadedTheme.name);
+			}
+			themes.push(loadedTheme);
+		} catch {
+			// Startup prompts should not fail because a theme is broken. The normal
+			// resource loader reports theme diagnostics later in startup.
+		}
+	}
+	return themes;
+}
+```
+
+## !!steps Creating and starting the screen
+
+`createStartupTui` registers themes, marks terminal colors as pending (the
+system theme starts grayscale), picks the theme from settings, installs
+keybindings and builds the TUI. `startStartupTui` starts it and then queries
+the real terminal colors, applying the theme again when they arrive.
+
+The color query does not block: it is fire and forget, and re-renders when the
+answer comes, even if that is after the timeout.
+
+```ts ! startup-ui.ts
+export async function createStartupTui(settingsManager: SettingsManager): Promise<TUI> {
+	setCapabilityOverrides(settingsManager.getTerminalCapabilityOverrides());
+	setRegisteredThemes(await loadStartupThemes(settingsManager));
+	// The system theme starts in grayscale until the terminal reports its colors.
+	markTerminalColorsPending();
+	initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), getTerminalTheme()) ?? SYSTEM_THEME_NAME);
+	setKeybindings(KeybindingsManager.create());
+	const ui: TUI = new TuiMainScreen(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir());
+	ui.setClearOnShrink(settingsManager.getClearOnShrink());
+	return ui;
+}
+
+export function startStartupTui(ui: TUI, settingsManager: SettingsManager): void {
+	ui.start();
+	const themeSetting = settingsManager.getThemeSetting();
+	queryStartupTerminalColors(ui, () => {
+		setTheme(resolveThemeSetting(themeSetting, getTerminalTheme()) ?? SYSTEM_THEME_NAME);
+	});
+}
+```
+
+## !!steps When first-time setup runs
+
+The documented conditions are all required: an official distribution,
+experimental features enabled, the default agent directory, and no existing
+`settings.json`. Because of the experimental condition, the setup screen
+currently only appears for users who opted in through
+[experimental.ts](/docs/src/core/experimental.ts).
+
+```ts ! startup-ui.ts
+export function shouldRunFirstTimeSetup(settingsPath: string = getSettingsPath()): boolean {
+	if (
+		!isOfficialDistribution({
+			packageName: PACKAGE_NAME,
+			appName: APP_NAME,
+			configDirName: CONFIG_DIR_NAME,
+		})
+	) {
+		return false;
+	}
+	if (!areExperimentalFeaturesEnabled()) {
+		return false;
+	}
+	if (process.env[ENV_AGENT_DIR]) {
+		return false;
+	}
+	return !existsSync(settingsPath);
+}
+```
+
+## !!steps The selector dialog and its settle guard
+
+Every dialog uses the same promise pattern. A `settled` flag makes sure that
+only the first outcome wins, then the screen is cleared, the TUI stopped, and
+the promise resolved. Cancel resolves with undefined. Option values are looked
+up by label, which means duplicate labels would resolve to the first one.
+
+```ts ! startup-ui.ts
+export async function showStartupSelector<T>(
+	settingsManager: SettingsManager,
+	title: string,
+	options: Array<{ label: string; value: T }>,
+): Promise<T | undefined> {
+	const ui = await createStartupTui(settingsManager);
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = async (result: T | undefined) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			await clearStartupTui(ui);
+			ui.stop();
+			resolve(result);
+		};
+```
+
+## !!steps First-time setup persists on submit
+
+The setup dialog previews themes live: choosing one calls `setTheme` and
+re-renders. Only when the user submits are the theme and the analytics choice
+written to settings and flushed to disk. Cancelling saves nothing, so the
+dialog would appear again next launch.
+
+```ts ! startup-ui.ts
+		const finish = async (result: FirstTimeSetupResult | undefined) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			// !mark(1:4)
+			if (result) {
+				settingsManager.setTheme(result.theme);
+				settingsManager.setEnableAnalytics(result.shareAnalytics);
+				await settingsManager.flush();
+			}
+			await clearStartupTui(ui);
+			ui.stop();
+			resolve();
+		};
+
+		ui.start();
+		let previewTheme = SYSTEM_THEME_NAME;
+		setTheme(previewTheme);
+```
+
+## !!steps Text input and cleanup
+
+The input dialog is the same shape with one extra duty: the input component is
+disposed before the TUI stops. The small delay in `clearStartupTui`
+(25 ms) gives the cleared frame time to reach the terminal before it is
+released.
+
+```ts ! startup-ui.ts
+async function clearStartupTui(ui: TUI): Promise<void> {
+	ui.clear();
+	ui.requestRender();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+}
+// ...
+		const finish = async (result: string | undefined) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			input.dispose();
+			await clearStartupTui(ui);
+			ui.stop();
+			resolve(result);
+		};
+```
+
+</Scrollycoding>
+
+The three dialogs are built from
+[extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts),
+[extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts)
+and [first-time-setup.ts](/docs/src/modes/interactive/components/first-time-setup.ts).
+The theme side is in [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and
+[theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts).
+Structurally, the repeated settle-and-resolve block is duplicated three times
+instead of shared.

@@ -1,0 +1,53 @@
+---
+title: "easter-egg-3d.lazy.ts"
+description: "Thin lazy-loading wrapper that plays the 3D pi logo and Armin easter eggs only when first triggered"
+source: "src/modes/interactive/components/easter-egg-3d.lazy.ts"
+full: true
+---
+
+The 3D easter eggs live in [easter-egg-3d.ts](/docs/src/modes/interactive/components/easter-egg-3d.ts), a heavy module that most sessions never need. This file is the lightweight entry point the rest of the UI imports. It checks that the egg can play, captures the current screen, and only then dynamically imports the real module.
+
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) calls it when the header logo is clicked and when the Armin easter egg is requested, falling back to the inline [armin.ts](/docs/src/modes/interactive/components/armin.ts) version when it returns false.
+
+<Scrollycoding>
+
+## !!steps Guarding and deferring the load
+
+The effect dissolves the rendered screen, so it needs the alternate-screen TUI; any other TUI returns `false`. If an overlay is already open it returns `true` without playing, so the caller does not fall back to the inline version while an overlay is on screen.
+
+The screen lines are captured synchronously before the import starts, so the dissolve begins from what the user saw, not from whatever is drawn after the module loads. A failed import is swallowed by the empty rejection handler.
+
+```ts ! easter-egg-3d.lazy.ts
+function playEasterEgg3d(tui: TUI, egg: EasterEgg3d): boolean {
+	// !mark
+	if (!(tui instanceof TuiAltScreen)) return false;
+	// !mark
+	if (tui.hasOverlay()) return true;
+	const screen = tui.getScreenLines();
+	import("./easter-egg-3d.ts").then(
+		(module) => module.playEasterEgg3d(tui, screen, egg),
+		() => {},
+	);
+	return true;
+}
+```
+
+## !!steps Public entry points
+
+Two exported helpers pick the egg. The pi logo variant needs the header logo top-left cell so the 3D model lifts off from the right place. The Armin variant returns the boolean so the caller can fall back to the inline animation when fullscreen is unavailable.
+
+```ts ! easter-egg-3d.lazy.ts
+/** Plays the 3D pi logo, lifting off the header logo whose top-left cell is at `column`, `row`. */
+export function playPiLogo3d(tui: TUI, column: number, row: number): void {
+	playEasterEgg3d(tui, { kind: "pi-logo", column, row });
+}
+
+/** Plays the 3D Armin. Returns false when it cannot play, so the caller can fall back to the inline version. */
+export function playArmin3d(tui: TUI): boolean {
+	return playEasterEgg3d(tui, { kind: "armin" });
+}
+```
+
+</Scrollycoding>
+
+The split keeps startup cost low: only a type import of `EasterEgg3d` ties this file to the heavy module at compile time. One quirk worth knowing is that `true` means "handled", not "played", since the overlay case also returns `true`.

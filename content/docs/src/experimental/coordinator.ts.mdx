@@ -1,0 +1,217 @@
+---
+title: "coordinator.ts"
+description: "A Node-only socket router process that lets a replaceable pi server sit behind one stable public socket, plus the client used to talk to it"
+source: "src/experimental/coordinator.ts"
+full: true
+---
+
+The coordinator solves a hand-over problem. Clients connect to one stable public socket. Behind it, the actual server can start, die or be replaced by a newer one, and the coordinator keeps routing to whichever is current. It also relays small control messages between the server and connected peers.
+
+The file holds two halves. The top is the library side used by [server.ts](/docs/src/experimental/server.ts): `CoordinatorConnection` and `ensureCoordinator`. From the comment onwards it is the process itself, which declares that it depends only on Node built-ins and never interprets payloads. It is experimental code. The executable wrapper is [coordinator-entry.ts](/docs/src/experimental/coordinator-entry.ts), and processes are spawned by [process.ts](/docs/src/experimental/process.ts).
+
+<Scrollycoding>
+
+## !!steps A versioned, validated message protocol
+
+Messages from the coordinator to a server are checked against a TypeBox union. The version constant is also demanded of every registering server and peer, so mismatched binaries fail at registration instead of misrouting. Payloads are `Unknown` on purpose, since the router never looks inside them.
+
+```ts ! coordinator.ts
+export const COORDINATOR_PROTOCOL_VERSION = 3;
+const COORDINATOR_START_TIMEOUT_MS = 10_000;
+const COORDINATOR_RETRY_MS = 10;
+
+const CoordinatorMessageSchema = Type.Union([
+	Type.Object({
+		type: Type.Literal("server_registered"),
+		serverConnectionId: Type.String(),
+		peers: Type.Array(Type.String()),
+	}),
+	Type.Object({ type: Type.Literal("server_replaced") }),
+	Type.Object({ type: Type.Literal("peer_connected"), peerId: Type.String() }),
+	Type.Object({ type: Type.Literal("peer_disconnected"), peerId: Type.String() }),
+	Type.Object({ type: Type.Literal("message"), from: Type.String(), payload: Type.Unknown() }),
+]);
+```
+
+## !!steps Registering as the server
+
+`connect` opens the control socket and sends `register_server` with a fresh connection id and the endpoint the coordinator should forward public clients to. The promise resolves only when `server_registered` comes back, and sends are refused before that. `replaced` is a promise that settles when this server loses its role, either because a newer server registered or because the socket dropped.
+
+```ts ! coordinator.ts
+	async connect(): Promise<void> {
+		if (this.#socket) throw new Error("Coordinator server is already connected");
+		const socket = await connectSocket(this.#controlPath);
+		this.#socket = socket;
+		attachJsonLineReader(socket, (message) => this.#handleMessage(message));
+		const registered = new Promise<void>((resolve, reject) => {
+			this.#resolveRegistered = resolve;
+			this.#rejectRegistered = reject;
+		});
+		socket.once("close", () => this.#disconnected(new Error("Coordinator connection closed")));
+		socket.once("error", (error) => this.#disconnected(error));
+		// !mark(1:5)
+		await writeJsonLine(socket, {
+			type: "register_server",
+			protocol: COORDINATOR_PROTOCOL_VERSION,
+			serverConnectionId: this.serverConnectionId,
+			endpoint: this.#endpoint,
+		});
+		await registered;
+	}
+```
+
+## !!steps Handling coordinator messages defensively
+
+Invalid shapes destroy the socket. A registration echoing the wrong connection id is also treated as an error. Peer join and leave events update `peerIds` and are forwarded to listeners, and `server_replaced` just flips the replaced flag.
+
+```ts ! coordinator.ts
+	#handleMessage(value: unknown): void {
+		// !mark
+		if (!Check(CoordinatorMessageSchema, value)) {
+			this.#socket?.destroy(new Error("Coordinator sent an invalid message"));
+			return;
+		}
+		const message: CoordinatorMessage = value;
+		if (message.type === "server_registered") {
+			if (message.serverConnectionId !== this.serverConnectionId) {
+				this.#socket?.destroy(new Error("Coordinator returned an invalid server registration"));
+				return;
+			}
+			for (const peerId of message.peers) this.peerIds.add(peerId);
+			this.#registered = true;
+```
+
+## !!steps Starting the coordinator on demand
+
+`ensureCoordinator` first tries the control socket. Only `ENOENT` and `ECONNREFUSED` count as "not running"; other errors propagate. If it is absent, a child is spawned and the function polls every 10 ms for up to 10 seconds, failing early if the child exits. The returned lease keeps one idle connection open, which is what stops the coordinator from shutting down as empty before the server registers.
+
+```ts ! coordinator.ts
+export async function ensureCoordinator(publicPath: string, controlPath: string): Promise<CoordinatorStartupLease> {
+	const existing = await tryConnect(controlPath);
+	if (existing) return { close: () => existing.destroy() };
+	const child = spawnInternalProcess("coordinator", [publicPath, controlPath]);
+	const deadline = Date.now() + COORDINATOR_START_TIMEOUT_MS;
+	while (true) {
+		const socket = await tryConnect(controlPath);
+		if (socket) return { close: () => socket.destroy() };
+		if (child.exitCode !== null || child.signalCode !== null) throw new Error("Coordinator exited during startup");
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for coordinator startup");
+		await new Promise<void>((resolve) => setTimeout(resolve, COORDINATOR_RETRY_MS));
+	}
+}
+```
+
+## !!steps The process side: two listening sockets
+
+From here the file is the coordinator process. A control socket carries newline-delimited JSON for the server and peers. A public socket carries raw proxied traffic. Startup removes a stale socket file but refuses to touch a path that is not a socket, or a socket that still accepts connections. Both sockets are `chmod 0600` (except on Windows), and an initial 30 second grace timer shuts the process down if nobody ever shows up.
+
+```ts ! coordinator.ts
+async function main(): Promise<void> {
+	await removeStaleSocket(controlPath);
+	await removeStaleSocket(publicPath);
+	try {
+		await listen(controlServer, controlPath);
+		await restrictSocket(controlPath);
+		await listen(publicServer, publicPath);
+		await restrictSocket(publicPath);
+	} catch (error) {
+		await Promise.all([cleanupSocket(controlPath), cleanupSocket(publicPath)]);
+		throw error;
+	}
+	scheduleEmptyShutdown(EMPTY_STARTUP_GRACE_MS);
+}
+```
+
+## !!steps Server registration and replacement
+
+Only one server is current. A new `register_server` replaces it: the new one gets the list of already connected peers, then all public connections are closed, peers are told the old server disconnected, the old server receives `server_replaced`, and peers are told a server connected. Closing public connections ensures no client keeps talking to a retired server.
+
+```ts ! coordinator.ts
+	const { serverConnectionId, endpoint } = message;
+	const server = { serverConnectionId, endpoint, socket };
+	const previous = currentServer;
+	currentServer = server;
+	cancelEmptyShutdown();
+	writeRoutedLine(socket, {
+		type: "server_registered",
+		serverConnectionId,
+		peers: [...peers.keys()],
+	});
+	// !mark(1:4)
+	if (previous && previous !== server) {
+		closePublicConnections();
+		notifyPeers({ type: "server_disconnected", serverConnectionId: previous.serverConnectionId });
+		writeRoutedLine(previous.socket, { type: "server_replaced" });
+	}
+	notifyPeers({ type: "server_connected", serverConnectionId });
+```
+
+## !!steps Routing messages between peers and the server
+
+Peers are addressed by id, the server by the reserved name `server`, and a peer cannot register under that name or an id already in use. `send` forwards a payload to its target and silently drops it if the target is gone. `broadcast` is allowed only from the server. Unknown message types throw, which destroys the offending socket.
+
+```ts ! coordinator.ts
+function handleRoutedMessage(from: string, message: ControlMessage): void {
+	if (message.type === "send") {
+		if (typeof message.to !== "string" || message.to.length === 0) {
+			throw new Error("Coordinator message target must be a string");
+		}
+		const { to } = message;
+		const target = to === "server" ? currentServer?.socket : peers.get(to)?.socket;
+		if (target) writeRoutedLine(target, { type: "message", from, payload: message.payload });
+		return;
+	}
+	if (message.type === "broadcast") {
+		// !mark
+		if (from !== "server") throw new Error("Only the current server may broadcast");
+```
+
+## !!steps Public connections are piped to the current server
+
+Each public client is piped byte for byte to the current server's endpoint. With no server, or when shutting down, the connection is destroyed. Errors and closes on either side destroy the other, and `finalize` runs once to drop the pair from `publicConnections` and re-check emptiness.
+
+```ts ! coordinator.ts
+function acceptPublicConnection(client: Socket): void {
+	if (shuttingDown || !currentServer) {
+		client.destroy();
+		return;
+	}
+	cancelEmptyShutdown();
+	const upstream = createConnection(currentServer.endpoint);
+	publicConnections.set(client, upstream);
+	// ...
+	upstream.once("connect", () => {
+		client.pipe(upstream);
+		upstream.pipe(client);
+	});
+	upstream.once("error", () => client.destroy());
+```
+
+## !!steps Exiting when nobody is left
+
+`checkEmpty` cancels the timer if anything is alive: a server, peers, public connections or control connections. Otherwise it schedules a shutdown after 250 ms, re-verifying emptiness when the timer fires. The timer is `unref`ed so it never keeps the process alive. `shutdownCoordinator` closes everything, removes socket files and exits 0.
+
+```ts ! coordinator.ts
+function checkEmpty(): void {
+	if (shuttingDown || currentServer || peers.size > 0 || publicConnections.size > 0 || controlConnections.size > 0) {
+		cancelEmptyShutdown();
+		return;
+	}
+	scheduleEmptyShutdown(EMPTY_SHUTDOWN_GRACE_MS);
+}
+
+function scheduleEmptyShutdown(delayMs: number): void {
+	if (emptyTimer || shuttingDown) return;
+	emptyTimer = setTimeout(() => {
+		emptyTimer = undefined;
+		if (!currentServer && peers.size === 0 && publicConnections.size === 0 && controlConnections.size === 0) {
+			void shutdownCoordinator();
+		}
+	}, delayMs);
+	emptyTimer.unref();
+}
+```
+
+</Scrollycoding>
+
+The server side of this protocol is in [server.ts](/docs/src/experimental/server.ts), and the peers that register on the control socket include the session workers, see [session-worker.ts](/docs/src/experimental/session-worker.ts) and [session-worker-manager.ts](/docs/src/experimental/session-worker-manager.ts). Structurally the module has two roles, library and process, in one file, with module-level mutable state (`peers`, `currentServer`, `running`) that is only safe because the coordinator process runs a single instance, guarded by the `running` flag.

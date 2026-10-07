@@ -1,0 +1,124 @@
+---
+title: "auth-command.ts"
+description: "Parser, usage text and validation for the `pi auth` subcommands, plus the helper that extracts a secret from an auth result"
+source: "src/cli/auth-command.ts"
+full: true
+---
+
+The `pi auth` family has three commands: `check`, `print-api-key` and `print-bearer-token`. This file owns everything about their command line: the typed `AuthCommand`, the help text, a hand-written parser for the extra flags, validation of the shared `--provider` and `--model` options, and a small function that pulls a credential string out of an auth result.
+
+The general-purpose option parser in [args.ts](/docs/src/cli/args.ts) produces the `Args` object validated here. The commands themselves are implemented in [auth-check.ts](/docs/src/cli/auth-check.ts) and [credential-print.ts](/docs/src/cli/credential-print.ts), and dispatch happens from [main.ts](/docs/src/main.ts).
+
+<Scrollycoding>
+
+## !!steps The command model
+
+A command is a kind plus its flags. `minExpiryMs` is optional and only meaningful for bearer tokens. `AuthCommandError` is a bare `Error` subclass so callers can tell user mistakes apart from crashes.
+
+```ts ! auth-command.ts
+export type AuthCommandKind = "check" | "api_key" | "bearer_token";
+
+export interface AuthCommand {
+	kind: AuthCommandKind;
+	args: string[];
+	json: boolean;
+	credentials: boolean;
+	noRefresh: boolean;
+	minExpiryMs?: number;
+}
+
+export class AuthCommandError extends Error {}
+```
+
+## !!steps Usage strings and help detection
+
+Usage lines are keyed by kind and built from `APP_NAME` in [config.ts](/docs/src/config.ts). Help is triggered by `auth` alone, `auth help`, or any `--help` or `-h` in the arguments.
+
+```ts ! auth-command.ts
+export function getAuthCommandUsage(kind: AuthCommandKind): string {
+	return AUTH_COMMAND_USAGE[kind];
+}
+
+export function isAuthCommandHelp(args: string[]): boolean {
+	return (
+		args[0] === "auth" &&
+		// !mark
+		(args[1] === undefined || args[1] === "help" || args.includes("--help") || args.includes("-h"))
+	);
+}
+```
+
+## !!steps Choosing the subcommand
+
+`parseAuthCommand` returns `undefined` when the first argument is not `auth`, letting the normal CLI continue. Otherwise the second argument selects the kind through a nested ternary, and anything else throws with a message listing the valid commands.
+
+```ts ! auth-command.ts
+export function parseAuthCommand(args: string[]): AuthCommand | undefined {
+	// !mark
+	if (args[0] !== "auth") return undefined;
+
+	const kind =
+		args[1] === "check"
+			? "check"
+			: args[1] === "print-api-key"
+				? "api_key"
+				: args[1] === "print-bearer-token"
+					? "bearer_token"
+					: undefined;
+```
+
+## !!steps Parsing durations and per-command flags
+
+`--min-expiry` accepts digits plus `ms`, `s`, `m` or `h` (case-insensitive) and converts to milliseconds. Flags are rejected on the wrong subcommand: `--min-expiry` only for bearer tokens, and `--json`, `--credentials`, `--no-refresh` only for `check`. Everything else is passed through in `args`.
+
+```ts ! auth-command.ts
+		if (arg === "--min-expiry") {
+			if (kind !== "bearer_token")
+				throw new AuthCommandError("--min-expiry is only supported by print-bearer-token");
+			const value = args[++index];
+			// !mark(1:2)
+			const match = value ? /^(\d+)(ms|s|m|h)$/iu.exec(value) : undefined;
+			if (!match) throw new AuthCommandError("--min-expiry must use a duration such as 30m or 1h");
+			const amount = Number(match[1]);
+			const unit = match[2];
+			minExpiryMs = amount * (unit === "ms" ? 1 : unit === "s" ? 1_000 : unit === "m" ? 60_000 : 3_600_000);
+			continue;
+		}
+```
+
+## !!steps Validating provider and model
+
+Validation runs on the parsed `Args`. Unknown flags, an API key, positional messages or file arguments are all refused, since an auth command must not silently ignore options that look meaningful. Both `check` and the print commands require at least one of `--provider` or `--model`; whitespace-only values count as absent.
+
+```ts ! auth-command.ts
+export function validateAuthCommandArgs(args: Args, kind: AuthCommandKind): { provider?: string; model?: string } {
+	const provider = args.provider?.trim() || undefined;
+	const model = args.model?.trim() || undefined;
+	if (args.unknownFlags.size > 0) {
+		const option = args.unknownFlags.keys().next().value;
+		throw new AuthCommandError(`Unknown option --${option} for "${getAuthCommandName(kind)}".`);
+	}
+	// !mark(1:3)
+	if (args.apiKey !== undefined || args.messages.length > 0 || args.fileArgs.length > 0) {
+		throw new AuthCommandError("Auth commands only accept --provider and --model");
+	}
+```
+
+## !!steps Extracting the secret
+
+An API key wins. Otherwise the headers are searched case-insensitively for `authorization`, and only a `Bearer` value yields a token, with the prefix stripped. Any other scheme returns `undefined`.
+
+```ts ! auth-command.ts
+export function getAuthCredential(auth: AuthResult | undefined): string | undefined {
+	if (auth?.auth.apiKey) return auth.auth.apiKey;
+	const authorization = Object.entries(auth?.auth.headers ?? {}).find(
+		([name]) => name.toLowerCase() === "authorization",
+	)?.[1];
+	// !mark
+	return typeof authorization === "string" ? /^Bearer\s+(.+)$/iu.exec(authorization)?.[1] : undefined;
+}
+```
+
+</Scrollycoding>
+
+Two small oddities: the help text hardcodes `pi` while the usage strings use `APP_NAME`, and the help says options are `[--provider]` optional while also requiring one of provider or model. The `check` and print branches of `validateAuthCommandArgs` differ only in their error message.

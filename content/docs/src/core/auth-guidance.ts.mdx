@@ -1,0 +1,77 @@
+---
+title: "auth-guidance.ts"
+description: "Builds the user-facing error messages shown when no model, no model list, or no API key is available"
+source: "src/core/auth-guidance.ts"
+full: true
+---
+
+When pi cannot talk to a model, the user needs to be told how to fix it. This
+file centralizes those messages so every place that detects the problem gives
+the same advice: log in with `/login`, and read the provider and model docs.
+
+Everything is built from one helper. The docs location comes from
+[config.ts](/docs/src/config.ts). Callers include
+[list-models.ts](/docs/src/cli/list-models.ts) and the session code in
+[agent-session.ts](/docs/src/core/agent-session.ts).
+
+<Scrollycoding>
+
+## !!steps The shared login help
+
+`getProviderLoginHelp` returns a three-line block: the instruction and two
+absolute paths to the shipped docs. Paths are computed at call time with
+`getDocsPath`, because the package directory depends on how pi was installed.
+
+```ts ! auth-guidance.ts
+export function getProviderLoginHelp(): string {
+	return [
+		"Use /login to log into a provider via OAuth or API key. See:",
+		`  ${join(getDocsPath(), "providers.md")}`,
+		`  ${join(getDocsPath(), "models.md")}`,
+	].join("\n");
+}
+```
+
+## !!steps No models at all
+
+When the list of available models is empty, the message is the plain statement
+plus the login help. The model list command prints this instead of an empty
+table.
+
+```ts ! auth-guidance.ts
+export function formatNoModelsAvailableMessage(): string {
+	return `No models available. ${getProviderLoginHelp()}`;
+}
+```
+
+## !!steps Models exist but none is chosen
+
+This variant adds a follow-up: after logging in, use `/model` to pick one. The
+two messages differ because available-but-unselected is recoverable with a
+single command.
+
+```ts ! auth-guidance.ts
+export function formatNoModelSelectedMessage(): string {
+	return `No model selected.\n\n${getProviderLoginHelp()}\n\nThen use /model to select a model.`;
+}
+```
+
+## !!steps Missing key for a specific provider
+
+The provider name is interpolated, with a special case: the sentinel
+`"unknown"` is shown as "the selected model", so users never see a literal
+"No API key found for unknown".
+
+```ts ! auth-guidance.ts
+const UNKNOWN_PROVIDER = "unknown";
+// ...
+export function formatNoApiKeyFoundMessage(provider: string): string {
+	const providerDisplay = provider === UNKNOWN_PROVIDER ? "the selected model" : provider;
+	return `No API key found for ${providerDisplay}.\n\n${getProviderLoginHelp()}`;
+}
+```
+
+</Scrollycoding>
+
+All four functions are pure string builders with no state. The model layer that
+decides which message applies is [model-runtime.ts](/docs/src/core/model-runtime.ts).

@@ -1,0 +1,32 @@
+---
+title: "execute.lazy.ts"
+description: "One-line lazy import that defers loading the codemode sandbox runtime until a script first runs."
+source: "src/extensions/codemode/execute.lazy.ts"
+full: true
+---
+
+This two-line file exists only to put a dynamic `import()` behind a function. The real executor in [execute.ts](/docs/src/extensions/codemode/execute.ts) pulls in the QuickJS wasm loader, the worker plumbing and the sandbox package, which is a lot to load at startup for a tool the model may never call.
+
+[tool.ts](/docs/src/extensions/codemode/tool.ts) imports this file statically but only calls the function from inside the tool's `execute`, so the heavy module is loaded on the first script.
+
+<Scrollycoding>
+
+## !!steps The doc comment
+
+The comment states the contract: the sandbox runtime loads on the first script, and points to the module that holds it. It is the only prose in the file.
+
+```ts ! execute.lazy.ts
+/** Loads the codemode sandbox runtime on the first script (see execute.ts). */
+```
+
+## !!steps The loader function
+
+`loadCodemodeExecutor` returns a promise for the module namespace of `execute.ts`. Callers then read `executeCodemode` from it. The import specifier keeps the `.ts` extension, matching the rest of the package. Repeated calls are cheap because the runtime caches the module after the first load.
+
+```ts ! execute.lazy.ts
+export const loadCodemodeExecutor = () => import("./execute.ts");
+```
+
+</Scrollycoding>
+
+The split gives startup a cheap import chain: [index.ts](/docs/src/extensions/codemode/index.ts) and [tool.ts](/docs/src/extensions/codemode/tool.ts) stay light, while [execute.ts](/docs/src/extensions/codemode/execute.ts) and its worker ([worker.ts](/docs/src/extensions/codemode/worker.ts)) load only when needed. The MCP extension has the same pattern in [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts).

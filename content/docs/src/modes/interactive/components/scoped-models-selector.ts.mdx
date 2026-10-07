@@ -1,0 +1,282 @@
+---
+title: "scoped-models-selector.ts"
+description: "The dialog for choosing and ordering the models that the model-cycling shortcut rotates through"
+source: "src/modes/interactive/components/scoped-models-selector.ts"
+full: true
+---
+
+This component edits the enabled model list. Changes apply to the session immediately through `onChange` and are written to settings only when the user saves, which `onPersist` signals. The picker for a single model is [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts), and the list is persisted by [settings-manager.ts](/docs/src/core/settings-manager.ts).
+
+The core idea is a small pure algebra over `EnabledIds`: either `null`, meaning every model is enabled, or an explicit ordered array. The helper functions at the top keep that representation consistent.
+
+<Scrollycoding>
+
+## !!steps Null means all enabled
+
+`normalizeEnabled` collapses an explicit list back to `null` whenever it covers every model. `toggle` from the all-enabled state turns into an explicit list of everything except the toggled id. Normalizing keeps the saved setting from growing a full list that behaves the same as no filter.
+
+```ts ! scoped-models-selector.ts
+// EnabledIds: null = all enabled (no filter), string[] = explicit ordered list
+type EnabledIds = string[] | null;
+
+function isEnabled(enabledIds: EnabledIds, id: string): boolean {
+	return enabledIds === null || enabledIds.includes(id);
+}
+
+/** Collapse an explicit list back to null (= all enabled) when it covers every available model. */
+function normalizeEnabled(result: string[], allIds: string[]): EnabledIds {
+	return result.length === allIds.length && result.every((id) => allIds.includes(id)) ? null : result;
+}
+
+function toggle(enabledIds: EnabledIds, allIds: string[], id: string): EnabledIds {
+	if (enabledIds === null) return allIds.filter((modelId) => modelId !== id);
+	const index = enabledIds.indexOf(id);
+	if (index >= 0) return [...enabledIds.slice(0, index), ...enabledIds.slice(index + 1)];
+	return normalizeEnabled([...enabledIds, id], allIds);
+}
+```
+
+## !!steps Enable all and clear all
+
+Both take an optional set of target ids, used when a search is active so the action applies only to visible results. Clearing from `null` yields either an empty list or all ids minus the targets.
+
+```ts ! scoped-models-selector.ts
+function enableAll(enabledIds: EnabledIds, allIds: string[], targetIds?: string[]): EnabledIds {
+	if (enabledIds === null) return null; // Already all enabled
+	const targets = targetIds ?? allIds;
+	const result = [...enabledIds];
+	for (const id of targets) {
+		if (!result.includes(id)) result.push(id);
+	}
+	return normalizeEnabled(result, allIds);
+}
+
+function clearAll(enabledIds: EnabledIds, allIds: string[], targetIds?: string[]): EnabledIds {
+	if (enabledIds === null) {
+		return targetIds ? allIds.filter((id) => !targetIds.includes(id)) : [];
+	}
+	const targets = new Set(targetIds ?? enabledIds);
+	return enabledIds.filter((id) => !targets.has(id));
+}
+```
+
+## !!steps Reordering and display order
+
+`move` swaps neighbours and does nothing on `null`, since order only matters in an explicit list. `getSortedIds` puts enabled models first in their saved order, then the rest.
+
+```ts ! scoped-models-selector.ts
+function move(enabledIds: EnabledIds, id: string, delta: number): EnabledIds {
+	if (enabledIds === null) return null;
+	const list = [...enabledIds];
+	const index = list.indexOf(id);
+	if (index < 0) return list;
+	const newIndex = index + delta;
+	if (newIndex < 0 || newIndex >= list.length) return list;
+	const result = [...list];
+	[result[index], result[newIndex]] = [result[newIndex], result[index]];
+	return result;
+}
+
+function getSortedIds(enabledIds: EnabledIds, allIds: string[]): string[] {
+	if (enabledIds === null) return allIds;
+	const enabledSet = new Set(enabledIds);
+	return [...enabledIds, ...allIds.filter((id) => !enabledSet.has(id))];
+}
+```
+
+## !!steps Config and callbacks
+
+The constructor takes all models, the current enabled ids, and an optional refresh status line. The callbacks separate session-only changes from persistence.
+
+```ts ! scoped-models-selector.ts
+export interface ModelsConfig {
+	allModels: Model<any>[];
+	enabledModelIds: string[] | null;
+	refreshStatus?: string;
+}
+
+export interface ModelsCallbacks {
+	/** Called whenever the enabled model set or order changes (session-only, no persist) */
+	onChange: (enabledModelIds: string[] | null) => void | Promise<void>;
+	/** Called when user wants to persist current selection to settings */
+	onPersist: (enabledModelIds: string[] | null) => void | Promise<void>;
+	onCancel: () => void;
+}
+
+/**
+ * Component for enabling/disabling models for Ctrl+P cycling.
+ * Changes are session-only until explicitly persisted with Ctrl+S.
+```
+
+## !!steps Building the dialog
+
+Models are keyed as `provider/id`. The header states that changes are session-only. Enabled ids may refer to models no longer available; those still show up, struck through and tagged unavailable.
+
+```ts ! scoped-models-selector.ts
+	constructor(config: ModelsConfig, callbacks: ModelsCallbacks) {
+		super();
+		this.callbacks = callbacks;
+
+		for (const model of config.allModels) {
+			const fullId = `${model.provider}/${model.id}`;
+			this.modelsById.set(fullId, model);
+			this.allIds.push(fullId);
+		}
+
+		this.enabledIds = config.enabledModelIds === null ? null : [...config.enabledModelIds];
+		this.filteredItems = this.buildItems();
+
+		// Header
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("accent", theme.bold("Model Configuration")), 0, 0));
+		this.addChild(
+			new Text(theme.fg("muted", `Session-only. ${keyDisplayText("app.models.save")} to save to settings.`), 0, 0),
+// ...
+		this.footerText = new Text(this.getFooterText(), 0, 0);
+		this.addChild(this.footerText);
+
+		this.addChild(new DynamicBorder());
+		this.updateList();
+	}
+```
+
+## !!steps Updating while a refresh runs
+
+`updateModels` lets the owner swap in a refreshed catalog without losing the user's place: it remembers the selected id and restores the index afterwards.
+
+```ts ! scoped-models-selector.ts
+	updateModels(models: readonly Model<any>[], enabledModelIds?: string[] | null): void {
+		const selectedId = this.filteredItems[this.selectedIndex]?.fullId;
+		if (enabledModelIds !== undefined) this.enabledIds = enabledModelIds === null ? null : [...enabledModelIds];
+		this.modelsById.clear();
+		this.allIds = [];
+		for (const model of models) {
+			const fullId = `${model.provider}/${model.id}`;
+			this.modelsById.set(fullId, model);
+			this.allIds.push(fullId);
+		}
+		this.refresh();
+		const refreshedIndex = selectedId ? this.filteredItems.findIndex((item) => item.fullId === selectedId) : -1;
+		if (refreshedIndex >= 0) {
+			this.selectedIndex = refreshedIndex;
+			this.updateList();
+		}
+	}
+```
+
+## !!steps Footer and filtering
+
+The footer lists key hints, a count (or all enabled), and an unsaved marker. `refresh` rebuilds items, applies the fuzzy filter, clamps the selection and redraws.
+
+```ts ! scoped-models-selector.ts
+	private getFooterText(): string {
+		const enabledCount = this.enabledIds?.filter((id) => this.modelsById.has(id)).length ?? this.allIds.length;
+		const unavailableCount = this.enabledIds?.filter((id) => !this.modelsById.has(id)).length ?? 0;
+		const allEnabled = this.enabledIds === null;
+		const countText = allEnabled
+			? "all enabled"
+			: `${enabledCount}/${this.allIds.length} enabled${unavailableCount ? ` · ${unavailableCount} unavailable` : ""}`;
+		const parts = [
+			`${keyDisplayText("tui.select.confirm")} toggle`,
+			`${keyDisplayText("app.models.enableAll")} all`,
+			`${keyDisplayText("app.models.clearAll")} clear`,
+			`${keyDisplayText("app.models.toggleProvider")} provider`,
+			`${keyDisplayText("app.models.reorderUp")}/${keyDisplayText("app.models.reorderDown")} reorder`,
+			`${keyDisplayText("app.models.save")} save`,
+			countText,
+		];
+		return this.isDirty
+			? theme.fg("dim", `  ${parts.join(" · ")} `) + theme.fg("warning", "(unsaved)")
+			: theme.fg("dim", `  ${parts.join(" · ")}`);
+	}
+
+	private refresh(): void {
+		const query = this.searchInput.getValue();
+		const items = this.buildItems();
+		this.filteredItems = query
+			? fuzzyFilter(items, query, (item) =>
+					item.model
+						? getModelSearchText({ id: item.model.id, provider: item.model.provider, name: item.model.name })
+						: item.fullId,
+				)
+			: items;
+		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
+		this.updateList();
+		this.footerText.setText(this.getFooterText());
+	}
+```
+
+## !!steps Key handling
+
+Each edit sets `isDirty`, refreshes and notifies. Reordering is only allowed for enabled models in an explicit list. Provider toggle clears the provider if all its models are on, else enables them all. Save calls `onPersist` and clears the dirty flag. Ctrl+C first clears search, then cancels.
+
+```ts ! scoped-models-selector.ts
+		// Reorder enabled models
+		const reorderUp = kb.matches(data, "app.models.reorderUp");
+		const reorderDown = kb.matches(data, "app.models.reorderDown");
+		if (reorderUp || reorderDown) {
+			if (this.enabledIds === null) return;
+			const item = this.filteredItems[this.selectedIndex];
+			if (item && isEnabled(this.enabledIds, item.fullId)) {
+				const delta = reorderUp ? -1 : 1;
+				const currentIndex = this.enabledIds.indexOf(item.fullId);
+				const newIndex = currentIndex + delta;
+				// Only move if within bounds
+				if (newIndex >= 0 && newIndex < this.enabledIds.length) {
+					this.enabledIds = move(this.enabledIds, item.fullId, delta);
+					this.isDirty = true;
+					this.selectedIndex += delta;
+					this.refresh();
+					this.notifyChange();
+				}
+			}
+			return;
+		}
+
+		// Toggle on Enter
+		if (kb.matches(data, "tui.select.confirm")) {
+			const item = this.filteredItems[this.selectedIndex];
+			if (item) {
+				this.enabledIds = toggle(this.enabledIds, this.allIds, item.fullId);
+				this.isDirty = true;
+				this.refresh();
+				this.notifyChange();
+			}
+			return;
+		}
+// ...
+		// Save/persist to settings
+		if (kb.matches(data, "app.models.save")) {
+			this.callbacks.onPersist(this.enabledIds === null ? null : [...this.enabledIds]);
+			this.isDirty = false;
+			this.footerText.setText(this.getFooterText());
+			return;
+		}
+
+		// Ctrl+C - clear search or cancel if empty
+		if (matchesKey(data, Key.ctrl("c"))) {
+			if (this.searchInput.getValue()) {
+				this.searchInput.setValue("");
+				this.refresh();
+			} else {
+				this.callbacks.onCancel();
+			}
+			return;
+		}
+
+		// Escape - cancel
+		if (matchesKey(data, Key.escape)) {
+			this.callbacks.onCancel();
+			return;
+		}
+
+		// Pass everything else to search input
+		this.searchInput.handleInput(data);
+		this.refresh();
+	}
+```
+
+</Scrollycoding>
+
+The owner in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) decides what `onChange` does to the live session. Note that `move` has its own bounds check but the handler also checks bounds before calling it.

@@ -1,0 +1,53 @@
+---
+title: "telemetry.ts"
+description: "Decides whether anonymous install telemetry is on, with the PI_TELEMETRY environment variable overriding the setting"
+source: "src/core/telemetry.ts"
+full: true
+---
+
+A single decision function: is install telemetry enabled? The answer comes from
+the `PI_TELEMETRY` environment variable when it is set, and from the saved
+setting otherwise. The file only decides; it does not send anything.
+
+<Scrollycoding>
+
+## !!steps What counts as true
+
+An unset or empty value is false. Otherwise the accepted spellings are `1`,
+`true` and `yes`, with the words matched case-insensitively. Anything else, such
+as `0`, `off` or garbage, is false.
+
+```ts ! telemetry.ts
+function isTruthyEnvFlag(value: string | undefined): boolean {
+	if (!value) return false;
+	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+}
+```
+
+## !!steps The environment wins when it is defined
+
+The check is `!== undefined`, not truthiness, so `PI_TELEMETRY=` (empty) or
+`PI_TELEMETRY=0` explicitly disables telemetry even if the setting says
+enabled. Only when the variable is absent does the code read
+`getEnableInstallTelemetry()` from
+[settings-manager.ts](/docs/src/core/settings-manager.ts). The env value is a
+default parameter, which lets tests pass a value without touching `process.env`.
+
+```ts ! telemetry.ts
+export function isInstallTelemetryEnabled(
+	settingsManager: SettingsManager,
+	telemetryEnv: string | undefined = process.env.PI_TELEMETRY,
+): boolean {
+	// !mark
+	return telemetryEnv !== undefined ? isTruthyEnvFlag(telemetryEnv) : settingsManager.getEnableInstallTelemetry();
+}
+```
+
+</Scrollycoding>
+
+Within this package nothing else calls `isInstallTelemetryEnabled`; the
+install-telemetry sending code is not in this tree. The function appears to be
+unused here, though the setting it reads is defined by
+[settings-manager.ts](/docs/src/core/settings-manager.ts) and the session that
+holds the manager is [agent-session.ts](/docs/src/core/agent-session.ts). Its
+opt-out rule keeps the environment override in one place.

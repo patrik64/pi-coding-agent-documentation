@@ -1,0 +1,119 @@
+---
+title: "usage-totals.ts"
+description: "Arithmetic on token and cost usage: accumulators, two-usage sums and a per-model cost breakdown over session entries"
+source: "src/core/usage-totals.ts"
+full: true
+---
+
+Token usage appears in several places in a session: on assistant messages, on standalone usage entries, and on tool results, compactions and branch summaries that ran their own model calls. This file holds the small pure functions that add those numbers up, so statistics and cost displays share one definition of what counts.
+
+It depends only on the `Usage` type from the AI package and on the entry types of [session-manager.ts](/docs/src/core/session-manager.ts).
+
+<Scrollycoding>
+
+## !!steps Totals accumulator
+
+`UsageTotals` is a flat record of the four token categories plus a dollar cost. `createUsageTotals` returns zeros and `addUsageToTotals` mutates it, taking only `usage.cost.total` so per-category cost is not tracked here.
+
+```ts ! usage-totals.ts
+export interface UsageTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
+export function createUsageTotals(): UsageTotals {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cost: 0,
+	};
+}
+
+export function addUsageToTotals(totals: UsageTotals, usage: Usage): void {
+	totals.input += usage.input;
+	totals.output += usage.output;
+	totals.cacheRead += usage.cacheRead;
+	totals.cacheWrite += usage.cacheWrite;
+	totals.cost += usage.cost.total;
+}
+```
+
+## !!steps Combining two full usages
+
+`combineUsage` returns a new `Usage` with every counter and every cost component summed. The optional fields `cacheWrite1h` and `reasoning` are kept only if at least one side reports them, so a sum of two usages from providers that never report reasoning does not grow a spurious zero.
+
+```ts ! usage-totals.ts
+export function combineUsage(first: Usage, second: Usage): Usage {
+	return {
+		input: first.input + second.input,
+		output: first.output + second.output,
+		cacheRead: first.cacheRead + second.cacheRead,
+		cacheWrite: first.cacheWrite + second.cacheWrite,
+		// !mark(1:6)
+		...(first.cacheWrite1h !== undefined || second.cacheWrite1h !== undefined
+			? { cacheWrite1h: (first.cacheWrite1h ?? 0) + (second.cacheWrite1h ?? 0) }
+			: {}),
+		...(first.reasoning !== undefined || second.reasoning !== undefined
+			? { reasoning: (first.reasoning ?? 0) + (second.reasoning ?? 0) }
+			: {}),
+		totalTokens: first.totalTokens + second.totalTokens,
+```
+
+## !!steps Where usage can come from
+
+`getUsageCostBreakdown` walks session entries and assigns each to a bucket. Assistant messages and standalone `usage` entries are keyed by `provider/model`, preferring the response model over the requested one. Tool result messages, branch summaries and compactions that carry usage go into a shared `Tools/summaries` bucket instead of any model.
+
+Entries with no key or no usage are skipped.
+
+```ts ! usage-totals.ts
+	for (const entry of entries) {
+		let key: string | undefined;
+		let usage: Usage | undefined;
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			// !mark
+			key = `${entry.message.provider}/${entry.message.responseModel ?? entry.message.model}`;
+			usage = entry.message.usage;
+		} else if (entry.type === "usage") {
+			key = `${entry.provider}/${entry.model}`;
+			usage = entry.usage;
+		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+			key = "Tools/summaries";
+			usage = entry.message.usage;
+		} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+			key = "Tools/summaries";
+			usage = entry.usage;
+		}
+		if (!key || !usage) continue;
+```
+
+## !!steps Grouping and ordering
+
+Each bucket owns a `UsageTotals`, created on first sight. The result keeps only buckets with some cost or tokens, with tokens counted as input plus output plus both cache categories, sorted by cost descending.
+
+```ts ! usage-totals.ts
+		let totals = totalsByKey.get(key);
+		if (!totals) {
+			totals = createUsageTotals();
+			totalsByKey.set(key, totals);
+		}
+		addUsageToTotals(totals, usage);
+	}
+
+	return Array.from(totalsByKey, ([key, totals]) => ({
+		key,
+		cost: totals.cost,
+		tokens: totals.input + totals.output + totals.cacheRead + totals.cacheWrite,
+	}))
+		// !mark(1:2)
+		.filter((entry) => entry.cost > 0 || entry.tokens > 0)
+		.sort((a, b) => b.cost - a.cost);
+```
+
+</Scrollycoding>
+
+The totals helpers are used by [agent-session.ts](/docs/src/core/agent-session.ts), [compaction](/docs/src/core/compaction/compaction.ts), [nested-tool-calls.ts](/docs/src/core/nested-tool-calls.ts) and the [footer](/docs/src/modes/interactive/components/footer.ts). The pieces are independent: `addUsageToTotals` handles streaming accumulation, `combineUsage` handles merging two complete records, and the breakdown composes the former. Note the token total here excludes reasoning tokens, since `UsageTotals` has no field for them.

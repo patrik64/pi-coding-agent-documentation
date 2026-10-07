@@ -1,0 +1,262 @@
+---
+title: "git.ts"
+description: "Parses the many spellings of a git package source into a normalized GitSource with host, path, and optional pinned ref"
+source: "src/utils/git.ts"
+full: true
+---
+
+Packages can be installed from git, and users write the source in many ways: `git:github.com/user/repo@v1`, `https://github.com/user/repo.git`, `git@host:user/repo`, and more. This file turns any accepted spelling into one `GitSource` record, or null when the input is not a safe, recognizable git URL.
+
+It is used by [package-manager.ts](/docs/src/core/package-manager.ts). Hosted-provider handling is delegated to the `hosted-git-info` package, with a generic fallback for self-hosted servers.
+
+<Scrollycoding>
+
+## !!steps The result type
+
+`GitSource` carries the clone URL, host, repo path, an optional ref and a `pinned` flag. Pinned means a ref was specified, which the comment says stops the package from being auto-updated.
+
+```ts ! git.ts
+/**
+ * Parsed git URL information.
+ */
+export type GitSource = {
+	/** Always "git" for git sources */
+	type: "git";
+	/** Clone URL (always valid for git clone, without ref suffix) */
+	repo: string;
+	/** Git host domain (e.g., "github.com") */
+	host: string;
+	/** Repository path (e.g., "user/repo") */
+	path: string;
+	/** Git ref (branch, tag, commit) if specified */
+	ref?: string;
+	/** True if ref was specified (package won't be auto-updated) */
+	pinned: boolean;
+};
+```
+
+## !!steps Splitting off an @ref suffix
+
+`splitRef` separates `repo@ref`. It handles three syntaxes: scp-like `git@host:path`, URLs with a protocol (parsed with `URL` so the `@` in credentials is not confused with a ref, since only the pathname is examined), and bare `host/path`. If either side of the `@` is empty the input is returned unchanged.
+
+```ts ! git.ts
+function splitRef(url: string): { repo: string; ref?: string } {
+	const scpLikeMatch = url.match(/^git@([^:]+):(.+)$/);
+	if (scpLikeMatch) {
+		const pathWithMaybeRef = scpLikeMatch[2] ?? "";
+		const refSeparator = pathWithMaybeRef.indexOf("@");
+		if (refSeparator < 0) return { repo: url };
+		const repoPath = pathWithMaybeRef.slice(0, refSeparator);
+		const ref = pathWithMaybeRef.slice(refSeparator + 1);
+		if (!repoPath || !ref) return { repo: url };
+		return {
+			repo: `git@${scpLikeMatch[1] ?? ""}:${repoPath}`,
+			ref,
+		};
+	}
+
+	if (url.includes("://")) {
+		try {
+			const parsed = new URL(url);
+			const pathWithMaybeRef = parsed.pathname.replace(/^\/+/, "");
+			const refSeparator = pathWithMaybeRef.indexOf("@");
+			if (refSeparator < 0) return { repo: url };
+			const repoPath = pathWithMaybeRef.slice(0, refSeparator);
+			const ref = pathWithMaybeRef.slice(refSeparator + 1);
+			if (!repoPath || !ref) return { repo: url };
+			parsed.pathname = `/${repoPath}`;
+			return {
+				repo: parsed.toString().replace(/\/$/, ""),
+				ref,
+			};
+		} catch {
+			return { repo: url };
+		}
+	}
+```
+
+## !!steps Rejecting unsafe parts
+
+Host and path later end up in filesystem locations, so `hasUnsafeGitInstallPart` checks both the raw and the percent-decoded value for NUL bytes, backslashes, a leading slash and `..` segments. A value that fails to decode is rejected. The host may not contain a slash at all.
+
+```ts ! git.ts
+function decodeForValidation(value: string): string | null {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return null;
+	}
+}
+
+function hasUnsafeGitInstallPart(value: string, allowSlash: boolean): boolean {
+	const decoded = decodeForValidation(value);
+	if (decoded === null) {
+		return true;
+	}
+	const candidates = [value, decoded];
+	for (const candidate of candidates) {
+		if (candidate.includes("\0") || candidate.includes("\\") || candidate.startsWith("/")) {
+			return true;
+		}
+		if (!allowSlash && candidate.includes("/")) {
+			return true;
+		}
+		if (candidate.split("/").includes("..")) {
+			return true;
+		}
+	}
+	return false;
+}
+```
+
+## !!steps Building the normalized record
+
+`buildGitSource` strips a trailing `.git`, requires a host and at least two path segments (owner and repo), runs the safety check and sets `pinned` from the presence of a ref.
+
+```ts ! git.ts
+function buildGitSource(args: { repo: string; host: string; path: string; ref?: string }): GitSource | null {
+	if (args.path.startsWith("/")) {
+		return null;
+	}
+	const normalizedPath = args.path.replace(/\.git$/, "").replace(/^\/+/, "");
+	if (!args.host || !normalizedPath || normalizedPath.split("/").length < 2) {
+		return null;
+	}
+	if (hasUnsafeGitInstallPart(args.host, false) || hasUnsafeGitInstallPart(normalizedPath, true)) {
+		return null;
+	}
+
+	return {
+		type: "git",
+		repo: args.repo,
+		host: args.host,
+		path: normalizedPath,
+		ref: args.ref,
+		pinned: Boolean(args.ref),
+	};
+}
+```
+
+## !!steps Generic URLs
+
+For servers `hosted-git-info` does not know, `parseGenericGitUrl` extracts host and path itself. For a bare `host/path` form it requires the host to contain a dot or be `localhost`, then prefixes `https://`.
+
+```ts ! git.ts
+function parseGenericGitUrl(url: string): GitSource | null {
+	const { repo: repoWithoutRef, ref } = splitRef(url);
+	let repo = repoWithoutRef;
+	let host = "";
+	let path = "";
+
+	const scpLikeMatch = repoWithoutRef.match(/^git@([^:]+):(.+)$/);
+	if (scpLikeMatch) {
+		host = scpLikeMatch[1] ?? "";
+		path = scpLikeMatch[2] ?? "";
+	} else if (
+		repoWithoutRef.startsWith("https://") ||
+		repoWithoutRef.startsWith("http://") ||
+		repoWithoutRef.startsWith("ssh://") ||
+		repoWithoutRef.startsWith("git://")
+	) {
+		try {
+			const parsed = new URL(repoWithoutRef);
+			host = parsed.hostname;
+			path = parsed.pathname.replace(/^\/+/, "");
+		} catch {
+			return null;
+		}
+	} else {
+		const slashIndex = repoWithoutRef.indexOf("/");
+		if (slashIndex < 0) {
+			return null;
+		}
+		host = repoWithoutRef.slice(0, slashIndex);
+		path = repoWithoutRef.slice(slashIndex + 1);
+		if (!host.includes(".") && host !== "localhost") {
+			return null;
+		}
+		repo = `https://${repoWithoutRef}`;
+	}
+
+	return buildGitSource({ repo, host, path, ref });
+}
+```
+
+## !!steps The public entry point and its rules
+
+Without a `git:` prefix, only explicit `http(s)`, `ssh` or `git` protocol URLs are accepted. With the prefix, shorthand forms are allowed. The function first asks `hosted-git-info`, trying the ref-joined form first; a candidate whose project name still contains `@` is skipped when a ref was split off. Bare shorthand gets an `https://` prefix.
+
+```ts ! git.ts
+/**
+ * Parse git source into a GitSource.
+ *
+ * Rules:
+ * - With git: prefix, accept all historical shorthand forms.
+ * - Without git: prefix, only accept explicit protocol URLs.
+ */
+export function parseGitUrl(source: string): GitSource | null {
+	const trimmed = source.trim();
+	const hasGitPrefix = trimmed.startsWith("git:");
+	const url = hasGitPrefix ? trimmed.slice(4).trim() : trimmed;
+
+	if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) {
+		return null;
+	}
+
+	const split = splitRef(url);
+
+	const hostedCandidates = [split.ref ? `${split.repo}#${split.ref}` : undefined, url].filter(
+		(value): value is string => Boolean(value),
+	);
+	for (const candidate of hostedCandidates) {
+		const info = hostedGitInfo.fromUrl(candidate);
+		if (info) {
+			if (split.ref && info.project?.includes("@")) {
+				continue;
+			}
+			const useHttpsPrefix =
+				!split.repo.startsWith("http://") &&
+				!split.repo.startsWith("https://") &&
+				!split.repo.startsWith("ssh://") &&
+				!split.repo.startsWith("git://") &&
+				!split.repo.startsWith("git@");
+			return buildGitSource({
+				repo: useHttpsPrefix ? `https://${split.repo}` : split.repo,
+				host: info.domain || "",
+				path: `${info.user}/${info.project}`,
+				ref: info.committish || split.ref || undefined,
+			});
+		}
+	}
+```
+
+## !!steps HTTPS retry and generic fallback
+
+If the first pass finds nothing, the same lookup is repeated with `https://` prepended, which catches shorthand like `github.com/user/repo`. When even that fails, the generic parser has the last word.
+
+```ts ! git.ts
+	const httpsCandidates = [split.ref ? `https://${split.repo}#${split.ref}` : undefined, `https://${url}`].filter(
+		(value): value is string => Boolean(value),
+	);
+	for (const candidate of httpsCandidates) {
+		const info = hostedGitInfo.fromUrl(candidate);
+		if (info) {
+			if (split.ref && info.project?.includes("@")) {
+				continue;
+			}
+			return buildGitSource({
+				repo: `https://${split.repo}`,
+				host: info.domain || "",
+				path: `${info.user}/${info.project}`,
+				ref: info.committish || split.ref || undefined,
+			});
+		}
+	}
+
+	return parseGenericGitUrl(url);
+}
+```
+
+</Scrollycoding>
+
+The pipeline is: normalize prefix, split ref, try known hosts, then fall back to generic parsing, always finishing in `buildGitSource` so the safety checks apply to every route.

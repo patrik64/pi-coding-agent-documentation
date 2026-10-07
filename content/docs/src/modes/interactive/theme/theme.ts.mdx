@@ -1,0 +1,390 @@
+---
+title: "theme.ts"
+description: "The Theme class and global theme instance: token-to-ANSI mapping, theme loading and hot reload, light/dark detection, and the style adapters other components consume"
+source: "src/modes/interactive/theme/theme.ts"
+full: true
+---
+
+Every colored character in the TUI goes through this file. It defines the vocabulary of theme tokens (`accent`, `mdHeading`, `toolDiffAdded` and about fifty more), the `Theme` class that turns a token into an escape sequence, and the machinery that finds, loads, validates and hot-reloads themes.
+
+Themes come from four places: the generated system theme, the built-in `dark` and `light` JSON files ([dark.json](/docs/src/modes/interactive/theme/dark.json), [light.json](/docs/src/modes/interactive/theme/light.json)), user files in the custom themes directory, and themes registered by extensions. The JSON shape is validated by [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts), and the system theme is built by [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts).
+
+The file ends with adapters that translate the theme into the shapes `pi-tui` components expect: markdown, select list, editor and settings list themes, plus syntax highlighting.
+
+<Scrollycoding>
+
+## !!steps Foreground and background tokens
+
+Tokens are split into `ThemeColor` (foreground) and `ThemeBg` (background). The split is enforced in the types, and `ThemeStyle` explains why: an empty string means "terminal default", which is the default foreground in one slot and the default background in the other, so a token is only accepted in its own slot.
+
+A handful of tokens are optional in theme JSON: scrollbar track and thumb, `thinkingMax`, and the search match pair. Older themes without them keep working because of the fallbacks in the next step.
+
+```ts ! theme.ts
+export type ThemeBg =
+	| "selectedBg"
+	| "searchMatchBg"
+	| "userMessageBg"
+	| "customMessageBg"
+	| "toolPendingBg"
+	| "toolSuccessBg"
+	| "toolErrorBg";
+
+export type ThemeToken = ThemeColor | ThemeBg;
+
+/**
+ * Tokens are only accepted in their own slot, because "" (terminal default) means the default foreground
+ * or background depending on the slot. Use `theme.colors[token]` to use a token's color in the other slot.
+ */
+// !mark(1:4)
+export interface ThemeStyle extends TextAttributes {
+	fg?: ThemeColor | Color;
+	bg?: ThemeBg | Color;
+}
+```
+
+## !!steps Variables and fallbacks in theme JSON
+
+A theme file can define `vars` and refer to them by name from `colors`. `resolveVarRefs` returns numbers, empty strings, hex values and `oklch(...)` or `okhsl(...)` expressions as they are, and otherwise follows variable names recursively. A `visited` set turns a cycle into a clear "Circular variable reference" error, and a missing name is an error too.
+
+`withThemeColorFallbacks` fills the optional tokens from related required ones: the track from `muted`, the thumb from `text`, `thinkingMax` from `thinkingXhigh`, and the search colors from the selection and text colors.
+
+```ts ! theme.ts
+function resolveVarRefs(
+	value: ColorValue,
+	vars: Record<string, ColorValue>,
+	visited = new Set<string>(),
+): string | number {
+	if (typeof value === "number" || value === "" || value.startsWith("#") || /^ok(lch|hsl)\(/i.test(value)) {
+		return value;
+	}
+	// !mark(1:3)
+	if (visited.has(value)) {
+		throw new Error(`Circular variable reference detected: ${value}`);
+	}
+	if (!(value in vars)) {
+		throw new Error(`Variable reference not found: ${value}`);
+	}
+	visited.add(value);
+	return resolveVarRefs(vars[value], vars, visited);
+}
+```
+
+## !!steps Deciding whether a theme is light or dark
+
+`terminalColors` is module state replaced, never mutated, on every update, so themes can cache work by object identity. `setTerminalColors` stores what the terminal reports and clears the pending flag, during which the system theme renders in grayscale.
+
+For themes with their own colors, `detectAppearance` compares average lightness in OKLCH of foregrounds against backgrounds: dark when the background is darker than the foreground. Palette colors 0 to 15 are skipped because they follow the user's terminal palette and say nothing about the theme. If only one side is available it falls back to a 0.5 threshold.
+
+```ts ! theme.ts
+function averageLightness(colors: Color[]): number | undefined {
+	// Palette colors 0-15 follow the user's terminal palette, so they say nothing about the theme.
+	// !mark
+	const fixed = colors.filter((color) => color.kind !== "indexed" || color.index >= 16);
+	if (fixed.length === 0) return undefined;
+	return fixed.reduce((sum, color) => sum + colorToOklch(color).l, 0) / fixed.length;
+}
+
+/** Detect the background a theme is designed for from the lightness of its own colors. */
+function detectAppearance(foregrounds: Color[], backgrounds: Color[]): ThemeAppearance | undefined {
+	const fg = averageLightness(foregrounds);
+	const bg = averageLightness(backgrounds);
+	// !mark(1:3)
+	if (fg !== undefined && bg !== undefined) return bg < fg ? "dark" : "light";
+	if (bg !== undefined) return bg < 0.5 ? "dark" : "light";
+	if (fg !== undefined) return fg > 0.5 ? "dark" : "light";
+	return undefined;
+}
+```
+
+## !!steps Precomputing escape sequences in the constructor
+
+Rendering is hot, so the `Theme` constructor does the expensive work once. For every token it builds the foreground or background escape sequence for the detected color mode (truecolor, 256, or 16) and stores it in a map, making `fg()` and `bg()` a lookup and string concat.
+
+A token whose value is `""` has no color of its own. It gets the reset code (`39m` or `49m`) and is recorded in a list so that the `colors` getter can later fill it from the terminal's reported defaults. Optional tokens are defaulted here as well, so the same fallback logic exists in both this constructor and `withThemeColorFallbacks`.
+
+```ts ! theme.ts
+		// Returns the escape sequence for the token's own slot.
+		const addToken = (token: ThemeToken, value: string | number, isBackground: boolean): string => {
+			// !mark(1:3)
+			if (value === "") {
+				(isBackground ? this.defaultBackgroundTokens : this.defaultForegroundTokens).push(token);
+				return isBackground ? "\x1b[49m" : "\x1b[39m";
+			}
+			const color = parseColor(value);
+			this.concreteColors[token] = color;
+			(isBackground ? concreteBackgrounds : concreteForegrounds).push(color);
+			return isBackground ? backgroundAnsi(color, mode) : foregroundAnsi(color, mode);
+		};
+		for (const [token, value] of Object.entries(foregrounds) as [ThemeColor, string | number][]) {
+			this.fgAnsi.set(token, addToken(token, value, false));
+		}
+```
+
+## !!steps Concrete colors and faint tokens
+
+The `colors` getter answers a different question than `fg()`: what is the actual RGB of each token, for code that needs real colors (HTML export, color mixing). It caches by the identity of `terminalColors`, so it recomputes only after the terminal reports again.
+
+Tokens set to `""` receive the terminal's reported foreground or background, or a guessed default based on the theme's appearance. Tokens marked faint are approximated by mixing 40 percent toward the background, since a real SGR 2 attribute cannot be turned into a hex color.
+
+```ts ! theme.ts
+	get colors(): Readonly<Record<ThemeToken, Color>> {
+		const terminal = terminalColors;
+		// !mark
+		if (this.resolvedColors?.terminal !== terminal) {
+			const guess = GUESSED_DEFAULT_COLORS[this.appearance];
+			const toColor = (rgb: RgbColor | undefined, fallback: Color) =>
+				rgb ? rgbColor(rgb.r, rgb.g, rgb.b) : fallback;
+			const foreground = toColor(terminal.foreground, guess.foreground);
+			const background = toColor(terminal.background, guess.background);
+			const colors = { ...this.concreteColors };
+			for (const token of this.defaultForegroundTokens) colors[token] = foreground;
+			for (const token of this.defaultBackgroundTokens) colors[token] = background;
+			for (const token of this.dimTokens) {
+				const color = colors[token];
+				// !mark
+				if (color) colors[token] = mixColors(color, background, 0.4);
+			}
+```
+
+## !!steps fg, bg and the dim variants
+
+`fg` and `bg` wrap text in the precomputed opening sequence and a precise close: `39m` resets only the foreground, `49m` only the background, so nesting works. A faint token adds SGR 2 and closes with `22;39m`, which clears both faintness and color.
+
+An unknown token throws instead of returning plain text, so a typo in a component is a loud error. The `getFgAnsi` variant returns only the opening sequence, with SGR 2 included for faint tokens, for callers that compose their own closing.
+
+```ts ! theme.ts
+	fg(color: ThemeColor, text: string): string {
+		const ansi = this.tokenAnsi(this.fgAnsi, color);
+		// !mark
+		if (this.dimTokens.has(color)) return `${ansi}\x1b[2m${text}\x1b[22;39m`;
+		return `${ansi}${text}\x1b[39m`;
+	}
+
+	bg(color: ThemeBg, text: string): string {
+		const ansi = this.tokenAnsi(this.bgAnsi, color);
+		return `${ansi}${text}\x1b[49m`;
+	}
+
+	private tokenAnsi<T extends ThemeToken>(ansi: Map<T, string>, token: T): string {
+		const value = ansi.get(token);
+		// !mark
+		if (value === undefined) throw new Error(`Unknown theme color: ${token}`);
+		return value;
+	}
+```
+
+## !!steps Finding themes from several sources
+
+`getAvailableThemesWithPaths` merges sources in priority order with a `seen` set, so the first source to claim a name wins: the system theme, then the built-ins, then custom files, then extension-registered themes. The result is sorted alphabetically but with the system theme pinned first, since it is the default.
+
+Custom files are listed by actually loading each one, so a file whose JSON is invalid is silently skipped here. The comment notes the resource loader reports those errors during normal startup. Names containing `/` are rejected for registered themes, because that character is reserved for the `light/dark` auto-theme setting.
+
+```ts ! theme.ts
+	// Built-in themes. The system theme is generated, so it has no file.
+	addTheme({ name: SYSTEM_THEME_NAME, path: undefined });
+	for (const name of Object.keys(getBuiltinThemes())) {
+		addTheme({ name, path: path.join(themesDir, `${name}.json`) });
+	}
+
+	// Custom themes
+	for (const themeInfo of getCustomThemeInfos()) {
+		addTheme(themeInfo);
+	}
+
+	for (const [name, theme] of registeredThemes.entries()) {
+		addTheme({ name, path: theme.sourcePath });
+	}
+
+	// The system theme comes first: it is the default and adapts to every terminal.
+	// !mark(1:3)
+	return result.sort((a, b) =>
+		a.name === SYSTEM_THEME_NAME ? -1 : b.name === SYSTEM_THEME_NAME ? 1 : a.name.localeCompare(b.name),
+	);
+```
+
+## !!steps Loading with an optional validator
+
+Validation is pluggable. By default `parseThemeJson` only checks that the value is an object with a `colors` map. A presentation can call `setThemeJsonValidator` to install the full schema check. The doc comment gives the reason: validating user-authored JSON needs typebox, and a presentation using only built-in themes should not pay about 17 MB of module graph for it.
+
+`loadTheme` then resolves by priority: the reserved system name first, then registered themes, then JSON built-ins and custom files. `getThemeByName` swallows errors and returns `undefined`, for callers that only want to test existence.
+
+```ts ! theme.ts
+function parseThemeJson(label: string, json: unknown): ThemeJson {
+	// !mark
+	if (themeJsonValidator) return themeJsonValidator(label, json);
+	if (typeof json !== "object" || json === null || !("colors" in json)) {
+		throw new Error(`Invalid theme "${label}": expected an object with a "colors" map.`);
+	}
+	return json as ThemeJson;
+}
+
+// ...
+function loadTheme(name: string, mode?: TerminalColorMode): Theme {
+	// The system theme name is reserved: it takes precedence over custom themes of the same name.
+	// !mark
+	if (name === SYSTEM_THEME_NAME) return createSystemTheme(mode);
+	const registeredTheme = registeredThemes.get(name);
+	if (registeredTheme) {
+		return registeredTheme;
+	}
+	const themeJson = loadThemeJson(name);
+	return createTheme(themeJson, mode);
+}
+```
+
+## !!steps Auto light and dark theme settings
+
+A theme setting can be a single name or `light/dark`, for example `paper/midnight`. `parseAutoThemeSetting` accepts exactly one slash with non-empty trimmed names on both sides. `resolveThemeSetting` then picks a side by the terminal's appearance, and a setting with a slash that does not parse yields `undefined` rather than being treated as a plain name.
+
+Terminal appearance itself comes from a priority chain in `detectTerminalTheme`: the reported background color, then the terminal's light/dark report, then the `COLORFGBG` variable, and finally dark. `COLORFGBG` indices are classified like Vim does, with 8 (bright black) counted as dark.
+
+```ts ! theme.ts
+export function resolveThemeSetting(
+	themeSetting: string | undefined,
+	terminalTheme: TerminalTheme,
+): string | undefined {
+	const autoTheme = parseAutoThemeSetting(themeSetting);
+	if (autoTheme) {
+		return terminalTheme === "light" ? autoTheme.lightTheme : autoTheme.darkTheme;
+	}
+	// !mark
+	if (themeSetting?.includes("/")) return undefined;
+	if (typeof themeSetting === "string") return themeSetting;
+	return undefined;
+}
+
+// ...
+export function detectColorFgBgTheme(env: NodeJS.ProcessEnv = process.env): TerminalTheme | undefined {
+	const bg = env.COLORFGBG?.split(";").at(-1)?.trim();
+	if (!bg || !/^\d{1,2}$/.test(bg)) return undefined;
+	const index = Number(bg);
+	if (index > 15) return undefined;
+	// !mark
+	return index <= 6 || index === 8 ? "dark" : "light";
+}
+```
+
+## !!steps A global theme behind a Proxy on globalThis
+
+Every component imports `theme` and calls it as if it were a constant. It is really a `Proxy` that reads the current instance from `globalThis` under a `Symbol.for` key on every property access. Because the instance lives on `globalThis`, two module graphs loaded by different loaders (node and jiti in dev mode) see the same theme and a switch applies to both.
+
+Access before `initTheme()` throws a descriptive error. `setGlobalTheme` also writes a second key for the old package scope, so code compiled against the previous package name still finds the theme.
+
+```ts ! theme.ts
+// Use globalThis to share theme across module loaders (node + jiti in dev mode)
+const THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
+const THEME_KEY_OLD = Symbol.for("@mariozechner/pi-coding-agent:theme");
+
+// Export theme as a getter that reads from globalThis
+// This ensures all module instances (node, jiti) see the same theme
+export const theme: Theme = new Proxy({} as Theme, {
+	get(_target, prop) {
+		const t = (globalThis as Record<symbol, Theme>)[THEME_KEY];
+		// !mark
+		if (!t) throw new Error("Theme not initialized. Call initTheme() first.");
+		return (t as unknown as Record<string | symbol, unknown>)[prop];
+	},
+});
+
+function setGlobalTheme(t: Theme): void {
+	// !mark(1:2)
+	(globalThis as Record<symbol, Theme>)[THEME_KEY] = t;
+	(globalThis as Record<symbol, Theme>)[THEME_KEY_OLD] = t;
+}
+```
+
+## !!steps Initialization and the silent system fallback
+
+`initTheme` and `setTheme` differ in how they report trouble. Startup never fails because of a bad theme: `initTheme` catches any error, switches to the system theme and says nothing. `setTheme` falls back the same way but returns `{ success: false, error }` so the settings UI can show why.
+
+`setTheme` also fires the change callback registered by `onThemeChange`, which is how the UI invalidates its cached renders. The fallback paths do not start a watcher, and `setThemeInstance` stops any running one because an in-memory instance has no file to watch.
+
+```ts ! theme.ts
+export function setTheme(name: string, enableWatcher: boolean = false): { success: boolean; error?: string } {
+	currentThemeName = name;
+	try {
+		setGlobalTheme(loadTheme(name));
+		if (enableWatcher) {
+			startThemeWatcher();
+		}
+		// !mark
+		if (onThemeChangeCallback) {
+			onThemeChangeCallback();
+		}
+		return { success: true };
+	} catch (error) {
+		// Theme is invalid - fall back to the system theme
+		currentThemeName = SYSTEM_THEME_NAME;
+		setGlobalTheme(loadTheme(SYSTEM_THEME_NAME));
+		// Don't start watcher for fallback theme
+		return {
+			success: false,
+			// !mark
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+```
+
+## !!steps Hot reload that tolerates half-written files
+
+The watcher only runs for custom themes, since the built-ins and the system theme are not files the user edits. It watches the whole directory using the guarded helper from [fs-watch.ts](/docs/src/utils/fs-watch.ts), but reacts only to the watched file name or to events with no file name.
+
+Reloads are debounced by 100 ms. The timer callback re-checks that the current theme is still the one being watched, that the file still exists, and wraps the reload in a `try`. Editors often write by truncating or by rename, so a transient invalid or missing file keeps the last good theme active.
+
+```ts ! theme.ts
+		themeReloadTimer = setTimeout(() => {
+			themeReloadTimer = undefined;
+
+			// Ignore stale timers after switching themes or stopping the watcher
+			// !mark
+			if (currentThemeName !== watchedThemeName) {
+				return;
+			}
+
+			// Keep the last successfully loaded theme active if the file is temporarily missing
+			if (!fs.existsSync(themeFile)) {
+				return;
+			}
+
+			try {
+				// Reload the theme from disk and refresh the registry cache
+				const reloadedTheme = loadThemeFromPath(themeFile);
+				// !mark
+				registeredThemes.set(watchedThemeName, reloadedTheme);
+				setGlobalTheme(reloadedTheme);
+```
+
+## !!steps Adapters for pi-tui components
+
+The bottom of the file maps the theme onto the interfaces that `pi-tui` widgets want. `getMarkdownTheme` binds each markdown role to an `md*` token. `getSelectListTheme`, `getEditorTheme` and `getSettingsListTheme` do the same for lists and the editor border.
+
+Syntax highlighting maps highlight.js scope names to `syntax*` tokens. The highlight theme object is cached per `Theme` instance, so a theme switch rebuilds it once. When no supported language is given, code is not auto-detected: the comment explains that detection mislabels prose as AppleScript and colors random words as keywords, so it falls back to plain `mdCodeBlock` color.
+
+```ts ! theme.ts
+function getCliHighlightTheme(t: Theme): CliHighlightTheme {
+	// !mark
+	if (cachedHighlightThemeFor !== t || !cachedCliHighlightTheme) {
+		cachedHighlightThemeFor = t;
+		cachedCliHighlightTheme = buildCliHighlightTheme(t);
+	}
+	return cachedCliHighlightTheme;
+}
+
+export function highlightCode(code: string, lang?: string): string[] {
+	// Validate language before highlighting to avoid stderr spam from cli-highlight
+	const validLang = lang && supportsLanguage(lang) ? lang : undefined;
+	// Skip highlighting when no valid language is specified. cli-highlight's
+	// auto-detection is unreliable and can misidentify prose as AppleScript,
+	// LiveCodeServer, etc., coloring random English words as keywords.
+	// !mark(1:3)
+	if (!validLang) {
+		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
+	}
+```
+
+</Scrollycoding>
+
+The consumers are everywhere: [tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts) styles search matches with it, and HTML export reads `getResolvedThemeColors`, `isLightTheme` and `getThemeExportColors`. [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) sits on top of this file and drives `setTheme` from user settings and terminal reports.
+
+One structural note: this file is a module-level singleton with mutable state (`currentThemeName`, the watcher, the registry, terminal colors) mixed with pure helpers. The pure parts are exported with injectable arguments, like the `env` parameter of `detectColorFgBgTheme`, specifically so they can be tested without touching that state.

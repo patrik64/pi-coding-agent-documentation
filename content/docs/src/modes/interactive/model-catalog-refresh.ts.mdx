@@ -1,0 +1,94 @@
+---
+title: "model-catalog-refresh.ts"
+description: "Deduplicates concurrent model catalog refreshes per runtime while letting each caller cancel independently"
+source: "src/modes/interactive/model-catalog-refresh.ts"
+full: true
+---
+
+Several interactive features (model pickers, login flows) can ask for a refresh of every provider's model catalog at nearly the same moment. Hitting every provider twice is wasteful, but naive sharing has a cancellation problem: if one caller aborts, it must not kill the refresh another caller is still waiting on.
+
+This file solves that with a reference-counted shared operation. It wraps the `refresh` method of [model-runtime.ts](/docs/src/core/model-runtime.ts) and uses `raceWithAbortSignal` from [abort.ts](/docs/src/utils/abort.ts).
+
+<Scrollycoding>
+
+## !!steps Per-runtime bookkeeping
+
+The coordinator keeps a `WeakMap` from runtime to an active record: its own `AbortController`, the shared promise and a count of `waiters`. Weak keys mean a discarded runtime cannot leak an entry. The type only requires `refresh`, via `Pick`, which keeps the function easy to test with a fake.
+
+```ts ! model-catalog-refresh.ts
+type ModelCatalogRuntime = Pick<ModelRuntime, "refresh">;
+
+interface ActiveModelCatalogRefresh {
+	controller: AbortController;
+	promise: Promise<ModelsRefreshResult>;
+	waiters: number;
+}
+
+class ModelCatalogRefreshCoordinator {
+	private readonly activeByRuntime = new WeakMap<ModelCatalogRuntime, ActiveModelCatalogRefresh>();
+```
+
+## !!steps Starting the shared operation
+
+The first caller creates the real refresh, driven by the coordinator's own controller rather than the caller's signal. That is the key decision: the underlying work is never tied to one caller.
+
+When the operation settles, the `finally` removes the entry, but only if the map still holds this same record (`created`), so a newer refresh started after an abort is not deleted by an older one finishing late.
+
+```ts ! model-catalog-refresh.ts
+	refresh(modelRuntime: ModelCatalogRuntime, signal: AbortSignal): Promise<ModelsRefreshResult> {
+		signal.throwIfAborted();
+		let active = this.activeByRuntime.get(modelRuntime);
+		if (!active) {
+			const controller = new AbortController();
+			let created!: ActiveModelCatalogRefresh;
+			const operation = modelRuntime.refresh({ signal: controller.signal });
+			// !mark(1:5)
+			const promise = raceWithAbortSignal(operation, controller.signal).finally(() => {
+				if (this.activeByRuntime.get(modelRuntime) === created) {
+					this.activeByRuntime.delete(modelRuntime);
+				}
+			});
+			created = { controller, promise, waiters: 0 };
+			active = created;
+			this.activeByRuntime.set(modelRuntime, active);
+		}
+```
+
+## !!steps Joining and leaving
+
+Every caller, first or later, increments `waiters` and gets the shared promise raced against its own signal. So an abort rejects only that caller's promise.
+
+When a caller finishes (success, failure or abort) the count drops. If it hits zero while the record is still current, nobody is interested any more and the underlying refresh is aborted. So the work lives exactly as long as at least one caller wants it.
+
+```ts ! model-catalog-refresh.ts
+		active.waiters++;
+		return raceWithAbortSignal(active.promise, signal).finally(() => {
+			active.waiters--;
+			// !mark(1:3)
+			if (active.waiters === 0 && this.activeByRuntime.get(modelRuntime) === active) {
+				active.controller.abort();
+			}
+		});
+	}
+}
+```
+
+## !!steps The module-level singleton
+
+A single coordinator instance is shared by the whole process, and the exported function is a thin wrapper. The documentation comment states the scope: interactive all-catalog refreshes.
+
+```ts ! model-catalog-refresh.ts
+const modelCatalogRefreshCoordinator = new ModelCatalogRefreshCoordinator();
+
+/** Share concurrent interactive all-catalog refreshes while keeping each caller's cancellation independent. */
+export function refreshModelCatalogs(
+	modelRuntime: ModelCatalogRuntime,
+	signal: AbortSignal,
+): Promise<ModelsRefreshResult> {
+	return modelCatalogRefreshCoordinator.refresh(modelRuntime, signal);
+}
+```
+
+</Scrollycoding>
+
+The consumers are in interactive mode, for example [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and the picker in [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts). Once the shared promise settles, the next call starts a fresh refresh; results are not cached beyond that.

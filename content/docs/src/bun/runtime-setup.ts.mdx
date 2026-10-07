@@ -1,0 +1,51 @@
+---
+title: "runtime-setup.ts"
+description: "Side-effect module that configures the process and registers Bun-specific providers before the CLI starts"
+source: "src/bun/runtime-setup.ts"
+full: true
+---
+
+A compiled Bun binary cannot rely on dynamic discovery the way a Node install can, so a few things have to be wired in explicitly. This module does that work as a series of top-level statements, with no exports.
+
+It is imported by [cli.ts](/docs/src/bun/cli.ts) after [sandbox-env-setup.ts](/docs/src/bun/sandbox-env-setup.ts) and before the shared CLI. It reaches into [config.ts](/docs/src/config.ts) for the app name and the QuickJS path setter.
+
+<Scrollycoding>
+
+## !!steps Imports that carry the Bun-specific pieces
+
+Three imports come from the `pi-ai` package: the Bedrock provider module, the Bun OAuth flows and the compat setter. The WASM import is typed by [quickjs-wasm.d.ts](/docs/src/bun/quickjs-wasm.d.ts) and evaluates to a readable path even inside a compiled executable.
+
+```ts ! runtime-setup.ts
+import { bedrockProviderModule } from "@earendil-works/pi-ai/bedrock-provider";
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
+import { setBedrockProviderModule } from "@earendil-works/pi-ai/compat";
+// Bun loads .wasm imports as files: embedded in compiled executables, evaluating to a readable path.
+// !mark
+import quickjsWasmPath from "quickjs-wasi/quickjs.wasm";
+import { APP_NAME, setEmbeddedQuickJSWasmPath } from "../config.ts";
+```
+
+## !!steps Process tweaks
+
+The process title becomes the app name so it is recognizable in `ps`. `process.emitWarning` is replaced with a no-op, which suppresses Node and Bun runtime warnings for the whole process, including ones that might be useful for debugging.
+
+```ts ! runtime-setup.ts
+// !mark(1:2)
+process.title = APP_NAME;
+process.emitWarning = (() => {}) as typeof process.emitWarning;
+```
+
+## !!steps Registering providers and paths
+
+The remaining calls inject the Bun OAuth flows, hand the Bedrock provider module to the compat layer, and tell the config module where the embedded QuickJS binary lives. This eager registration is what the Node build gets through ordinary module resolution.
+
+```ts ! runtime-setup.ts
+// !mark(1:3)
+registerBunOAuthFlows();
+setBedrockProviderModule(bedrockProviderModule);
+setEmbeddedQuickJSWasmPath(quickjsWasmPath);
+```
+
+</Scrollycoding>
+
+The ordering relative to the sandbox fix is deliberate: environment first, then runtime wiring, then the CLI. The file has no tests since it is pure top-level side effects.

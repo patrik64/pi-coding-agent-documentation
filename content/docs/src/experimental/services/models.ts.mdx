@@ -1,0 +1,76 @@
+---
+title: "models.ts"
+description: "The Models service contract: replicated catalog, configuration and refresh state plus the five model and thinking-level operations (experimental)"
+source: "src/experimental/services/models.ts"
+full: true
+---
+
+This file is pure contract. It declares the shape of the replicated state and the method surface of the `pi.models` service, and nothing else. The implementation lives in [models-provider.ts](/docs/src/experimental/services/models-provider.ts) and the consumers (the slash commands, a client UI) only see these types.
+
+It belongs to the experimental server and worker stack. The state is a `ReplicatedState` from the chord library, so every attached client sees the same catalog and configuration without polling.
+
+<Scrollycoding>
+
+## !!steps Plain data types for a model reference
+
+A model is identified by a provider plus a model id, never by an object from the model registry. `ModelSummary` adds the display name and whether the model supports reasoning, which is all a picker UI needs.
+
+Keeping these as plain strings and booleans is what lets the state cross a process boundary as JSON.
+
+```ts ! models.ts
+export interface ModelRef {
+	provider: string;
+	modelId: string;
+}
+
+export interface ModelSummary extends ModelRef {
+	name: string;
+	reasoning: boolean;
+}
+```
+
+## !!steps Three independent slices of state
+
+`ModelsState` is split into the catalog, the current configuration and the refresh status. The catalog carries a `revision` counter so clients can tell a new snapshot from the same one.
+
+The refresh status is a union: a plain status word, or a warning that carries a map of provider id to error message. A partial failure while refreshing providers therefore does not erase the models that did load.
+
+```ts ! models.ts
+export interface ModelsState {
+	// !mark(1:4)
+	catalog: {
+		revision: number;
+		availableModels: ModelSummary[];
+	};
+	configuration: {
+		model: ModelRef | null;
+		thinkingLevel: ModelThinkingLevel;
+	};
+	// !mark
+	refresh: { status: "idle" | "refreshing" | "done" } | { status: "warning"; errors: Record<string, string> };
+}
+```
+
+## !!steps The service surface and its registration name
+
+Every method takes a chord `Context` as its last argument, which carries cancellation and call identity. `cycleThinking` and `selectThinking` change only the reasoning level, while `select` changes the model.
+
+`defineService` binds the interface to the name `pi.models`. The interface and the constant share the identifier `Models`, so one import gives both the type and the token used by `env.provide` and `env.use`. Note this one is not marked local, so it is reachable remotely.
+
+```ts ! models.ts
+export interface Models {
+	readonly state: ReplicatedState<ModelsState>;
+	cycleThinking(context: Context): Promise<void>;
+	getThinkingLevels(context: Context): Promise<ModelThinkingLevel[]>;
+	refresh(context: Context): Promise<void>;
+	select(model: ModelRef, context: Context): Promise<void>;
+	selectThinking(level: ModelThinkingLevel, context: Context): Promise<void>;
+}
+
+// !mark
+export const Models = defineService<Models>("pi.models");
+```
+
+</Scrollycoding>
+
+The provider in [models-provider.ts](/docs/src/experimental/services/models-provider.ts) fills this contract, [slash-commands-provider.ts](/docs/src/experimental/services/slash-commands-provider.ts) calls it for the model and thinking commands, and [worker.ts](/docs/src/experimental/services/worker.ts) installs it into every session worker. Structurally it follows the same pattern as [sessions.ts](/docs/src/experimental/services/sessions.ts) and [transcript.ts](/docs/src/experimental/services/transcript.ts): types plus one `defineService` line.

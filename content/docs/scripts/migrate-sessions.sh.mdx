@@ -1,0 +1,115 @@
+---
+title: "migrate-sessions.sh"
+description: "One-off bash script that moves session files stranded in the agent directory into per-cwd session folders"
+source: "scripts/migrate-sessions.sh"
+full: true
+---
+
+Version 0.30.0 had a bug that saved session `.jsonl` files directly in `~/.pi/agent/` instead of `~/.pi/agent/sessions/<encoded-cwd>/`. This script repairs those installs by reading each stray file's header, working out which working directory it belongs to, and moving it where [session-manager.ts](/docs/src/core/session-manager.ts) expects to find it.
+
+It is a standalone maintenance tool, not part of the runtime. It supports a `--dry-run` flag and skips (rather than overwrites) anything it cannot place safely. Its directory-name encoding mirrors the one used for session folders; compare [migrations.ts](/docs/src/migrations.ts) for the in-app migrations.
+
+<Scrollycoding>
+
+## !!steps Setup and dry-run flag
+
+The agent directory defaults to `~/.pi/agent` but honors `PI_AGENT_DIR`. `set -e` aborts on unexpected failures. The only argument is `--dry-run`, which flips a flag that later guards every filesystem change.
+
+```bash ! migrate-sessions.sh
+set -e
+
+AGENT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}"
+DRY_RUN=false
+
+// !mark(1:4)
+if [[ "$1" == "--dry-run" ]]; then
+    DRY_RUN=true
+    echo "Dry run mode - no files will be moved"
+    echo
+fi
+```
+
+## !!steps Finding stray files
+
+The glob only matches `.jsonl` files directly inside the agent directory, so sessions already in `sessions/` are never touched. `nullglob` is turned on just for this expansion so an empty match yields an empty array instead of a literal pattern, then turned off again.
+
+```bash ! migrate-sessions.sh
+# Find all .jsonl files directly in agent dir (not in subdirectories)
+// !mark(1:3)
+shopt -s nullglob
+files=("$AGENT_DIR"/*.jsonl)
+shopt -u nullglob
+
+if [[ ${#files[@]} -eq 0 ]]; then
+    echo "No session files found in $AGENT_DIR"
+    exit 0
+fi
+```
+
+## !!steps Reading the cwd from the header
+
+The first line of a session file is its header, a JSON object carrying `cwd`. The script reads it with `head -1` and extracts the field with `jq`. Unreadable files, invalid JSON and headers without a `cwd` are counted as skipped and the loop continues.
+
+```bash ! migrate-sessions.sh
+for file in "${files[@]}"; do
+    filename=$(basename "$file")
+    
+    # Read first line and extract cwd using jq
+    if ! first_line=$(head -1 "$file" 2>/dev/null); then
+        echo "SKIP: $filename - cannot read file"
+        ((failed++))
+        continue
+    fi
+    
+    # Parse JSON and extract cwd
+    // !mark
+    if ! cwd=$(echo "$first_line" | jq -r '.cwd // empty' 2>/dev/null); then
+        echo "SKIP: $filename - invalid JSON"
+        ((failed++))
+        continue
+    fi
+```
+
+## !!steps Encoding the directory name
+
+The target folder name is the cwd with the leading slash dropped and every `/`, `:` or `\` turned into `-`, wrapped in `--` on both sides. For `/Users/me/proj` that gives `--Users-me-proj--`. An existing target file is never overwritten.
+
+```bash ! migrate-sessions.sh
+    # Encode cwd: remove leading slash, replace slashes with dashes, wrap with --
+    // !mark(1:2)
+    encoded=$(echo "$cwd" | sed 's|^/||' | sed 's|[/:\\]|-|g')
+    encoded="--${encoded}--"
+    
+    target_dir="$AGENT_DIR/sessions/$encoded"
+    target_file="$target_dir/$filename"
+    
+    if [[ -e "$target_file" ]]; then
+        echo "SKIP: $filename - target already exists"
+        ((failed++))
+        continue
+    fi
+```
+
+## !!steps Moving and reporting
+
+Only the `mkdir` and `mv` are guarded by the dry-run flag; the `MIGRATE` lines are printed either way, so a dry run shows exactly what a real run would do. The summary at the end suggests a real run when a dry run found work.
+
+```bash ! migrate-sessions.sh
+    echo "MIGRATE: $filename"
+    echo "    cwd: $cwd"
+    echo "    to:  $target_dir/"
+    
+    // !mark(1:4)
+    if [[ "$DRY_RUN" == false ]]; then
+        mkdir -p "$target_dir"
+        mv "$file" "$target_file"
+    fi
+    
+    ((migrated++))
+    echo
+done
+```
+
+</Scrollycoding>
+
+One caution worth knowing: under `set -e`, `((failed++))` and `((migrated++))` return a non-zero status when the counter was 0 before the increment, which makes `set -e` abort the script on the very first skip or migration (the counters start at 0). The script has no tests.

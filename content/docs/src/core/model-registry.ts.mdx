@@ -1,0 +1,162 @@
+---
+title: "model-registry.ts"
+description: "A thin synchronous facade over ModelRuntime that extensions use to find models, resolve auth and register providers"
+source: "src/core/model-registry.ts"
+full: true
+---
+
+`ModelRegistry` is the compatibility layer between extensions and the real model machinery. Earlier versions of pi had a registry that owned models, auth and custom providers. That logic now lives in [model-runtime.ts](/docs/src/core/model-runtime.ts), and this class survives as a stable surface that forwards almost every call.
+
+The file is nearly all delegation, so the walkthrough focuses on the few places where the facade adds behavior: the auth result shape, the error normalization, and the dual-signature `registerProvider`.
+
+<Scrollycoding>
+
+## !!steps The facade and what it hides
+
+The class holds one private `ModelRuntime`. The comment states the policy: extensions get this synchronous facade, while coding-agent internals talk to the runtime directly. The type re-exports keep the public import path unchanged even though the types moved to [provider-composer.ts](/docs/src/core/provider-composer.ts).
+
+`ResolvedRequestAuth` is a discriminated union on `ok`, so callers handle failure without try and catch.
+
+```ts ! model-registry.ts
+export type { ProviderConfigInput } from "./provider-composer.ts";
+export type ResolvedRequestAuth =
+	| {
+			ok: true;
+			apiKey?: string;
+			headers?: ProviderHeaders;
+			baseUrl?: string;
+			env?: Record<string, string>;
+	  }
+	| { ok: false; error: string };
+export { clearApiKeyCache } from "./provider-composer.ts";
+
+/**
+ * Synchronous compatibility facade exposed to extensions.
+ * Coding-agent internals use ModelRuntime directly.
+ */
+export class ModelRegistry {
+	private readonly runtime: ModelRuntime;
+```
+
+## !!steps Reading models returns copies
+
+`getAll` and `getAvailable` spread the runtime's arrays, so an extension that sorts or mutates the result cannot corrupt the runtime's state. `getAvailable` reads a snapshot, which is why the refresh comment says to await `refresh()` before relying on synchronous reads.
+
+```ts ! model-registry.ts
+	/** Reload models.json asynchronously. Await before making synchronous registry reads. */
+	refresh(options?: ModelsRefreshOptions): Promise<ModelsRefreshResult> {
+		return this.runtime.refresh(options);
+	}
+
+	getError(): string | undefined {
+		return this.runtime.getError();
+	}
+
+	getAll(): Model<Api>[] {
+		return [...this.runtime.getModels()];
+	}
+
+	getAvailable(): Model<Api>[] {
+		return [...this.runtime.getAvailableSnapshot()];
+	}
+```
+
+## !!steps Resolving request auth without throwing
+
+`getApiKeyAndHeaders` is the one method with real logic. If the runtime has no auth resolution, the fallback depends on the compatibility config: when the model requires an auth header it is an error, otherwise the request proceeds with just the static headers (local servers with no key, for instance).
+
+Successful results spread `baseUrl` in only when set, so the key is absent rather than `undefined`.
+
+```ts ! model-registry.ts
+	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
+		try {
+			const resolution = await this.runtime.getAuth(model);
+			if (!resolution) {
+				const compatibility = this.runtime.getCompatibilityRequestConfig(model);
+				if (compatibility.authHeader) {
+					return { ok: false, error: `No API key found for "${model.provider}"` };
+				}
+				return { ok: true, headers: compatibility.headers };
+			}
+			return {
+				ok: true,
+				apiKey: resolution.auth.apiKey,
+				headers: resolution.auth.headers,
+				...(resolution.auth.baseUrl ? { baseUrl: resolution.auth.baseUrl } : {}),
+				env: resolution.env,
+			};
+```
+
+## !!steps Unwrapping error causes
+
+When resolution throws, the facade prefers the message of `error.cause` over the outer error, since the runtime wraps credential failures. One specific internal message, `authHeader requires a resolved API key`, is rewritten to the same friendly `No API key found` text used above, so both failure paths look identical to a caller.
+
+```ts ! model-registry.ts
+		} catch (error) {
+			const cause = error instanceof Error ? error.cause : undefined;
+			const message =
+				cause instanceof Error ? cause.message : error instanceof Error ? error.message : String(error);
+			return {
+				ok: false,
+				error:
+					message === "authHeader requires a resolved API key"
+						? `No API key found for "${model.provider}"`
+						: message,
+			};
+		}
+```
+
+## !!steps Streaming, classifying and image generation
+
+Extensions can call models directly through the registry. `stream` and `streamSimple` return the event stream, and `complete` awaits the final message. The docs on `classify` and `generateImages` say they never reject, so failures come back inside the result type.
+
+Typed lookups use `ModelType` and `ModelTypeMap` so `findOfType("classifier", ...)` is typed as a classifier model rather than a chat model.
+
+```ts ! model-registry.ts
+	/** Stream through the configured provider with request-time authentication. */
+	stream<TApi extends Api>(
+		model: Model<TApi>,
+		context: Context,
+		options?: ModelsApiStreamOptions<TApi>,
+	): AssistantMessageEventStream {
+		return this.runtime.stream(model, context, options);
+	}
+
+	/** Stream with provider-neutral options and request-time authentication. */
+	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		return this.runtime.streamSimple(model, context, options);
+	}
+```
+
+## !!steps Registering providers two ways
+
+`registerProvider` is overloaded. Passing a name plus a `ProviderConfigInput` registers a declarative provider (the same shape as a `models.json` entry), which the runtime composes into a full provider. Passing a ready-made `Provider` object registers it natively.
+
+The implementation signature distinguishes them by `typeof` and throws if a name arrives without a config. This is how extensions loaded by [loader.ts](/docs/src/core/extensions/loader.ts) add custom backends.
+
+```ts ! model-registry.ts
+	registerProvider(provider: Provider): void;
+	registerProvider(providerName: string, config: ProviderConfigInput): void;
+	registerProvider(providerOrName: Provider | string, config?: ProviderConfigInput): void {
+		if (typeof providerOrName === "string") {
+			if (!config) throw new Error("Provider config is required when registering by name");
+			this.runtime.registerProvider(providerOrName, config);
+			return;
+		}
+		this.runtime.registerNativeProvider(providerOrName);
+	}
+
+	unregisterProvider(providerName: string): void {
+		this.runtime.unregisterProvider(providerName);
+	}
+
+	registerVirtualModel(definition: VirtualModelDefinition): void {
+		this.runtime.registerVirtualModel(definition);
+	}
+```
+
+</Scrollycoding>
+
+Behind this facade sit [model-runtime.ts](/docs/src/core/model-runtime.ts) (state and auth), [provider-composer.ts](/docs/src/core/provider-composer.ts) (turning config into providers) and [virtual-models.ts](/docs/src/core/virtual-models.ts) (the definitions accepted by `registerVirtualModel`). Selection helpers such as [model-resolver.ts](/docs/src/core/model-resolver.ts) take a registry as input.
+
+Structurally the file is a list of one-line forwarders; if a new capability is added to the runtime, extensions only see it once a matching method is added here.

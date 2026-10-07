@@ -1,0 +1,64 @@
+---
+title: "cli.ts"
+description: "The six-line executable shim that installs process-level CLI setup and hands argv to main()"
+source: "src/cli.ts"
+full: true
+---
+
+This is the file the package's `bin` entry points at. It does no work of its
+own: it wires two other modules together in a fixed order and leaves.
+
+Keeping the shim this small means everything testable lives in
+[main.ts](/docs/src/main.ts), which exports `main` and can be called from
+tests or from another entry point. [rpc-entry.ts](/docs/src/rpc-entry.ts) is exactly that: it repeats the same
+setup inline and calls `main` with `--mode rpc` prepended.
+
+<Scrollycoding>
+
+## !!steps A shebang makes the file directly runnable
+
+The first line is a `node` shebang, so the published file can be executed as a
+command after installation. The `.ts` extensions in the imports are intentional:
+the project runs and builds TypeScript with explicit extensions.
+
+```ts ! cli.ts
+#!/usr/bin/env node
+import { setupCli } from "./cli/setup.ts";
+import { main } from "./main.ts";
+```
+
+## !!steps Setup runs before main
+
+`setupCli` from [setup.ts](/docs/src/cli/setup.ts) is called synchronously
+before anything else. It sets the process title, marks the environment with
+`PI_CODING_AGENT` and `AI_AGENT`, silences `process.emitWarning`, and configures the HTTP dispatcher
+before any provider SDK can issue a request.
+
+```ts ! cli.ts
+// ...
+// !mark
+setupCli();
+main(process.argv.slice(2));
+```
+
+## !!steps argv is trimmed and the promise is not awaited
+
+`process.argv.slice(2)` drops the `node` binary and the script path, so
+[parseArgs](/docs/src/cli/args.ts) sees only user arguments.
+
+The returned promise from `main` is neither awaited nor given a `.catch`. Errors
+inside `main` mostly exit through `process.exit` after printing, so there is
+nothing to await, but a thrown error that escapes would surface as an unhandled
+rejection rather than a formatted message.
+
+```ts ! cli.ts
+// ...
+setupCli();
+// !mark
+main(process.argv.slice(2));
+```
+
+</Scrollycoding>
+
+The three files form a line: this shim, then [main.ts](/docs/src/main.ts) for
+orchestration, then [args.ts](/docs/src/cli/args.ts) for the flag grammar.

@@ -1,0 +1,146 @@
+---
+title: "render-utils.ts"
+description: "Small formatting helpers shared by every tool renderer: path display, output text extraction and the generic call header"
+source: "src/core/tools/render-utils.ts"
+full: true
+---
+
+Each built-in tool has a renderer that decides how its call and result look in the terminal UI. Those renderers all need the same few chores: shorten a path, turn a result's content blocks into plain text, cope with arguments that are not strings, and print a generic header. This file collects them.
+
+The helpers are deliberately tolerant. Tool arguments come from a model and may be missing, null or the wrong type, so most functions accept `unknown` and degrade to a visible placeholder instead of throwing. The renderers in [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) and the individual files such as [renderers/read.ts](/docs/src/core/tools/renderers/read.ts) are the consumers.
+
+<Scrollycoding>
+
+## !!steps Path display and terminal hyperlinks
+
+`shortenPath` replaces the home directory prefix with `~` and returns an empty string for non-strings. Note it is a plain `startsWith` check, so a sibling directory whose name merely begins with the home path would also be shortened.
+
+`linkPath` wraps already-styled text in an OSC 8 hyperlink pointing at the absolute file URL, but only when the terminal reports hyperlink support. The raw path is resolved against the cwd with `resolvePath` from [paths.ts](/docs/src/utils/paths.ts).
+
+```ts ! render-utils.ts
+export function shortenPath(path: unknown): string {
+	if (typeof path !== "string") return "";
+	const home = os.homedir();
+	// !mark(1:3)
+	if (path.startsWith(home)) {
+		return `~${path.slice(home.length)}`;
+	}
+	return path;
+}
+
+export function linkPath(styledText: string, rawPath: string, cwd: string): string {
+	// !mark
+	if (!getCapabilities().hyperlinks) return styledText;
+	const absolutePath = resolvePath(rawPath, cwd);
+	return hyperlink(styledText, pathToFileURL(absolutePath).href);
+}
+```
+
+## !!steps Three-state argument coercion
+
+`str` returns a three-way answer. A string passes through, `null` or `undefined` becomes the empty string (the argument is merely absent), and anything else yields `null`, which callers treat as an invalid argument and render as `[invalid arg]`.
+
+`replaceTabs` converts tabs to three spaces so terminal tab stops do not misalign boxes, and `normalizeDisplayText` strips carriage returns.
+
+```ts ! render-utils.ts
+export function str(value: unknown): string | null {
+	if (typeof value === "string") return value;
+	// !mark
+	if (value == null) return "";
+	return null;
+}
+
+export function replaceTabs(text: string): string {
+	return text.replace(/\t/g, "   ");
+}
+
+export function normalizeDisplayText(text: string): string {
+	return text.replace(/\r/g, "");
+}
+```
+
+## !!steps Turning a result into display text
+
+`getTextOutput` joins all text blocks after stripping ANSI escapes ([ansi.ts](/docs/src/utils/ansi.ts)) and sanitizing binary garbage ([shell.ts](/docs/src/utils/shell.ts)), then removes carriage returns.
+
+Image blocks are only listed as indicators when the terminal cannot show images or the user turned image display off. The indicator carries the mime type and, when the data decodes, its dimensions. When images can be displayed, the function leaves them out of the text because the UI draws them separately.
+
+```ts ! render-utils.ts
+export function getTextOutput(
+	result: { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> } | undefined,
+	showImages: boolean,
+): string {
+	if (!result) return "";
+
+	const textBlocks = result.content.filter((c) => c.type === "text");
+	const imageBlocks = result.content.filter((c) => c.type === "image");
+
+	let output = textBlocks.map((c) => sanitizeBinaryOutput(stripAnsi(c.text || "")).replace(/\r/g, "")).join("\n");
+
+	const caps = getCapabilities();
+	// !mark
+	if (imageBlocks.length > 0 && (!caps.images || !showImages)) {
+		const imageIndicators = imageBlocks
+// ...
+		output = output ? `${output}\n${imageIndicators}` : imageIndicators;
+	}
+
+	return output;
+}
+```
+
+## !!steps Generic call header
+
+`formatToolCallWithArgs` is the fallback header for tools that provide no custom call rendering. Collapsed, arguments become `key=value` pairs on the title line, cut at 100 characters with an ellipsis. Expanded, each argument gets its own `key: value` line, strings raw and multi-line values indented.
+
+Non-object arguments are wrapped as a single `args` entry. `JSON.stringify(value) ?? String(value)` guards against values such as functions where stringify returns undefined.
+
+```ts ! render-utils.ts
+const COLLAPSED_ARGS_CHARS = 100;
+
+export function formatToolCallWithArgs(title: string, args: unknown, theme: Theme, expanded: boolean): string {
+	const header = theme.fg("toolTitle", theme.bold(title));
+	if (args == null) return header;
+	const entries =
+		typeof args === "object" && !Array.isArray(args)
+			? Object.entries(args)
+			: ([["args", args]] as [string, unknown][]);
+	if (entries.length === 0) return header;
+	if (expanded) {
+// ...
+	}
+	// !mark(1:2)
+	const pairs = entries.map(([key, value]) => `${key}=${JSON.stringify(value) ?? String(value)}`).join(" ");
+	const preview = pairs.length > COLLAPSED_ARGS_CHARS ? `${pairs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...` : pairs;
+	return `${header} ${theme.fg("muted", preview)}`;
+}
+```
+
+## !!steps The shared path renderer
+
+`renderToolPath` combines the earlier helpers. A `null` path (invalid argument) shows the error marker. An empty path uses the caller's `emptyFallback` if given, otherwise a dimmed `...`, which is what a still-streaming call looks like before the model has produced the path. A real path is shortened, accented and made clickable.
+
+[renderers/ls.ts](/docs/src/core/tools/renderers/ls.ts) uses `emptyFallback: "."` because listing with no path means the current directory.
+
+```ts ! render-utils.ts
+export function invalidArgText(theme: Theme): string {
+	return theme.fg("error", "[invalid arg]");
+}
+
+export function renderToolPath(
+	rawPath: string | null,
+	theme: Theme,
+	cwd: string,
+	options?: { emptyFallback?: string },
+): string {
+	// !mark(1:3)
+	if (rawPath === null) return invalidArgText(theme);
+	const value = rawPath || options?.emptyFallback;
+	if (!value) return theme.fg("toolOutput", "...");
+	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd);
+}
+```
+
+</Scrollycoding>
+
+The helpers are imported by every file in the `renderers` folder, including [renderers/write.ts](/docs/src/core/tools/renderers/write.ts) and [renderers/edit.ts](/docs/src/core/tools/renderers/edit.ts). The file has no state and no dependency on the tool implementations, only on the theme type, which keeps render-only processes light. `formatToolCallWithArgs` is the one export not used by the built-in renderers; it serves tools with no renderer of their own, through the interactive tool-execution component and the MCP extension's tools.

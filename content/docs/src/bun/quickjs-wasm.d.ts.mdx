@@ -1,0 +1,35 @@
+---
+title: "quickjs-wasm.d.ts"
+description: "Type declaration that tells TypeScript a .wasm import under Bun resolves to a file path string"
+source: "src/bun/quickjs-wasm.d.ts"
+full: true
+---
+
+TypeScript does not know what importing a `.wasm` file yields. This declaration file fixes that for one module specifier, `quickjs-wasi/quickjs.wasm`, which [runtime-setup.ts](/docs/src/bun/runtime-setup.ts) imports.
+
+It contains no runtime code. Bun's default loader for `.wasm` evaluates to the file's path (embedded inside compiled executables), so the declared default export is simply a string.
+
+<Scrollycoding>
+
+## !!steps Why the comment matters
+
+The first line records the contract: the import is consumed by runtime-setup and relies on Bun's loader behavior. Under another bundler the same import could mean something else, so this is Bun-specific.
+
+```ts ! quickjs-wasm.d.ts
+// Imported by runtime-setup.ts. Bun's default loader for .wasm evaluates to the file's path.
+```
+
+## !!steps The ambient module
+
+`declare module` with a specifier string types that exact import. The default export is a `string`, which runtime-setup passes to `setEmbeddedQuickJSWasmPath` in [config.ts](/docs/src/config.ts) so the QuickJS sandbox can find its binary inside a compiled executable.
+
+```ts ! quickjs-wasm.d.ts
+declare module "quickjs-wasi/quickjs.wasm" {
+	const path: string;
+	export default path;
+}
+```
+
+</Scrollycoding>
+
+Because it lives under `src/bun/`, it only matters for the Bun build; the Node build never imports the `.wasm` file this way.

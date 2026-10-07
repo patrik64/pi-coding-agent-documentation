@@ -1,0 +1,79 @@
+---
+title: "frontmatter.ts"
+description: "Splits a markdown document into its YAML frontmatter and body, tolerating BOMs and CRLF line endings"
+source: "src/utils/frontmatter.ts"
+full: true
+---
+
+Skills, prompt templates and similar resources are markdown files with a YAML header between `---` lines. This tiny module is the one place that splits the header from the body and parses the YAML.
+
+It is used by [skills.ts](/docs/src/core/skills.ts) and [prompt-templates.ts](/docs/src/core/prompt-templates.ts), and relies on `stripBom` from [text.ts](/docs/src/utils/text.ts).
+
+<Scrollycoding>
+
+## !!steps Normalizing the input
+
+Before looking for delimiters the content loses any byte order mark and has `\r\n` and bare `\r` rewritten to `\n`. That way the later index arithmetic works the same for files saved on Windows.
+
+```ts ! frontmatter.ts
+import { parse } from "yaml";
+import { stripBom } from "./text.ts";
+
+type ParsedFrontmatter<T extends Record<string, unknown>> = {
+	frontmatter: T;
+	body: string;
+};
+
+const normalizeNewlines = (value: string): string => value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+```
+
+## !!steps Extracting the YAML block
+
+The document must start with `---`. The closing delimiter is the first `\n---` after position 3. If either is missing the whole text is returned as body with no YAML. Note the closing check does not require the delimiter to be alone on its line, so a line like `---foo` would also end the header.
+
+The body is trimmed, while the YAML slice starts at index 4, skipping the opening line.
+
+```ts ! frontmatter.ts
+const extractFrontmatter = (content: string): { yamlString: string | null; body: string } => {
+	const normalized = normalizeNewlines(stripBom(content));
+
+	if (!normalized.startsWith("---")) {
+		return { yamlString: null, body: normalized };
+	}
+
+	const endIndex = normalized.indexOf("\n---", 3);
+	if (endIndex === -1) {
+		return { yamlString: null, body: normalized };
+	}
+
+	return {
+		yamlString: normalized.slice(4, endIndex),
+		body: normalized.slice(endIndex + 4).trim(),
+	};
+};
+```
+
+## !!steps Parsing and the public helpers
+
+`parseFrontmatter` parses with the `yaml` package and substitutes an empty object when the header is empty. The generic parameter lets callers type the expected keys, but nothing validates them at runtime. A YAML syntax error is not caught here and propagates to the caller.
+
+`stripFrontmatter` is the shortcut when only the body matters.
+
+```ts ! frontmatter.ts
+export const parseFrontmatter = <T extends Record<string, unknown> = Record<string, unknown>>(
+	content: string,
+): ParsedFrontmatter<T> => {
+	const { yamlString, body } = extractFrontmatter(content);
+	if (!yamlString) {
+		return { frontmatter: {} as T, body };
+	}
+	const parsed = parse(yamlString);
+	return { frontmatter: (parsed ?? {}) as T, body };
+};
+
+export const stripFrontmatter = (content: string): string => parseFrontmatter(content).body;
+```
+
+</Scrollycoding>
+
+Note that parsing failures surface as exceptions from the yaml library, so callers such as the skill loader decide how to report a bad file.

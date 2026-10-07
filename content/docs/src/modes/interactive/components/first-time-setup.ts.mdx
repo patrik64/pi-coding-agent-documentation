@@ -1,0 +1,222 @@
+---
+title: "first-time-setup.ts"
+description: "The two-step first-run dialog that lets the user pick a theme with live preview and opt in or out of anonymous analytics"
+source: "src/modes/interactive/components/first-time-setup.ts"
+full: true
+---
+
+The first time pi runs interactively, before the main UI exists, the startup code shows this dialog. Step one is a theme picker; step two is an analytics opt-in. The dialog does not write any settings itself. It only reports a `FirstTimeSetupResult` through callbacks, and the code in [startup-ui.ts](/docs/src/cli/startup-ui.ts) persists it via the settings manager.
+
+The component is a small state machine over a `Container`. Every keypress rebuilds the whole child list, which is what makes live theme previews work: when the theme changes, all text is regenerated with the new colors.
+
+<Scrollycoding>
+
+## !!steps Result, options and constants
+
+The dialog's contract is three callbacks: preview a theme, submit a result, or cancel. The theme choices are the system theme (taken from [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts)), dark and light. The analytics choices carry a boolean value with a human label.
+
+```ts ! first-time-setup.ts
+// !mark
+export interface FirstTimeSetupResult {
+	theme: string;
+	shareAnalytics: boolean;
+}
+
+// !mark
+export interface FirstTimeSetupOptions {
+	onThemePreview: (themeName: string) => void;
+	onSubmit: (result: FirstTimeSetupResult) => void;
+	onCancel: () => void;
+}
+
+// !mark
+const THEME_OPTIONS: Array<{ value: string; label: string }> = [
+	{ value: SYSTEM_THEME_NAME, label: "System (matches your terminal colors)" },
+	{ value: "dark", label: "Dark" },
+	{ value: "light", label: "Light" },
+];
+
+// !mark
+const ANALYTICS_OPTIONS: Array<{ value: boolean; label: string }> = [
+	{ value: true, label: "Share anonymous usage data" },
+	{ value: false, label: "Don't share" },
+];
+
+const SETUP_LOGO_LINES = ["██████", "██  ██", "████  ██", "██    ██"];
+```
+
+## !!steps State and rebuild on invalidate
+
+`step` is either `theme` or `analytics`, and each step has its own selection index. The first theme (system) starts selected. `invalidate` is overridden to rebuild the children before calling the base implementation; the comment explains that the system theme may receive the terminal's real colors after the dialog was first drawn.
+
+```ts ! first-time-setup.ts
+/** First-time setup dialog: theme choice and analytics opt-in. */
+export class FirstTimeSetupComponent extends Container {
+// !mark(1:3)
+	private step: "theme" | "analytics" = "theme";
+	private themeIndex: number;
+	private analyticsIndex = 0;
+	private readonly options: FirstTimeSetupOptions;
+
+	constructor(options: FirstTimeSetupOptions) {
+		super();
+		this.options = options;
+		this.themeIndex = 0;
+		this.update();
+	}
+
+	/** Rebuild on theme changes, e.g. when the system theme receives the terminal's colors. */
+// !mark(1:4)
+	override invalidate(): void {
+		this.update();
+		super.invalidate();
+	}
+```
+
+## !!steps Rendering the theme step
+
+`update` starts with `clear()` and re-adds a border, spacer, logo, spacer and a bold welcome line using `APP_NAME` from [config.ts](/docs/src/config.ts). The theme step then adds a prompt and the option list. Rebuilding everything, instead of patching one row, is the simplest way to guarantee every piece of text picks up a previewed theme.
+
+```ts ! first-time-setup.ts
+	// Rebuild the whole dialog on every change so theme previews recolor all text.
+	private update(): void {
+// !mark
+		this.clear();
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+// !mark
+		this.addChild(new Text(theme.fg("accent", SETUP_LOGO_LINES.join("\n")), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(
+// !mark
+			new Text(theme.fg("accent", theme.bold(`Welcome to ${APP_NAME}, the minimal coding agent.`)), 1, 0),
+		);
+		this.addChild(new Spacer(1));
+
+// !mark
+		if (this.step === "theme") {
+			this.addChild(new Text(theme.fg("text", "Pick a theme."), 1, 0));
+			this.addChild(new Spacer(1));
+			this.addOptionList(
+				THEME_OPTIONS.map((option) => option.label),
+				this.themeIndex,
+			);
+```
+
+## !!steps Rendering the analytics step
+
+The second step explains what opting in means: a tracking identifier is stored in `settings.json`, anonymous analytics are enabled, and `/privacy` shows what is shared. The default selection is index 0, which is the opt-in option, so pressing Enter without moving accepts sharing.
+
+```ts ! first-time-setup.ts
+		} else {
+// !mark
+			this.addChild(new Text(theme.fg("text", "Opt-in to anonymous usage data sharing?"), 1, 0));
+			this.addChild(
+				new Text(
+					theme.fg(
+						"muted",
+						"Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json.",
+					),
+					1,
+					0,
+				),
+			);
+			this.addChild(new Spacer(1));
+// !mark
+			this.addOptionList(
+				ANALYTICS_OPTIONS.map((option) => option.label),
+				this.analyticsIndex,
+			);
+		}
+```
+
+## !!steps Hint line and option rows
+
+The hint changes with the step: confirm reads continue on the first page and finish on the second, and cancel is labelled skip setup. `addOptionList` draws each label with an accent arrow when selected and two spaces otherwise, the same visual language as [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts).
+
+```ts ! first-time-setup.ts
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Text(
+				rawKeyHint("↑↓", "navigate") +
+					"  " +
+// !mark
+					keyHint("tui.select.confirm", this.step === "theme" ? "continue" : "finish") +
+					"  " +
+// !mark
+					keyHint("tui.select.cancel", "skip setup"),
+				1,
+				0,
+			),
+		);
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder());
+	}
+
+	private addOptionList(labels: string[], selectedIndex: number): void {
+		for (let i = 0; i < labels.length; i++) {
+			const isSelected = i === selectedIndex;
+// !mark(1:2)
+			const prefix = isSelected ? theme.fg("accent", "→ ") : "  ";
+			const label = isSelected ? theme.fg("accent", labels[i]) : theme.fg("text", labels[i]);
+			this.addChild(new Text(`${prefix}${label}`, 1, 0));
+		}
+	}
+```
+
+## !!steps Moving the selection
+
+Selection clamps at both ends. On the theme step a changed index triggers `onThemePreview`, so the whole app recolors as the user browses. On the analytics step only the index changes. Both paths end with `update` to redraw.
+
+```ts ! first-time-setup.ts
+	private moveSelection(delta: number): void {
+		if (this.step === "theme") {
+// !mark(1:5)
+			const next = Math.max(0, Math.min(THEME_OPTIONS.length - 1, this.themeIndex + delta));
+			if (next !== this.themeIndex) {
+				this.themeIndex = next;
+// !mark
+				this.options.onThemePreview(THEME_OPTIONS[this.themeIndex].value);
+			}
+		} else {
+			this.analyticsIndex = Math.max(0, Math.min(ANALYTICS_OPTIONS.length - 1, this.analyticsIndex + delta));
+		}
+		this.update();
+	}
+```
+
+## !!steps Key handling
+
+Up and down, plus `k` and `j`, move the selection. Confirm advances from theme to analytics, and on the second step calls `onSubmit` with both choices. Cancel calls `onCancel` from either step. Note there is no way to go back to the theme page once the analytics page is shown.
+
+```ts ! first-time-setup.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+// !mark
+		if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
+			this.moveSelection(-1);
+// !mark
+		} else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
+			this.moveSelection(1);
+// !mark
+		} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
+			if (this.step === "theme") {
+				this.step = "analytics";
+				this.update();
+			} else {
+// !mark
+				this.options.onSubmit({
+					theme: THEME_OPTIONS[this.themeIndex].value,
+					shareAnalytics: ANALYTICS_OPTIONS[this.analyticsIndex].value,
+				});
+			}
+// !mark
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
+			this.options.onCancel();
+		}
+	}
+```
+
+</Scrollycoding>
+
+The caller in [startup-ui.ts](/docs/src/cli/startup-ui.ts) owns the persistence and decides when the dialog runs; this file only owns the interaction. Theming flows through [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and hint formatting through [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).

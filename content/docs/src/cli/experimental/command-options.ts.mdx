@@ -1,0 +1,126 @@
+---
+title: "command-options.ts"
+description: "Shared option definitions for experimental commands: auth token inputs and the strict --connect transport address parser"
+source: "src/cli/experimental/command-options.ts"
+full: true
+---
+
+Both experimental commands need to know how to authenticate and where to connect. This module defines those options once, on top of the builders in [command.ts](/docs/src/cli/experimental/command.ts), so [client.ts](/docs/src/cli/experimental/commands/client.ts) and [server.ts](/docs/src/cli/experimental/commands/server.ts) accept identical syntax. This is experimental code.
+
+The notable part is the address parser. It accepts only two URL shapes, `unix:///absolute/path` and `radius://<server-id>`, and rejects everything else, so that no ambiguous or sneaky address reaches the transport layer. Server IDs are validated by `isServerId` from the pi-protocol package.
+
+<Scrollycoding>
+
+## !!steps Types for auth and transports
+
+Authentication is either a literal token or a path to a file holding one. A transport address is a tagged union of a unix socket path or a radius server ID.
+
+```ts ! command-options.ts
+export type AuthInput =
+	| { readonly type: "token"; readonly token: string }
+	| { readonly type: "file"; readonly path: string };
+
+interface UnixTransportAddress {
+	readonly transport: "unix";
+	readonly path: string;
+}
+
+interface RadiusTransportAddress {
+	readonly transport: "radius";
+	readonly serverId: ServerId;
+}
+
+export type TransportAddress = UnixTransportAddress | RadiusTransportAddress;
+```
+
+## !!steps Mutually exclusive token options
+
+The two options are plain string options. `parseAuthInput` rejects supplying both, and returns no `auth` at all when neither is given, leaving the default to the consumer. Prefer the file form to keep secrets out of process listings.
+
+```ts ! command-options.ts
+export const authTokenOption = stringOption("--auth-token");
+export const authTokenFileOption = stringOption("--auth-token-file");
+
+function parseAuthInput(options: { readonly authToken?: string; readonly authTokenFile?: string }): {
+	auth?: AuthInput;
+	errors: string[];
+} {
+	// !mark(1:3)
+	if (options.authToken !== undefined && options.authTokenFile !== undefined) {
+		return { errors: ["--auth-token and --auth-token-file are mutually exclusive"] };
+	}
+```
+
+## !!steps Radius addresses
+
+A `radius:` URL must be bare: no credentials, port, query, fragment or extra path, and the original string must equal the canonical `radius://host` form. The host must be a lowercase UUIDv4 server ID.
+
+```ts ! command-options.ts
+	if (url.protocol === "radius:") {
+		if (
+			url.username ||
+			url.password ||
+			url.port ||
+			(url.pathname !== "" && url.pathname !== "/") ||
+			url.search ||
+			url.hash ||
+			// !mark
+			value !== `radius://${url.hostname}${url.pathname}`
+		) {
+			return { error: `Invalid --connect address "${value}"` };
+		}
+		const serverId = url.hostname;
+		if (!isServerId(serverId)) {
+			return { error: "Radius transport address requires a lowercase UUIDv4 server ID" };
+		}
+		return { address: { transport: "radius", serverId } };
+	}
+```
+
+## !!steps Unix socket addresses
+
+Unix addresses must start with exactly `unix:///`, with no authority, query or fragment, and the parsed `href` must round-trip to the input. The path is percent-decoded, rejected if it contains a NUL byte, and must be absolute.
+
+```ts ! command-options.ts
+	if (
+		!value.startsWith("unix:///") ||
+		value.startsWith("unix:////") ||
+		value.includes("?") ||
+		value.includes("#") ||
+		url.href !== value
+	) {
+		return { error: `Invalid --connect address "${value}"` };
+	}
+	let path: string;
+	try {
+		path = decodeURIComponent(url.pathname);
+	} catch {
+		return { error: `Invalid --connect address "${value}"` };
+	}
+	// !mark(1:2)
+	if (path.includes("\0")) return { error: `Invalid --connect address "${value}"` };
+	if (!posix.isAbsolute(path)) return { error: "Unix transport address requires an absolute path" };
+```
+
+## !!steps The connect option and helpers
+
+`connectOption` wraps the parser as a typed value option. `parseAuth` reads both token options from a parsed input. `unsupportedOptions` produces the error used when leftover arguments remain, since these commands do not yet accept the regular CLI flags.
+
+```ts ! command-options.ts
+export const connectOption = valueOption("--connect", (value) => {
+	const result = parseTransportAddress(value);
+	return result.address
+		? { ok: true, value: result.address }
+		: { ok: false, error: result.error ?? `Invalid --connect address "${value}"` };
+});
+
+// !mark
+export function unsupportedOptions(command: string, input: ParsedCommandInput): string[] {
+	if (input.remainingArgs.length === 0) return [];
+	return [`The experimental ${command} command does not support existing CLI options yet`];
+}
+```
+
+</Scrollycoding>
+
+Overall the strictness is deliberate: addresses are compared against their canonical form so lookalike strings are refused. No test file is documented alongside this module.

@@ -1,0 +1,51 @@
+---
+title: "coordinator-entry.ts"
+description: "Executable entry point for the internal coordinator child process, guarded so it only runs when spawned with the coordinator role"
+source: "src/experimental/coordinator-entry.ts"
+full: true
+---
+
+The coordinator is a small socket router that sits between the experimental server and its clients. It runs as its own detached process, and this file is the executable that process starts from. It is experimental code.
+
+The file is deliberately thin: it checks that it was launched by pi itself, then hands the arguments to `runCoordinatorProcess` in [coordinator.ts](/docs/src/experimental/coordinator.ts).
+
+<Scrollycoding>
+
+## !!steps Reading and clearing the role
+
+The parent sets an environment variable naming the child's role. `consumeInternalProcessRole` from [process.ts](/docs/src/experimental/process.ts) validates it and deletes it, so grandchildren do not inherit it by accident.
+
+```ts ! coordinator-entry.ts
+#!/usr/bin/env node
+import { runCoordinatorProcess } from "./coordinator.ts";
+import { consumeInternalProcessRole } from "./process.ts";
+
+// !mark
+const role = consumeInternalProcessRole();
+```
+
+## !!steps Refusing to run by hand
+
+If the role is anything other than `coordinator`, including missing, the module throws. That stops someone from starting the router by running the file directly, since it would otherwise bind sockets at paths taken from raw arguments.
+
+```ts ! coordinator-entry.ts
+// ...
+// !mark
+if (role !== "coordinator") throw new Error("Coordinator entrypoint requires an internal coordinator invocation");
+```
+
+## !!steps Run and exit on failure
+
+The two socket paths come from `process.argv.slice(2)`. A rejection is logged and turns into exit code 1, because a coordinator that failed to start has nobody to report to.
+
+```ts ! coordinator-entry.ts
+// ...
+void runCoordinatorProcess(process.argv.slice(2)).catch((error: unknown) => {
+	console.error(error);
+	process.exit(1);
+});
+```
+
+</Scrollycoding>
+
+[coordinator.ts](/docs/src/experimental/coordinator.ts) contains the same guard at its bottom, using `isDirectInternalProcessEntry`, so this file is a separate executable that repeats that guard without importing the module for side effects. The spawn side is `spawnInternalProcess` in [process.ts](/docs/src/experimental/process.ts).

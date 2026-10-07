@@ -1,0 +1,137 @@
+---
+title: "file-processor.ts"
+description: "Turns @file command-line arguments into tagged text blocks and image attachments for the first prompt"
+source: "src/cli/file-processor.ts"
+full: true
+---
+
+When a user runs pi with `@notes.md` or `@screenshot.png`, the argument parser
+([args.ts](/docs/src/cli/args.ts)) collects those paths. This file reads them
+and produces two things: a block of text to prepend to the prompt, and a list
+of images to attach.
+
+Text files are inlined inside `file` tags with their absolute path. Images are
+attached as real image content and only referenced in the text. The result is
+combined with other input by [initial-message.ts](/docs/src/cli/initial-message.ts).
+
+<Scrollycoding>
+
+## !!steps Result type and options
+
+`ProcessedFiles` is what callers get back. The only option is whether to
+resize images, which defaults to on so that large screenshots do not blow up
+the request size.
+
+```ts ! file-processor.ts
+export interface ProcessedFiles {
+	text: string;
+	images: ImageContent[];
+}
+
+export interface ProcessFileOptions {
+	/** Whether to auto-resize images. Default: true */
+	autoResizeImages?: boolean;
+}
+```
+
+## !!steps Path resolution and existence checks
+
+Each argument is resolved relative to the current directory via
+[path-utils.ts](/docs/src/core/tools/path-utils.ts), which handles `~` and the
+odd Unicode spaces macOS puts in screenshot names. A missing file is fatal: the
+function prints an error and calls `process.exit(1)`, so it is not suitable for
+library use. An empty file is skipped silently.
+
+```ts ! file-processor.ts
+export async function processFileArguments(fileArgs: string[], options?: ProcessFileOptions): Promise<ProcessedFiles> {
+	const autoResizeImages = options?.autoResizeImages ?? true;
+	let text = "";
+	const images: ImageContent[] = [];
+
+	for (const fileArg of fileArgs) {
+		// Expand and resolve path (handles ~ expansion and macOS screenshot Unicode spaces)
+		const absolutePath = resolve(resolveReadPath(fileArg, process.cwd()));
+
+		// Check if file exists
+		try {
+			await access(absolutePath);
+		} catch {
+			console.error(chalk.red(`Error: File not found: ${absolutePath}`));
+			process.exit(1);
+		}
+```
+
+## !!steps Detecting images by content
+
+Empty files are skipped first, then the file is classified. Detection is done
+from the file itself via [mime.ts](/docs/src/utils/mime.ts) rather than by
+extension, so a misnamed image is still treated as an image.
+
+```ts ! file-processor.ts
+		// Check if file is empty
+		const stats = await stat(absolutePath);
+		if (stats.size === 0) {
+			// Skip empty files
+			continue;
+		}
+
+		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
+```
+
+## !!steps Image files
+
+The bytes go through `processImage` from
+[image-process.ts](/docs/src/utils/image-process.ts). If processing fails, the
+failure message is placed inside the file tag as text and no attachment is
+made; the run continues. On success, the image is pushed as an attachment and
+the text gets an empty tag, or one containing processing hints (for example a
+note that the image was resized).
+
+```ts ! file-processor.ts
+		if (mimeType) {
+			// Handle image file
+			const content = await readFile(absolutePath);
+			const processed = await processImage(content, mimeType, { autoResizeImages });
+
+			if (!processed.ok) {
+				text += `<file name="${absolutePath}">${processed.message}</file>\n`;
+				continue;
+			}
+
+			const attachment: ImageContent = {
+				type: "image",
+				mimeType: processed.mimeType,
+				data: processed.data,
+			};
+			images.push(attachment);
+```
+
+## !!steps Text files
+
+Anything that is not an image is read as UTF-8 with a byte-order mark stripped
+(see [text.ts](/docs/src/utils/text.ts)) and wrapped in a tag with newlines
+around the content. A read error, such as a permissions problem, again exits
+the process.
+
+```ts ! file-processor.ts
+		} else {
+			// Handle text file
+			try {
+				const content = stripBom(await readFile(absolutePath, "utf-8"));
+				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
+				process.exit(1);
+			}
+		}
+	}
+
+	return { text, images };
+```
+
+</Scrollycoding>
+
+Binary non-image files are not detected: they are read as UTF-8 text and
+inlined, which can produce garbage. The caller is
+[main.ts](/docs/src/main.ts).

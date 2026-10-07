@@ -1,0 +1,41 @@
+---
+title: Code Graph
+description: Every documented file as a node, connected wherever one file's page refers to another
+full: true
+---
+
+The sidebar shows where each file lives. This page shows what each file is
+connected to: every documented source file is a node, and two nodes are joined
+when either file's page links to the other.
+
+<CodeGraph />
+
+## Reading the graph
+
+- **Color** is the layer, named in the legend: the core engine under
+  `src/core`, the CLI and the modes (interactive TUI, RPC) on top of it, and
+  the extensions, utilities and experimental code around it.
+- **Size** is the number of connections, so the files everything else leans on
+  are the large dots.
+- **Names** are shown for the most connected files in view. Zoom in and more
+  appear, until every dot is named.
+- **Hover** a file to name its neighbors and fade the rest; its summary appears
+  under the graph. **Click** to open its page.
+- **Drag** a file to pull it aside, or drag the background to pan. The button
+  in the corner brings the whole graph back into view.
+
+The table under the graph holds the same data, sorted by connections, for
+reading without a pointer.
+
+## What a connection is
+
+A connection is a link in the prose, not an import found by parsing the
+source. A page links to another file when its walkthrough has a reason to
+mention it: a function it calls, a type it shares, or the module that consumes
+it.
+
+That makes this a map of how the code is explained. It follows how the code is
+built closely, but not exactly: a dependency that no walkthrough mentions is
+missing, and connections have no direction. One line stands for a link from
+either page, or from both. Only the hand-written walkthroughs link out, so the
+graph grows denser as more generated pages are promoted.

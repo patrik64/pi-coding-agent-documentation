@@ -1,0 +1,173 @@
+---
+title: "status-indicator.ts"
+description: "Loader subclasses for each activity line: working, retry countdown, compaction and branch summary, plus an idle placeholder"
+source: "src/modes/interactive/components/status-indicator.ts"
+full: true
+---
+
+The interactive UI shows what the agent is doing in a one-line spinner. This file defines a base `StatusIndicator` on top of the TUI `Loader`, and one thin subclass per activity. The `kind` field lets callers check which indicator is currently showing.
+
+Messages embed cancel hints through `keyText` from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), and retry uses [countdown-timer.ts](/docs/src/modes/interactive/components/countdown-timer.ts).
+
+<Scrollycoding>
+
+## !!steps Base class and border rendering
+
+`StatusIndicator` adds a `kind` tag. `renderInBorder` renders at `width + 2`, takes the second line (the first is a spacer) and strips one leading space, so the text can sit inside a border row. `renderSpinnerInBorder` renders only the spinner glyph. `dispose` just stops the animation.
+
+```ts ! status-indicator.ts
+export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary";
+
+export class StatusIndicator extends Loader {
+	readonly kind: StatusIndicatorKind;
+
+	constructor(
+		kind: StatusIndicatorKind,
+		ui: TUI,
+		spinnerColorFn: (str: string) => string,
+		messageColorFn: (str: string) => string,
+		message: string,
+		indicator?: WorkingIndicatorOptions,
+	) {
+		super(ui, spinnerColorFn, messageColorFn, message, indicator);
+		this.kind = kind;
+	}
+
+	// !mark(1:3)
+	renderInBorder(width: number): string {
+		const line = super.render(width + 2)[1] ?? "";
+		return truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+	}
+
+	renderSpinnerInBorder(width: number): string {
+		return truncateToWidth(this.getRenderedIndicator(), width, "");
+	}
+
+	// !mark(1:3)
+	dispose(): void {
+		this.stop();
+	}
+}
+```
+
+## !!steps Working indicator
+
+The default working indicator uses accent for the spinner and muted for the text, unless the caller passes one color function for both.
+
+```ts ! status-indicator.ts
+export class WorkingStatusIndicator extends StatusIndicator {
+	constructor(ui: TUI, message: string, indicator?: WorkingIndicatorOptions, colorFn?: (text: string) => string) {
+		super(
+			"working",
+			ui,
+			// !mark(1:2)
+			colorFn ?? ((text) => theme.fg("accent", text)),
+			colorFn ?? ((text) => theme.fg("muted", text)),
+			message,
+			indicator,
+		);
+	}
+}
+```
+
+## !!steps Retry with a live countdown
+
+The message is a function of remaining seconds. A `CountdownTimer` updates it each tick and clears the reference when done. `dispose` must dispose the timer too, otherwise it would keep ticking.
+
+```ts ! status-indicator.ts
+export class RetryStatusIndicator extends StatusIndicator {
+	private countdown: CountdownTimer | undefined;
+
+	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number) {
+		// !mark(1:2)
+		const retryMessage = (seconds: number) =>
+			`Retrying (${attempt}/${maxAttempts}) in ${seconds}s... (${keyText("app.interrupt")} to cancel)`;
+		super(
+			"retry",
+			ui,
+			(spinner) => theme.fg("warning", spinner),
+			(text) => theme.fg("muted", text),
+			retryMessage(Math.ceil(delayMs / 1000)),
+		);
+		// !mark(1:6)
+		this.countdown = new CountdownTimer(
+			delayMs,
+			ui,
+			(seconds) => {
+				this.setMessage(retryMessage(seconds));
+			},
+			() => {
+				this.countdown = undefined;
+			},
+		);
+	}
+
+	override dispose(): void {
+		// !mark(1:2)
+		this.countdown?.dispose();
+		this.countdown = undefined;
+		super.dispose();
+	}
+}
+```
+
+## !!steps Compaction and branch summary
+
+Compaction picks its label from the reason: manual, threshold or overflow. Overflow adds a prefix saying that context overflowed. Branch summary is a fixed label.
+
+```ts ! status-indicator.ts
+export type CompactionStatusReason = "manual" | "threshold" | "overflow";
+
+export class CompactionStatusIndicator extends StatusIndicator {
+	constructor(ui: TUI, reason: CompactionStatusReason) {
+		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
+		// !mark(1:4)
+		const label =
+			reason === "manual"
+				? `Compacting context... ${cancelHint}`
+				: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
+		super(
+			"compaction",
+			ui,
+			(spinner) => theme.fg("accent", spinner),
+			(text) => theme.fg("muted", text),
+			label,
+		);
+	}
+}
+
+export class BranchSummaryStatusIndicator extends StatusIndicator {
+	constructor(ui: TUI) {
+		// !mark(1:3)
+		super(
+			"branchSummary",
+			ui,
+			(spinner) => theme.fg("accent", spinner),
+			(text) => theme.fg("muted", text),
+			`Summarizing branch... (${keyText("app.interrupt")} to cancel)`,
+		);
+	}
+}
+```
+
+## !!steps Idle placeholder
+
+`IdleStatus` is not a loader. It renders two blank lines so the layout does not jump when no activity is shown.
+
+```ts ! status-indicator.ts
+export class IdleStatus implements Component {
+	invalidate(): void {
+		// No cached state to invalidate.
+	}
+
+	// !mark(1:4)
+	render(width: number): string[] {
+		const emptyLine = " ".repeat(width);
+		return [emptyLine, emptyLine];
+	}
+}
+```
+
+</Scrollycoding>
+
+The indicators are consumed by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts), which owns the TUI. The `renderInBorder` methods exist so the line can be drawn inside a border row instead of as its own row.

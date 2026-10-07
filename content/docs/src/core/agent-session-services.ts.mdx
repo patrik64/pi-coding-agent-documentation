@@ -1,0 +1,259 @@
+---
+title: "agent-session-services.ts"
+description: "Builds the cwd-bound infrastructure (model runtime, settings, resource loader) that an AgentSession is then created on top of"
+source: "src/core/agent-session-services.ts"
+full: true
+---
+
+An `AgentSession` needs a lot of things that depend on the working directory:
+settings read from the project, extensions and skills discovered under it, and
+a model registry that extensions may add providers to. This file builds exactly
+that bundle, called `AgentSessionServices`, and nothing else. It never creates
+the session itself.
+
+The split exists so callers can resolve things like `--model` or `--tools`
+against the freshly built services before the session is constructed. It also
+means that when the effective cwd changes (resume of a session recorded in
+another directory), the whole bundle can simply be rebuilt.
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) is the main
+caller, and the final step delegates to
+[sdk.ts](/docs/src/core/sdk.ts).
+
+<Scrollycoding>
+
+## !!steps Diagnostics instead of exits
+
+Setup problems are collected, not thrown or printed. The runtime hands the
+list back and the app layer decides whether an `error` entry aborts startup or
+a `warning` is merely shown. That keeps this module usable from the SDK, print
+mode and the TUI without any of them inheriting `process.exit` behavior.
+
+```ts ! agent-session-services.ts
+/**
+ * Non-fatal issues collected while creating services or sessions.
+ *
+ * Runtime creation returns diagnostics to the caller instead of printing or
+ * exiting. The app layer decides whether warnings should be shown and whether
+ * errors should abort startup.
+ */
+// !mark(1:4)
+export interface AgentSessionRuntimeDiagnostic {
+	type: "info" | "warning" | "error";
+	message: string;
+}
+```
+
+## !!steps The shape of the services bundle
+
+`AgentSessionServices` is the output: cwd, agent dir, the
+[model-runtime.ts](/docs/src/core/model-runtime.ts) instance, the
+[settings-manager.ts](/docs/src/core/settings-manager.ts) instance, the
+[resource-loader.ts](/docs/src/core/resource-loader.ts) and the diagnostics.
+
+The doc comment is explicit that this is infrastructure only. Note
+`resourceLoaderOptions` on the input type omits `cwd`, `agentDir` and
+`settingsManager`, because the function supplies those itself so they cannot
+disagree with the bundle.
+
+```ts ! agent-session-services.ts
+export interface CreateAgentSessionServicesOptions {
+	cwd: string;
+	agentDir?: string;
+	settingsManager?: SettingsManager;
+	modelRuntime?: ModelRuntime;
+	modelRuntimeSignal?: AbortSignal;
+	extensionFlagValues?: Map<string, boolean | string>;
+	// !mark
+	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
+	resourceLoaderReloadOptions?: ResourceLoaderReloadOptions;
+}
+// ...
+export interface AgentSessionServices {
+	cwd: string;
+	agentDir: string;
+	modelRuntime: ModelRuntime;
+	settingsManager: SettingsManager;
+	resourceLoader: ResourceLoader;
+	diagnostics: AgentSessionRuntimeDiagnostic[];
+}
+```
+
+## !!steps Constructing the pieces in dependency order
+
+Everything optional is created only when the caller did not pass one in. The
+model runtime reads `auth.json` and `models.json` from the agent dir; the
+settings manager is scoped to cwd plus agent dir; and the resource loader is
+built last because it needs the settings manager.
+
+Then `reload()` runs, which is the expensive step: it discovers and loads
+extensions, skills, prompts and context files. Everything after this point
+assumes extensions are loaded.
+
+```ts ! agent-session-services.ts
+export async function createAgentSessionServices(
+	options: CreateAgentSessionServicesOptions,
+): Promise<AgentSessionServices> {
+	// !mark(1:2)
+	const cwd = resolvePath(options.cwd);
+	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const modelRuntime =
+		options.modelRuntime ??
+		(await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			signal: options.modelRuntimeSignal,
+		}));
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const resourceLoader = new DefaultResourceLoader({
+		...(options.resourceLoaderOptions ?? {}),
+		cwd,
+		agentDir,
+		settingsManager,
+	});
+	// !mark
+	await resourceLoader.reload(options.resourceLoaderReloadOptions);
+```
+
+## !!steps Draining provider registrations queued by extensions
+
+An extension can call `registerProvider` while it is still loading, before any
+model runtime is bound to it. Those calls are queued on the extension runtime
+as `pendingProviderRegistrations`. Here they are replayed against the real
+[model-runtime.ts](/docs/src/core/model-runtime.ts), and the queue is cleared
+so a second pass cannot register twice.
+
+A failing registration becomes an `error` diagnostic naming the extension path
+and the loop continues, so one bad extension does not stop the others.
+[loader.ts](/docs/src/core/extensions/loader.ts) is where those queues are
+filled.
+
+```ts ! agent-session-services.ts
+	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
+	const extensionsResult = resourceLoader.getExtensions();
+	// !mark(1:3)
+	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+		try {
+			modelRuntime.registerProvider(name, config);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			diagnostics.push({
+				type: "error",
+				message: `Extension "${extensionPath}" error: ${message}`,
+			});
+		}
+	}
+	// !mark
+	extensionsResult.runtime.pendingProviderRegistrations = [];
+```
+
+## !!steps Native providers, virtual models, and a refresh
+
+Two more queues get the same treatment: native providers and virtual models
+(see [virtual-models.ts](/docs/src/core/virtual-models.ts)). The three loops
+are copy-pasted rather than shared.
+
+After registration the runtime is refreshed with `allowNetwork: false`, so
+startup never blocks on a remote model catalog fetch just because an
+extension added a provider.
+
+```ts ! agent-session-services.ts
+	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
+		try {
+			modelRuntime.registerVirtualModel(definition);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			diagnostics.push({
+				type: "error",
+				message: `Extension "${extensionPath}" error: ${message}`,
+			});
+		}
+	}
+	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
+	// !mark
+	await modelRuntime.refresh({ allowNetwork: false });
+	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+```
+
+## !!steps Applying extension CLI flags
+
+Extensions can declare flags (`--something`) that the CLI parser cannot know
+about up front, so the CLI passes unrecognized ones as a map and they are
+validated here, after extensions have registered their flags.
+
+Boolean flags are simply set to `true`. String flags need an actual string
+value or an error diagnostic is produced. Anything not registered by any
+extension is collected and reported once as a single "Unknown option(s)"
+error with correct pluralization. The flag values land on
+`extensionsResult.runtime.flagValues`, which
+[runner.ts](/docs/src/core/extensions/runner.ts) later exposes to handlers.
+
+```ts ! agent-session-services.ts
+	const unknownFlags: string[] = [];
+	for (const [name, value] of extensionFlagValues) {
+		const flag = registeredFlags.get(name);
+		if (!flag) {
+			unknownFlags.push(name);
+			continue;
+		}
+		// !mark(1:3)
+		if (flag.type === "boolean") {
+			extensionsResult.runtime.flagValues.set(name, true);
+			continue;
+		}
+		// !mark(1:3)
+		if (typeof value === "string") {
+			extensionsResult.runtime.flagValues.set(name, value);
+			continue;
+		}
+		diagnostics.push({
+			type: "error",
+			message: `Extension flag "--${name}" requires a value`,
+		});
+	}
+```
+
+## !!steps From services to a session
+
+`createAgentSessionFromServices` is a thin adapter: it unpacks the services
+into the option bag that [sdk.ts](/docs/src/core/sdk.ts) understands and
+forwards the per-session choices (model, thinking level, tool selection,
+custom tools, the session manager and the start event).
+
+Passing the same `modelRuntime`, `settingsManager` and `resourceLoader`
+through means `createAgentSession` skips its own defaulting for all three.
+
+```ts ! agent-session-services.ts
+export async function createAgentSessionFromServices(
+	options: CreateAgentSessionFromServicesOptions,
+): Promise<CreateAgentSessionResult> {
+	return createAgentSession({
+		cwd: options.services.cwd,
+		agentDir: options.services.agentDir,
+		// !mark(1:3)
+		modelRuntime: options.services.modelRuntime,
+		settingsManager: options.services.settingsManager,
+		resourceLoader: options.services.resourceLoader,
+		sessionManager: options.sessionManager,
+		model: options.model,
+		thinkingLevel: options.thinkingLevel,
+		scopedModels: options.scopedModels,
+		tools: options.tools,
+		excludeTools: options.excludeTools,
+		noTools: options.noTools,
+		customTools: options.customTools,
+		sessionStartEvent: options.sessionStartEvent,
+	});
+}
+```
+
+</Scrollycoding>
+
+The two functions here are the two halves of a runtime factory: services
+first, session second, with the caller free to compute model and tool options
+in between. [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts)
+re-exports both and calls them from the factory it stores; the CLI entry in
+[main.ts](/docs/src/main.ts) supplies that factory.
+
+One structural note: the diagnostics returned in `AgentSessionServices` only
+cover this phase. The runtime later merges them with whatever session creation
+adds.

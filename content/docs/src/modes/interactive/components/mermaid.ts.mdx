@@ -1,0 +1,123 @@
+---
+title: "mermaid.ts"
+description: "A Markdown transformer that replaces Mermaid code blocks with Unicode box-drawing diagrams in the terminal"
+source: "src/modes/interactive/components/mermaid.ts"
+full: true
+---
+
+This file is a `MarkdownTransformer` (see [types.ts](/docs/src/core/extensions/types.ts)) that finds fenced `mermaid` blocks and renders them as terminal art using the `grok-mermaid` library. Diagram rows are re-emitted as Markdown inline code spans, so the normal Markdown renderer preserves their spacing.
+
+Whether it runs depends on the `MermaidRenderingMode` setting from [settings-manager.ts](/docs/src/core/settings-manager.ts). Chaining happens in [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts).
+
+<Scrollycoding>
+
+## !!steps Detecting Mermaid blocks
+
+The file parses Markdown with a `Marked` lexer rather than regexes. `isMermaid` accepts a `code` token whose first info-string word is `mermaid`, case-insensitively. Because only top-level tokens are scanned, blocks nested in lists or quotes are left alone.
+
+```ts ! mermaid.ts
+const markdownParser = new Marked();
+
+interface MermaidTransformerOptions {
+	getMode: () => MermaidRenderingMode;
+	theme?: Theme;
+}
+
+function isMermaid(token: Token): token is Token & { type: "code"; text: string; lang?: string } {
+	return token.type === "code" && token.lang?.trim().split(/\s+/, 1)[0]?.toLowerCase() === "mermaid";
+}
+```
+
+## !!steps Smuggling rows through Markdown
+
+Each diagram row becomes a code span so spaces and box characters survive. Empty rows use a non-breaking space because an empty span has no height. The delimiter is one backtick longer than the longest run inside the content, with padding if the content starts or ends with a backtick, following CommonMark.
+
+```ts ! mermaid.ts
+function codeSpan(line: string): string {
+	// Encode each diagram row as inline code (` ... `) so Markdown preserves its spacing and
+	// box-drawing characters. Use a non-breaking space for blank rows because an
+	// empty code span has no visible height.
+	const content = line || "\u00a0";
+// ...
+	const longestBacktickRun = Math.max(0, ...Array.from(content.matchAll(/`+/g), (match) => match[0].length));
+	const fence = "`".repeat(longestBacktickRun + 1);
+	const padding = content.startsWith("`") || content.endsWith("`") ? " " : "";
+	return `${fence}${padding}${content}${padding}${fence}`;
+}
+```
+
+## !!steps Theming spans
+
+`grok-mermaid` returns styled spans with a class. `styleSpan` maps each class to a theme color: borders muted, edges accent, titles bold accent, and `none` left unstyled.
+
+```ts ! mermaid.ts
+function styleSpan(span: Span, theme: Theme): string {
+	switch (span.cls) {
+		case "border":
+			return theme.fg("borderMuted", span.text);
+		case "text":
+			return theme.fg("text", span.text);
+		case "edge":
+			return theme.fg("accent", span.text);
+		case "edgeLabel":
+			return theme.fg("muted", span.text);
+		case "title":
+			return theme.fg("accent", theme.bold(span.text));
+		case "none":
+			return span.text;
+	}
+}
+
+function themedLines(art: MermaidArt, theme: Theme): string[] {
+	return art.styled.map((row) => row.map((span) => styleSpan(span, theme)).join(""));
+}
+```
+
+## !!steps When not to transform
+
+The transformer bails out and returns the markdown unchanged when the mode is `off`, when the message is `assistant-thinking`, or when streaming is in progress unless the mode is `streaming`.
+
+```ts ! mermaid.ts
+/** Create a transformer that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
+export function createMermaidMarkdownTransformer(options: MermaidTransformerOptions): MarkdownTransformer {
+	return (markdown, context) => {
+		const mode = options.getMode();
+		if (
+			mode === "off" ||
+			context.messageType === "assistant-thinking" ||
+			(context.isStreaming && mode !== "streaming")
+		) {
+			return markdown;
+		}
+```
+
+## !!steps Per-block fallbacks
+
+Each token is mapped back to text. Non-Mermaid tokens return their `raw`. If rendering fails or the art is wider than the terminal, the original block is kept. Once streaming has finished, warnings from the renderer keep the source block and append a one-line warning, so a half-valid diagram is never silently replaced.
+
+```ts ! mermaid.ts
+		return markdownParser
+			.lexer(markdown)
+			.map((token) => {
+				if (!isMermaid(token)) return token.raw;
+				const art = render(token.text);
+				if (!art || art.width > context.availableWidth) return token.raw;
+				if (!context.isStreaming && art.warnings.length > 0) {
+					const suffix = art.warnings.length > 1 ? ` (+${art.warnings.length - 1} more)` : "";
+					const warning = `Mermaid diagram not rendered: ${art.warnings[0]}${suffix}`;
+					const styledWarning = options.theme ? options.theme.fg("warning", warning) : warning;
+					return `${token.raw}\n${codeSpan(styledWarning)}  \n`;
+				}
+				const lines = options.theme ? themedLines(art, options.theme) : art.plain;
+				// Markdown hard breaks keep every diagram row on its own line.
+				return `${lines.map(codeSpan).join("  \n")}\n`;
+			})
+// ...
+			.join("");
+	};
+}
+```
+
+</Scrollycoding>
+
+The result is joined back into one string, so the rest of the pipeline sees ordinary Markdown. The module-level `markdownParser` is shared across calls. The `theme` option is optional, which lets the transformer run unstyled in tests or non-TUI contexts.

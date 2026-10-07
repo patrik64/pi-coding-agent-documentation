@@ -1,0 +1,36 @@
+---
+title: "worker.ts"
+description: "Worker entry that re-exports pi-codemode's sandbox worker so bundled builds have it on disk."
+source: "src/extensions/codemode/worker.ts"
+full: true
+---
+
+The codemode sandbox runs scripts in a worker thread. In a normal install the worker file is found inside the `pi-codemode` package, but in a bundled build (the Node bundle and the Bun single binary) that package file is not on disk. This file gives the bundlers a real entrypoint to compile.
+
+It contains no logic of its own. It is a side-effect import.
+
+<Scrollycoding>
+
+## !!steps Why a separate entrypoint
+
+The header comment explains the reason and names the resolver: `getCodemodeWorkerSpecifier()` in [config.ts](/docs/src/config.ts) decides which file the sandbox starts as its worker.
+
+```ts ! worker.ts
+/**
+ * Worker entry for the codemode sandbox in bundled builds. The Node bundle and the Bun binary
+ * build this file as a separate entrypoint because pi-codemode's own worker file is not on disk
+ * there; `getCodemodeWorkerSpecifier()` in config.ts resolves it.
+ */
+```
+
+## !!steps The import
+
+Importing `@earendil-works/pi-codemode/worker` runs that module, which installs the worker's message handling. Nothing is exported, so the file only works as a thread entry.
+
+```ts ! worker.ts
+import "@earendil-works/pi-codemode/worker";
+```
+
+</Scrollycoding>
+
+The specifier is passed as `workerUrl` when [execute.ts](/docs/src/extensions/codemode/execute.ts) constructs the `CodemodeSandbox`, together with the wasm path from the same config file. Because [execute.lazy.ts](/docs/src/extensions/codemode/execute.lazy.ts) delays loading the executor, the worker is only started when a script actually runs.

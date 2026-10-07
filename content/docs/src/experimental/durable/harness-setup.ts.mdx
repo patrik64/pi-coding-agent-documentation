@@ -1,0 +1,158 @@
+---
+title: "harness-setup.ts"
+description: "Glue that turns pi's settings, model resolution and coding tools into inputs for the experimental durable harness"
+source: "src/experimental/durable/harness-setup.ts"
+full: true
+---
+
+The durable experiment runs the agent on top of the `pi-durable` Harness instead of [agent-session.ts](/docs/src/core/agent-session.ts). The Harness knows nothing about pi's settings files, proxy configuration or model defaults, so this file adapts them.
+
+Everything here is a small bridge: HTTP setup, a settings object, a tool registry, a per-directory execution environment, and first-model selection. [runtime.ts](/docs/src/experimental/durable/runtime.ts) calls each of them once while opening a session.
+
+This is experimental code and not part of the shipped interactive mode.
+
+<Scrollycoding>
+
+## !!steps Configuring HTTP before any provider call
+
+`configureHarnessHttp` applies the proxy from global settings and installs the shared undici dispatcher with the configured idle timeout. The doc comment states the reason: without one dispatcher for fetch, some provider streams break off.
+
+Both calls come from [http-dispatcher.ts](/docs/src/core/http-dispatcher.ts) and read from [settings-manager.ts](/docs/src/core/settings-manager.ts).
+
+```ts ! harness-setup.ts
+/** pi's HTTP setup: proxy, idle timeouts, and one undici for fetch. Without it, some provider streams break off. */
+export function configureHarnessHttp(settingsManager: SettingsManager): void {
+	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+}
+```
+
+## !!steps Settings as live getters
+
+The Harness expects a `HarnessSettings` object. Each field is a getter, so the Harness reads the current value from the settings manager every time it needs it rather than a snapshot.
+
+The stream timeout has one quirk: an idle timeout of 0 means disabled in pi's settings, so it is mapped to 2147483647, the largest 32-bit timer value. A provider-specific `timeoutMs` wins over the idle setting, and `maxRetries` is only included when it is defined.
+
+```ts ! harness-setup.ts
+/** Harness settings read at every use from pi's settings as loaded at startup. */
+export function createHarnessSettings(settingsManager: SettingsManager): HarnessSettings {
+	return {
+		get stream() {
+			const provider = settingsManager.getProviderRetrySettings();
+			const idle = settingsManager.getHttpIdleTimeoutMs();
+			return {
+				// !mark
+				timeoutMs: provider.timeoutMs ?? (idle === 0 ? 2147483647 : idle),
+				maxRetryDelayMs: provider.maxRetryDelayMs,
+				...(provider.maxRetries === undefined ? {} : { maxRetries: provider.maxRetries }),
+			};
+		},
+		get compaction() {
+			return settingsManager.getCompactionSettings();
+		},
+		get retry() {
+			return settingsManager.getRetrySettings();
+		},
+		get steeringMode() {
+			return settingsManager.getSteeringMode();
+		},
+		get followUpMode() {
+			return settingsManager.getFollowUpMode();
+		},
+	};
+}
+```
+
+## !!steps A registry with pi tools and prompt
+
+A Registry is the Harness's list of installed extensions. Here it gets the stock `CodingTools` from `pi-durable` plus the pi system prompt extension from [prompt.ts](/docs/src/experimental/durable/prompt.ts).
+
+```ts ! harness-setup.ts
+/** A registry with pi's coding tools and system prompt. */
+export function createCodingRegistry(settingsManager: SettingsManager, cwd: string): Registry {
+	const registry = createRegistry();
+	registry.install(CodingTools);
+	registry.install(createPiPrompt(settingsManager, cwd));
+	return registry;
+}
+```
+
+## !!steps One execution environment per directory
+
+`ExecutionEnvs` caches a `NodeExecutionEnv` per working directory, so every conversation in the same directory shares one. The `env` property is an arrow function so it can be handed to the Harness as a bare callback without losing `this`. When a conversation has no cwd, the default one from construction is used.
+
+`cleanup` empties the map before awaiting each environment's cleanup, so a second call cannot clean the same environment twice.
+
+```ts ! harness-setup.ts
+/** One execution environment per directory, shared by every conversation in it. */
+export class ExecutionEnvs {
+	readonly #defaultCwd: string;
+	readonly #envs = new Map<string, NodeExecutionEnv>();
+
+	constructor(defaultCwd: string) {
+		this.#defaultCwd = defaultCwd;
+	}
+
+	// !mark
+	readonly env = ({ cwd = this.#defaultCwd }: EnvTarget): NodeExecutionEnv => {
+		let env = this.#envs.get(cwd);
+		if (env === undefined) {
+			env = new NodeExecutionEnv({ cwd });
+			this.#envs.set(cwd, env);
+		}
+		return env;
+	};
+
+	async cleanup(context: Context): Promise<void> {
+		// !mark(1:2)
+		const envs = [...this.#envs.values()];
+		this.#envs.clear();
+		for (const env of envs) await env.cleanup(context);
+	}
+}
+```
+
+## !!steps Choosing the first model
+
+A new root conversation needs a model. With `--provider` and `--model` the CLI value is resolved through `resolveCliModel` from [model-resolver.ts](/docs/src/core/model-resolver.ts) and an unresolvable one throws.
+
+Without CLI input it falls back to `findInitialModel` using the saved default provider, model and thinking level. The result may carry a `fallbackMessage`, which the runtime shows as an info notice. Note that `durable/main.ts` never passes the `cli` argument, so only the default path is exercised today.
+
+```ts ! harness-setup.ts
+export interface InitialModel {
+	readonly model?: ModelRef;
+	readonly thinkingLevel?: ModelThinkingLevel;
+	readonly fallbackMessage?: string;
+}
+
+/** The model a new root conversation starts with: an explicit `--provider`/`--model`, or pi's default resolution. */
+export async function findInitialAgentModel(
+	settingsManager: SettingsManager,
+	modelRuntime: ModelRuntime,
+	cli?: { readonly provider?: string; readonly model: string },
+): Promise<InitialModel> {
+	// !mark
+	if (cli !== undefined) {
+		const resolved = resolveCliModel({ cliProvider: cli.provider, cliModel: cli.model, modelRuntime });
+		if (resolved.error !== undefined || resolved.model === undefined) {
+			throw new Error(`Could not resolve model: ${resolved.error ?? cli.model}`);
+		}
+		return {
+			model: { provider: resolved.model.provider, modelId: resolved.model.id },
+			...(resolved.thinkingLevel === undefined ? {} : { thinkingLevel: resolved.thinkingLevel }),
+		};
+	}
+	// !mark
+	const initial = await findInitialModel({
+		scopedModels: [],
+		isContinuing: false,
+		defaultProvider: settingsManager.getDefaultProvider(),
+		defaultModelId: settingsManager.getDefaultModel(),
+		defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+		modelRuntime,
+	});
+```
+
+</Scrollycoding>
+
+[runtime.ts](/docs/src/experimental/durable/runtime.ts) is the only consumer. The model objects come from [model-runtime.ts](/docs/src/core/model-runtime.ts). The structure is six independent exports with no shared state except the `ExecutionEnvs` cache.

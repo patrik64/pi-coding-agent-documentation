@@ -1,0 +1,80 @@
+---
+title: "index.ts"
+description: "Barrel file re-exporting the interactive UI components so that extensions and the package entry can import them from one place"
+source: "src/modes/interactive/components/index.ts"
+full: true
+---
+
+This file contains no logic. It gathers the reusable TUI components from the folder into one module, with the header comment "UI Components for extensions". The package entry [index.ts](/docs/src/index.ts) re-exports a matching list so that extension authors can build UI that looks like the built-in dialogs.
+
+Exports are written alphabetically by module, with types marked by inline `type` modifiers next to values.
+
+<Scrollycoding>
+
+## !!steps Message and display components
+
+The first block exports the display components: the Armin figure, assistant and bash output, loaders, summary messages, the custom editor and message, and the diff renderer. Several have their own walkthroughs, for example [armin.ts](/docs/src/modes/interactive/components/armin.ts), [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts) and [diff.ts](/docs/src/modes/interactive/components/diff.ts).
+
+```ts ! index.ts
+// !mark
+// UI Components for extensions
+export { ArminComponent } from "./armin.ts";
+export { AssistantMessageComponent } from "./assistant-message.ts";
+export { BashExecutionComponent } from "./bash-execution.ts";
+export { BorderedLoader } from "./bordered-loader.ts";
+export { BranchSummaryMessageComponent } from "./branch-summary-message.ts";
+export { CompactionSummaryMessageComponent } from "./compaction-summary-message.ts";
+export { CustomEditor, type CustomEditorOptions } from "./custom-editor.ts";
+export { CustomMessageComponent } from "./custom-message.ts";
+export { type RenderDiffOptions, renderDiff } from "./diff.ts";
+export { DynamicBorder } from "./dynamic-border.ts";
+```
+
+## !!steps Extension dialogs, setup and footer
+
+Next come the dynamic border and the three extension dialogs ([extension-editor.ts](/docs/src/modes/interactive/components/extension-editor.ts), [extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts), [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts)), the first-time setup dialog with its option and result types, the footer, and the key hint helpers. `keyDisplayText` and `formatKeyText` are not exported from here.
+
+```ts ! index.ts
+export { DynamicBorder } from "./dynamic-border.ts";
+export { ExtensionEditorComponent } from "./extension-editor.ts";
+export { ExtensionInputComponent } from "./extension-input.ts";
+export { ExtensionSelectorComponent } from "./extension-selector.ts";
+// !mark(1:5)
+export {
+	FirstTimeSetupComponent,
+	type FirstTimeSetupOptions,
+	type FirstTimeSetupResult,
+} from "./first-time-setup.ts";
+export { FooterComponent } from "./footer.ts";
+export { keyHint, keyText, rawKeyHint } from "./keybinding-hints.ts";
+```
+
+## !!steps Selectors, tool output and utilities
+
+The remainder exports pickers (model, OAuth, session, settings, theme, thinking, tree, trust, user message), the tool-execution component and the visual truncation helper. Not every component in the folder is listed, for example countdown timer, pi-logo, status indicator and the easter egg modules are internal and imported directly by their users.
+
+```ts ! index.ts
+// !mark
+export { LoginDialogComponent } from "./login-dialog.ts";
+export { ModelSelectorComponent } from "./model-selector.ts";
+export { OAuthSelectorComponent } from "./oauth-selector.ts";
+export { type ModelsCallbacks, type ModelsConfig, ScopedModelsSelectorComponent } from "./scoped-models-selector.ts";
+export { SessionSelectorComponent } from "./session-selector.ts";
+export { type SettingsCallbacks, type SettingsConfig, SettingsSelectorComponent } from "./settings-selector.ts";
+export { ShowImagesSelectorComponent } from "./show-images-selector.ts";
+export { SkillInvocationMessageComponent } from "./skill-invocation-message.ts";
+export { ThemeSelectorComponent } from "./theme-selector.ts";
+export { ThinkingSelectorComponent } from "./thinking-selector.ts";
+// !mark
+export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.ts";
+export { TreeSelectorComponent } from "./tree-selector.ts";
+export { TrustSelectorComponent } from "./trust-selector.ts";
+export { UserMessageComponent } from "./user-message.ts";
+export { UserMessageSelectorComponent } from "./user-message-selector.ts";
+// !mark
+export { truncateToVisualLines, type VisualTruncateResult } from "./visual-truncate.ts";
+```
+
+</Scrollycoding>
+
+Inside the app, the interactive mode imports many of these files directly instead of going through this barrel, so the barrel is chiefly the public surface. Its exports are mirrored by name in [index.ts](/docs/src/index.ts). The selectors are documented in [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts) and [session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts).

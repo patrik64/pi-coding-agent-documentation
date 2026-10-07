@@ -1,0 +1,146 @@
+---
+title: "trust-selector.ts"
+description: "The TUI dialog where the user decides whether the current project is trusted, showing the saved decision and the scopes it can be saved to"
+source: "src/modes/interactive/components/trust-selector.ts"
+full: true
+---
+
+Pi can load project-local extensions, settings and resources, so it asks whether a project directory is trusted. This component is the interactive form of that question. It does not store anything itself: it renders the options computed by [trust-manager.ts](/docs/src/core/trust-manager.ts) and hands the chosen option back through a callback.
+
+It is a plain `Container` of `Text`, `Spacer` and a [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) frame, styled through [theme.ts](/docs/src/modes/interactive/theme/theme.ts). Key hints come from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+
+<Scrollycoding>
+
+## !!steps What the dialog is given
+
+The caller supplies the working directory, the decision already saved for it (or `null`), whether the current session treats the project as trusted, and two callbacks. `TrustSelection` is deliberately narrow: only `trusted` and `updates` are passed back, so the caller decides how to persist.
+
+`formatDecision` turns the saved entry into a line of text. When the entry was saved for a different path than the one being looked at, it says the decision is inherited from that path, which is how a parent-directory decision shows up for a child project.
+
+```ts ! trust-selector.ts
+export type TrustSelection = Pick<ProjectTrustOption, "trusted" | "updates">;
+
+export interface TrustSelectorOptions {
+	cwd: string;
+	savedDecision: ProjectTrustStoreEntry | null;
+	projectTrusted: boolean;
+	onSelect: (selection: TrustSelection) => void;
+	onCancel: () => void;
+}
+
+function formatDecision(trustPath: string | undefined, decision: ProjectTrustStoreEntry | null): string {
+	// !mark(1:3)
+	if (decision === null) {
+		return "none";
+	}
+	const label = decision.decision ? "trusted" : "untrusted";
+	if (trustPath !== undefined && decision.path !== trustPath) {
+		return `${label} (inherited from ${decision.path})`;
+	}
+	return `${label} (${decision.path})`;
+}
+```
+
+## !!steps Preselecting the saved option
+
+The options list comes from `getProjectTrustOptions(cwd)`. The constructor starts the cursor on whichever option matches the saved decision, falling back to index 0 when none does (`findIndex` returns -1, clamped by `Math.max`).
+
+`isSavedOption` matches on three things at once: the option has a `savedPath`, its `trusted` flag equals the saved decision, and the saved path is that same path. That is what lets the list put a checkmark on exactly the entry that is currently in force.
+
+```ts ! trust-selector.ts
+	constructor(options: TrustSelectorOptions) {
+		super();
+
+		this.savedDecision = options.savedDecision;
+		// !mark(1:4)
+		this.trustOptions = getProjectTrustOptions(options.cwd);
+		this.selectedIndex = Math.max(
+			0,
+			this.trustOptions.findIndex((option) => this.isSavedOption(option)),
+		);
+		this.onSelectCallback = options.onSelect;
+		this.onCancelCallback = options.onCancel;
+```
+
+## !!steps Header, status lines and layout
+
+The layout is built once: border, title, the directory, two status lines, an empty `listContainer`, the key hint line and a closing border. The two status lines are different facts. "Saved decision" is what is on disk; "Current session" is what this run is actually doing, which can differ (for example when trust was overridden for one run).
+
+Only `listContainer` is rebuilt later, so the header is never re-rendered on navigation.
+
+```ts ! trust-selector.ts
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("accent", theme.bold("Project trust")), 1, 0));
+		this.addChild(new Text(theme.fg("muted", options.cwd), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					`Saved decision: ${formatDecision(this.trustOptions[0]?.savedPath, options.savedDecision)}`,
+				),
+				1,
+				0,
+			),
+		);
+		// !mark
+		this.addChild(
+			new Text(theme.fg("muted", `Current session: ${options.projectTrusted ? "trusted" : "untrusted"}`), 1, 0),
+		);
+```
+
+## !!steps Redrawing the list
+
+`updateList` clears the container and re-adds one `Text` per option. Each row has two independent markers: an arrow for the cursor and a checkmark for the saved option, so the cursor can sit on a row that is not the saved one.
+
+```ts ! trust-selector.ts
+	private updateList(): void {
+		this.listContainer.clear();
+		for (let i = 0; i < this.trustOptions.length; i++) {
+			const option = this.trustOptions[i];
+			if (!option) {
+				continue;
+			}
+
+			// !mark(1:5)
+			const isSelected = i === this.selectedIndex;
+			const isCurrent = this.isSavedOption(option);
+			const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
+			const prefix = isSelected ? theme.fg("accent", "→ ") : "  ";
+			const label = isSelected ? theme.fg("accent", option.label) : theme.fg("text", option.label);
+			this.listContainer.addChild(new Text(`${prefix}${currentMarker}${label}`, 1, 0));
+		}
+	}
+```
+
+## !!steps Keyboard handling
+
+Navigation accepts the configurable `tui.select.*` bindings plus vim-style `j` and `k`, and confirm also accepts a bare newline. Movement clamps at both ends instead of wrapping (contrast with [user-message-selector.ts](/docs/src/modes/interactive/components/user-message-selector.ts), which wraps).
+
+On confirm only `trusted` and `updates` of the selected option are reported; cancel just calls the cancel callback.
+
+```ts ! trust-selector.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+		// !mark(1:3)
+		if (kb.matches(keyData, "tui.select.up") || keyData === "k") {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.updateList();
+		} else if (kb.matches(keyData, "tui.select.down") || keyData === "j") {
+			this.selectedIndex = Math.min(this.trustOptions.length - 1, this.selectedIndex + 1);
+			this.updateList();
+		} else if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
+			const selected = this.trustOptions[this.selectedIndex];
+			if (selected) {
+				this.onSelectCallback({ trusted: selected.trusted, updates: selected.updates });
+			}
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
+			this.onCancelCallback();
+		}
+	}
+```
+
+</Scrollycoding>
+
+This selector is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts), which swaps it into the editor slot like the other selectors, for example [theme-selector.ts](/docs/src/modes/interactive/components/theme-selector.ts). All policy (which options exist, what `updates` means, where it is stored) lives in [trust-manager.ts](/docs/src/core/trust-manager.ts); this file is only presentation and input.

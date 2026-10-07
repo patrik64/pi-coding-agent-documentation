@@ -1,0 +1,176 @@
+---
+title: "renderer.ts"
+description: "Terminal rendering for the codemode tool: highlighted script, live nested-call rows with cost, and trimmed script output."
+source: "src/extensions/codemode/renderer.ts"
+full: true
+---
+
+A codemode call is unusual in the transcript. The model sends one tool call containing a JavaScript script, and that script makes many nested tool calls that never reach the model as separate calls. If the UI only showed the outer call, the user would see a wall of code and nothing about what it did.
+
+This file supplies `renderCall` and `renderResult` for the tool definition in [tool.ts](/docs/src/extensions/codemode/tool.ts). The call shows the script; the result shows one status row per nested call (fed by the progress updates from [execute.ts](/docs/src/extensions/codemode/execute.ts)), the total model cost, and the script output without its boilerplate header.
+
+<Scrollycoding>
+
+## !!steps Limits and header pattern
+
+The constants set how much is shown while collapsed: 10 lines of code, the last 8 nested calls, 5 lines of output, and 80 characters of arguments. `SCRIPT_HEADER` matches the `Script completed` or `Script failed` header with wall time that execute.ts puts at the start of every result, so the renderer can remove it.
+
+Helpers come from [render-utils.ts](/docs/src/core/tools/render-utils.ts), [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts), [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) and [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+```ts ! renderer.ts
+const CODE_PREVIEW_LINES = 10;
+const CALL_PREVIEW_COUNT = 8;
+const OUTPUT_PREVIEW_LINES = 5;
+const COLLAPSED_ARGS_CHARS = 80;
+const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/;
+
+function expandHint(theme: Theme, hidden: number, noun: string): string {
+	return `${theme.fg("muted", `... (${hidden} more ${noun},`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+}
+```
+
+## !!steps Duration and cost formatting
+
+Durations switch from milliseconds to seconds at one second. Costs print with cents for amounts of a cent or more and with two significant digits below that, because classifier calls often cost fractions of a cent and `$0.00` would hide them.
+
+```ts ! renderer.ts
+function formatDuration(ms: number | undefined): string {
+	if (ms === undefined) return "";
+	return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Cents for larger amounts, two significant digits for the fractions of a cent classifier calls cost. */
+function formatCost(cost: number): string {
+	return `$${cost >= 0.01 ? cost.toFixed(2) : cost.toPrecision(2)}`;
+}
+```
+
+## !!steps One row per nested call
+
+A status icon covers the four states a `CodemodeNestedCall` can have: running, ok, error and cancelled. `formatCall` builds the row from the icon, tool name, arguments, duration and cost.
+
+Arguments are cut to 80 characters unless expanded. The error text only appears when expanded, and its continuation lines are indented under the row.
+
+```ts ! renderer.ts
+function statusIcon(call: CodemodeNestedCall, theme: Theme): string {
+	switch (call.status) {
+		case "running":
+			return theme.fg("warning", "…");
+		case "ok":
+			return theme.fg("success", "✓");
+		case "error":
+			return theme.fg("error", "✗");
+		case "cancelled":
+			return theme.fg("muted", "⊘");
+	}
+}
+
+function formatCall(call: CodemodeNestedCall, theme: Theme, expanded: boolean): string {
+	const args =
+		!expanded && call.args.length > COLLAPSED_ARGS_CHARS
+			? `${call.args.slice(0, COLLAPSED_ARGS_CHARS - 3)}...`
+			: call.args;
+	const duration = formatDuration(call.durationMs);
+	let line = `${statusIcon(call, theme)} ${theme.fg("toolTitle", call.name)}`;
+	if (args) line += ` ${theme.fg("muted", args)}`;
+	if (duration) line += ` ${theme.fg("dim", duration)}`;
+	if (call.cost) line += ` ${theme.fg("dim", formatCost(call.cost))}`;
+	if (expanded && call.error) line += `\n    ${theme.fg("error", call.error.split("\n").join("\n    "))}`;
+	return line;
+}
+```
+
+## !!steps Rendering the call
+
+`renderCall` reuses `context.lastComponent` when there is one and clears it, so streaming re-renders do not allocate a new container each time. A missing code argument shows `[invalid arg]` rather than crashing.
+
+The script is syntax-highlighted as JavaScript after normalizing carriage returns and tabs. Collapsed, it goes through `VisualLinePreview`, which counts wrapped visual lines and keeps the start; expanded, the full text is shown. The `// @options:` line is part of the code, so it appears automatically.
+
+```ts ! renderer.ts
+	renderCall(args, theme, context) {
+		// The code includes the `// @options:` line, so options show as part of the script.
+		const code = str((args as { code?: unknown } | undefined)?.code);
+		const title = theme.fg("toolTitle", theme.bold("codemode"));
+		const component = (context.lastComponent as Container | undefined) ?? new Container();
+		component.clear();
+		if (code === null) {
+			component.addChild(new Text(`${title} ${theme.fg("error", "[invalid arg]")}`, 0, 0));
+			return component;
+		}
+		component.addChild(new Text(title, 0, 0));
+		if (code) {
+			const highlighted = highlightCode(replaceTabs(code.replace(/\r/g, "").trimEnd()), "javascript").join("\n");
+```
+
+## !!steps Nested calls and the cost total
+
+In the result, collapsed view shows only the last 8 calls, with a line saying how many earlier calls are hidden. Because the hidden rows would otherwise drop their cost from view, the `Model calls:` total sums every priced call, and appears only when more than one call has a cost.
+
+```ts ! renderer.ts
+	renderResult(result, options, theme, context) {
+		const component = (context.lastComponent as Container | undefined) ?? new Container();
+		component.clear();
+		const calls = result.details?.calls ?? [];
+		if (calls.length > 0) {
+			const shown = options.expanded ? calls : calls.slice(-CALL_PREVIEW_COUNT);
+			const lines = shown.map((call) => formatCall(call, theme, options.expanded));
+			if (shown.length < calls.length) {
+				lines.unshift(
+					`${theme.fg("muted", `... (${calls.length - shown.length} earlier calls,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+				);
+			}
+			// Collapsed rows hide earlier calls, so the total covers every call.
+			const priced = calls.filter((call) => call.cost);
+			if (priced.length > 1) {
+				const total = priced.reduce((sum, call) => sum + (call.cost ?? 0), 0);
+				lines.push(theme.fg("muted", `Model calls: ${formatCost(total)}`));
+			}
+```
+
+## !!steps Stripping the header
+
+The first content block is the header text. If it matches `SCRIPT_HEADER` it is dropped before the output is extracted. The comment notes that rejected input (invalid options) has no header, so the match is optional. While the result is partial, no output is shown at all.
+
+```ts ! renderer.ts
+		// Drop the "Script completed\nWall time ...\nOutput:\n" header. Rejected input (invalid options)
+		// has no header.
+		const [first, ...rest] = result.content;
+		const hasHeader = first?.type === "text" && SCRIPT_HEADER.test(first.text);
+		const output = options.isPartial
+			? ""
+			: getTextOutput({ ...result, content: hasHeader ? rest : result.content }, context.showImages).trim();
+		if (output) {
+			const color = context.isError ? "error" : "toolOutput";
+			const styled = replaceTabs(output)
+				.split("\n")
+				.map((line) => theme.fg(color, line))
+				.join("\n");
+```
+
+## !!steps Collapsed output and the full-output path
+
+Collapsed output is limited by visual (wrapped) lines, not logical ones, because script output is often a single huge JSON line. When output was truncated, the preview would hide the notice at the end, so the file path from `details.fullOutputPath` is printed separately.
+
+```ts ! renderer.ts
+			component.addChild(new Spacer(1));
+			if (options.expanded) {
+				component.addChild(new Text(styled, 0, 0));
+			} else {
+				// Limit wrapped lines, not logical ones: script output is often one long JSON line.
+				component.addChild(
+					new VisualLinePreview({
+						text: styled,
+						maxVisualLines: OUTPUT_PREVIEW_LINES,
+						keep: "start",
+						formatHint: (hidden) => expandHint(theme, hidden, "lines"),
+					}),
+				);
+				// The collapsed preview hides the truncation notice at the end, so name the file here.
+				const fullOutputPath = result.details?.fullOutputPath;
+				if (fullOutputPath) component.addChild(new Text(theme.fg("muted", `Full output: ${fullOutputPath}`), 0, 0));
+			}
+```
+
+</Scrollycoding>
+
+The exported `codemodeRenderers` object is spread into the tool definition in [tool.ts](/docs/src/extensions/codemode/tool.ts). The detail shape it reads (`calls`, `fullOutputPath`) is defined there and filled by [execute.ts](/docs/src/extensions/codemode/execute.ts). The header comment at the top of the file contains a stray line break mid-sentence ("Nested calls are not" on its own line), which is cosmetic.

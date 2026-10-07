@@ -1,0 +1,9 @@
+{
+  "title": "rpc",
+  "pages": [
+    "jsonl.ts",
+    "rpc-client.ts",
+    "rpc-mode.ts",
+    "rpc-types.ts"
+  ]
+}

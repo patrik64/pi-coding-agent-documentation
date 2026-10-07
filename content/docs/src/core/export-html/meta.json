@@ -1,0 +1,11 @@
+{
+  "title": "export-html",
+  "pages": [
+    "ansi-to-html.ts",
+    "index.ts",
+    "template.css",
+    "template.html",
+    "template.js",
+    "tool-renderer.ts"
+  ]
+}

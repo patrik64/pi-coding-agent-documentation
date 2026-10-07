@@ -1,0 +1,52 @@
+---
+title: "plugins.ts"
+description: "Two service contracts for plugin reload: server-built generations offered to presentations, and the reload hook inside a session worker (experimental)"
+source: "src/experimental/services/plugins.ts"
+full: true
+---
+
+Plugins in the experimental stack live in two places. The server prepares a build of the plugins that a presentation (a client UI) may run, and each session worker hosts its own plugin facets. This file declares one service for each side.
+
+Both are tiny interfaces with a token created by `defineService`. The implementations are spread around: the server side in [server.ts](/docs/src/experimental/services/server.ts) and the worker side in [worker.ts](/docs/src/experimental/services/worker.ts).
+
+<Scrollycoding>
+
+## !!steps Presentation plugins are prepared, then reloaded
+
+`prepareSession` takes a session id and an optional list of package paths, where `null` means no explicit selection. It returns a JSON value, because what the server builds has to be shipped to the client.
+
+`reload` takes no arguments at all. The server remembers what `prepareSession` selected for that client, which is why calling reload first fails in [server.ts](/docs/src/experimental/services/server.ts) with an explicit error.
+
+```ts ! plugins.ts
+/** Server-built plugin generations available to presentations. */
+export interface PresentationPlugins {
+	// !mark(1:4)
+	prepareSession(
+		request: { readonly sessionId: string; readonly packagePaths: readonly string[] | null },
+		context: Context,
+	): Promise<JsonValue>;
+	reload(context: Context): Promise<JsonValue>;
+}
+
+export const PresentationPlugins = defineService<PresentationPlugins>("pi.presentation-plugins");
+```
+
+## !!steps Session plugins reload inside the worker
+
+`SessionPlugins` is the worker-side half. It returns nothing, since the effect is that the facets in the worker are swapped for a freshly loaded set.
+
+The registered name `pi.session-plugins` is separate from `pi.presentation-plugins`, so a client can call the two halves independently. The built-in `/reload` command in [slash-commands-provider.ts](/docs/src/experimental/services/slash-commands-provider.ts) calls both in order.
+
+```ts ! plugins.ts
+/** Plugin facets hosted in the currently attached Session worker. */
+// !mark(1:2)
+export interface SessionPlugins {
+	reload(context: Context): Promise<void>;
+}
+
+export const SessionPlugins = defineService<SessionPlugins>("pi.session-plugins");
+```
+
+</Scrollycoding>
+
+The two services never call each other. The `/reload` command is the one place that sequences them: reload the presentation build, reload the worker facets, then tell the local client to apply the new data.

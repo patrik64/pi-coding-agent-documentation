@@ -1,0 +1,88 @@
+---
+title: "external-editor.ts"
+description: "Opens the user's prompt in an external editor via a temp file and returns the edited text once the editor exits"
+source: "src/modes/interactive/external-editor.ts"
+full: true
+---
+
+Long prompts are awkward in a terminal input box, so interactive mode can hand the current text to the user's `$EDITOR`-style command and take the result back. `editInExternalEditor` is that round trip: write a temp file, run the editor attached to the terminal, read the file back, clean up.
+
+It is one function with a small result union, called from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts). The BOM handling comes from [text.ts](/docs/src/utils/text.ts).
+
+<Scrollycoding>
+
+## !!steps Inputs and outputs
+
+The caller passes the full command string and the current content. The result is either `complete` with the new text, or `failed` with nothing: no distinction between "editor missing" and "editor exited non-zero".
+
+```ts ! external-editor.ts
+export interface ExternalEditorOptions {
+	command: string;
+	content: string;
+}
+
+export type ExternalEditorResult = { status: "complete"; content: string } | { status: "failed" };
+```
+
+## !!steps A private temp file
+
+The content goes into a fresh `mkdtemp` directory as `prompt.md`; the `.md` extension makes editors pick Markdown highlighting. The command is split on single spaces, so `code --wait` works but a path with spaces or quoted arguments does not.
+
+A line is printed to stdout first so the user knows why the UI disappeared.
+
+```ts ! external-editor.ts
+export async function editInExternalEditor(options: ExternalEditorOptions): Promise<ExternalEditorResult> {
+	const directory = mkdtempSync(join(tmpdir(), "pi-editor-"));
+	const filePath = join(directory, "prompt.md");
+	try {
+		writeFileSync(filePath, options.content, "utf-8");
+		// !mark
+		const [editor, ...editorArgs] = options.command.split(" ");
+		process.stdout.write(`Launching external editor: ${options.command}\nPi will resume when the editor exits.\n`);
+```
+
+## !!steps Async spawn, not spawnSync
+
+The comment records a real Windows bug: a synchronous child call can leave Node's console input read active after stdin is paused, so the parent and vim race for input until Ctrl+C. Hence an async `spawn` with `stdio: "inherit"` wrapped in a promise.
+
+A spawn error resolves to `null`, which is not 0, so it is treated as failure. On Windows the command runs through a shell.
+
+```ts ! external-editor.ts
+		// Do not use spawnSync here. On Windows, synchronous child_process calls can keep
+		// Node/libuv's console input read active after the parent pauses stdin, racing
+		// vim/nvim for the console input buffer until Ctrl+C cancels the pending read.
+		const exitCode = await new Promise<number | null>((resolve) => {
+			const child = spawn(editor, [...editorArgs, filePath], {
+				stdio: "inherit",
+				shell: process.platform === "win32",
+			});
+			// !mark(1:2)
+			child.on("error", () => resolve(null));
+			child.on("close", (code) => resolve(code));
+		});
+```
+
+## !!steps Reading back and cleaning up
+
+On success the file is read, a leading BOM is stripped, and a single trailing newline is removed (editors add one that the user did not type). The `finally` removes the whole directory, ignoring errors, on every path including failure.
+
+```ts ! external-editor.ts
+		if (exitCode !== 0) {
+			return { status: "failed" };
+		}
+
+		// !mark
+		return { status: "complete", content: stripBom(readFileSync(filePath, "utf-8")).replace(/\n$/, "") };
+	} finally {
+		try {
+			rmSync(directory, { recursive: true, force: true });
+		} catch {
+			// Cleanup is best effort.
+		}
+	}
+}
+```
+
+</Scrollycoding>
+
+The function does not touch the TUI itself; it only inherits stdio, so the caller is responsible for giving up the terminal around the call. Nothing here validates that the command is non-empty.

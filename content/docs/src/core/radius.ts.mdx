@@ -1,0 +1,42 @@
+---
+title: "radius.ts"
+description: "Constants and URL helper for the Radius gateway, the built-in provider whose location can be overridden by environment variable"
+source: "src/core/radius.ts"
+full: true
+---
+
+Radius is a gateway that the built-in provider of the same name signs in to. This file centralizes its identity: the provider id, the environment variable that overrides the gateway origin, the default MCP endpoint, and a function returning the effective gateway URL.
+
+The URL normalization and default come from the pi-ai package. The consumers are the experimental relay in [radius-auth.ts](/docs/src/experimental/radius-auth.ts), the bug report flow in [bug-report-upload.ts](/docs/src/core/bug-report-upload.ts), and the UI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+
+<Scrollycoding>
+
+## !!steps Identity constants
+
+`RADIUS_PROVIDER_ID` is the provider id used for credentials and models. `RADIUS_MCP_URL` is computed once at import time from the default gateway, so it ignores the environment override.
+
+```ts ! radius.ts
+import { DEFAULT_RADIUS_GATEWAY, normalizeRadiusGatewayUrl } from "@earendil-works/pi-ai/providers/radius-config";
+
+export const RADIUS_PROVIDER_ID = "radius";
+export const ENV_RADIUS_GATEWAY = "PI_RADIUS_GATEWAY";
+/** MCP endpoint of the gateway the built-in Radius provider signs in to. */
+// !mark
+export const RADIUS_MCP_URL = `${normalizeRadiusGatewayUrl(DEFAULT_RADIUS_GATEWAY)}/mcp`;
+```
+
+## !!steps Honoring the override
+
+`getRadiusGatewayUrl` reads `PI_RADIUS_GATEWAY` on every call, falling back to the default, and normalizes either. Because it reads the environment lazily, tests and wrappers can change the variable after startup.
+
+```ts ! radius.ts
+/** Radius gateway origin, honoring the `PI_RADIUS_GATEWAY` override. */
+export function getRadiusGatewayUrl(): string {
+// !mark
+	return normalizeRadiusGatewayUrl(process.env[ENV_RADIUS_GATEWAY] ?? DEFAULT_RADIUS_GATEWAY);
+}
+```
+
+</Scrollycoding>
+
+Worth noting the asymmetry: the MCP URL is fixed at module load while the gateway URL is dynamic, so a custom gateway does not change the MCP endpoint.

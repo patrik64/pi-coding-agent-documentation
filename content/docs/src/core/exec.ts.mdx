@@ -1,0 +1,134 @@
+---
+title: "exec.ts"
+description: "execCommand, a promise-based child process runner with timeout, abort and forced-kill support for extensions and tools"
+source: "src/core/exec.ts"
+full: true
+---
+
+Extensions and custom tools often need to run a program and look at its output. `execCommand` wraps `spawn` into a single awaitable call that never rejects: it always resolves with stdout, stderr, an exit code and a flag saying whether pi killed the process.
+
+It is the non-shell counterpart to the shell executor in [bash-executor.ts](/docs/src/core/bash-executor.ts). Here arguments are passed as an array with `shell: false`, so there is no quoting or injection concern. Extension APIs declared in [types.ts](/docs/src/core/extensions/types.ts) expose it to plugin authors.
+
+<Scrollycoding>
+
+## !!steps Options and result
+
+Callers can pass an abort signal, a timeout in milliseconds and a working directory override. The result carries `killed` so callers can tell a timeout or abort from a real failure exit.
+
+```ts ! exec.ts
+/**
+ * Options for executing shell commands.
+ */
+export interface ExecOptions {
+	/** AbortSignal to cancel the command */
+	signal?: AbortSignal;
+	/** Timeout in milliseconds */
+	timeout?: number;
+	/** Working directory */
+	cwd?: string;
+}
+
+/**
+ * Result of executing a shell command.
+ */
+export interface ExecResult {
+	stdout: string;
+	stderr: string;
+	code: number;
+	killed: boolean;
+}
+```
+
+## !!steps Spawning
+
+The promise executor never rejects. stdin is ignored so the child cannot block waiting for input, and both output streams are piped for collection. Note that the `cwd` parameter is positional while `options.cwd` in `ExecOptions` is not read anywhere in this function, so that field is effectively unused.
+
+```ts ! exec.ts
+export async function execCommand(
+	command: string,
+	args: string[],
+	cwd: string,
+	options?: ExecOptions,
+): Promise<ExecResult> {
+	return new Promise((resolve) => {
+		const proc = spawn(command, args, {
+			cwd,
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+```
+
+## !!steps Two-stage kill
+
+`killProcess` is idempotent thanks to the `killed` flag. It sends SIGTERM first, then SIGKILL five seconds later if the process still has not been marked killed. Since `proc.killed` becomes true as soon as a signal is sent successfully, that check is weaker than it looks: after the SIGTERM it is usually already true, so the SIGKILL fallback rarely fires.
+
+```ts ! exec.ts
+		let stdout = "";
+		let stderr = "";
+		let killed = false;
+		let timeoutId: NodeJS.Timeout | undefined;
+
+		const killProcess = () => {
+			if (!killed) {
+				killed = true;
+				proc.kill("SIGTERM");
+				// Force kill after 5 seconds if SIGTERM doesn't work
+				setTimeout(() => {
+					if (!proc.killed) {
+						proc.kill("SIGKILL");
+					}
+				}, 5000);
+			}
+		};
+```
+
+## !!steps Abort and timeout
+
+An already-aborted signal kills immediately; otherwise a one-shot listener is attached. A positive timeout arms a timer that calls the same kill path. Both triggers share `killProcess`, so `killed` is true for either.
+
+```ts ! exec.ts
+		// Handle abort signal
+		if (options?.signal) {
+			if (options.signal.aborted) {
+				killProcess();
+			} else {
+				options.signal.addEventListener("abort", killProcess, { once: true });
+			}
+		}
+
+		// Handle timeout
+		if (options?.timeout && options.timeout > 0) {
+			timeoutId = setTimeout(() => {
+				killProcess();
+			}, options.timeout);
+		}
+```
+
+## !!steps Collecting output and finishing
+
+Output is concatenated as strings with no size cap. Completion uses `waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) instead of the plain `close` event, so descendants that inherited the stdio handles cannot keep the promise pending forever. On success a null exit code becomes 0; on error the code is 1. Both paths clean up the timer and the abort listener.
+
+```ts ! exec.ts
+		proc.stdout?.on("data", (data) => {
+			stdout += data.toString();
+		});
+
+		proc.stderr?.on("data", (data) => {
+			stderr += data.toString();
+		});
+
+		// Wait for process termination without hanging on inherited stdio handles
+		// held open by detached descendants.
+		waitForChildProcess(proc)
+			.then((code) => {
+				if (timeoutId) clearTimeout(timeoutId);
+				if (options?.signal) {
+					options.signal.removeEventListener("abort", killProcess);
+				}
+				resolve({ stdout, stderr, code: code ?? 0, killed });
+			})
+```
+
+</Scrollycoding>
+
+The pending SIGKILL timer is never cleared, so a killed run can leave a five-second timer alive after the promise has resolved. Callers should treat `killed` plus a nonzero `code` as the signal that a command was cut short.

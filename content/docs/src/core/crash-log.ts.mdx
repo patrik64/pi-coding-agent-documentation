@@ -1,0 +1,174 @@
+---
+title: "crash-log.ts"
+description: "Best-effort on-disk log of recent crashes, with one-time notification and extension attribution from stack traces"
+source: "src/core/crash-log.ts"
+full: true
+---
+
+When pi dies from an uncaught exception or a fatal error, there is nobody to show the problem to. This module writes a small JSON record to `crashes.json` in the agent directory so the next launch can tell the user what happened, and so a bug report can attach it. It also contains a stack-trace matcher that figures out which loaded extension, if any, appears in a crash.
+
+Paths and version come from [config.ts](/docs/src/config.ts), extension metadata types from [types.ts](/docs/src/core/extensions/types.ts), and the synthetic-path test from [source-info.ts](/docs/src/core/source-info.ts). The records are consumed by [bug-report.ts](/docs/src/core/bug-report.ts).
+
+<Scrollycoding>
+
+## !!steps The record and its limits
+
+A record keeps the error text, the stack, the session file and the working directory. At most five records are kept, and a record older than seven days is no longer announced. The `notified` flag is what makes the notice appear only once.
+
+```ts ! crash-log.ts
+export interface CrashRecord {
+	timestamp: string;
+	version: string;
+	kind: "uncaught_exception" | "fatal_error";
+	message: string;
+	stack: string | null;
+	sessionFile: string | null;
+	cwd: string;
+	notified?: boolean;
+}
+
+const MAX_CRASH_RECORDS = 5;
+const MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+```
+
+## !!steps Reading defensively
+
+The file may be missing, corrupted or edited by hand, so reading never throws. Anything that is not an array yields an empty list, and entries without a string timestamp and message are filtered out.
+
+```ts ! crash-log.ts
+export function readCrashLog(path = crashLogPath()): CrashRecord[] {
+	try {
+		const records: unknown = JSON.parse(readFileSync(path, "utf8"));
+		return Array.isArray(records)
+			? records.filter(
+					(record): record is CrashRecord =>
+						typeof record === "object" &&
+						record !== null &&
+						typeof (record as CrashRecord).timestamp === "string" &&
+						typeof (record as CrashRecord).message === "string",
+				)
+			: [];
+	} catch {
+		return [];
+	}
+}
+```
+
+## !!steps Recording a crash
+
+This runs while the process is already failing, so the whole body is wrapped in a try and returns `undefined` on any failure. Non-Error values are stringified, and the new record is appended and trimmed to the last five.
+
+```ts ! crash-log.ts
+/** Best-effort persistence for callers that are already crashing. */
+export function recordCrash(
+	crash: { kind: CrashRecord["kind"]; error: unknown; sessionFile?: string; cwd: string },
+	path = crashLogPath(),
+): CrashRecord | undefined {
+	try {
+		const { error } = crash;
+		const record: CrashRecord = {
+			timestamp: new Date().toISOString(),
+			version: VERSION,
+			kind: crash.kind,
+			message: error instanceof Error ? error.message || error.name : String(error),
+			stack: error instanceof Error && error.stack ? error.stack : null,
+			sessionFile: crash.sessionFile ?? null,
+			cwd: crash.cwd,
+		};
+		writeCrashLog([...readCrashLog(path), record].slice(-MAX_CRASH_RECORDS), path);
+		return record;
+	} catch {
+		return undefined;
+	}
+}
+```
+
+## !!steps Announcing once
+
+On startup, the newest record that is un-notified and recent is returned. Then every record is rewritten as notified. If that write fails the notice may repeat, which the comment accepts as harmless. Note that all pending records are marked, not just the returned one.
+
+```ts ! crash-log.ts
+/** Return the newest recent crash, marking pending records as announced. */
+export function takeUnnotifiedCrash(path = crashLogPath(), now = Date.now()): CrashRecord | undefined {
+	const records = readCrashLog(path);
+	const crash = [...records]
+		.reverse()
+		.find((record) => !record.notified && now - Date.parse(record.timestamp) <= MAX_AGE);
+	if (!crash) return undefined;
+	try {
+		writeCrashLog(
+			records.map((record) => (record.notified ? record : { ...record, notified: true })),
+			path,
+		);
+	} catch {
+		// Showing the notice again is harmless.
+	}
+	return crash;
+}
+```
+
+## !!steps Matching paths inside a stack
+
+Matching is done on text. Windows separators are normalized, synthetic paths never match, and drive-letter paths compare case-insensitively. For a directory the check is a substring with a trailing slash; for a single file the character after the match must be a colon, a closing parenthesis or whitespace, so `a.ts` does not match `a.tsx`.
+
+```ts ! crash-log.ts
+function stackContainsPath(stack: string, targetPath: string, includeDescendants: boolean): boolean {
+	const target = normalizeStackPath(targetPath);
+	if (!target || isSyntheticPath(target)) return false;
+	const caseInsensitive = /^[a-z]:\//iu.test(target);
+	const haystack = caseInsensitive ? stack.toLowerCase() : stack;
+	const needle = caseInsensitive ? target.toLowerCase() : target;
+	if (includeDescendants) return haystack.includes(`${needle}/`);
+
+	let index = haystack.indexOf(needle);
+	while (index !== -1) {
+		const next = haystack[index + needle.length];
+		if (next === undefined || next === ":" || next === ")" || /\s/u.test(next)) return true;
+		index = haystack.indexOf(needle, index + needle.length);
+	}
+	return false;
+}
+```
+
+## !!steps Finding responsible extensions
+
+Only `at` frames after the first line are considered, and they are URI-decoded. Each extension is matched at the widest scope that makes sense: its package root for a real package, its directory when the entry is `index.js` or similar, otherwise the exact file. Single-file packages are special-cased so a local file path is not treated as a root. The label is the package source when there is one, and duplicates are dropped.
+
+```ts ! crash-log.ts
+	for (const extension of extensions) {
+		const resolvedPath = normalizeStackPath(extension.resolvedPath);
+		const singleFilePackage =
+			extension.sourceInfo.origin === "package" &&
+			!/^(?:npm:|git:|https?:\/\/|ssh:\/\/)/u.test(extension.sourceInfo.source) &&
+			/\.[cm]?[jt]s$/u.test(extension.sourceInfo.source);
+		const packageRoot =
+			extension.sourceInfo.origin === "package" && !singleFilePackage && extension.sourceInfo.baseDir
+				? extension.sourceInfo.baseDir
+				: undefined;
+		const slashIndex = resolvedPath.lastIndexOf("/");
+		const directoryEntry = /\/index\.[cm]?[jt]s$/u.test(resolvedPath);
+		const matched = packageRoot
+			? stackContainsPath(normalizedStack, packageRoot, true)
+			: directoryEntry && slashIndex !== -1
+				? stackContainsPath(normalizedStack, resolvedPath.slice(0, slashIndex), true)
+				: stackContainsPath(normalizedStack, resolvedPath, false);
+		if (!matched) continue;
+```
+
+## !!steps Clearing
+
+Deleting the log uses `force` so a missing file is fine, and failures are swallowed. The comment notes the consequence: records may be attached again later.
+
+```ts ! crash-log.ts
+export function clearCrashLog(path = crashLogPath()): void {
+	try {
+		rmSync(path, { force: true });
+	} catch {
+		// The records can be attached again if cleanup fails.
+	}
+}
+```
+
+</Scrollycoding>
+
+Every function takes an optional path, which is how tests point it at a temporary directory. Writers use synchronous fs calls on purpose, since async work may never finish during a crash.

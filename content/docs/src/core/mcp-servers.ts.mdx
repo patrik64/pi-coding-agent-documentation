@@ -1,0 +1,369 @@
+---
+title: "mcp-servers.ts"
+description: "MCP server config types, validation, tool-exposure rules and the registry of servers that extensions register"
+source: "src/core/mcp-servers.ts"
+full: true
+---
+
+pi supports MCP servers either from `mcp.json` or registered at runtime by extensions through `pi.registerMcpServer()`. The core deliberately does very little with them: this file defines the config shapes, validates raw entries, answers questions about tool names and exposure, and stores registrations. Actually connecting is left to the MCP extension under [extensions/mcp](/docs/src/extensions/mcp/index.ts) or any extension that listens for `mcp_servers_change`.
+
+The part worth reading carefully is the exposure model, which decides whether a server's tools are shown to the model directly, deferred behind a search tool, hidden, or reachable only from codemode scripts. The registry connects to the extension runner in [runner.ts](/docs/src/core/extensions/runner.ts).
+
+<Scrollycoding>
+
+## !!steps Matching tool names with wildcards
+
+`toolPatternRegExp` escapes every regex metacharacter in each piece between `*` characters, and then joins the pieces with `.*`. That makes `*` the only wildcard, anchored to the whole name.
+
+`createToolNameMatcher` splits entries into an exact-name set and a pattern list, so the common exact case stays a set lookup.
+
+```ts ! mcp-servers.ts
+function toolPatternRegExp(pattern: string): RegExp {
+	const source = pattern
+		.split("*")
+		// !mark(1:3)
+		.map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+		.join(".*");
+	return new RegExp(`^${source}$`);
+}
+
+/** Whether a tool name matches any of the entries, each an exact name or a pattern. */
+export function createToolNameMatcher(entries: readonly string[]): (name: string) => boolean {
+	// !mark(1:3)
+	const names = new Set(entries.filter((entry) => !entry.includes("*")));
+	const patterns = entries.filter((entry) => entry.includes("*")).map(toolPatternRegExp);
+	return (name) => names.has(name) || patterns.some((pattern) => pattern.test(name));
+}
+```
+
+## !!steps Recognising MCP tools
+
+Server tools are named `mcp__<server>__<tool>`. The three resource tools have fixed names and span all servers, so they are recognised from a small set. `isMcpToolName` answers whether a tool name came from MCP.
+
+```ts ! mcp-servers.ts
+/** MCP resource tools, which reach every server with resources. */
+export const LIST_MCP_RESOURCES_TOOL = "list_mcp_resources";
+export const LIST_MCP_RESOURCE_TEMPLATES_TOOL = "list_mcp_resource_templates";
+export const READ_MCP_RESOURCE_TOOL = "read_mcp_resource";
+
+const MCP_RESOURCE_TOOLS: ReadonlySet<string> = new Set([
+	LIST_MCP_RESOURCES_TOOL,
+	LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+	READ_MCP_RESOURCE_TOOL,
+]);
+
+/** Whether a tool comes from MCP: a server tool (`mcp__<server>__<tool>`) or a resource tool. */
+// !mark(1:2)
+export function isMcpToolName(name: string): boolean {
+	return name.startsWith("mcp__") || MCP_RESOURCE_TOOLS.has(name);
+}
+```
+
+## !!steps Exposure levels and aliases
+
+Four exposures control visibility. `direct` declares tools to the model as usual. `deferred` hides them until the `tool_search` tool loads them. `codemode` makes them callable only from codemode scripts, found with `searchTools()`. `hidden` registers them but makes them unreachable.
+
+The default is `codemode`. An older spelling, `codemode-deferred`, is accepted and rewritten to `codemode` during validation.
+
+```ts ! mcp-servers.ts
+/**
+ * - `codemode`: tools are callable from codemode scripts but neither declared to the model nor
+ *   listed in the codemode description, which lists only the server's namespace. Scripts find them
+ *   with `searchTools()`. `codemode-deferred` is accepted as an alias.
+ * - `deferred`: not declared to the model until the `tool_search` tool loads them; the model then
+ *   calls them directly. Does not need codemode.
+ * - `direct`: tools are declared to the model like any other tool (and callable from codemode).
+ * - `hidden`: tools are registered but unreachable.
+ */
+// !mark
+export type McpExposure = "codemode" | "deferred" | "direct" | "hidden";
+
+const MCP_EXPOSURES: readonly string[] = ["codemode", "deferred", "direct", "hidden"] satisfies McpExposure[];
+
+/** Older exposure names, accepted in configs and replaced by their current name when validated. */
+// !mark
+const MCP_EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = { "codemode-deferred": "codemode" };
+```
+
+## !!steps The shared config fields
+
+Fields common to every server: exposure, a one-sentence description used in the system prompt and tool ranking, per-tool overrides, an `enabled` switch, and a request timeout in seconds with a default of 60.
+
+`toolExposure` resolution is documented in the comment: an exact name beats patterns, and among patterns the first in object order wins. Setting the server to `hidden` and then overriding a few tools is the way to expose only those.
+
+```ts ! mcp-servers.ts
+interface McpServerConfigBase {
+	/** Default: `codemode`. */
+	// !mark
+	exposure?: McpExposure;
+	/**
+	 * What the server offers, in a sentence. The `mcp_servers` system prompt section lists the server
+	 * with it, tool search ranks the server's tools by it, and codemode's `describeNamespace()` returns it.
+	 */
+	description?: string;
+	/**
+	 * Exposure of single tools, overriding `exposure`. Keys are tool names as the server offers them,
+	 * or patterns where `*` matches any characters. An exact name wins over patterns; among patterns
+	 * the first match in the object wins. `hidden` removes tools, so `"exposure": "hidden"` with
+	 * overrides for a few tools exposes only those.
+	 */
+	// !mark
+	toolExposure?: Record<string, McpExposure>;
+	/** Set to false to keep the entry without connecting. Default: true. */
+	enabled?: boolean;
+	// !mark
+	/** Per-request timeout in seconds. Progress notifications from the server reset it. Default: 60. */
+	timeout?: number;
+}
+```
+
+## !!steps Stdio and HTTP server shapes
+
+A stdio server needs a `command`, with optional args, an `env` whose values may be `${NAME}` references or `!cmd` commands, and a working directory. An HTTP server needs a `url` plus headers, optional OAuth and an optional `auth` that reuses a pi provider login.
+
+The `auth` comment is a security rule: it sends a credential to the URL, so it is forbidden in project `mcp.json` files and requires https unless the host is loopback.
+
+```ts ! mcp-servers.ts
+export interface McpStdioServerConfig extends McpServerConfigBase {
+	// !mark(1:2)
+	type?: "stdio";
+	command: string;
+	args?: string[];
+	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
+	env?: Record<string, string>;
+	/** Relative paths resolve against the session working directory. */
+	cwd?: string;
+}
+// ...
+export interface McpHttpServerConfig extends McpServerConfigBase {
+	type?: "http";
+	url: string;
+	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
+	headers?: Record<string, string>;
+	oauth?: McpOAuthConfig;
+	/**
+	 * Send the token of a pi provider (`/login <provider>`) instead of using OAuth. Not allowed in project
+	 * `mcp.json` files, and requires https except on loopback hosts, since it sends the credential to `url`.
+	 */
+	// !mark
+	auth?: { provider: string };
+}
+
+export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
+```
+
+## !!steps OAuth client settings
+
+`McpOAuthConfig` covers servers that do not support dynamic client registration. Without `clientId`, pi registers itself. `callbackPort` and `callbackUrl` control the loopback redirect, and `clientRegistration` can switch from dynamic registration to a client ID metadata document. `authServerMetadataUrl` overrides discovery when a server advertises the wrong authorization server.
+
+```ts ! mcp-servers.ts
+/** OAuth client settings for servers that do not support dynamic client registration. */
+export interface McpOAuthConfig {
+	/** Pre-registered client id. Without it, pi registers a client with the authorization server. */
+	clientId?: string;
+	/** May reference environment variables (`${NAME}`) or commands (`!cmd`). */
+	clientSecret?: string;
+	/**
+	 * Port of the loopback callback server, for clients registered with a fixed redirect URI. Without
+	 * `callbackUrl`, the redirect URI is `http://127.0.0.1:<port>/callback`.
+	// !mark(1:2)
+	 */
+	callbackPort?: number;
+	/**
+	 * Redirect URI registered for `clientId`, for example `http://localhost:8080/oauth/callback`. It must
+	 * be an `http` URI on `localhost`, `127.0.0.1`, or `[::1]`. Without a port, the callback server
+	 * listens on `callbackPort` or a free port, which is added to the URI (RFC 8252).
+	 */
+	// !mark
+	callbackUrl?: string;
+	/** Scopes to request, separated by spaces. Default: the scopes the server advertises. */
+	scope?: string;
+	/**
+	 * `client_name` sent with dynamic client registration, for servers that only accept known clients.
+	 * Default: `pi`.
+	 */
+	clientName?: string;
+	/**
+	 * How pi identifies itself without `clientId`. `dcr` (default): dynamic client registration. `cimd`:
+	 * pi's Client ID Metadata Document on pi.dev, for authorization servers that allow pi by that URL. The
+	 * server must support it for public clients, and the callback must use the default path `/callback`.
+	 */
+	// !mark
+	clientRegistration?: "dcr" | "cimd";
+	/**
+	 * Authorization server metadata document (RFC 8414 or OpenID Connect discovery) to use instead of
+	 * discovery through the server, for servers that advertise a wrong authorization server or none.
+	 * The document is trusted as configured. Must use https, except on loopback hosts.
+	 */
+	authServerMetadataUrl?: string;
+}
+```
+
+## !!steps Loopback checks and namespaces
+
+`isLoopbackRedirectUri` accepts only `http` on localhost, 127.0.0.1 or `[::1]`, with no query or fragment. `mcpNamespace` builds the `mcp__server` prefix and replaces dashes with underscores, matching how tool names are produced, so a server named `my-server` has namespace `mcp__my_server`.
+
+```ts ! mcp-servers.ts
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
+/** Whether a redirect URI can be served by pi's loopback callback server. */
+export function isLoopbackRedirectUri(value: string): boolean {
+	if (!URL.canParse(value)) return false;
+	const url = new URL(value);
+	// !mark
+	return url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname) && url.search === "" && url.hash === "";
+}
+// ...
+const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
+
+/** Namespace of a server's tools: `mcp__<server>` with `-` replaced by `_`, like the tool names. */
+export function mcpNamespace(server: string): string {
+	// !mark
+	return `mcp__${server.replace(/-/g, "_")}`;
+}
+```
+
+## !!steps Validating OAuth
+
+Each rule returns an error string, or `undefined` when valid. Ports must be integers from 1 to 65535. A callback URL must be loopback, and if it carries a port that differs from `callbackPort` the config is rejected as contradictory.
+
+The `cimd` mode cannot combine with `clientId` or `clientName`, and needs a callback on localhost or 127.0.0.1 with path `/callback`, as the config comment on `clientRegistration` requires.
+
+```ts ! mcp-servers.ts
+	const port = value.callbackPort;
+	if (port !== undefined && (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)) {
+		return "oauth.callbackPort must be a port number";
+	}
+	// !mark(1:4)
+	if (value.callbackUrl !== undefined) {
+		if (typeof value.callbackUrl !== "string" || !isLoopbackRedirectUri(value.callbackUrl)) {
+			return "oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment";
+		}
+		const urlPort = new URL(value.callbackUrl).port;
+		if (urlPort && port !== undefined && Number(urlPort) !== port) {
+			return "oauth.callbackUrl and oauth.callbackPort name different ports";
+		}
+	}
+// ...
+	if (value.clientRegistration !== undefined && value.clientRegistration !== "dcr") {
+		if (value.clientRegistration !== "cimd") return 'oauth.clientRegistration must be "dcr" or "cimd"';
+		// !mark(1:3)
+		if (value.clientId !== undefined || value.clientName !== undefined) {
+			return 'oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName';
+		}
+		const callback = typeof value.callbackUrl === "string" ? new URL(value.callbackUrl) : undefined;
+		if (callback && (callback.hostname === "[::1]" || callback.pathname !== "/callback")) {
+			return 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback';
+		}
+	}
+```
+
+## !!steps Resolving the effective exposure
+
+`getMcpToolExposure` applies the documented precedence: exact override, then the first matching pattern in insertion order, then the server's own exposure, then `codemode`.
+
+```ts ! mcp-servers.ts
+/** Exposure of one tool of a server: its `toolExposure` entry, else the server's `exposure`. */
+export function getMcpToolExposure(config: McpServerConfig, toolName: string): McpExposure {
+	const overrides = config.toolExposure ?? {};
+	// !mark(1:6)
+	const exact = overrides[toolName];
+	if (exact !== undefined) return exact;
+	for (const [pattern, exposure] of Object.entries(overrides)) {
+		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;
+	}
+	return config.exposure ?? "codemode";
+}
+```
+
+## !!steps Validating a server entry
+
+`validateMcpServerConfig` returns either a config or an error string, never throwing. It checks the name against `^[A-Za-z0-9_-]+$` and then the common fields. A `type` of `sse` is rejected with a pointer to streamable HTTP.
+
+A `url` makes it an HTTP server and a `command` makes it stdio. Neither yields an error naming both options. The returned value is a copy with aliases resolved, cast to the specific config type.
+
+```ts ! mcp-servers.ts
+export function validateMcpServerConfig(name: string, raw: unknown): McpServerConfig | string {
+	// !mark
+	if (!SERVER_NAME.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
+	if (!isRecord(raw)) return `server "${name}" must be an object`;
+	const value = resolveExposureAliases(raw);
+	const { type, exposure, enabled, timeout, toolExposure, description } = value;
+	const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
+	if (exposure !== undefined && !isExposure(exposure)) {
+		return `server "${name}": exposure must be one of ${exposures}`;
+	}
+// ...
+	// !mark
+	if (type === "sse") return `server "${name}": legacy SSE transport is not supported; use the streamable HTTP URL`;
+
+	// !mark(1:3)
+	if (typeof value.url === "string" && (type === undefined || type === "http" || type === "streamable-http")) {
+		if (!URL.canParse(value.url) || !/^https?:$/.test(new URL(value.url).protocol)) {
+			return `server "${name}": url must be an http or https URL`;
+		}
+		if (value.headers !== undefined && !isStringRecord(value.headers)) {
+			return `server "${name}": headers must map names to strings`;
+		}
+		const oauthError = validateOAuth(value.oauth);
+		if (oauthError) return `server "${name}": ${oauthError}`;
+		if (value.auth !== undefined) {
+			if (!isRecord(value.auth) || typeof value.auth.provider !== "string" || !value.auth.provider) {
+				return `server "${name}": auth.provider must be a provider name`;
+			}
+			const url = new URL(value.url);
+			if (url.protocol !== "https:" && !LOOPBACK_HOSTS.includes(url.hostname)) {
+				return `server "${name}": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`;
+			}
+		}
+		return value as unknown as McpHttpServerConfig;
+	}
+```
+
+## !!steps The registry for extension-registered servers
+
+`McpServerRegistry` stores registrations in a map, keyed by server name, and calls a single change listener after each change. The runner sets that listener when it binds, in order to emit `mcp_servers_change`.
+
+`unregister` checks `extensionPath` first, so one extension cannot remove another's server. `register` has no such check; its comment says the caller verifies ownership. `list` returns copies, with the config cloned.
+
+```ts ! mcp-servers.ts
+/** Servers registered by the extensions of one runtime. */
+export class McpServerRegistry {
+	private readonly servers = new Map<string, RegisteredMcpServer>();
+	private changeListener: (() => void) | undefined;
+
+	/** Register or replace a server. The caller checks ownership. */
+	// !mark(1:3)
+	register(server: RegisteredMcpServer): void {
+		this.servers.set(server.name, server);
+		this.changeListener?.();
+	}
+
+	/** Remove a server registered by `extensionPath`. Servers of other extensions are left alone. */
+	unregister(name: string, extensionPath: string): void {
+		// !mark
+		if (this.servers.get(name)?.extensionPath !== extensionPath) return;
+		this.servers.delete(name);
+		this.changeListener?.();
+	}
+
+	get(name: string): RegisteredMcpServer | undefined {
+		return this.servers.get(name);
+	}
+
+	/** Copies of the registered servers, in registration order. */
+	list(): RegisteredMcpServer[] {
+		// !mark
+		return [...this.servers.values()].map((server) => ({ ...server, config: structuredClone(server.config) }));
+	}
+
+	/** Called after every change. The runner sets it when it binds, to emit `mcp_servers_change`. */
+	setChangeListener(listener: (() => void) | undefined): void {
+		this.changeListener = listener;
+	}
+}
+```
+
+</Scrollycoding>
+
+Config files and extension registrations both pass through the validation function, so the same rules apply to either source. One structural note: exposure aliases are resolved only inside validation, so code that reads a raw config without validating it can still see the old spelling.

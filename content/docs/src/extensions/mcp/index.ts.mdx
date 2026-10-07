@@ -1,0 +1,364 @@
+---
+title: "index.ts"
+description: "The built-in MCP extension: loads servers, registers their tools with an exposure level, waits for connections at the right moments, and provides the /mcp command"
+source: "src/extensions/mcp/index.ts"
+full: true
+---
+
+This file is the integration layer between MCP servers and pi's extension API. It reads server definitions from `mcp.json` (and from servers other extensions register), starts connections in the background when a session starts, registers each server's tools under names like `mcp__server__tool`, and offers the `/mcp` command to manage everything.
+
+Actual protocol work is delegated. [runtime.ts](/docs/src/extensions/mcp/runtime.ts) holds the connections and is loaded lazily, [config.ts](/docs/src/extensions/mcp/config.ts) parses and edits `mcp.json`, [tools.ts](/docs/src/extensions/mcp/tools.ts) builds tool definitions, [resources.ts](/docs/src/extensions/mcp/resources.ts) the resource tools, and [ui.ts](/docs/src/extensions/mcp/ui.ts) the manager screens.
+
+The key design idea is exposure. By default MCP tools are not declared to the model at all: they are reachable only from [codemode](/docs/src/extensions/codemode/tool.ts) scripts or through [tool_search](/docs/src/extensions/tool-search/tool.ts), so large tool catalogs do not bloat every request. The rest of the file keeps that promise: waiting for servers only when something needs them, and telling the model that the servers exist.
+
+<Scrollycoding>
+
+## !!steps Options that make the extension testable
+
+`createMcpExtension` takes an options bag, and every external dependency in it has a default: config loading, the transport factory, the credential store, the log path, the browser opener and the config writer. Tests replace them; production uses the defaults.
+
+`startupWaitMs` is the one behavioral knob. It bounds how long the first prompt waits for servers that declare direct tools, defaulting to 10 seconds, so a hanging server cannot block the conversation.
+
+```ts ! index.ts
+export interface McpExtensionOptions {
+	/** Defaults to reading `mcp.json` from the agent directory and the trusted project. */
+	loadConfig?: (ctx: ExtensionContext) => LoadedMcpConfig;
+	/** Defaults to stdio and streamable HTTP transports built from the server config. */
+	createTransport?: McpTransportFactory;
+	/** Defaults to `mcp-auth.json` in the agent directory. */
+	credentials?: McpOAuthCredentialStore;
+	// ...
+	/**
+	 * How long the first prompt waits for servers with `direct` tools that are still connecting at
+	 * startup, in milliseconds. Their tools become available when they connect. Other servers are
+	 * waited for when a script or search needs them. Default: 10000.
+	 */
+	// !mark
+	startupWaitMs?: number;
+}
+
+const DEFAULT_STARTUP_WAIT_MS = 10_000;
+```
+
+## !!steps Exposure decided from config, before connecting
+
+A server's exposure is known from config alone, which matters because tools are discovered only after connecting. `configuredExposures` collects the server-wide exposure plus every per-tool `toolExposure` override.
+
+Two predicates split servers into groups. If any tool is `direct`, the first prompt must wait for that server so its tools appear in the first request. If any is `codemode` or `deferred`, the model needs to be told the server exists. A server can be in both groups.
+
+```ts ! index.ts
+function exposureOf(entry: McpServerEntry): McpExposure {
+	// !mark
+	return entry.config.exposure ?? "codemode";
+}
+
+/** Exposures the server's tools can have, known from its config before it connects. */
+function configuredExposures(entry: McpServerEntry): Set<McpExposure> {
+	return new Set([exposureOf(entry), ...Object.values(entry.config.toolExposure ?? {})]);
+}
+
+/** Whether some of the server's tools are declared to the model, so the first prompt waits for them. */
+function hasDirectTools(entry: McpServerEntry): boolean {
+	return configuredExposures(entry).has("direct");
+}
+
+/** Whether some of the server's tools are reached through codemode or tool_search. */
+function hasIndirectTools(entry: McpServerEntry): boolean {
+	const exposures = configuredExposures(entry);
+	return exposures.has("codemode") || exposures.has("deferred");
+}
+```
+
+## !!steps Telling the model about servers it cannot see
+
+Because codemode and tool_search tools are not in the tool declarations, nothing would tell the model that a server exists. `renderServersSection` produces a system-prompt section that lists each enabled indirect server with how to reach it and a one-line summary taken from the configured description, or else the server's own instructions.
+
+The section has a hard budget of 4096 characters. It first drops trailing servers until the bare lines fit, adding a closing "N more servers" line, then splits the leftover space evenly as a per-server description limit capped at 250 characters, minus two for the `: ` separator.
+
+Servers are sorted by name, so the section is stable across runs and does not needlessly change the prompt.
+
+```ts ! index.ts
+export function renderServersSection(servers: readonly McpServerListing[]): string | undefined {
+	const listed = servers
+		.filter((server) => isEnabled(server) && hasIndirectTools(server.entry))
+		.sort((a, b) => a.entry.name.localeCompare(b.entry.name));
+	if (listed.length === 0) return undefined;
+	// ...
+	// Characters of the intro, the first `kept` server lines without descriptions, and the omission line.
+	const size = (kept: number) => [intro, ...heads.slice(0, kept), ...omitted(listed.length - kept)].join("\n").length;
+	let kept = listed.length;
+	// !mark
+	while (kept > 0 && size(kept) > MAX_SERVERS_SECTION_CHARS) kept--;
+	// Each description also takes a ": " separator.
+	const perServer =
+		kept === 0
+			? 0
+			// !mark
+			: Math.min(MAX_SERVER_DESCRIPTION_CHARS, Math.floor((MAX_SERVERS_SECTION_CHARS - size(kept)) / kept) - 2);
+```
+
+## !!steps Per-session state and who owns it
+
+Everything lives in the closure of the factory, not in module scope, so each extension instance is independent. The main list is `servers`, each entry being an `McpServer` with its config entry, an optional connection (absent when disabled), and a `ready` promise that settles when its connection attempt ends.
+
+Two fields guard against stale async work. `generation` is bumped on every session start and shutdown, and any late continuation compares it before acting. `waitedForStartup` makes the bounded startup wait happen at most once per session.
+
+```ts ! index.ts
+export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
+	return (pi: ExtensionAPI) => {
+		let servers: McpServer[] = [];
+		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
+		let configuredEntries: McpServerEntry[] = [];
+		let configErrors: string[] = [];
+		// ...
+		/** Whether a prompt already waited for the startup connections since the session started. */
+		let waitedForStartup = false;
+		const startupWaitMs = options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS;
+		/** Bumped on every session start and shutdown so a runtime load that resolves late is dropped. */
+		// !mark
+		let generation = 0;
+```
+
+## !!steps Registering tools under stable unique names
+
+`registerTools` is the `onTools` callback each connection calls after connecting or after a `list_changed` notification. It builds a namespace (name, description, instructions) and then a pi tool name for every server tool.
+
+Name assignment must be stable and collision free. A candidate is rejected if another owner already has it, if it was already taken in this pass, or if two tools of this server sanitize to the same plain name. In that last case all of them get the hash suffix, so the result does not depend on list order. The `toolOwners` map remembers who owns which name across reconnects.
+
+```ts ! index.ts
+			// Like Codex, all tools whose names sanitize to the same name get the hash suffix, so which
+			// one would keep the plain name does not depend on the order of the list.
+			const plain = [...new Set(connection.tools.map((tool) => tool.name))].map((tool) =>
+				createMcpToolName(server, tool),
+			);
+			const assignName = (tool: string, owner: string) => {
+				const name = createMcpToolName(server, tool, (candidate) => {
+					const existing = toolOwners.get(candidate);
+					return (
+						// !mark(1:3)
+						(existing !== undefined && existing !== owner) ||
+						current.has(candidate) ||
+						plain.indexOf(candidate) !== plain.lastIndexOf(candidate)
+					);
+				});
+				toolOwners.set(name, owner);
+				current.add(name);
+				return name;
+			};
+```
+
+## !!steps Tools cannot be unregistered, so they are hidden
+
+The extension API can register tools but not remove them. When a server drops a tool, or a server is disabled, the previous definition is registered again with `exposure: "hidden"`, which makes it unreachable. When the server offers the tool again, the normal path re-registers it with its configured exposure.
+
+This is why the file keeps a `definitions` map of the last definition per name. `hideTools` applies the same trick to a whole server.
+
+```ts ! index.ts
+			serverTools.set(server, current);
+			// Tools cannot be unregistered, so tools the server dropped are re-registered as hidden. When
+			// the server offers them again they are registered with their configured exposure above.
+			for (const name of previous) {
+				const definition = definitions.get(name);
+				// !mark
+				if (!current.has(name) && definition) pi.registerTool({ ...definition, exposure: "hidden" });
+			}
+			syncResourceTools();
+		};
+
+		/** Make a disabled server's tools unreachable. */
+		const hideTools = (server: string) => {
+			for (const name of serverTools.get(server) ?? []) {
+				const definition = definitions.get(name);
+				if (definition) pi.registerTool({ ...definition, exposure: "hidden" });
+			}
+```
+
+## !!steps Making sure the model can reach hidden tools
+
+`ensureDiscoveryActive` is the safety net for the exposure model. From the enabled servers' configured exposures it works out whether codemode, tool_search or both are needed, then activates them if they exist and are not already active. Codemode activation respects `autoEnableCodemode`.
+
+It only activates tools recognised by `isCodemodeTool` and `isToolSearchTool`, because another extension's tool with the same name cannot reach MCP tools. If neither route ends up active, it warns once per session that the MCP tools cannot be called.
+
+```ts ! index.ts
+			// Other extensions' tools of the same names cannot reach MCP tools, so never activate them.
+			const tools = pi.getAllTools();
+			const hasCodemode = tools.some(isCodemodeTool);
+			const hasToolSearch = tools.some(isToolSearchTool);
+			const active = pi.getActiveTools();
+			const activate: string[] = [];
+			// !mark(1:6)
+			if (needsCodemode && hasCodemode && autoEnableCodemode && !active.includes(CODEMODE_TOOL_NAME)) {
+				activate.push(CODEMODE_TOOL_NAME);
+			}
+			if (needsToolSearch && hasToolSearch && !active.includes(TOOL_SEARCH_TOOL_NAME)) {
+				activate.push(TOOL_SEARCH_TOOL_NAME);
+			}
+			if (activate.length > 0) pi.setActiveTools([...active, ...activate]);
+			const reachable = [...active, ...activate];
+			if (hasCodemode && reachable.includes(CODEMODE_TOOL_NAME)) return;
+```
+
+## !!steps Noticing a sign-in done elsewhere
+
+OAuth sign-in can happen in another process, for example `pi mcp login` run by the agent. The extension therefore snapshots the stored tokens of each connection at the moment it enters `needs-auth`, as a JSON string, and clears the snapshot when it leaves that state.
+
+On every `turn_start`, `reconnectSignedIn` compares the current stored tokens with the snapshot and reconnects the servers whose credentials changed. It uses `allSettled`, so one failing reconnect does not abort the rest.
+
+```ts ! index.ts
+		const tokensAtSignIn = new Map<McpServerConnection, string>();
+		const storedTokens = (connection: McpServerConnection): string => {
+			const url = connection.oauthUrl;
+			return url && credentials ? JSON.stringify(credentials.tokens(connection.name, url) ?? null) : "null";
+		};
+		const onConnectionChange = (connection: McpServerConnection) => {
+			// !mark(1:2)
+			if (connection.state !== "needs-auth") tokensAtSignIn.delete(connection);
+			else if (!tokensAtSignIn.has(connection)) tokensAtSignIn.set(connection, storedTokens(connection));
+			emitChange();
+		};
+		/** Reconnect servers that need a sign-in when their credentials were stored since. */
+		const reconnectSignedIn = async (ctx: ExtensionContext) => {
+			const signedIn = [...tokensAtSignIn].filter(([connection, tokens]) => storedTokens(connection) !== tokens);
+			if (signedIn.length === 0) return;
+			for (const [connection] of signedIn) tokensAtSignIn.delete(connection);
+			// !mark
+			await Promise.allSettled(signedIn.map(([connection]) => connection.reconnect()));
+```
+
+## !!steps Background connections that respect session lifetime
+
+`startConnection` runs the connect in the background and stores a swallowed-error version in `server.ready`, so waiters never throw, while the returned promise still rejects if the runtime cannot load. Failures of the connection itself are not errors here: they show up as state on the connection.
+
+It takes an `isCurrent` check and an optional `after` promise. After each await it checks `isCurrent()`, so a session that ended mid-connect does nothing further. `createConnection` is where the lazy [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts) import happens, wiring `onTools` to `registerTools`.
+
+```ts ! index.ts
+			const ready = (async () => {
+				await after;
+				// !mark
+				if (!isCurrent()) return;
+				const connection = await createConnection(server);
+				if (!isCurrent()) return;
+				await connection.getClient().catch(() => undefined);
+			})();
+			// !mark
+			server.ready = ready.catch(() => undefined);
+			return ready;
+```
+
+## !!steps Session start
+
+`session_start` loads config, resets the per-session flags, increments `generation`, and builds the server list: servers from `mcp.json` first, then extension-registered servers that no configured server overrides, matched by namespace.
+
+Discovery tools are activated from config straight away, before any server connects. With no enabled servers it only reports config problems. Otherwise it waits one `setImmediate` turn before loading the runtime, a deliberate delay so the first render is not blocked by importing the MCP client. Problems are reported once, after all connections settle.
+
+```ts ! index.ts
+			const current = ++generation;
+			sessionActive = true;
+			configuredEntries = loaded.servers;
+			const registered = registeredServers();
+			overridden = registered.overridden;
+			servers = [...loaded.servers.map((entry) => ({ entry })), ...registered.servers];
+			emitChange();
+			// Codemode or tool_search is activated from the config: the first prompt does not wait for
+			// servers whose tools are not declared to the model, and scripts or searches wait for them.
+			ensureDiscoveryActive(ctx);
+			const enabled = servers.filter(isEnabled);
+			if (enabled.length === 0) {
+				reportProblems(ctx);
+				return;
+			}
+			// The MCP client loads only now, so sessions without servers never pay for it. Waiting one
+			// event loop turn lets the first render happen before loading and connecting.
+			// !mark
+			const runtime = new Promise((resolve) => setImmediate(resolve)).then(() => loadMcpRuntime());
+```
+
+## !!steps Waiting only when something needs the server
+
+Three event hooks decide who waits. The first prompt waits, at most `startupWaitMs` and only once, for servers with direct tools, and notifies if the timeout wins. `before_agent_start` also writes or removes the `mcp_servers` section of the system prompt on every prompt.
+
+The `tool_call` hook covers indirect servers. A codemode script waits only for servers whose namespace its source mentions, or for all pending servers if it calls `searchTools`, `describeNamespace`, `describeTool` or `ALL_TOOLS`. tool_search and the resource tools wait for everything, since they can reach any server. The wait is tied to `ctx.signal`, so cancelling the turn stops it.
+
+```ts ! index.ts
+			const pendingServers = servers.filter(
+				(server) => isEnabled(server) && server.connection?.state !== "connected" && server.ready,
+			);
+			if (pendingServers.length === 0) return;
+			let waiting: McpServer[] = [];
+			if (isCodemodeTool(tool)) {
+				const { code } = event.input as { code?: unknown };
+				const source = typeof code === "string" ? code : "";
+				// !mark
+				waiting = pendingServers.filter((server) => scriptNeedsServer(source, server.entry.name));
+			} else if (isToolSearchTool(tool) || RESOURCE_TOOL_NAMES.has(tool.name)) {
+				// !mark
+				waiting = pendingServers;
+			}
+			await waitForServers(waiting, ctx.signal);
+```
+
+## !!steps Late registrations and shutdown
+
+Extensions can register or remove MCP servers mid-session. `mcp_servers_change` diffs by `registeredConfig`, a JSON snapshot of the config: a server whose registration vanished or changed is dropped (its tools hidden, its connection closed), and a changed one comes back as a new server and connects right away.
+
+After connecting it re-checks `generation`. If the session ended while it waited, the connections it just made are closed rather than leaked. `session_shutdown` bumps `generation`, empties the list and closes every connection.
+
+```ts ! index.ts
+			const removed = servers.filter(
+				(server) =>
+					server.entry.scope === "extension" &&
+					// !mark
+					next.get(server.entry.name)?.registeredConfig !== server.registeredConfig,
+			);
+			servers = servers.filter((server) => !removed.includes(server));
+			for (const server of removed) hideTools(server.entry.name);
+			const added = registered.servers.filter((server) => !findServer(server.entry.name));
+			servers.push(...added);
+			emitChange();
+			ensureDiscoveryActive(ctx);
+			await Promise.all(removed.map((server) => server.connection?.close()));
+			const connecting = added.filter(isEnabled);
+			if (current !== generation || connecting.length === 0) return;
+			try {
+				await Promise.all(connecting.map((server) => startConnection(server, () => current === generation)));
+				if (current !== generation) {
+					// !mark
+					await Promise.all(connecting.map((server) => server.connection?.close()));
+					return;
+				}
+```
+
+## !!steps The /mcp command in two modes
+
+With no arguments, `/mcp` opens the interactive manager in the TUI and prints a plain status text elsewhere. The handler first awaits `pending`, so it never shows a half-started state. The subcommands `login`, `logout` and `reconnect` take an optional server name. More than one argument prints the usage line.
+
+When the name is omitted, `pickServer` narrows to eligible servers and then to preferred ones (for login, those needing sign-in), and only prompts the user when the choice is still ambiguous. The manager itself is a pair of nested menu loops in `manage`, driven by the pure builders `serversMenu` and `serverMenu`, which list only the actions valid for the server's current state.
+
+```ts ! index.ts
+			handler: async (args, ctx) => {
+				// !mark
+				await pending;
+				const [action, name, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+				if (action === undefined) {
+					if (ctx.mode === "tui") await showMcpManager(ctx, (ui) => manage(ui, ctx));
+					else ctx.ui.notify(formatStatus(), "info");
+					return;
+				}
+				if (extra.length > 0) {
+					ctx.ui.notify(MCP_USAGE, "warning");
+					return;
+				}
+				switch (action) {
+					case "login": {
+						// !mark
+						const server = await pickServer(name, ctx, oauthPick);
+						if (server) await loginCommand(server, ctx);
+						return;
+					}
+```
+
+</Scrollycoding>
+
+The pieces connect through one loop: config produces `servers`, `startConnection` produces connections, each connection calls `registerTools` and `onChange`, and everything user-visible, from the manager menu to the `mcp_servers` prompt section, is derived from that same `servers` array. The extension API it targets is described in [types.ts](/docs/src/core/extensions/types.ts), and namespace handling comes from [mcp-servers.ts](/docs/src/core/mcp-servers.ts).
+
+One structural note: the file is one large closure. Most helpers capture mutable state such as `servers`, `generation` and `credentials`, so they cannot be unit tested on their own. Only the pure functions, `renderServersSection` among them, are exported for tests.

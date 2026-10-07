@@ -1,0 +1,74 @@
+---
+title: "countdown-timer.ts"
+description: "A one-second interval countdown that dialog components use to auto-dismiss after a timeout"
+source: "src/modes/interactive/components/countdown-timer.ts"
+full: true
+---
+
+Some dialogs, such as the extension prompts in [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts) and [extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts), can be given a timeout. `CountdownTimer` is the small shared helper that drives that: it ticks once per second, tells the dialog how many seconds remain so it can update its title, and fires an expiry callback at zero.
+
+The class has no rendering of its own. It only calls back into the owner and, if it was given a `TUI`, asks it to repaint after each tick.
+
+<Scrollycoding>
+
+## !!steps State and construction
+
+The timer keeps the interval handle, the remaining whole seconds, and the three collaborators: the optional `TUI`, the tick callback, and the expire callback. The `TUI` is optional so the timer can be used where no repaint is available.
+
+The constructor rounds the timeout up with `Math.ceil`, so a 1500 ms timeout shows 2 seconds. It also calls `onTick` immediately, so the dialog shows the initial value without waiting a full second.
+
+```ts ! countdown-timer.ts
+export class CountdownTimer {
+	private intervalId: ReturnType<typeof setInterval> | undefined;
+	private remainingSeconds: number;
+	private tui: TUI | undefined;
+	private onTick: (seconds: number) => void;
+	private onExpire: () => void;
+
+	constructor(timeoutMs: number, tui: TUI | undefined, onTick: (seconds: number) => void, onExpire: () => void) {
+		this.tui = tui;
+		this.onTick = onTick;
+		this.onExpire = onExpire;
+		this.remainingSeconds = Math.ceil(timeoutMs / 1000);
+		// !mark
+		this.onTick(this.remainingSeconds);
+```
+
+## !!steps The interval
+
+Each second the counter drops, the owner is notified, and a render is requested. Only then is expiry checked, so the callback sees a final tick of `0` before `onExpire` runs.
+
+On expiry the timer disposes itself first, then calls `onExpire`. That order means the callback can safely close the dialog (which may also call `dispose`) without the interval firing again.
+
+```ts ! countdown-timer.ts
+		// !mark
+		this.intervalId = setInterval(() => {
+			this.remainingSeconds--;
+			this.onTick(this.remainingSeconds);
+			this.tui?.requestRender();
+
+			if (this.remainingSeconds <= 0) {
+				// !mark(2:2)
+				this.dispose();
+				this.onExpire();
+			}
+		}, 1000);
+	}
+```
+
+## !!steps Disposal
+
+`dispose` is idempotent: it clears the interval only if one is set and then forgets the handle. Dialogs call it when the user answers before the timeout, so a stale timer never fires into a closed dialog.
+
+```ts ! countdown-timer.ts
+	dispose(): void {
+		if (this.intervalId) {
+			clearInterval(this.intervalId);
+			this.intervalId = undefined;
+		}
+	}
+```
+
+</Scrollycoding>
+
+The file is leaf-level: it imports only the `TUI` type from the TUI library. Consumers construct it with their own title-update closure, so the same timer serves any dialog. Note the first tick happens in the constructor, before `intervalId` is assigned, so an `onTick` that calls `dispose` during construction would not stop the interval.

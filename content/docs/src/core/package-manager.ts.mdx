@@ -1,0 +1,403 @@
+---
+title: "package-manager.ts"
+description: "Installs npm, git and local packages for pi and resolves every extension, skill, prompt and theme path with precedence and enable/disable rules"
+source: "src/core/package-manager.ts"
+full: true
+---
+
+This is the largest file in the core, and it does two separate things. First, it is a small package installer: it understands `npm:` specs, git URLs and local paths, installs them into pi's own directories under the user or project scope, and updates them. Second, and more important for the rest of the app, it is a resource resolver: given the settings, the installed packages and the conventional directories, it produces the full list of extension, skill, prompt and theme files, each with an `enabled` flag and metadata about where it came from.
+
+The result, `ResolvedPaths`, is consumed by [resource-loader.ts](/docs/src/core/resource-loader.ts), which loads the enabled files. Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts), package manifests are read through [pi-manifest.ts](/docs/src/core/pi-manifest.ts), and the command-line `pi install` family lives in [package-manager-cli.ts](/docs/src/package-manager-cli.ts).
+
+<Scrollycoding>
+
+## !!steps The shape of the result
+
+Everything is reported as `ResolvedResource`: a path, an `enabled` flag, and `PathMetadata` with the originating source string, the scope (`user`, `project` or `temporary`), whether it came from a package or a top-level setting, and the package root. Disabled resources are still returned, so a configuration UI can show them.
+
+`MissingSourceAction` is the answer a caller gives when a configured package is not installed: install it, skip it or fail.
+
+```ts ! package-manager.ts
+export interface PathMetadata {
+	source: string;
+	scope: SourceScope;
+	origin: "package" | "top-level";
+	baseDir?: string;
+	packageRoot?: string;
+}
+
+export interface ResolvedResource {
+	path: string;
+	enabled: boolean;
+	metadata: PathMetadata;
+}
+
+export interface ResolvedPaths {
+	extensions: ResolvedResource[];
+	skills: ResolvedResource[];
+	prompts: ResolvedResource[];
+	themes: ResolvedResource[];
+}
+
+export type MissingSourceAction = "install" | "skip" | "error";
+```
+
+## !!steps Precedence ranks decide who wins a name collision
+
+Resolved resources are sorted by `resourcePrecedenceRank` so that later "first one wins" de-duplication (names of skills and prompts) gives the right answer. Project settings entries beat project auto-discovery, which beats user entries, then user auto-discovery, then package resources. Built-in extensions rank last so they load after everything else.
+
+The comment's table lists ranks 0 to 4 and omits the built-in rank 5 that the code adds.
+
+```ts ! package-manager.ts
+ * Precedence (highest to lowest):
+ *   0  project + settings entry (source: "local", scope: "project")
+ *   1  project + auto-discovered (source: "auto", scope: "project")
+ *   2  user + settings entry (source: "local", scope: "user")
+ *   3  user + auto-discovered (source: "auto", scope: "user")
+ *   4  package resource (origin: "package")
+ */
+function resourcePrecedenceRank(m: PathMetadata): number {
+	// Built-in extensions load after file and package extensions, whichever scope enables them.
+	if (m.source === "builtin") return 5;
+	if (m.origin === "package") return 4;
+	const scopeBase = m.scope === "project" ? 0 : 2;
+	return scopeBase + (m.source === "local" ? 0 : 1);
+}
+```
+
+## !!steps Include, exclude, force-include, force-exclude
+
+Settings lists and package filters use a tiny pattern language, applied in `applyPatterns` in four ordered steps. Plain entries include (if there are none, everything is included). A `!` entry excludes by glob. A `+` entry force-includes an exact path, overriding exclusions, and a `-` entry force-excludes an exact path and wins over everything.
+
+Globs use `minimatch` against the relative path, the file name and the absolute path. The exact forms compare normalized strings only, with a `./` prefix tolerated.
+
+```ts ! package-manager.ts
+	// Step 1: Apply includes (or all if no includes)
+	let result: string[];
+	if (includes.length === 0) {
+		result = [...allPaths];
+	} else {
+		result = allPaths.filter((filePath) => matchesAnyPattern(filePath, includes, baseDir));
+	}
+
+	// Step 2: Apply excludes
+	if (excludes.length > 0) {
+		result = result.filter((filePath) => !matchesAnyPattern(filePath, excludes, baseDir));
+	}
+
+	// Step 3: Force-include (add back from allPaths, overriding exclusions)
+	if (forceIncludes.length > 0) {
+		for (const filePath of allPaths) {
+			if (!result.includes(filePath) && matchesAnyExactPattern(filePath, forceIncludes, baseDir)) {
+				result.push(filePath);
+			}
+		}
+	}
+```
+
+## !!steps Skill files match by their folder
+
+A skill is a `SKILL.md` inside a folder, so users naturally write the folder name in a pattern. `matchesAnyPattern` detects `SKILL.md` and additionally tests the parent directory's relative path, name and absolute path against each pattern. The exact variant does the same for the parent path.
+
+This is why `!my-skill` disables a skill even though the actual file is `my-skill/SKILL.md`.
+
+```ts ! package-manager.ts
+	const isSkillFile = name === "SKILL.md";
+	const parentDir = isSkillFile ? dirname(filePath) : undefined;
+	const parentRel = isSkillFile ? toPosixPath(relative(baseDir, parentDir!)) : undefined;
+	const parentName = isSkillFile ? basename(parentDir!) : undefined;
+	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
+
+	return patterns.some((pattern) => {
+		const normalizedPattern = toPosixPath(pattern);
+		if (
+			minimatch(rel, normalizedPattern) ||
+			minimatch(name, normalizedPattern) ||
+			minimatch(filePathPosix, normalizedPattern)
+		) {
+			return true;
+		}
+		if (!isSkillFile) return false;
+```
+
+## !!steps Walking directories while honoring ignore files
+
+`collectFiles` recurses through a resource directory, skipping dot entries and `node_modules`, following symlinks that resolve to real files or directories, and consulting `.gitignore`, `.ignore` and `.fdignore` files at every level. `addIgnoreRules` rewrites each rule with the directory's relative prefix, so a nested ignore file only applies to its own subtree while a single `ignore` matcher accumulates rules from the top.
+
+Directories are tested with a trailing slash, as gitignore semantics require. Errors are swallowed, so an unreadable directory simply yields fewer files.
+
+```ts ! package-manager.ts
+	const root = rootDir ?? dir;
+	const ig = ignoreMatcher ?? ignore();
+	addIgnoreRules(ig, dir, root);
+
+	try {
+		const entries = readdirSync(dir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (entry.name.startsWith(".")) continue;
+			if (skipNodeModules && entry.name === "node_modules") continue;
+
+			const fullPath = join(dir, entry.name);
+			let isDir = entry.isDirectory();
+			let isFile = entry.isFile();
+```
+
+## !!steps Skill discovery has two modes
+
+`collectSkillEntries` implements two conventions. In `pi` mode (used for `skills/` directories), a folder containing `SKILL.md` is a skill and its scan stops there, while loose `.md` files directly in the root are also skills. In `agents` mode (for `.agents/skills`), only nested folders are scanned, so root-level markdown files are not treated as skills.
+
+The check for `SKILL.md` happens first and returns immediately, which means a skill folder cannot contain nested skills.
+
+```ts ! package-manager.ts
+			const relPath = toPosixPath(relative(root, fullPath));
+			const shouldIncludeMarkdownFile =
+				isFile &&
+				entry.name.endsWith(".md") &&
+				!ig.ignores(relPath) &&
+				((mode === "pi" && dir === root) || (mode === "agents" && dir !== root));
+			if (shouldIncludeMarkdownFile) {
+				entries.push(fullPath);
+				continue;
+			}
+
+			if (!isDir) continue;
+			if (ig.ignores(`${relPath}/`)) continue;
+
+			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+```
+
+## !!steps Extension entry points
+
+Extensions are not just files. `resolveExtensionEntries` treats a directory as one extension if its `package.json` has a `pi.extensions` manifest list (entries that exist), or else if it has `index.ts` or `index.js`. `collectAutoExtensionEntries` checks the directory itself first, and only if it has no entry points does it list loose `.ts` and `.js` files and one level of subdirectories.
+
+That lets `extensions/foo.ts` and `extensions/bar/index.ts` both work without configuration.
+
+```ts ! package-manager.ts
+function resolveExtensionEntries(dir: string): string[] | null {
+	const packageJsonPath = join(dir, "package.json");
+	if (existsSync(packageJsonPath)) {
+		const manifest = readPiManifest(packageJsonPath);
+		if (manifest?.extensions?.length) {
+			const entries: string[] = [];
+			for (const extPath of manifest.extensions) {
+				const resolvedExtPath = resolve(dir, extPath);
+				if (existsSync(resolvedExtPath)) {
+					entries.push(resolvedExtPath);
+				}
+			}
+			if (entries.length > 0) {
+				return entries;
+			}
+		}
+	}
+```
+
+## !!steps Parsing sources
+
+A source string becomes an npm, git or local source. `npm:` prefixes win, then anything `isLocalPath` recognizes, then `parseGitUrl` from [git.ts](/docs/src/utils/git.ts). Anything else falls through to a local path.
+
+For npm, the spec is split into name and version. A version is "pinned" only if it is an exact semver, in which case updates skip it; a range such as `^1.2.0` is kept as a range and constrains both the installed-version check and the update lookup.
+
+```ts ! package-manager.ts
+	private parseSource(source: string): ParsedSource {
+		if (source.startsWith("npm:")) {
+			const spec = source.slice("npm:".length).trim();
+			const { name, version } = this.parseNpmSpec(spec);
+			return {
+				type: "npm",
+				spec,
+				name,
+				version,
+				range: getNpmVersionRange(version),
+				pinned: isExactNpmVersion(version),
+			};
+		}
+
+		if (isLocalPath(source)) {
+			return { type: "local", path: source };
+		}
+```
+
+## !!steps Identity and project-over-user dedupe
+
+The same package can be configured in both user and project settings. `getPackageIdentity` reduces a source to `npm:name`, `git:host/path` (so SSH and HTTPS URLs of one repo match) or `local:` plus the resolved path.
+
+`dedupePackages` keeps the project entry when identities collide. The exception is a project entry with `autoload` false, which is a delta over the user entry: both are kept, so the project entry only toggles individual resources of the user's package.
+
+```ts ! package-manager.ts
+		const result: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		const seen = new Map<string, number>();
+		for (const entry of packages) {
+			const identity = this.getPackageIdentity(this.getPackageSourceString(entry.pkg), entry.scope);
+			const index = seen.get(identity);
+			if (index === undefined) {
+				seen.set(identity, result.length);
+				result.push(entry);
+				continue;
+			}
+			const existing = result[index];
+			if (existing?.scope === "project" && entry.scope === "user") {
+				if (typeof existing.pkg === "object" && existing.pkg.autoload === false) result.push(entry);
+			} else if (entry.scope === "project") {
+				result[index] = entry;
+			}
+		}
+		return result;
+```
+
+## !!steps The resolve pipeline
+
+`resolve` is the main entry. Project packages are listed before user ones and de-duplicated, then installed packages contribute resources. Next, top-level `extensions`, `skills`, `prompts` and `themes` settings entries are expanded for project first, then user. Auto-discovery of conventional directories follows, and finally built-in extensions are added.
+
+The accumulator only stores the first sighting of a path (`addResource` ignores later ones), so the order of these calls is itself a precedence rule.
+
+```ts ! package-manager.ts
+		// Collect all packages with scope (project first so cwd resources win collisions)
+		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		for (const pkg of projectSettings.packages ?? []) {
+			allPackages.push({ pkg, scope: "project" });
+		}
+		for (const pkg of globalSettings.packages ?? []) {
+			allPackages.push({ pkg, scope: "user" });
+		}
+
+		// Dedupe: project scope wins over global for same package identity
+		const packageSources = this.dedupePackages(allPackages);
+		await this.resolvePackageSources(packageSources, accumulator, onMissing);
+```
+
+## !!steps Installing what is missing, and going offline
+
+`resolvePackageSources` handles each source by type. Local paths are resolved against the scope's base directory. For npm and git it checks whether the install exists, and for npm also whether the installed version satisfies the configured range. If not, `installMissing` either installs directly, or asks `onMissing`.
+
+Under `PI_OFFLINE` set to `1`, `true` or `yes`, no install or refresh happens. Temporary git sources that are not pinned are refreshed on each resolve, but a failed refresh keeps the cached checkout.
+
+```ts ! package-manager.ts
+			const installMissing = async (): Promise<boolean> => {
+				if (isOfflineModeEnabled()) return false;
+				if (!onMissing) {
+					await this.installParsedSource(parsed, resolvedScope);
+					return true;
+				}
+				const action = await onMissing(resolvedSource);
+				if (action === "skip") return false;
+				if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
+				await this.installParsedSource(parsed, resolvedScope);
+				return true;
+			};
+```
+
+## !!steps Filters, manifests and conventions inside a package
+
+Once a package directory exists, `collectPackageResources` decides what it provides. If the settings entry has a filter object, each resource type is handled by `applyPackageFilter` (patterns applied to everything the package offers; an empty array disables that type), by the delta filter when `autoload` is false, or by the package defaults.
+
+Without a filter, a `pi` manifest in `package.json` lists the resources. Without either, conventional `extensions`, `skills`, `prompts` and `themes` directories are scanned. The boolean result tells local-directory callers whether the folder looked like a package at all.
+
+```ts ! package-manager.ts
+		if (filter) {
+			for (const resourceType of RESOURCE_TYPES) {
+				const patterns = filter[resourceType];
+				const target = this.getTargetMap(accumulator, resourceType);
+				if (filter.autoload === false) {
+					this.applyPackageDeltaFilter(packageRoot, patterns ?? [], resourceType, target, metadata);
+				} else if (patterns !== undefined) {
+					this.applyPackageFilter(packageRoot, patterns, resourceType, target, metadata);
+				} else {
+					this.collectDefaultResources(packageRoot, resourceType, target, metadata);
+				}
+			}
+			return true;
+		}
+```
+
+## !!steps Auto-discovery and the trust gate
+
+`addAutoDiscoveredResources` scans `.pi` (project) and the agent directory (user) for the four resource directories, and applies each settings list as overrides through `isEnabledByOverrides`. Project scanning, including `.agents/skills` directories found by walking up from the cwd to the git root, happens only when `isProjectTrusted()` is true, since project files can run code. User-level `~/.agents/skills` is always scanned.
+
+The same trust rule guards installs: `assertProjectTrustedForScope` throws before touching project package storage.
+
+```ts ! package-manager.ts
+		const userAgentsSkillsDir = join(getHomeDir(), ".agents", "skills");
+		const projectTrusted = this.settingsManager.isProjectTrusted();
+		const projectAgentsSkillDirs = projectTrusted
+			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))
+			: [];
+```
+
+## !!steps Git installs and the update marker
+
+A git install clones into a path under `git/host/path`, checks out the ref if there is one, and installs dependencies with the detected package manager, removing the half-built directory if anything fails. `resolveManagedPath` refuses any path that escapes the install root.
+
+Updating uses `ensureGitRef`: it fetches only the target ref and, if the head moved, writes a `.pi-update-incomplete` marker, runs `git reset --hard`, then `git clean -fdx` and reinstalls dependencies, deleting the marker last. If the marker is found on a later run, the clean and install is repeated, so an interrupted update self-heals.
+
+```ts ! package-manager.ts
+		const markerPath = this.getGitUpdateMarkerPath(targetDir);
+		if (localHead.trim() === targetHead.trim()) {
+			if (existsSync(markerPath)) {
+				await this.cleanAndInstallGitDependencies(targetDir, markerPath);
+			} else {
+				await this.repairMissingGitDependencies(targetDir);
+			}
+			return;
+		}
+
+		writeFileSync(markerPath, "", "utf-8");
+		await this.runCommand("git", ["reset", "--hard", commitRef], { cwd: targetDir });
+		await this.cleanAndInstallGitDependencies(targetDir, markerPath);
+```
+
+## !!steps Supporting npm, pnpm and bun
+
+The npm command is configurable in settings (`getNpmCommand`), and `getPackageManagerName` infers whether it is really npm, pnpm or bun, including wrapper commands. `getNpmInstallArgs` then builds matching flags for each. All three disable peer dependency resolution, because extension packages get pi's own packages from the host through loader aliases and a stale auto-installed peer could block updates.
+
+npm packages are installed into a private `npm` project directory with a generated `package.json`, not globally. For user scope, an older global install is still found as a legacy fallback.
+
+```ts ! package-manager.ts
+		if (packageManagerName === "bun") {
+			return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
+		}
+		if (packageManagerName === "pnpm") {
+			return [
+				"install",
+				...specs,
+				"--prefix",
+				installRoot,
+				"--config.auto-install-peers=false",
+				"--config.strict-peer-dependencies=false",
+				"--config.strict-dep-builds=false",
+			];
+		}
+		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps"];
+```
+
+## !!steps Bounded concurrency for update checks
+
+Update checks hit the network once per package, so they run through `runWithConcurrency`, a small worker pool: a fixed number of workers pull the next index from a shared counter and write results into a pre-sized array, which keeps result order equal to input order.
+
+`checkForAvailableUpdates` uses a limit of four, compares the installed npm version with `npm view` using `semver`, and compares git heads with `ls-remote`. Failures count as "no update" there, while `update` itself treats a failed version lookup as "needs update".
+
+```ts ! package-manager.ts
+		const results: T[] = new Array(tasks.length);
+		let nextIndex = 0;
+		const workerCount = Math.max(1, Math.min(limit, tasks.length));
+
+		const worker = async () => {
+			while (true) {
+				const index = nextIndex;
+				nextIndex += 1;
+				if (index >= tasks.length) {
+					return;
+				}
+				results[index] = await tasks[index]();
+			}
+		};
+
+		await Promise.all(Array.from({ length: workerCount }, () => worker()));
+		return results;
+```
+
+</Scrollycoding>
+
+The resolver feeds [resource-loader.ts](/docs/src/core/resource-loader.ts); interactive startup in [startup-ui.ts](/docs/src/cli/startup-ui.ts) and [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) use install, update and the update check, with progress events surfaced through `setProgressCallback`. Child processes are spawned through [child-process.ts](/docs/src/utils/child-process.ts), and output goes to stderr when [output-guard.ts](/docs/src/core/output-guard.ts) says stdout is taken over by a protocol mode.
+
+Structurally the file has a long block of pure helper functions at the top (patterns, directory walking, discovery), then one large class that mixes settings editing, resolution, installers and process runners. `checkForAvailableUpdates` exists on the class but not on the `PackageManager` interface.

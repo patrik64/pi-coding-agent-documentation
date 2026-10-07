@@ -1,0 +1,71 @@
+---
+title: "slash-commands.ts"
+description: "Contracts for slash commands: a contribution shape and a local registry service with register, replace, list and subscribe (experimental)"
+source: "src/experimental/services/slash-commands.ts"
+full: true
+---
+
+A slash command is a named action a user types, like `/model`. This file defines what a command looks like and what the registry offers. The registry class and the built-in commands are in [slash-commands-provider.ts](/docs/src/experimental/services/slash-commands-provider.ts).
+
+The registry is a local service, so only facets in the same process can see it. Commands are provided by facets, and a UI subscribes to the list to build its completion menu.
+
+<Scrollycoding>
+
+## !!steps Argument completion and run results
+
+A completion is a value, a label and optional description. The result of running a command is either an agent operation response, an agent queue response (both from [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts)), or `undefined` when the command has nothing to report.
+
+This means a command like `/compact` can hand back the controller's response directly, while `/model` returns nothing.
+
+```ts ! slash-commands.ts
+export interface SlashCommandCompletion {
+	readonly value: string;
+	readonly label: string;
+	readonly description?: string;
+}
+
+// !mark
+export type SlashCommandRunResult = AgentOperationResponse | AgentQueueResponse | undefined;
+```
+
+## !!steps A command contribution
+
+Name, description and hint are for display. `getArgumentCompletions` is optional and may be sync or async, and may return `null` to say there are no suggestions. `run` receives the raw argument string, not parsed arguments, so each command parses its own input.
+
+```ts ! slash-commands.ts
+export interface SlashCommandContribution {
+	readonly name: string;
+	readonly description?: string;
+	readonly argumentHint?: string;
+	// !mark(1:3)
+	getArgumentCompletions?(
+		argumentPrefix: string,
+	): readonly SlashCommandCompletion[] | null | Promise<readonly SlashCommandCompletion[] | null>;
+	// !mark
+	run(args: string, context: Context): SlashCommandRunResult | Promise<SlashCommandRunResult>;
+}
+```
+
+## !!steps A registry with replace semantics
+
+`register` is for new names, and `replace` exists for plugin reloads. The comment explains it: during a reload the old facet generation is still alive while the new one starts, so the same name has to exist twice for a moment.
+
+`list` returns the current commands and `subscribe` lets a consumer react to changes. Every method that adds something returns an unregister function. The token is `pi.local.slash-commands`, marked local.
+
+```ts ! slash-commands.ts
+export interface SlashCommands {
+	register(command: SlashCommandContribution): () => void;
+	// !mark(1:2)
+	/** Stage a same-name replacement while the previous facet generation retires. */
+	replace(command: SlashCommandContribution): () => void;
+	list(): readonly SlashCommandContribution[];
+	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void;
+}
+
+// !mark
+export const SlashCommands = defineService<SlashCommands>("pi.local.slash-commands", { local: true });
+```
+
+</Scrollycoding>
+
+The registry implementation in [slash-commands-provider.ts](/docs/src/experimental/services/slash-commands-provider.ts) is where the duplicate-name behavior is actually defined. This file only describes the surface.

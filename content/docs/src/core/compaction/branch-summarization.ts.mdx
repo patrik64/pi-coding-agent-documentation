@@ -1,0 +1,206 @@
+---
+title: "branch-summarization.ts"
+description: "Summarizes the branch you are leaving when you navigate to another point in the session tree, so its context is not lost"
+source: "src/core/compaction/branch-summarization.ts"
+full: true
+---
+
+Sessions in pi are trees. When you jump to a different node with `/tree`, the conversation you were on becomes an abandoned branch. This file produces a summary of that branch, which is stored as a `branch_summary` entry at the new position so the model still knows what was explored.
+
+It is a sibling of [compaction.ts](/docs/src/core/compaction/compaction.ts) and borrows its token estimator, its single LLM call wrapper and its failure check. The file-operation tracking comes from [utils.ts](/docs/src/core/compaction/utils.ts). The caller is the tree navigation code in [agent-session.ts](/docs/src/core/agent-session.ts), which also lets extensions override or replace the result through the `session_before_tree` event in [types.ts](/docs/src/core/extensions/types.ts).
+
+<Scrollycoding>
+
+## !!steps What gets summarized: the path back to the common ancestor
+
+`collectEntriesForBranchSummary` finds the deepest node shared by the old position and the target. It builds a set of ids on the old branch, then scans the target's path from the leaf back toward the root and takes the first hit.
+
+It then walks parent pointers from the old leaf up to that ancestor and reverses the list into chronological order. The comment is explicit that it does not stop at compaction boundaries, so an earlier compaction summary on the abandoned branch is included and becomes part of what is summarized. With no old leaf there is nothing to summarize and the result is empty.
+
+The session is passed as a `ReadonlySessionManager` from [session-manager.ts](/docs/src/core/session-manager.ts).
+
+```ts ! branch-summarization.ts
+	// Find common ancestor (deepest node that's on both paths)
+	const oldPath = new Set(session.getBranch(oldLeafId).map((e) => e.id));
+	const targetPath = session.getBranch(targetId);
+
+	// targetPath is root-first, so iterate backwards to find deepest common ancestor
+	let commonAncestorId: string | null = null;
+	for (let i = targetPath.length - 1; i >= 0; i--) {
+		// !mark(1:4)
+		if (oldPath.has(targetPath[i].id)) {
+			commonAncestorId = targetPath[i].id;
+			break;
+		}
+	}
+
+	// Collect entries from old leaf back to common ancestor
+	const entries: SessionEntry[] = [];
+	let current: string | null = oldLeafId;
+
+	while (current && current !== commonAncestorId) {
+		const entry = session.getEntry(current);
+		if (!entry) break;
+		entries.push(entry);
+		current = entry.parentId;
+	}
+```
+
+## !!steps Turning entries into messages
+
+`getMessageFromEntry` maps each session entry to at most one message. Tool results are dropped on purpose: the assistant's tool call already records what happened, and the result bodies are often large. Custom messages, branch summaries and compaction entries become their message equivalents using the factories in [messages.ts](/docs/src/core/messages.ts).
+
+Bookkeeping entries such as model changes, labels and session info yield nothing. The switch has no default, so a new entry type added to the union would make the function's return type incomplete and be flagged by the compiler.
+
+```ts ! branch-summarization.ts
+function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
+	switch (entry.type) {
+		case "message":
+			// Skip tool results - context is in assistant's tool call
+			// !mark
+			if (entry.message.role === "toolResult") return undefined;
+			return entry.message;
+
+		case "custom_message":
+			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
+
+		case "branch_summary":
+			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
+
+		case "compaction":
+			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+```
+
+## !!steps Two passes: file tracking first, then the token budget
+
+`prepareBranchEntries` makes two passes. The first scans every entry for earlier `branch_summary` entries that pi itself produced (not ones flagged `fromHook`) and merges their `readFiles` and `modifiedFiles`. It does this before any budget applies, so cumulative file tracking survives even when old content gets dropped.
+
+The second pass goes newest to oldest and prepends messages until the budget is hit. Recent context therefore wins over old context. A budget of zero means no limit.
+
+```ts ! branch-summarization.ts
+	for (const entry of entries) {
+		// !mark
+		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
+			const details = entry.details as BranchSummaryDetails;
+			if (Array.isArray(details.readFiles)) {
+				for (const f of details.readFiles) fileOps.read.add(f);
+			}
+			if (Array.isArray(details.modifiedFiles)) {
+				// Modified files go into both edited and written for proper deduplication
+				for (const f of details.modifiedFiles) {
+					fileOps.edited.add(f);
+				}
+			}
+		}
+	}
+```
+
+## !!steps Summaries get a second chance at the budget
+
+When the next message would overflow the budget, the loop usually stops. The exception is a `compaction` or `branch_summary` entry, which is treated as important context: it is still added if the running total is under 90 percent of the budget. The loop then breaks either way, so older entries are never considered.
+
+One subtlety follows from the order of statements. `extractFileOpsFromMessage` runs before the budget check, so file operations of the message that triggers the cutoff are still recorded even though its text is not included.
+
+```ts ! branch-summarization.ts
+		// Extract file ops from assistant messages (tool calls)
+		extractFileOpsFromMessage(message, fileOps);
+
+		const tokens = estimateTokens(message);
+
+		// Check budget before adding
+		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
+			// If this is a summary entry, try to fit it anyway as it's important context
+			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				// !mark
+				if (totalTokens < tokenBudget * 0.9) {
+					messages.unshift(message);
+					totalTokens += tokens;
+				}
+			}
+			// Stop - we've hit the budget
+			break;
+		}
+```
+
+## !!steps The prompt and its framing preamble
+
+The branch prompt asks for the same headings as the compaction prompt (Goal, Constraints, Progress, Key Decisions, Next Steps) but omits the Critical Context section and does not have an update variant, since a branch is summarized once.
+
+`BRANCH_SUMMARY_PREAMBLE` is prepended to the model's output later. It tells whoever reads the summary in the new branch that the user explored a different path before returning.
+
+```ts ! branch-summarization.ts
+const BRANCH_SUMMARY_PREAMBLE = `The user explored a different conversation branch before returning here.
+Summary of that exploration:
+
+`;
+
+const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
+
+Use this EXACT format:
+
+## Goal
+[What was the user trying to accomplish in this branch?]
+// ...
+## Next Steps
+1. [What should happen next to continue this work]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+```
+
+## !!steps Budget, instructions and the model call
+
+`generateBranchSummary` derives the history budget as the context window (128000 when the model reports none) minus `reserveTokens`, which defaults to 16384. The output is capped at 4096 tokens, or the model's own limit if smaller.
+
+Custom instructions can either be appended as "Additional focus" or, with `replaceInstructions`, replace the whole prompt. The conversation is serialized to text and wrapped in tags, like in compaction, before the call goes through `completeSummarization` with the caller's `streamFn` and retry policy.
+
+```ts ! branch-summarization.ts
+	// Token budget = context window minus reserved space for prompt + response
+	const contextWindow = model.contextWindow || 128000;
+	const tokenBudget = contextWindow - reserveTokens;
+
+	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
+
+	if (messages.length === 0) {
+		return { summary: "No content to summarize" };
+	}
+	// ...
+	// Build prompt
+	let instructions: string;
+	// !mark(1:5)
+	if (replaceInstructions && customInstructions) {
+		instructions = customInstructions;
+	} else if (customInstructions) {
+		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	} else {
+		instructions = BRANCH_SUMMARY_PROMPT;
+	}
+```
+
+## !!steps Failures are values, not exceptions
+
+Unlike `compact`, which throws on a bad response, this function returns a `BranchSummaryResult` describing the outcome. An aborted request yields `aborted: true`, and a provider error, a truncated generation or an attempted tool call yields an `error` string. That lets tree navigation cancel cleanly instead of unwinding through exceptions.
+
+On success it prepends the preamble and appends the read and modified file lists. The final `summary || "No summary generated"` can never take its fallback, because the preamble is always non-empty by that point.
+
+```ts ! branch-summarization.ts
+	// Check if aborted or errored
+	if (response.stopReason === "aborted") {
+		return { aborted: true };
+	}
+	const failure = getSummarizationFailure(response, "Branch summarization");
+	if (failure) {
+		return { error: failure };
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		return { error: "Branch summarization attempted to call a tool" };
+	}
+
+	let summary = contentText(response.content);
+
+	// Prepend preamble to provide context about the branch summary
+	summary = BRANCH_SUMMARY_PREAMBLE + summary;
+```
+
+</Scrollycoding>
+
+Branch summarization is the smaller cousin of compaction: same prompt family, same call wrapper, same file-list convention, but driven by tree navigation rather than context pressure. The result's `readFiles` and `modifiedFiles` are saved as the `details` of the new `branch_summary` entry, which is what the first pass of `prepareBranchEntries` reads back the next time a branch containing it is summarized.

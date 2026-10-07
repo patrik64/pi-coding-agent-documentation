@@ -1,0 +1,7 @@
+{
+  "title": "commands",
+  "pages": [
+    "client.ts",
+    "server.ts"
+  ]
+}

@@ -1,0 +1,142 @@
+---
+title: "extension-input.ts"
+description: "A one-line text prompt dialog for extensions, with optional initial value, description and auto-cancel timeout"
+source: "src/modes/interactive/components/extension-input.ts"
+full: true
+---
+
+When an extension needs a short piece of text from the user, this component is what gets shown. It wraps pi-tui's `Input` widget in the same bordered frame used by the other extension dialogs, and adds an optional countdown that cancels the prompt.
+
+It implements `Focusable` so that focus can be forwarded to the inner input, which matters for IME cursor placement. Sister components are [extension-selector.ts](/docs/src/modes/interactive/components/extension-selector.ts) for lists and [extension-editor.ts](/docs/src/modes/interactive/components/extension-editor.ts) for multi-line text.
+
+<Scrollycoding>
+
+## !!steps Options and fields
+
+The options object is all optional: a `tui` for the countdown, a timeout in seconds, an initial value and a description. The component keeps the base title and a reference to the title `Text` so a countdown can rewrite the visible title without losing the original wording.
+
+```ts ! extension-input.ts
+export interface ExtensionInputOptions {
+// !mark
+	tui?: TUI;
+	timeout?: number;
+	initialValue?: string;
+	description?: string;
+}
+
+export class ExtensionInputComponent extends Container implements Focusable {
+	private input: Input;
+	private onSubmitCallback: (value: string) => void;
+	private onCancelCallback: () => void;
+	private titleText: Text;
+	private baseTitle: string;
+// !mark
+	private countdown: CountdownTimer | undefined;
+```
+
+## !!steps Forwarding focus to the input
+
+The container is what the TUI focuses, but the hardware cursor must sit inside the input field. The `focused` setter therefore copies the flag to the inner `Input`. The comment names the reason: IME composition windows are positioned from the cursor.
+
+```ts ! extension-input.ts
+	// Focusable implementation - propagate to input for IME cursor positioning
+	private _focused = false;
+	get focused(): boolean {
+		return this._focused;
+	}
+// !mark(1:3)
+	set focused(value: boolean) {
+		this._focused = value;
+		this.input.focused = value;
+	}
+```
+
+## !!steps Frame and countdown
+
+The constructor takes a `_placeholder` parameter that it never reads; the argument is accepted for signature compatibility but no placeholder is ever shown. The countdown is created only when a positive timeout and a `tui` are both supplied, and its expiry callback is the cancel callback.
+
+```ts ! extension-input.ts
+	constructor(
+		title: string,
+// !mark
+		_placeholder: string | undefined,
+		onSubmit: (value: string) => void,
+		onCancel: () => void,
+		opts?: ExtensionInputOptions,
+	) {
+		super();
+
+		this.onSubmitCallback = onSubmit;
+		this.onCancelCallback = onCancel;
+		this.baseTitle = title;
+
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+
+		this.titleText = new Text(theme.fg("accent", title), 1, 0);
+		this.addChild(this.titleText);
+		if (opts?.description) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(theme.fg("text", opts.description), 1, 0));
+		}
+		this.addChild(new Spacer(1));
+
+// !mark
+		if (opts?.timeout && opts.timeout > 0 && opts.tui) {
+			this.countdown = new CountdownTimer(
+				opts.timeout,
+				opts.tui,
+// !mark(1:2)
+				(s) => this.titleText.setText(theme.fg("accent", `${this.baseTitle} (${s}s)`)),
+				() => this.onCancelCallback(),
+			);
+		}
+```
+
+## !!steps Input widget and hint
+
+The `Input` is created after the countdown, optionally pre-filled with the initial value. A hint line with the confirm and cancel keys comes from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), followed by the closing border.
+
+```ts ! extension-input.ts
+		this.input = new Input();
+// !mark
+		if (opts?.initialValue) this.input.setValue(opts.initialValue);
+		this.addChild(this.input);
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new Text(`${keyHint("tui.select.confirm", "submit")}  ${keyHint("tui.select.cancel", "cancel")}`, 1, 0),
+		);
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder());
+	}
+```
+
+## !!steps Key handling and disposal
+
+Confirm submits the current value. Both the bound confirm key and a bare newline are accepted. Cancel calls the cancel callback, and everything else is passed to the input for typing and cursor movement. `dispose` stops the countdown timer so it cannot fire after the dialog is gone.
+
+```ts ! extension-input.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+// !mark
+		if (kb.matches(keyData, "tui.select.confirm") || keyData === "\n") {
+			this.onSubmitCallback(this.input.getValue());
+// !mark
+		} else if (kb.matches(keyData, "tui.select.cancel")) {
+			this.onCancelCallback();
+		} else {
+// !mark
+			this.input.handleInput(keyData);
+		}
+	}
+
+// !mark(1:3)
+	dispose(): void {
+		this.countdown?.dispose();
+	}
+}
+```
+
+</Scrollycoding>
+
+The component is re-exported from the package entry [index.ts](/docs/src/index.ts) so extensions can show it, and the extension API types are described in [types.ts](/docs/src/core/extensions/types.ts). The countdown logic itself lives in [countdown-timer.ts](/docs/src/modes/interactive/components/countdown-timer.ts), and the frame in [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts).

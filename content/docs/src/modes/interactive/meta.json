@@ -1,0 +1,15 @@
+{
+  "title": "interactive",
+  "pages": [
+    "components",
+    "theme",
+    "bug-report.ts",
+    "chat-viewport.ts",
+    "external-editor.ts",
+    "interactive-mode.ts",
+    "model-catalog-refresh.ts",
+    "model-search.ts",
+    "session-share.ts",
+    "tui-renderer.ts"
+  ]
+}

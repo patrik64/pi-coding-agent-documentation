@@ -1,0 +1,90 @@
+---
+title: "ansi.ts"
+description: "Strips ANSI escape sequences from strings, adapted from ansi-regex and strip-ansi"
+source: "src/utils/ansi.ts"
+full: true
+---
+
+`ansi.ts` is a vendored, trimmed copy of two small MIT-licensed libraries by Sindre Sorhus, kept in-repo to avoid a dependency. It exposes one function, `stripAnsi`, used when output must be measured or stored as plain text; for example in [bash-executor.ts](/docs/src/core/bash-executor.ts) and tool rendering.
+
+The license header is preserved at the top of the file, as the MIT terms require.
+
+<Scrollycoding>
+
+## !!steps Attribution header
+
+Lines 1 to 27 carry the original copyright and permission notice. Everything below is derived from `ansi-regex` and `strip-ansi`.
+
+```ts ! ansi.ts
+/*
+ * Portions of this file are derived from:
+ * - ansi-regex (https://github.com/chalk/ansi-regex)
+ * - strip-ansi (https://github.com/chalk/strip-ansi)
+ *
+ * MIT License
+ *
+ * Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+ *
+// ...
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+```
+
+## !!steps Building the regex
+
+`ansiRegex` combines two alternatives: OSC sequences (`ESC ]` up to the first string terminator) and CSI sequences (an introducer, optional intermediates, numeric parameters separated by `;` or `:`, and a final byte). The terminator may be BEL, `ESC \\` or the 8-bit `0x9c`.
+
+```ts ! ansi.ts
+function ansiRegex({ onlyFirst = false }: { onlyFirst?: boolean } = {}): RegExp {
+	// Valid string terminator sequences are BEL, ESC\, and 0x9c
+	const ST = "(?:\\u0007|\\u001B\\u005C|\\u009C)";
+
+	// OSC sequences only: ESC ] ... ST (non-greedy until the first ST)
+	const osc = `(?:\\u001B\\][\\s\\S]*?${ST})`;
+
+	// CSI and related: ESC/C1, optional intermediates, optional params (supports ; and :) then final byte
+	const csi = "[\\u001B\\u009B][[\\]()#;?]*(?:\\d{1,4}(?:[;:]\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]";
+
+	// !mark
+	const pattern = `${osc}|${csi}`;
+
+	return new RegExp(pattern, onlyFirst ? undefined : "g");
+}
+```
+
+## !!steps Compiled once
+
+The global regex is created at module load and reused. The `onlyFirst` option is never used in this file, so the non-global variant is dead in practice.
+
+```ts ! ansi.ts
+// !mark
+const regex = ansiRegex();
+```
+
+## !!steps stripAnsi and its fast path
+
+The function rejects non-strings with a `TypeError`. It then returns early when the value contains neither `ESC` nor the 8-bit CSI character, skipping the regex for the common plain-text case. The comment explains why `lastIndex` need not be reset: `replace` handles that itself.
+
+```ts ! ansi.ts
+export function stripAnsi(value: string): string {
+	if (typeof value !== "string") {
+		throw new TypeError(`Expected a \`string\`, got \`${typeof value}\``);
+	}
+
+	// !mark(1:4)
+	// Fast path: ANSI codes require ESC (7-bit) or CSI (8-bit) introducer
+	if (!value.includes("\u001B") && !value.includes("\u009B")) {
+		return value;
+	}
+
+	// Even though the regex is global, we don't need to reset the `.lastIndex`
+	// because unlike `.exec()` and `.test()`, `.replace()` does it automatically
+	// and doing it manually has a performance penalty.
+	return value.replace(regex, "");
+}
+```
+
+</Scrollycoding>
+
+The module has no dependencies and no state besides the compiled regex, so it is safe to import anywhere. Width-aware text handling lives elsewhere in the TUI packages; this file only removes escapes.

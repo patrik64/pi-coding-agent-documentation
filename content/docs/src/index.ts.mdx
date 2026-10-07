@@ -1,0 +1,401 @@
+---
+title: "index.ts"
+description: "The package's public entry point: a barrel that re-exports the SDK, extension API, tools, run modes, UI components and utilities"
+source: "src/index.ts"
+full: true
+---
+
+This file contains no logic. It is the list of everything a consumer of the
+coding-agent package can import: someone embedding the agent as a library,
+writing an extension, or building a custom UI on top of the same components
+the CLI uses.
+
+Reading it top to bottom is a map of the package. Core session management
+comes first, then the extension system, then model and resource plumbing, then
+tools, built-in extensions, run modes and finally UI and utility helpers. If a
+symbol is not exported here, it is internal.
+
+<Scrollycoding>
+
+## !!steps Arguments, config paths and the session class
+
+The first exports are the small stable pieces: the CLI argument parser from
+[args.ts](/docs/src/cli/args.ts), the path helpers and `VERSION` from
+[config.ts](/docs/src/config.ts), and the central class from
+[agent-session.ts](/docs/src/core/agent-session.ts) together with its event,
+config and stats types.
+
+`parseSkillBlock` is exported alongside `AgentSession` because UIs need to
+recognize the `skill` wrapper that the session puts around expanded skill
+commands.
+
+```ts ! index.ts
+// Core session management
+
+export { type Args, parseArgs } from "./cli/args.ts";
+
+// Config paths
+export {
+	CONFIG_DIR_NAME,
+	getAgentDir,
+	getDocsPath,
+	getExamplesPath,
+	getPackageDir,
+	getReadmePath,
+	VERSION,
+} from "./config.ts";
+// !mark(1:9)
+export {
+	AgentSession,
+	type AgentSessionConfig,
+	type AgentSessionEvent,
+	type AgentSessionEventListener,
+	type ModelCycleResult,
+	type ParsedSkillBlock,
+	type PromptOptions,
+	parseSkillBlock,
+	type SessionStats,
+} from "./core/agent-session.ts";
+```
+
+## !!steps Compaction and the event bus
+
+Compaction is exported as a whole toolkit rather than just a function:
+`compact`, `shouldCompact`, `findCutPoint`, token estimators, branch-summary
+generators and the default settings. Extensions that implement their own
+compaction (via `session_before_compact`) need these helpers to produce
+results shaped like the built-in one. They come from
+[compaction/index.ts](/docs/src/core/compaction/index.ts).
+
+The event bus factory from [event-bus.ts](/docs/src/core/event-bus.ts) is
+exported so hosts can create the bus extensions communicate over.
+
+```ts ! index.ts
+// Compaction
+export {
+	type BranchPreparation,
+	type BranchSummaryResult,
+	type CollectEntriesResult,
+	type CompactionResult,
+	type CutPointResult,
+	calculateContextTokens,
+	collectEntriesForBranchSummary,
+	// !mark(1:2)
+	compact,
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateTokens,
+	type FileOperations,
+	findCutPoint,
+	findTurnStartIndex,
+// ...
+	shouldCompact,
+} from "./core/compaction/index.ts";
+export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
+```
+
+## !!steps The extension API surface
+
+By far the longest block is a type-only re-export from
+[extensions/index.ts](/docs/src/core/extensions/index.ts): every event type
+(`ToolCallEvent`, `SessionBeforeCompactEvent`, `BeforeProviderRequestEvent`
+and so on), their result types, the context objects handlers receive, and the
+UI context. This is the contract extension authors code against.
+
+Keeping it `export type` means none of it costs anything at runtime.
+
+```ts ! index.ts
+// Extension system
+export type {
+	AfterProviderResponseEvent,
+	AgentActivityOutcome,
+	AgentBeforeSettleEvent,
+	AgentBeforeSettleEventResult,
+	AgentEndEvent,
+	AgentSettledEvent,
+	AgentStartEvent,
+// ...
+	// !mark(1:3)
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+// ...
+	WriteToolCallEvent,
+} from "./core/extensions/index.ts";
+```
+
+## !!steps Extension runtime values
+
+The value exports from the same module are the things an extension or host
+calls: `ExtensionRunner`, `discoverAndLoadExtensions`, `defineTool`, and the
+`is*ToolResult` and `isToolCallEventType` type guards that narrow events to
+a specific built-in tool.
+
+The guards exist because tool events are a discriminated union by tool name
+only at runtime; they give handlers typed access to `input` and `details`.
+
+```ts ! index.ts
+export {
+	createExtensionRuntime,
+	// !mark(1:2)
+	defineTool,
+	discoverAndLoadExtensions,
+	ExtensionRunner,
+	isBashToolResult,
+	isEditToolResult,
+	isFindToolResult,
+	isGrepToolResult,
+	isLsToolResult,
+	isPowerShellToolResult,
+	isReadToolResult,
+	// !mark
+	isToolCallEventType,
+	isWriteToolResult,
+	wrapRegisteredTool,
+	wrapRegisteredTools,
+} from "./core/extensions/index.ts";
+```
+
+## !!steps Models, resources and packages
+
+A middle group exposes model and resource plumbing: `ModelRegistry` from
+[model-registry.ts](/docs/src/core/model-registry.ts), the CLI model resolvers
+from [model-resolver.ts](/docs/src/core/model-resolver.ts), and
+`ModelRuntime` with its credential-sync error from
+[model-runtime.ts](/docs/src/core/model-runtime.ts).
+
+It also exports the package manager and resource loader types
+(`DefaultPackageManager`, `DefaultResourceLoader`, `loadProjectContextFiles`),
+which let an SDK user build their own loader and hand it to
+`createAgentSession`.
+
+```ts ! index.ts
+export { ModelRegistry } from "./core/model-registry.ts";
+export {
+	type ModelScopeDiagnostic,
+	type ResolveCliModelResult,
+	type ResolveModelScopeResult,
+	// !mark(1:2)
+	resolveCliModel,
+	resolveModelScopeWithDiagnostics,
+	type ScopedModel,
+} from "./core/model-resolver.ts";
+export {
+	type CreateModelRuntimeOptions,
+	CredentialSynchronizationError,
+	// !mark
+	ModelRuntime,
+	type ModelRuntimeAuthOverrides,
+} from "./core/model-runtime.ts";
+```
+
+## !!steps The SDK factories
+
+This block is the programmatic API proper, re-exported from
+[sdk.ts](/docs/src/core/sdk.ts) (which in turn re-exports
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts)):
+`createAgentSession`, the services pair, `createAgentSessionRuntime`,
+`AgentSessionRuntime`, and the per-tool factories for custom working
+directories.
+
+Two lines are worth noticing: the comments `// Factory` and `// Tool
+factories` appear inline between names, and the list is sorted
+alphabetically by the formatter, so the "factory" comment sits in the middle
+rather than heading a group.
+
+```ts ! index.ts
+// SDK for programmatic usage
+export {
+	AgentSessionRuntime,
+	type AgentSessionRuntimeDiagnostic,
+	type AgentSessionServices,
+	type CreateAgentSessionFromServicesOptions,
+	type CreateAgentSessionOptions,
+	type CreateAgentSessionResult,
+	type CreateAgentSessionRuntimeFactory,
+	type CreateAgentSessionRuntimeResult,
+	type CreateAgentSessionServicesOptions,
+	// Factory
+	// !mark(1:4)
+	createAgentSession,
+	createAgentSessionFromServices,
+	createAgentSessionRuntime,
+	createAgentSessionServices,
+	createBashTool,
+	// Tool factories (for custom cwd)
+	createCodingTools,
+```
+
+## !!steps Session files, settings and skills
+
+The session-manager block exports the on-disk format: entry types, the
+`CURRENT_SESSION_VERSION`, `parseSessionEntries`, `migrateSessionEntries` and
+the context builders. These let external tools read or convert session JSONL
+files without going through a live session; see
+[session-manager.ts](/docs/src/core/session-manager.ts).
+
+Settings (`SettingsManager` and its option types) and skill loading
+(`loadSkills`, `formatSkillsForPrompt`) follow, from
+[settings-manager.ts](/docs/src/core/settings-manager.ts) and
+[skills.ts](/docs/src/core/skills.ts).
+
+```ts ! index.ts
+export {
+	type BranchSummaryEntry,
+	buildContextEntries,
+	buildSessionContext,
+	buildSessionProjection,
+	type CompactionEntry,
+	type ContextEditableContent,
+	type ContextEditEntry,
+	// !mark(1:2)
+	CURRENT_SESSION_VERSION,
+	type CustomEntry,
+// ...
+	migrateSessionEntries,
+	type NewSessionOptions,
+	type ProjectedSessionEntry,
+	// !mark
+	parseSessionEntries,
+// ...
+} from "./core/session-manager.ts";
+```
+
+## !!steps Built-in tools
+
+The tools block exports, per tool, an operations interface (for example
+`BashOperations`, `EditOperations`), input and details types, the
+`create*ToolDefinition` builders, and shared truncation helpers
+(`truncateHead`, `truncateTail`, `DEFAULT_MAX_BYTES`, `DEFAULT_MAX_LINES`).
+
+The `*Operations` interfaces are the pluggable seam: an SDK user can supply
+remote file or shell operations (for SSH or a container) while keeping the
+built-in tool logic. Everything originates in
+[tools/index.ts](/docs/src/core/tools/index.ts).
+
+```ts ! index.ts
+// Tools
+export {
+	type BashOperations,
+	type BashSpawnContext,
+	type BashSpawnHook,
+	type BashToolDetails,
+	type BashToolInput,
+	type BashToolOptions,
+	// !mark(1:2)
+	createBashToolDefinition,
+	createEditToolDefinition,
+// ...
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	type EditOperations,
+// ...
+	// !mark(1:3)
+	truncateHead,
+	truncateLine,
+	truncateTail,
+```
+
+## !!steps Built-in extensions and trust
+
+Some features ship as extensions rather than core code: codemode, MCP and
+tool search. The comment states the rule: the CLI loads them automatically,
+whereas SDK sessions must add them to their extension factories explicitly.
+They live in
+[codemode/index.ts](/docs/src/extensions/codemode/index.ts),
+[mcp/index.ts](/docs/src/extensions/mcp/index.ts) and
+[tool-search/index.ts](/docs/src/extensions/tool-search/index.ts).
+
+Just above, the trust store and virtual-model route types are exported for
+hosts that manage project trust or implement routed models.
+
+```ts ! index.ts
+// Built-in extensions. The CLI loads them; SDK sessions add them to their extension factories.
+// !mark
+export { type CodemodeExtensionOptions, createCodemodeExtension } from "./extensions/codemode/index.ts";
+export type { CodemodeStoreEntryData, CodemodeToolDetails } from "./extensions/codemode/tool.ts";
+export type { LoadedMcpConfig, McpExposure, McpServerConfig, McpServerEntry } from "./extensions/mcp/config.ts";
+// !mark(1:2)
+export { createMcpExtension, type McpExtensionOptions, type McpTransportFactory } from "./extensions/mcp/index.ts";
+export { createToolSearchExtension } from "./extensions/tool-search/index.ts";
+```
+
+## !!steps Run modes
+
+The last big group exposes the three ways of running the agent as a library:
+`InteractiveMode` (the TUI), `runPrintMode`, and `runRpcMode` together with
+`RpcClient` and the RPC command and response types, all from
+[modes/index.ts](/docs/src/modes/index.ts). `main` and `MainOptions` from
+[main.ts](/docs/src/main.ts) export the whole CLI as a function.
+
+An embedder can therefore either run the stock CLI, or assemble a session via
+the SDK and drive it with one of these modes.
+
+```ts ! index.ts
+// Main entry point
+export { type MainOptions, main } from "./main.ts";
+// Run modes for programmatic SDK usage
+export {
+	// !mark
+	InteractiveMode,
+	type InteractiveModeOptions,
+	type JsonAgentSessionEvent,
+	type ModelInfo,
+	type PrintModeOptions,
+	// !mark
+	RpcClient,
+	type RpcClientOptions,
+	type RpcCommand,
+	type RpcEventListener,
+	type RpcExtensionUIRequest,
+	type RpcExtensionUIResponse,
+	type RpcResponse,
+	type RpcSessionState,
+	// !mark(1:2)
+	runPrintMode,
+	runRpcMode,
+} from "./modes/index.ts";
+```
+
+## !!steps UI components, themes and utilities
+
+The tail serves extensions that render their own TUI: message and tool
+components, selectors, `BorderedLoader`, `renderDiff`, and `keyHint` from
+[components/index.ts](/docs/src/modes/interactive/components/index.ts), plus
+theme helpers from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+Finally come small utilities: `copyToClipboard`
+([clipboard.ts](/docs/src/utils/clipboard.ts)), frontmatter parsing, image
+conversion and resizing, MIME sniffing and shell config.
+
+```ts ! index.ts
+// Theme utilities for custom tools and extensions
+export {
+	getLanguageFromPath,
+	getMarkdownTheme,
+	getSelectListTheme,
+	getSettingsListTheme,
+	highlightCode,
+	// !mark
+	initTheme,
+	Theme,
+// ...
+} from "./modes/interactive/theme/theme.ts";
+// Clipboard utilities
+// !mark
+export { copyToClipboard } from "./utils/clipboard.ts";
+export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.ts";
+export { convertToPng } from "./utils/image-convert.ts";
+```
+
+</Scrollycoding>
+
+Almost nothing imports this file inside the package; the exception is
+[virtual-modules.ts](/docs/src/core/extensions/virtual-modules.ts), which
+bundles the whole barrel so extensions can import the package by name. Because it is a pure barrel, the real
+documentation for each name lives on the page of the module it comes from, and
+the Code Graph edges from this page are effectively the package's public
+surface.
+
+One structural note: the export list is hand-maintained and alphabetized by the
+formatter, so a symbol added to an internal module only becomes public when
+someone also adds it here.

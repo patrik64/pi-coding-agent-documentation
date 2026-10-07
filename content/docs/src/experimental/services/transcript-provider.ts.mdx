@@ -1,0 +1,44 @@
+---
+title: "transcript-provider.ts"
+description: "Facet factory that serves a conversation's durable view state as the Transcript service (experimental)"
+source: "src/experimental/services/transcript-provider.ts"
+full: true
+---
+
+This is the provider side of [transcript.ts](/docs/src/experimental/services/transcript.ts). It is one function that asks the conversation for its view state and wraps it in a chord facet.
+
+The only subtlety is ownership: the facet takes responsibility for disposing the attached state when the facet goes away.
+
+<Scrollycoding>
+
+## !!steps Attach first, build the facet second
+
+The function is async because `conversation.viewState` has to attach a replicated view before anything can use it. The `Context` parameter is passed through to that call. In [worker.ts](/docs/src/experimental/services/worker.ts) it is the background context, since this runs at startup and not on behalf of a client.
+
+```ts ! transcript-provider.ts
+/** Serve the conversation's durable view state. The facet owns and disposes the attached state. */
+export async function createTranscriptServiceFacet(conversation: Conversation, context: Context): Promise<Facet> {
+	// !mark
+	const state = await conversation.viewState(context);
+```
+
+## !!steps The facet owns the state
+
+Inside `setup`, `env.own` registers a disposer so the state is released when the facet is torn down or reloaded. Then `env.provide` publishes the service under the `Transcript` token with the state as its only member.
+
+The id `@pi/transcript` identifies the facet in the facet host, which matters when plugins are reloaded and built-in facets must stay stable.
+
+```ts ! transcript-provider.ts
+	return defineFacet({
+		id: "@pi/transcript",
+		setup(env) {
+			// !mark(1:2)
+			env.own(() => state.dispose());
+			env.provide(Transcript, { state });
+		},
+	});
+```
+
+</Scrollycoding>
+
+This provider is the thinnest of the built-in facets next to [models-provider.ts](/docs/src/experimental/services/models-provider.ts), which also acquires a document up front and disposes it through `env.own`.

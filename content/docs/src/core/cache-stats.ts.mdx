@@ -1,0 +1,203 @@
+---
+title: "cache-stats.ts"
+description: "Detects prompt-cache misses across a session's assistant messages and totals the extra tokens and dollars they cost"
+source: "src/core/cache-stats.ts"
+full: true
+---
+
+Prompt caching makes repeated prompts cheap, but only if the next request
+starts with the same prefix and arrives before the cache expires. When a turn
+re-bills content that was in the previous prompt, the user pays more without
+any visible sign. This file computes that waste from the usage numbers already
+stored on assistant messages.
+
+The input is the list of session entries from
+[session-manager.ts](/docs/src/core/session-manager.ts), plus a small price
+lookup satisfied by [model-runtime.ts](/docs/src/core/model-runtime.ts). The
+related keep-alive feature is [cache-warmer.ts](/docs/src/core/cache-warmer.ts),
+whose `cache_warm` usage entries are read here.
+
+<Scrollycoding>
+
+## !!steps Constants and result types
+
+Two thresholds define what counts. The TTL (5 minutes, Anthropic's default) is
+exported so other code can mention idle time as a likely cause. The noise floor
+of 1024 tokens ignores small differences caused by where cache breakpoints
+fall.
+
+```ts ! cache-stats.ts
+export const CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Per-turn misses at or below this are cache breakpoint granularity noise. */
+const NOISE_FLOOR_TOKENS = 1024;
+
+/** A counted cache miss on a single assistant message. */
+export interface CacheMiss {
+	/** Prompt tokens that were in the previous turn's prompt but not read from cache. */
+	missedTokens: number;
+	/** Extra dollars paid vs. a full cache hit; 0 when pricing is unknown. */
+	missedCost: number;
+	/** Milliseconds since the previous request (which last refreshed the cache). */
+	idleMs: number;
+	/** True when the model changed relative to the previous request. */
+	modelChanged: boolean;
+}
+```
+
+## !!steps What the scan remembers
+
+Detection compares each request to the one before it, so the scan carries a
+`PreviousRequest`. The `reportedCache` flag is sticky and exists for one
+case: providers that only report cache reads. On those, a turn with zero cache
+tokens is a total miss, but on providers that never report caching the same
+zero means nothing. Remembering that some earlier request reported cache
+activity separates the two.
+
+```ts ! cache-stats.ts
+/** The last request seen by the scan; everything in its prompt should be cached. */
+interface PreviousRequest {
+	promptTokens: number;
+	modelKey: string;
+	timestamp: number;
+	/**
+	 * Sticky: some earlier request in this scan segment reported cache activity.
+	 * Distinguishes a total miss on a cache-read-only provider (OpenAI-style,
+	 * writes unreported) from a provider that never reports caching at all.
+	 */
+	reportedCache: boolean;
+}
+```
+
+## !!steps Deciding whether a turn missed
+
+The prompt size is input plus cache read plus cache write. Nothing is counted
+on the first turn, after a reset, for empty prompts, or for zero-cache turns on
+providers that never showed cache activity. Missed tokens are the smaller of the
+two prompt sizes minus what was actually read from cache, so a shrinking prompt
+is not blamed for tokens that no longer exist.
+
+```ts ! cache-stats.ts
+	const usage = message.usage;
+	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	// A zero-cache turn only counts when cache activity was reported before:
+	// on cache-read-only providers that is a total miss, while on providers
+	// that never report caching it means nothing.
+	if (!prev || promptTokens <= 0 || (usage.cacheRead + usage.cacheWrite === 0 && !prev.reportedCache)) {
+		return undefined;
+	}
+
+	// !mark
+	const missedTokens = Math.min(prev.promptTokens, promptTokens) - usage.cacheRead;
+	if (missedTokens <= NOISE_FLOOR_TOKENS) return undefined;
+```
+
+## !!steps Pricing the miss
+
+The extra cost is the missed tokens times the difference between the rate
+actually paid and the cache-read rate. The paid rate is derived from this
+message's own cost breakdown (input plus cache write, which includes any write
+premium). The read rate comes from the message if it had reads, and otherwise
+from the price source, which is quoted per million tokens. The difference is
+clamped at zero, so an odd price table cannot produce negative waste.
+
+```ts ! cache-stats.ts
+	const paidTokens = usage.input + usage.cacheWrite;
+	const paidPerToken = paidTokens > 0 ? (usage.cost.input + usage.cost.cacheWrite) / paidTokens : 0;
+	const readPerToken =
+		usage.cacheRead > 0
+			? usage.cost.cacheRead / usage.cacheRead
+			: (models.getModel(message.provider, message.model)?.cost.cacheRead ?? 0) / 1_000_000;
+
+	return {
+		missedTokens,
+		missedCost: missedTokens * Math.max(0, paidPerToken - readPerToken),
+		idleMs: Math.max(0, message.timestamp - prev.timestamp),
+		modelChanged: `${message.provider}/${message.model}` !== prev.modelKey,
+	};
+```
+
+## !!steps Walking the entries
+
+`scan` replays the session. Compaction and branch summaries reset the baseline,
+because the context legitimately changed. Model switches deliberately do not
+reset it: a new model re-bills the whole prompt, which is real waste.
+
+A `cache_warm` usage entry sets the baseline without being counted, so a
+keep-alive request counts as having refreshed the cache.
+
+```ts ! cache-stats.ts
+	for (const entry of entries) {
+		if (entry.type === "compaction" || entry.type === "branch_summary") {
+			// The context legitimately changed; the next turn's prompt is new content,
+			// not re-billed content. Model switches are NOT exempt: they re-bill the
+			// full prompt and should be counted.
+			prev = undefined;
+			continue;
+		}
+		if (entry.type === "usage" && entry.kind === "cache_warm") {
+			const promptTokens = entry.usage.input + entry.usage.cacheRead + entry.usage.cacheWrite;
+			if (promptTokens > 0) {
+				prev = {
+					promptTokens,
+					modelKey: `${entry.provider}/${entry.model}`,
+					timestamp: Date.parse(entry.timestamp),
+					reportedCache: true,
+				};
+			}
+```
+
+## !!steps Assistant messages and the baseline update
+
+For each assistant message, a miss is computed against the current baseline and
+added to totals and a map keyed by the message object itself. Then the message
+becomes the new baseline. If the message had no prompt tokens, `asPreviousRequest`
+returns undefined and the old baseline is kept.
+
+```ts ! cache-stats.ts
+		} else if (entry.type === "message" && entry.message.role === "assistant") {
+			const miss = detectMiss(prev, entry.message, models);
+			if (miss) {
+				totals.missedTokens += miss.missedTokens;
+				totals.missedCost += miss.missedCost;
+				totals.missCount += 1;
+				misses.set(entry.message, miss);
+			}
+			prev = asPreviousRequest(entry.message, prev?.reportedCache ?? false) ?? prev;
+		}
+```
+
+## !!steps Three public views of one scan
+
+All exports run the same scan and take a different part of it. Totals feed
+summary displays, the map lets the chat be rebuilt with per-message notices
+after a resume or compaction, and `detectCacheMiss` checks one just-finished
+message. That last one requires that the entries do not yet include the
+message, since the message end event fires before it is saved.
+
+```ts ! cache-stats.ts
+export function computeCacheWaste(entries: SessionEntry[], models: ModelPriceSource): CacheWasteTotals {
+	return scan(entries, models).totals;
+}
+// ...
+export function collectCacheMisses(
+	entries: SessionEntry[],
+	models: ModelPriceSource,
+): Map<AssistantMessage, CacheMiss> {
+	return scan(entries, models).misses;
+}
+// ...
+export function detectCacheMiss(
+	entries: SessionEntry[],
+	message: AssistantMessage,
+	models: ModelPriceSource,
+): CacheMiss | undefined {
+	return detectMiss(scan(entries, models).prev, message, models);
+}
+```
+
+</Scrollycoding>
+
+Each call to `detectCacheMiss` rescans the whole session, so it is linear in
+session length per assistant message. That is fine for typical sessions but
+would add up for very long ones.

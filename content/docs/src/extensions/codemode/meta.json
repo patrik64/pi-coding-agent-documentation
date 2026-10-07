@@ -1,0 +1,11 @@
+{
+  "title": "codemode",
+  "pages": [
+    "execute.lazy.ts",
+    "execute.ts",
+    "index.ts",
+    "renderer.ts",
+    "tool.ts",
+    "worker.ts"
+  ]
+}

@@ -1,0 +1,117 @@
+---
+title: "project-trust.ts"
+description: "Adapts the startup selector and input dialogs into the UI object that the project-trust check uses to ask the user"
+source: "src/cli/project-trust.ts"
+full: true
+---
+
+Before pi loads project-level configuration and extensions, it may need to ask
+whether the project is trusted. That question comes up before the main TUI
+exists, so it cannot use the normal extension UI. This file builds a
+`ProjectTrustContext` (the type is in
+[types.ts](/docs/src/core/extensions/types.ts)) whose prompts are backed by the
+small standalone dialogs in [startup-ui.ts](/docs/src/cli/startup-ui.ts).
+
+The logic that decides trust is in
+[project-trust.ts](/docs/src/core/project-trust.ts); this file only supplies the
+means to ask.
+
+<Scrollycoding>
+
+## !!steps Building the context
+
+The function takes the working directory, the app mode, the settings manager
+and whether a UI is available. The interactive mode is reported as `tui` to the
+trust logic; every other mode name is passed through.
+
+```ts ! project-trust.ts
+export function createProjectTrustContext(options: {
+	cwd: string;
+	mode: AppMode;
+	settingsManager: SettingsManager;
+	hasUI: boolean;
+}): ProjectTrustContext {
+	return {
+		cwd: options.cwd,
+		mode: options.mode === "interactive" ? "tui" : options.mode,
+		hasUI: options.hasUI,
+```
+
+## !!steps Select
+
+A selector is only shown when there is a UI and the mode is interactive.
+Otherwise it returns undefined, which means no answer. The string options are
+converted to label and value pairs for the dialog.
+
+```ts ! project-trust.ts
+		ui: {
+			select: async (title, selectOptions) => {
+				if (!options.hasUI) {
+					return undefined;
+				}
+				if (options.mode !== "interactive") {
+					return undefined;
+				}
+				return showStartupSelector(
+					options.settingsManager,
+					title,
+					selectOptions.map((option) => ({ label: option, value: option })),
+				);
+			},
+```
+
+## !!steps Confirm defaults to no
+
+Confirmation is a two-option selector with real boolean values. When there is
+no UI, the mode is not interactive, or the user dismisses the dialog, the
+answer is `false`. For a trust question this is the safe default: silence never
+grants trust.
+
+```ts ! project-trust.ts
+			confirm: async (title, message) => {
+				if (!options.hasUI) {
+					return false;
+				}
+				if (options.mode !== "interactive") {
+					return false;
+				}
+				return (
+					(await showStartupSelector(options.settingsManager, `${title}\n${message}`, [
+						{ label: "Yes", value: true },
+						{ label: "No", value: false },
+					])) ?? false
+				);
+			},
+```
+
+## !!steps Input and notify
+
+Input follows the same guard and returns undefined when unavailable. `notify`
+behaves differently: in the interactive mode it prints nothing (the dialogs
+carry the information), while in other modes it writes colored text to stderr,
+red for errors, yellow for warnings, cyan otherwise.
+
+```ts ! project-trust.ts
+			input: async (title, placeholder) => {
+				if (!options.hasUI) {
+					return undefined;
+				}
+				if (options.mode !== "interactive") {
+					return undefined;
+				}
+				return showStartupInput(options.settingsManager, title, placeholder);
+			},
+			notify: (message, type = "info") => {
+				if (options.mode !== "interactive") {
+					const color = type === "error" ? chalk.red : type === "warning" ? chalk.yellow : chalk.cyan;
+					console.error(color(message));
+				}
+			},
+```
+
+</Scrollycoding>
+
+Each prompt opens and tears down its own TUI instance, which is acceptable
+because the trust questions are rare and happen once at launch. Settings are
+passed along so the dialogs use the user's theme, via
+[settings-manager.ts](/docs/src/core/settings-manager.ts).

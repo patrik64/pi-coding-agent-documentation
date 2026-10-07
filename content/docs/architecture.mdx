@@ -1,0 +1,85 @@
+---
+title: Architecture
+description: How the session, tools, extensions and modes of the coding agent fit together
+---
+
+The coding agent is three layers. The **core** (`src/core`) owns everything
+that is true no matter how Pi is driven. The **modes** (`src/modes`) are thin
+front ends over it. The **extensions** and utilities around it add capabilities
+without the core knowing about them.
+
+## Entry points
+
+[cli.ts](/docs/src/cli.ts) is the executable; it hands off to
+[main.ts](/docs/src/main.ts), which parses flags with
+[args.ts](/docs/src/cli/args.ts), loads settings and resources, builds a
+session and picks a mode. [index.ts](/docs/src/index.ts) is the other front
+door: the public SDK surface, built on
+[sdk.ts](/docs/src/core/sdk.ts).
+
+## The session is the center
+
+[agent-session.ts](/docs/src/core/agent-session.ts) is the hub. It wraps the
+agent loop, persists every message through
+[session-manager.ts](/docs/src/core/session-manager.ts) (a JSONL tree of
+entries, where each path is a branch), reads configuration from
+[settings-manager.ts](/docs/src/core/settings-manager.ts) and assembles the
+prompt with [system-prompt.ts](/docs/src/core/system-prompt.ts). Its
+construction is split in two:
+[agent-session-services.ts](/docs/src/core/agent-session-services.ts) builds
+the long-lived services and
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) swaps whole
+sessions in and out for fork, resume and new-session.
+
+Long conversations are shortened by
+[compaction.ts](/docs/src/core/compaction/compaction.ts) and
+[branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts),
+which insert summary entries instead of deleting history.
+
+## Models, credentials and resources
+
+[model-registry.ts](/docs/src/core/model-registry.ts),
+[model-resolver.ts](/docs/src/core/model-resolver.ts) and
+[model-runtime.ts](/docs/src/core/model-runtime.ts) decide which model to talk
+to; [auth-storage.ts](/docs/src/core/auth-storage.ts) holds the credentials.
+[resource-loader.ts](/docs/src/core/resource-loader.ts) discovers extensions,
+skills, prompt templates and themes, and
+[package-manager.ts](/docs/src/core/package-manager.ts) installs them from npm
+or git.
+
+## Tools
+
+The four default tools live in `src/core/tools`, registered by
+[index.ts](/docs/src/core/tools/index.ts):
+[read.ts](/docs/src/core/tools/read.ts),
+[bash.ts](/docs/src/core/tools/bash.ts),
+[edit.ts](/docs/src/core/tools/edit.ts) and
+[write.ts](/docs/src/core/tools/write.ts). Output is bounded by
+[truncate.ts](/docs/src/core/tools/truncate.ts), edits are matched by
+[edit-diff.ts](/docs/src/core/tools/edit-diff.ts), and shell commands also run
+through [bash-executor.ts](/docs/src/core/bash-executor.ts) for the user's own
+`!` commands.
+
+## Extensions
+
+Extensions are TypeScript modules loaded into the Pi process by
+[loader.ts](/docs/src/core/extensions/loader.ts). Their contract is
+[types.ts](/docs/src/core/extensions/types.ts), and
+[runner.ts](/docs/src/core/extensions/runner.ts) dispatches session events to
+them. [event-bus.ts](/docs/src/core/event-bus.ts) lets extensions talk to each
+other. The bundled [MCP extension](/docs/src/extensions/mcp/index.ts) is built
+the same way, over [runtime.ts](/docs/src/extensions/mcp/runtime.ts).
+
+## Modes
+
+All modes consume the same session events.
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) renders
+them in the terminal through
+[tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts), with colors
+from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and pickers such as
+[session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts)
+and [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts).
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) exposes the same session as
+JSONL commands over stdin and stdout, framed by
+[jsonl.ts](/docs/src/modes/rpc/jsonl.ts) and typed by
+[rpc-types.ts](/docs/src/modes/rpc/rpc-types.ts).

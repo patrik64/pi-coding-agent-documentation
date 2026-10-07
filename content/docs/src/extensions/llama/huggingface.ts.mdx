@@ -1,0 +1,128 @@
+---
+title: "huggingface.ts"
+description: "Minimal Hugging Face Hub client for finding GGUF models and listing their quantizations, plus token discovery."
+source: "src/extensions/llama/huggingface.ts"
+full: true
+---
+
+When the user chooses to download a model from the `/llama` command, pi needs to search the Hugging Face Hub for GGUF repositories and let the user pick a quantization. This file does only that: a token finder, a search call and a details call that parses file names into quantizations with sizes.
+
+The actual download is performed by the llama.cpp server (through `downloadAndWait` in [client.ts](/docs/src/extensions/llama/client.ts)), not by pi. The search results feed the picker in [ui.ts](/docs/src/extensions/llama/ui.ts), and the flow is orchestrated in [index.ts](/docs/src/extensions/llama/index.ts).
+
+<Scrollycoding>
+
+## !!steps Quantization patterns
+
+Quantization names are recovered from file names with a regular expression. It accepts an optional `UD-` prefix with `IQ` or `Q` forms such as `Q4_K_M`, plus `BF16`, `F16`, `F32` and `MXFP` variants, anchored to the end of the stem after a separator. Split files such as `-00001-of-00003` are normalized away by `SHARD_SUFFIX_PATTERN` first, so shards of one quantization count together.
+
+```ts ! huggingface.ts
+const DEFAULT_HUGGING_FACE_URL = "https://huggingface.co";
+const QUANTIZATION_PATTERN =
+	/(?:^|[-_.])((?:UD-)?(?:IQ\d(?:_[A-Z0-9]+)+|Q\d(?:_[A-Z0-9]+)+|BF16|F16|F32|MXFP\d(?:_[A-Z0-9]+)*))$/iu;
+const SHARD_SUFFIX_PATTERN = /-\d{5}-of-\d{5}$/u;
+
+export interface HuggingFaceModel {
+	id: string;
+	downloads: number;
+}
+```
+
+## !!steps Finding a token
+
+Gated models need a token, and the Hugging Face CLI stores one in well-known places. `findHuggingFaceToken` checks `HF_TOKEN` first, then `HF_TOKEN_PATH`, `HF_HOME/token`, `XDG_CACHE_HOME/huggingface/token` and finally `~/.cache/huggingface/token`. A `Set` removes duplicate paths, an unreadable or empty file is skipped, and no token is a valid result because most public repositories work anonymously.
+
+```ts ! huggingface.ts
+export async function findHuggingFaceToken(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+	const fromEnvironment = env.HF_TOKEN?.trim();
+	if (fromEnvironment) return fromEnvironment;
+
+	const paths = [
+		env.HF_TOKEN_PATH,
+		env.HF_HOME ? join(env.HF_HOME, "token") : undefined,
+		env.XDG_CACHE_HOME ? join(env.XDG_CACHE_HOME, "huggingface", "token") : undefined,
+		join(homedir(), ".cache", "huggingface", "token"),
+	].filter((path): path is string => Boolean(path));
+	for (const path of new Set(paths)) {
+		const token = await readToken(path);
+		if (token) return token;
+	}
+	return undefined;
+}
+```
+
+## !!steps Requests and rate limits
+
+Like the llama client, requests use a 15 second timeout joined with the caller's signal. A 429 response gets a specific message: the wait comes from `retry-after` or, failing that, from the `t=` field of the `ratelimit` header, which `parseRateLimitDelay` extracts. Other failures use the JSON `error` string or the status code.
+
+```ts ! huggingface.ts
+		if (!response.ok) {
+			const fallback = `Hugging Face returned HTTP ${response.status}`;
+			if (response.status === 429) {
+				const delay =
+					Number(response.headers.get("retry-after")) || parseRateLimitDelay(response.headers.get("ratelimit"));
+				throw new Error(
+					delay ? `Hugging Face rate limit reached; retry in ${delay}s` : "Hugging Face rate limit reached",
+				);
+			}
+			throw new Error(payloadError(payload, fallback));
+			}
+```
+
+## !!steps Searching
+
+Search asks for the 20 most downloaded repositories with the `gguf` filter. The response is filtered defensively: entries without a string id are dropped, and a missing download count becomes zero.
+
+```ts ! huggingface.ts
+	async search(query: string, signal?: AbortSignal): Promise<HuggingFaceModel[]> {
+		const params = new URLSearchParams({
+			search: query,
+			filter: "gguf",
+			sort: "downloads",
+			direction: "-1",
+			limit: "20",
+		});
+		const payload = await this.request(`/api/models?${params}`, signal);
+		if (!Array.isArray(payload)) throw new Error("Hugging Face returned invalid search results");
+```
+
+## !!steps Grouping files into quantizations
+
+`details` requests the repository with `blobs=true` so file sizes are included. For each `.gguf` file it skips multimodal projector files (names starting with `mmproj`), strips the shard suffix, matches the quantization and adds up sizes. If any file in a group lacks a size, the group is marked incomplete and its total is reported as unknown rather than too small.
+
+```ts ! huggingface.ts
+				const filename = file.rfilename.split("/").at(-1)!;
+				if (filename.toLowerCase().startsWith("mmproj")) continue;
+				const stem = filename.slice(0, -5).replace(SHARD_SUFFIX_PATTERN, "");
+				const quantization = stem.match(QUANTIZATION_PATTERN)?.[1]?.toUpperCase();
+				if (!quantization) continue;
+				const current = sizes.get(quantization) ?? { total: 0, complete: true };
+				if (typeof file.size === "number") current.total += file.size;
+				else current.complete = false;
+				sizes.set(quantization, current);
+```
+
+## !!steps Ordering and gating
+
+The list is sorted with `Q4_K_M` first, the same one the UI labels as recommended, then by size ascending with unknown sizes last, then by name. The result also carries the gating mode, normalized to `auto`, `manual` or false, which the download flow uses to warn that the llama.cpp server needs an `HF_TOKEN` with access.
+
+```ts ! huggingface.ts
+		const quantizations = [...sizes]
+			.map(([name, size]) => ({ name, size: size.complete ? size.total : undefined }))
+			.sort((left, right) => {
+				if (left.name === "Q4_K_M") return -1;
+				if (right.name === "Q4_K_M") return 1;
+				return (
+					(left.size ?? Number.MAX_SAFE_INTEGER) - (right.size ?? Number.MAX_SAFE_INTEGER) ||
+					left.name.localeCompare(right.name)
+				);
+			});
+		return {
+			id: typeof model.id === "string" ? model.id : id,
+			gated: model.gated === "auto" || model.gated === "manual" ? model.gated : false,
+			quantizations,
+		};
+```
+
+</Scrollycoding>
+
+The client uses plain `fetch` with an optional bearer token and no retry logic: a rate limit is surfaced to the user as an error message. Its only consumer is [index.ts](/docs/src/extensions/llama/index.ts), and the server-side counterpart of the download is [client.ts](/docs/src/extensions/llama/client.ts).

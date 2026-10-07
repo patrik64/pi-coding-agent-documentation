@@ -1,0 +1,157 @@
+---
+title: "photon.ts"
+description: "Lazy loader for the photon WASM image library, with an fs patch so it also works in Bun compiled binaries"
+source: "src/utils/photon.ts"
+full: true
+---
+
+Photon is a Rust image library compiled to WebAssembly and used for resizing and converting images. Its CommonJS entry loads the `.wasm` file with `fs.readFileSync(__dirname + '/photon_rs_bg.wasm')`. In a Bun compiled binary, `__dirname` bakes in the build machine's path, so the read fails on the user's machine.
+
+This module loads photon once, lazily, and temporarily patches `fs.readFileSync` during the import so a missing wasm file is looked up next to the executable instead. Consumers are [image-resize-core.ts](/docs/src/utils/image-resize-core.ts), [image-convert.ts](/docs/src/utils/image-convert.ts) and [clipboard-image.ts](/docs/src/utils/clipboard-image.ts).
+
+<Scrollycoding>
+
+## !!steps The problem and the plan
+
+The header comment states both the failure and the two-part fix: patch the read, and copy the wasm beside the binary in the `build:binary` step.
+
+```ts ! photon.ts
+ * The challenge: photon-node's CJS entry uses fs.readFileSync(__dirname + '/photon_rs_bg.wasm')
+ * which bakes the build machine's absolute path into Bun compiled binaries.
+ *
+ * Solution:
+ * 1. Patch fs.readFileSync to redirect missing photon_rs_bg.wasm reads
+ * 2. Copy photon_rs_bg.wasm next to the executable in build:binary
+ */
+```
+
+## !!steps Module state and fallback locations
+
+The module is cached in two variables: the loaded module and the in-flight promise. Fallback search order is next to the executable, a `photon` subfolder beside it, then the current working directory.
+
+```ts ! photon.ts
+const WASM_FILENAME = "photon_rs_bg.wasm";
+
+// Lazy-loaded photon module
+let photonModule: typeof import("@silvia-odwyer/photon-node") | null = null;
+let loadPromise: Promise<typeof import("@silvia-odwyer/photon-node") | null> | null = null;
+
+function pathOrNull(file: PathOrFileDescriptor): string | null {
+	if (typeof file === "string") {
+		return file;
+	}
+	if (file instanceof URL) {
+		return fileURLToPath(file);
+	}
+	return null;
+}
+
+function getFallbackWasmPaths(): string[] {
+	const execDir = path.dirname(process.execPath);
+	return [
+		path.join(execDir, WASM_FILENAME),
+		path.join(execDir, "photon", WASM_FILENAME),
+		path.join(process.cwd(), WASM_FILENAME),
+	];
+}
+```
+
+## !!steps The patched readFileSync
+
+Only reads whose path ends in the wasm filename are intercepted. The original read is tried first; if it fails with anything other than a missing file, the error is rethrown. On `ENOENT`, the first existing fallback is read, preserving whether options were passed. If no fallback exists, the original error is thrown.
+
+```ts ! photon.ts
+	const patchedReadFileSync: ReadFileSync = ((...args: Parameters<ReadFileSync>) => {
+		const [file, options] = args;
+		const resolvedPath = pathOrNull(file);
+
+		if (resolvedPath?.endsWith(WASM_FILENAME)) {
+			try {
+				return originalReadFileSync(...args);
+			} catch (error) {
+				const err = error as NodeJS.ErrnoException;
+				// !mark(1:3)
+				if (err?.code && err.code !== "ENOENT") {
+					throw error;
+				}
+
+				for (const fallbackPath of fallbackPaths) {
+					if (!fs.existsSync(fallbackPath)) {
+						continue;
+					}
+					if (options === undefined) {
+						return originalReadFileSync(fallbackPath);
+					}
+					return originalReadFileSync(fallbackPath, options);
+				}
+
+				throw error;
+			}
+		}
+
+		return originalReadFileSync(...args);
+	}) as ReadFileSync;
+```
+
+## !!steps Installing and undoing the patch
+
+Assigning to `fs.readFileSync` can fail on a frozen or accessor-defined property, so there is an `Object.defineProperty` fallback. The function returns a restore closure that uses the same two strategies to put the original back.
+
+```ts ! photon.ts
+	try {
+		mutableFs.readFileSync = patchedReadFileSync;
+	} catch {
+		Object.defineProperty(fs, "readFileSync", {
+			value: patchedReadFileSync,
+			writable: true,
+			configurable: true,
+		});
+	}
+
+	return () => {
+		try {
+			mutableFs.readFileSync = originalReadFileSync;
+		} catch {
+			Object.defineProperty(fs, "readFileSync", {
+				value: originalReadFileSync,
+				writable: true,
+				configurable: true,
+			});
+		}
+	};
+```
+
+## !!steps Single-flight loading
+
+`loadPhoton` returns the cached module, or the pending promise if a load is running, so concurrent callers share one import. The patch is active only for the duration of the dynamic import (restored in `finally`). Any failure yields `null` rather than throwing, and because `photonModule` stays null while `loadPromise` is kept, a failed load is cached and never retried in that process.
+
+```ts ! photon.ts
+export async function loadPhoton(): Promise<typeof import("@silvia-odwyer/photon-node") | null> {
+	if (photonModule) {
+		return photonModule;
+	}
+
+	if (loadPromise) {
+		return loadPromise;
+	}
+
+	loadPromise = (async () => {
+		const restoreReadFileSync = patchPhotonWasmRead();
+		try {
+			photonModule = await import("@silvia-odwyer/photon-node");
+			return photonModule;
+		} catch {
+			photonModule = null;
+			return photonModule;
+		} finally {
+			restoreReadFileSync();
+		}
+	})();
+
+	return loadPromise;
+}
+```
+
+</Scrollycoding>
+
+Callers must handle a `null` result, which is how image features degrade when the wasm is missing. Patching a global like `fs.readFileSync` is a hack, mitigated by keeping it narrow (suffix match) and short-lived (restored right after the import settles).

@@ -1,0 +1,135 @@
+---
+title: "dark.json"
+description: "The built-in dark theme: a small OKHSL palette in vars, mapped onto every color token the TUI and HTML export use"
+source: "src/modes/interactive/theme/dark.json"
+full: true
+---
+
+This is the built-in dark theme, shipped as data rather than code. A theme is a JSON document with a name, an appearance, a `vars` table of named colors, a `colors` table that assigns a value to every token, and an `export` block for the HTML session export. It is loaded and resolved by [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and checked against the schema in [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts), whose JSON Schema twin is [theme-schema.json](/docs/src/modes/interactive/theme/theme-schema.json).
+
+Colors are written in `okhsl(hue saturation% lightness%)`, a perceptual color space, so the palette is designed by lightness rather than by hex guesswork. The light counterpart, [light.json](/docs/src/modes/interactive/theme/light.json), has the same keys with different numbers.
+
+<Scrollycoding>
+
+## !!steps Header and palette variables
+
+`appearance` tells pi what background the theme is made for (otherwise it is detected from the colors). The `vars` block defines seven hue families at about the same lightness (67%) plus `blueBg`, a dark blue used as a surface. Tokens below refer to these by name, so changing `violet` retargets every violet token at once.
+
+```json ! dark.json
+{
+	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"name": "dark",
+	"appearance": "dark",
+	"vars": {
+		"text": "okhsl(234 3% 89%)",
+		"muted": "okhsl(229 6% 67%)",
+		"violet": "okhsl(295 50% 67%)",
+		"blue": "okhsl(232 54% 67%)",
+		"green": "okhsl(159 59% 67%)",
+		"red": "okhsl(20 72% 67%)",
+		"yellow": "okhsl(83 88% 67%)",
+		"blueBg": "okhsl(233 41% 24%)"
+	},
+```
+
+## !!steps Core UI colors
+
+A token value is either a var name, a literal color, an empty string (terminal default) or a 0 to 255 palette index. Core tokens mix both styles: `accent` and `success` use vars, while borders and `dim` use their own literals because they need slightly different lightness than the named palette.
+
+`selectedBg` reuses `blueBg`, which is why selected rows and user messages share a tint.
+
+```json ! dark.json
+	"colors": {
+		"accent": "violet",
+		"border": "okhsl(231 57% 65%)",
+		"borderAccent": "okhsl(295 53% 64%)",
+		"borderMuted": "okhsl(229 8% 53%)",
+		"success": "green",
+		"error": "red",
+		"warning": "yellow",
+		"muted": "muted",
+		"dim": "okhsl(229 8% 56%)",
+		"text": "text",
+		"thinkingText": "okhsl(226 7% 65%)",
+		"selectedBg": "blueBg",
+```
+
+## !!steps Message and tool surfaces
+
+Background tokens are about 24% lightness: dark enough that the 67% foreground tokens read comfortably on them. User messages use the blue surface, custom (extension) messages a violet one, and tool calls change their background by state: neutral grey while pending, green on success and red on error.
+
+These are the surfaces that [user-message.ts](/docs/src/modes/interactive/components/user-message.ts) and [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts) paint.
+
+```json ! dark.json
+		"scrollbarTrack": "okhsl(237 7% 33%)",
+		"scrollbarThumb": "okhsl(232 7% 65%)",
+		"searchMatchBg": "okhsl(53 51% 24%)",
+		"searchMatchText": "muted",
+		"userMessageBg": "blueBg",
+		"userMessageText": "text",
+		"customMessageBg": "okhsl(295 42% 24%)",
+		"customMessageText": "muted",
+		"customMessageLabel": "violet",
+		"toolPendingBg": "okhsl(229 5% 24%)",
+		"toolSuccessBg": "okhsl(158 46% 25%)",
+		"toolErrorBg": "okhsl(19 54% 25%)",
+		"toolTitle": "text",
+		"toolOutput": "muted",
+```
+
+## !!steps Markdown, diffs and syntax
+
+Markdown and syntax tokens mostly point back to vars, so the code highlighter and the prose renderer stay in one palette. Only variables and strings get dedicated literals, to separate them from the keyword blue and the function yellow.
+
+```json ! dark.json
+		"mdHeading": "yellow",
+		"mdLink": "blue",
+		"mdLinkUrl": "muted",
+		"mdCode": "violet",
+		"mdCodeBlock": "green",
+		"mdCodeBlockBorder": "muted",
+		"mdQuote": "muted",
+		"mdQuoteBorder": "muted",
+		"mdHr": "muted",
+		"mdListBullet": "violet",
+		"toolDiffAdded": "green",
+		"toolDiffRemoved": "red",
+		"toolDiffContext": "muted",
+		"syntaxComment": "muted",
+		"syntaxKeyword": "blue",
+		"syntaxFunction": "yellow",
+		"syntaxVariable": "okhsl(202 58% 67%)",
+		"syntaxString": "okhsl(52 67% 67%)",
+		"syntaxNumber": "green",
+		"syntaxType": "violet",
+		"syntaxOperator": "muted",
+		"syntaxPunctuation": "muted",
+```
+
+## !!steps Thinking levels, bash mode and export
+
+The seven thinking levels form a ramp from grey (`thinkingOff`) through blue and violet to magenta, ending in an orange-red `thinkingMax`; they color the editor border by reasoning effort. `bashMode` colors the input when the user is typing a shell command.
+
+The `export` block holds the three background colors for the standalone HTML export of a session.
+
+```json ! dark.json
+		"thinkingOff": "okhsl(229 8% 49%)",
+		"thinkingMinimal": "okhsl(232 20% 52%)",
+		"thinkingLow": "okhsl(232 45% 54%)",
+		"thinkingMedium": "okhsl(263 59% 56%)",
+		"thinkingHigh": "okhsl(295 73% 59%)",
+		"thinkingXhigh": "okhsl(337 81% 61%)",
+		"thinkingMax": "okhsl(20 99% 63%)",
+		"bashMode": "okhsl(159 64% 65%)"
+	},
+	"export": {
+		"pageBg": "okhsl(262 14% 16%)",
+		"cardBg": "okhsl(264 13% 19%)",
+		"infoBg": "okhsl(53 51% 24%)"
+	}
+}
+```
+
+</Scrollycoding>
+
+Together with the light theme this is the reference for the required token set: the validator's error message literally points users at these two files. The third built-in, the terminal-derived `system` theme, is not a JSON file at all; it is computed by [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts). One small inconsistency: `thinkingMax` is optional in the schema but both themes define it, and `export.infoBg` equals `searchMatchBg` in both.

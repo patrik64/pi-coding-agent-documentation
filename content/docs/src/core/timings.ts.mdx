@@ -1,0 +1,97 @@
+---
+title: "timings.ts"
+description: "Opt-in startup profiler that records elapsed time between labeled checkpoints and prints a table to stderr"
+source: "src/core/timings.ts"
+full: true
+---
+
+A tiny profiler for startup. With `PI_TIMING=1` in the environment, code can
+call `time("label")` at checkpoints and `printTimings()` prints how long each
+interval took. Without the flag every function returns immediately, so the
+calls can stay in production code at no cost.
+
+The main consumer is [main.ts](/docs/src/main.ts), which marks steps such as
+argument parsing, migrations, session creation and theme initialization.
+
+<Scrollycoding>
+
+## !!steps A flag read once, and two namespaces
+
+`ENABLED` is computed when the module loads, so toggling the variable later has
+no effect. Timings are grouped by namespace; the type allows only `main` and
+`extensions`. Each namespace stores its list of intervals and the timestamp of
+the last checkpoint.
+
+```ts ! timings.ts
+const ENABLED = process.env.PI_TIMING === "1";
+interface TimingNamespace {
+	timings: Array<{ label: string; ms: number }>;
+	lastTime: number;
+}
+
+type TimingLabel = "main" | "extensions";
+
+const timingNamespaces = new Map<TimingLabel, TimingNamespace>();
+```
+
+## !!steps Recording is an interval, not a timestamp
+
+`resetTimings` starts a namespace clock at now. `time` records the milliseconds
+since the previous checkpoint under the new label and advances the clock, so
+each entry is the cost of the step that just finished. A namespace used before
+any reset is created lazily at its first call, which makes that first entry
+roughly zero.
+
+```ts ! timings.ts
+export function resetTimings(namespace: TimingLabel = "main"): void {
+	if (!ENABLED) return;
+	timingNamespaces.set(namespace, { timings: [], lastTime: Date.now() });
+}
+
+export function time(label: string, namespace: TimingLabel = "main"): void {
+	if (!ENABLED) return;
+	const now = Date.now();
+
+	if (!timingNamespaces.has(namespace)) {
+		resetTimings(namespace);
+	}
+
+	const timingNamespace = timingNamespaces.get(namespace)!;
+	timingNamespace.timings.push({ label, ms: now - timingNamespace.lastTime });
+	timingNamespace.lastTime = now;
+}
+```
+
+## !!steps Printing to stderr
+
+Output goes to `console.error` so it never mixes with JSON or piped stdout from
+the print and RPC modes. Entries with a negative duration are filtered out,
+which can happen if the wall clock moves backwards. The total is the sum of the
+printed entries only.
+
+```ts ! timings.ts
+function printTimingGroup(title: string, timings: TimingNamespace["timings"]): void {
+	const printableTimings = timings.filter((timing) => timing.ms >= 0);
+	if (printableTimings.length === 0) return;
+	console.error(`\n--- ${title} ---`);
+	for (const t of printableTimings) {
+		console.error(`  ${t.label}: ${t.ms}ms`);
+	}
+	console.error(`  TOTAL: ${printableTimings.reduce((a, b) => a + b.ms, 0)}ms`);
+	console.error(`${"-".repeat(title.length + 8)}\n`);
+}
+
+export function printTimings(): void {
+	if (!ENABLED) return;
+	for (const [namespace, timingNamespace] of timingNamespaces) {
+		printTimingGroup(`Startup Timings: ${namespace}`, timingNamespace.timings);
+	}
+}
+```
+
+</Scrollycoding>
+
+The `extensions` namespace is for measuring extension loading separately from
+the main startup path. Using `Date.now()` gives millisecond resolution and is
+affected by clock changes, so this is a coarse tool compared with
+`performance.now()`.

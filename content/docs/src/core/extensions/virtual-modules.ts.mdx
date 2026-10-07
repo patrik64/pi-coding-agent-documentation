@@ -1,0 +1,90 @@
+---
+title: "virtual-modules.ts"
+description: "The table of packages that extensions can import without installing, served from pi's own bundled copies"
+source: "src/core/extensions/virtual-modules.ts"
+full: true
+---
+
+An extension is a loose TypeScript file that may live anywhere, and it cannot be expected to have `node_modules` next to it. This file builds the map of module specifiers that pi resolves to its own already-loaded copies, so an extension can `import` from `typebox`, the pi packages and the coding-agent API.
+
+The same table works in source runs and in compiled binaries, which is why the values are namespace objects rather than file paths. [loader.ts](/docs/src/core/extensions/loader.ts) consumes the table.
+
+<Scrollycoding>
+
+## !!steps Namespace imports of every bundled package
+
+Each import is a `* as` namespace so the whole module object can be handed over as the extension's view of that package.
+
+```ts ! virtual-modules.ts
+// !mark(1:2)
+import * as bundledPiAgentCore from "@earendil-works/pi-agent-core";
+import * as bundledPiAiCompat from "@earendil-works/pi-ai/compat";
+import * as bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
+import * as bundledPiAiProviders from "@earendil-works/pi-ai/providers/all";
+import * as bundledPiTui from "@earendil-works/pi-tui";
+import * as bundledTypebox from "typebox";
+import * as bundledTypeboxCompile from "typebox/compile";
+import * as bundledTypeboxValue from "typebox/value";
+```
+
+## !!steps The coding-agent package imports itself
+
+The last import pulls in the package's own [index.ts](/docs/src/index.ts), so extensions that import the coding-agent package get the public API.
+
+The comment notes why that is safe: loader exports are not re-exported from the index, so there is no cycle back into the loader.
+
+```ts ! virtual-modules.ts
+// !mark(1:3)
+// This import is safe because loader.ts exports are not re-exported from index.ts.
+// Extensions can therefore import from @earendil-works/pi-coding-agent.
+import * as bundledPiCodingAgent from "../../index.ts";
+```
+
+## !!steps The typebox family, under old and new names
+
+The map starts with the typebox family, under both the new `typebox` name and the legacy `@sinclair/typebox` name, pointing at the same objects. Existing extensions written against either spelling keep working.
+
+```ts ! virtual-modules.ts
+export const VIRTUAL_MODULES: Record<string, unknown> = {
+	// !mark
+	typebox: bundledTypebox,
+	"typebox/compile": bundledTypeboxCompile,
+	"typebox/value": bundledTypeboxValue,
+	// !mark
+	"@sinclair/typebox": bundledTypebox,
+	"@sinclair/typebox/compile": bundledTypeboxCompile,
+	"@sinclair/typebox/value": bundledTypeboxValue,
+```
+
+## !!steps Two package scopes and the compat entry
+
+The pi packages are registered twice, under `@earendil-works` and the older `@mariozechner` scope. Both scopes resolve to the same bundled objects.
+
+The pi-ai root maps to the compat entrypoint, a strict superset of the core entry, so extensions using the old global API keep working until compat is removed.
+
+```ts ! virtual-modules.ts
+	"@earendil-works/pi-agent-core": bundledPiAgentCore,
+	"@earendil-works/pi-tui": bundledPiTui,
+	// !mark(1:4)
+	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
+	// superset of the core entrypoint): existing extensions using the old
+	// global API keep working at runtime until compat is removed.
+	"@earendil-works/pi-ai": bundledPiAiCompat,
+	"@earendil-works/pi-ai/compat": bundledPiAiCompat,
+	"@earendil-works/pi-ai/oauth": bundledPiAiOauth,
+	"@earendil-works/pi-ai/providers/all": bundledPiAiProviders,
+	"@earendil-works/pi-coding-agent": bundledPiCodingAgent,
+	"@mariozechner/pi-agent-core": bundledPiAgentCore,
+	"@mariozechner/pi-tui": bundledPiTui,
+	// !mark
+	"@mariozechner/pi-ai": bundledPiAiCompat,
+	"@mariozechner/pi-ai/compat": bundledPiAiCompat,
+	"@mariozechner/pi-ai/oauth": bundledPiAiOauth,
+	"@mariozechner/pi-ai/providers/all": bundledPiAiProviders,
+	"@mariozechner/pi-coding-agent": bundledPiCodingAgent,
+};
+```
+
+</Scrollycoding>
+
+The table is consumed by the extension loader and nothing else. Adding a package here is the only way to make it importable from extensions in a compiled binary, so it is effectively part of the public extension API surface alongside [types.ts](/docs/src/core/extensions/types.ts).

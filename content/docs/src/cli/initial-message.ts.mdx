@@ -1,0 +1,75 @@
+---
+title: "initial-message.ts"
+description: "Merges piped stdin, @file contents and the first positional message into the single opening prompt"
+source: "src/cli/initial-message.ts"
+full: true
+---
+
+A pi invocation can supply input in three places at once: text piped on
+standard input, `@file` arguments, and plain message arguments. This file
+combines them into one initial message plus images.
+
+Parsed arguments come from [args.ts](/docs/src/cli/args.ts) and the file text
+and images from [file-processor.ts](/docs/src/cli/file-processor.ts).
+
+<Scrollycoding>
+
+## !!steps Input and output shapes
+
+The input is a plain object, so callers can pass only what they have. The
+result leaves fields undefined, not empty, when there is nothing to send.
+
+```ts ! initial-message.ts
+export interface InitialMessageInput {
+	parsed: Args;
+	fileText?: string;
+	fileImages?: ImageContent[];
+	stdinContent?: string;
+}
+
+export interface InitialMessageResult {
+	initialMessage?: string;
+	initialImages?: ImageContent[];
+}
+```
+
+## !!steps Ordering of the parts
+
+Parts are pushed in a fixed order: stdin first, then file text, then the first
+CLI message. The first message is also removed from `parsed.messages`, so the
+remaining ones can be sent as follow-ups. That mutation of the argument is the
+non-obvious side effect of this function.
+
+```ts ! initial-message.ts
+	const parts: string[] = [];
+	if (stdinContent !== undefined) {
+		parts.push(stdinContent);
+	}
+	if (fileText) {
+		parts.push(fileText);
+	}
+
+	// !mark(1:2)
+	if (parsed.messages.length > 0) {
+		parts.push(parsed.messages[0]);
+		parsed.messages.shift();
+	}
+```
+
+## !!steps Joining
+
+Parts are joined with an empty string, not a separator. This works because
+file text already ends with a newline, but stdin content with no trailing
+newline would run straight into the message.
+
+```ts ! initial-message.ts
+	return {
+		initialMessage: parts.length > 0 ? parts.join("") : undefined,
+		initialImages: fileImages && fileImages.length > 0 ? fileImages : undefined,
+	};
+```
+
+</Scrollycoding>
+
+It is used for non-interactive mode, as the doc comment says. See
+[main.ts](/docs/src/main.ts) for the call site.

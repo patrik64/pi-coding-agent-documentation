@@ -1,0 +1,99 @@
+---
+title: "abort.ts"
+description: "Helpers for normalising AbortSignals and racing a promise against an abort"
+source: "src/utils/abort.ts"
+full: true
+---
+
+`abort.ts` holds two small helpers for cancellable async work. One normalises an optional signal; the other lets a caller stop waiting on an operation when a signal fires, without leaving the abandoned promise unobserved.
+
+Typical consumers are the model and auth code such as [model-runtime.ts](/docs/src/core/model-runtime.ts), where an operation cannot always be cancelled but the caller must still be released.
+
+<Scrollycoding>
+
+## !!steps Choosing the abort reason
+
+`abortReason` prefers the signal's own `reason`. When none was given it builds a generic error named `AbortError`, so callers can detect aborts by name in the usual way.
+
+```ts ! abort.ts
+function abortReason(signal: AbortSignal): unknown {
+	if (signal.reason !== undefined) return signal.reason;
+	const error = new Error("The operation was aborted");
+	error.name = "AbortError";
+	return error;
+}
+```
+
+## !!steps Normalising an optional signal
+
+`operationSignal` returns the caller's signal or a fresh one that never aborts. It lets downstream code take a plain `AbortSignal` without null checks and without imposing a deadline.
+
+```ts ! abort.ts
+/** Normalize an optional public signal without imposing a deadline. */
+export function operationSignal(signal?: AbortSignal): AbortSignal {
+	return signal ?? new AbortController().signal;
+}
+```
+
+## !!steps Fast paths in raceWithAbortSignal
+
+With no signal the operation is returned unchanged. With an already aborted signal the function rejects immediately, but first attaches an empty catch to the operation. That catch matters: otherwise a later rejection of the abandoned promise would surface as an unhandled rejection.
+
+```ts ! abort.ts
+/** Stop waiting on abort while observing the abandoned operation through settlement. */
+export function raceWithAbortSignal<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return operation;
+	if (signal.aborted) {
+		// !mark
+		void operation.catch(() => {});
+		return Promise.reject(abortReason(signal));
+	}
+```
+
+## !!steps Racing with a settled flag
+
+A `settled` flag guarantees exactly one outcome. The abort listener is registered with `once`, and every exit path removes it. Whichever side loses the race is ignored, but the operation is still observed through `then`, so its eventual error is handled.
+
+```ts ! abort.ts
+	return new Promise<T>((resolve, reject) => {
+		// !mark
+		let settled = false;
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(abortReason(signal));
+		};
+
+		signal.addEventListener("abort", onAbort, { once: true });
+```
+
+## !!steps Observing the operation
+
+Success and failure handlers both check `settled`, clean up and then resolve or reject. The last line re-checks `signal.aborted` to cover a signal that aborted between the first check and listener registration.
+
+```ts ! abort.ts
+		void operation.then(
+			(value) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(error);
+			},
+		);
+		// !mark
+		if (signal.aborted) onAbort();
+	});
+}
+```
+
+</Scrollycoding>
+
+The race never cancels the underlying work; it only stops the caller waiting. Anything that needs real cancellation must pass the signal into the operation itself.

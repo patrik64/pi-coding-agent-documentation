@@ -1,0 +1,639 @@
+---
+title: "session-worker-manager.ts"
+description: "Process manager for the experimental server: launches one worker per session, tracks demand, routes service calls, and handles crashes, timeouts and takeover"
+source: "src/experimental/session-worker-manager.ts"
+full: true
+---
+
+This is the biggest file in the experimental server and its job is hard to see from the outside: it makes a set of worker processes look like in-process session objects. A session runs in its own child process (see [session-worker.ts](/docs/src/experimental/session-worker.ts)), and the manager talks to it over a coordinator connection from [coordinator.ts](/docs/src/experimental/coordinator.ts).
+
+Everything is bookkeeping: which workers exist, which clients are attached, which requests are in flight, and what must be cleaned up when something fails. Almost every method is therefore about making sure a promise or timer is settled exactly once.
+
+The server may itself be replaced by a newer server process. The manager has two exit paths for that reason: `shutdown` stops the workers, while `detach` just forgets them.
+
+<Scrollycoding>
+
+## !!steps Constants and record types
+
+Four timeouts bound startup, shutdown, discovery and demand updates. Operations, in contrast, deliberately have none (the doc comment on `#invoke` says so).
+
+`WorkerRecord` is a running worker. It has a `terminated` promise that resolves with an error or `undefined`, a set of attachment ids and flags for stopping. `PendingLaunch` is a worker that was spawned but has not reported ready.
+
+```ts ! session-worker-manager.ts
+const WORKER_STARTUP_TIMEOUT_MS = 15_000;
+// !mark(1:3)
+const WORKER_SHUTDOWN_TIMEOUT_MS = 10_000;
+const WORKER_DISCOVERY_TIMEOUT_MS = 5_000;
+const WORKER_DEMAND_TIMEOUT_MS = 5_000;
+// ...
+interface WorkerRecord {
+	readonly peerId: string;
+	readonly metadata: SessionCatalogMetadata;
+	readonly pid: number;
+	readonly token: string;
+	readonly pluginManifestPaths: readonly string[];
+	// !mark
+	readonly terminated: Promise<Error | undefined>;
+	resolveTerminated(error: Error | undefined): void;
+	readonly attachmentIds: Set<string>;
+	expectedStop: boolean;
+	stopPromise?: Promise<void>;
+	stopping: boolean;
+}
+// ...
+interface PendingLaunch {
+	readonly sessionKey: string;
+	readonly peerId: string;
+	readonly token: string;
+	readonly pluginManifestPaths: readonly string[];
+	readonly child: ChildProcess;
+	readonly timer: NodeJS.Timeout;
+	readonly promise: Promise<WorkerRecord>;
+	resolve(worker: WorkerRecord): void;
+	reject(error: Error): void;
+}
+```
+
+## !!steps Maps indexed by different keys
+
+The class keeps workers in two maps, one by session directory path and one by peer id, plus maps for pending launches, demand updates, operations and service subscriptions. Different events arrive keyed differently: the session is known when opening, the peer id when a coordinator event comes.
+
+The constructor takes only a `Pick` of the coordinator connection, which keeps it testable, and registers an event listener whose remover is kept for later.
+
+```ts ! session-worker-manager.ts
+export class SessionWorkerManager {
+	readonly workerPids = new Map<string, number>();
+	// !mark
+	readonly #coordinator: Pick<
+		CoordinatorConnection,
+		"controlPath" | "serverConnectionId" | "wasReplaced" | "onEvent" | "send" | "broadcast"
+	>;
+	readonly #sessionDir: string;
+	readonly #model: { readonly provider?: string; readonly model: string } | undefined;
+	// !mark(1:5)
+	readonly #workersBySession = new Map<string, WorkerRecord>();
+	readonly #workersByPeer = new Map<string, WorkerRecord>();
+	readonly #pending = new Map<string, PendingLaunch>();
+	readonly #pendingDemand = new Map<string, PendingDemand>();
+	readonly #pendingOperations = new Map<string, PendingWorkerOperation>();
+	readonly #serviceSubscriptions = new Map<string, WorkerServiceSubscription>();
+	readonly #removeListener: () => void;
+	readonly #onWorkerCountChanged: ((count: number) => void) | undefined;
+	#discoveryPeers?: Set<string>;
+	#resolveDiscovery?: () => void;
+	#detached = false;
+	#shuttingDown = false;
+
+	constructor(
+		coordinator: Pick<
+			CoordinatorConnection,
+			"controlPath" | "serverConnectionId" | "wasReplaced" | "onEvent" | "send" | "broadcast"
+		>,
+		sessionDir: string,
+		model?: { readonly provider?: string; readonly model: string },
+		onWorkerCountChanged?: (count: number) => void,
+	) {
+		this.#coordinator = coordinator;
+		this.#sessionDir = sessionDir;
+		this.#model = model;
+		this.#onWorkerCountChanged = onWorkerCountChanged;
+		// !mark
+		this.#removeListener = coordinator.onEvent((event) => this.#handleCoordinatorEvent(event));
+	}
+```
+
+## !!steps Opening a session is idempotent
+
+`openSession` first rejects if the manager is shutting down, then checks that the requested plugin selection matches any running or starting worker. Then there are three outcomes: reuse a running worker, wait for a pending launch, or launch a new one.
+
+A conflicting plugin selection throws `SessionPluginSelectionConflictError`, since a worker's plugins are fixed at spawn.
+
+```ts ! session-worker-manager.ts
+	assertSessionPluginManifestPaths(metadata: SessionCatalogMetadata, manifestPaths: readonly string[]): void {
+		// !mark
+		const existing = this.#workersBySession.get(metadata.path);
+		if (existing !== undefined && !sameStrings(existing.pluginManifestPaths, manifestPaths)) {
+			throw new SessionPluginSelectionConflictError(
+				`Session ${metadata.id} is active with a different plugin selection`,
+			);
+		}
+		const pending = this.#pending.get(metadata.path);
+		if (pending !== undefined && !sameStrings(pending.pluginManifestPaths, manifestPaths)) {
+			throw new SessionPluginSelectionConflictError(
+				`Session ${metadata.id} is starting with a different plugin selection`,
+			);
+		}
+	}
+	// ...
+	async openSession(
+		metadata: SessionCatalogMetadata,
+		context: Context,
+		pluginManifestPaths: readonly string[],
+	): Promise<RoutedSessionHandle> {
+		if (this.#detached || this.#shuttingDown) throw new Error("Experimental server is shutting down");
+		// !mark
+		this.assertSessionPluginManifestPaths(metadata, pluginManifestPaths);
+		const existing = this.#workersBySession.get(metadata.path);
+		// !mark
+		if (existing) return this.#routedHandle(existing);
+		const pending = this.#pending.get(metadata.path);
+		// !mark
+		if (pending) return this.#routedHandle(await pending.promise);
+		return this.#routedHandle(await this.#launch(metadata, context, pluginManifestPaths));
+	}
+
+	async closeSession(metadata: SessionCatalogMetadata, context: Context): Promise<void> {
+		const worker = this.#workersBySession.get(metadata.path) ?? (await this.#pending.get(metadata.path)?.promise);
+		if (worker !== undefined) await this.#stopWorker(worker, context);
+	}
+```
+
+## !!steps Launching a worker process
+
+`#launch` makes a peer id and a secret token, then spawns the child through [process.ts](/docs/src/experimental/process.ts) with the control address, token, session key and peer id in environment variables. The session key is base64url-encoded because it is a filesystem path.
+
+A pending record with a 15 second timer is stored before returning. A child error or exit before ready fails the pending launch, and the timer is unref'd so it does not hold the process open.
+
+```ts ! session-worker-manager.ts
+	#launch(
+		metadata: SessionCatalogMetadata,
+		_context: Context,
+		pluginManifestPaths: readonly string[],
+	): Promise<WorkerRecord> {
+		const sessionKey = metadata.path;
+		const peerId = `worker-${randomUUID()}`;
+		const token = randomUUID();
+		let child: ChildProcess;
+		try {
+			const options: SessionWorkerOptions = {
+				sessionDir: this.#sessionDir,
+				metadata: { id: metadata.id, createdAt: metadata.createdAt, cwd: metadata.cwd, path: metadata.path },
+				pluginManifestPaths: [...pluginManifestPaths],
+				...(this.#model ?? {}),
+			};
+			// !mark
+			child = spawnInternalProcess("session-worker", [JSON.stringify(options)], {
+				env: {
+					[SESSION_WORKER_CONTROL_ADDRESS_ENV]: this.#coordinator.controlPath,
+					[SESSION_WORKER_CONTROL_TOKEN_ENV]: token,
+					[SESSION_WORKER_SESSION_KEY_ENV]: Buffer.from(sessionKey).toString("base64url"),
+					[SESSION_WORKER_PEER_ID_ENV]: peerId,
+				},
+			});
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		let resolve!: (worker: WorkerRecord) => void;
+		let reject!: (error: Error) => void;
+		const promise = new Promise<WorkerRecord>((resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		});
+		// !mark(1:4)
+		const timer = setTimeout(
+			() => this.#failPending(sessionKey, new Error("Session worker startup timed out")),
+			WORKER_STARTUP_TIMEOUT_MS,
+		);
+		timer.unref();
+		const pending = {
+			sessionKey,
+			peerId,
+			token,
+			pluginManifestPaths: Object.freeze([...pluginManifestPaths]),
+			child,
+			timer,
+			promise,
+			resolve,
+			reject,
+		};
+		// !mark
+		this.#pending.set(sessionKey, pending);
+		this.#notifyWorkerCountChanged();
+		// !mark(1:2)
+		child.once("error", (error) => this.#failPending(sessionKey, error));
+		child.once("exit", (code, signal) => this.#childExited(pending, code, signal));
+		return promise;
+	}
+```
+
+## !!steps Accepting events from workers
+
+Coordinator events are validated: payloads are checked against `SessionWorkerEventSchema`, and an invalid operation response rejects that worker's pending operations instead of leaving them hanging. A disconnect either removes a known worker or fails a pending launch.
+
+Every later handler also compares peer id, token and session key against the record, so a message from a different peer cannot settle someone else's request.
+
+```ts ! session-worker-manager.ts
+	#handleCoordinatorEvent(event: CoordinatorConnectionEvent): void {
+		if (this.#detached) return;
+		// !mark
+		if (event.type === "peer_disconnected") {
+			this.#markDiscovered(event.peerId);
+			const worker = this.#workersByPeer.get(event.peerId);
+			if (worker) {
+				this.#removeWorker(
+					worker,
+					worker.expectedStop
+						? undefined
+						: new Error(`Session worker ${worker.metadata.id} disconnected unexpectedly`),
+				);
+			}
+			const pending = this.#pendingPeer(event.peerId);
+			if (pending) this.#failPending(pending.sessionKey, new Error("Session worker disconnected during startup"));
+			return;
+		}
+		if (event.type !== "message") return;
+		// !mark
+		if (!Check(SessionWorkerEventSchema, event.payload)) {
+			if (
+				typeof event.payload === "object" &&
+				event.payload !== null &&
+				"type" in event.payload &&
+				event.payload.type === "operation_response"
+			) {
+				const worker = this.#workersByPeer.get(event.from);
+				if (worker)
+					this.#rejectWorkerOperations(worker, new Error("Session worker returned an invalid operation response"));
+			}
+			return;
+		}
+		// ...
+		if (message.type === "worker_failed") {
+			const pending = this.#pending.get(message.sessionKey);
+			// !mark
+			if (pending?.peerId === event.from && pending.token === message.token) {
+				this.#failPending(message.sessionKey, new Error(`Session worker failed: ${message.message}`));
+			}
+			return;
+		}
+```
+
+## !!steps Turning a ready message into a worker
+
+`#recordReadyWorker` validates that the metadata is consistent and absolute, compares plugin paths with what was requested, and rejects a second worker for the same session by telling it to shut down.
+
+When it all checks out, the `WorkerRecord` is created and registered in both maps, the pending launch resolves, and the worker count callback fires.
+
+```ts ! session-worker-manager.ts
+	#recordReadyWorker(peerId: string, message: Extract<SessionWorkerEvent, { type: "worker_ready" }>): void {
+		// !mark(1:6)
+		if (
+			message.sessionKey !== message.metadata.path ||
+			message.sessionId !== message.metadata.id ||
+			!isAbsolute(message.metadata.cwd) ||
+			!isAbsolute(message.metadata.path)
+		) {
+			return;
+		}
+		this.#markDiscovered(peerId);
+		const pending = this.#pending.get(message.sessionKey);
+		// !mark(1:3)
+		if (pending?.peerId === peerId && !sameStrings(message.pluginManifestPaths, pending.pluginManifestPaths)) {
+			this.#failPending(message.sessionKey, new Error("Session worker started with stale plugin packages"));
+			return;
+		}
+		const existing = this.#workersBySession.get(message.sessionKey);
+		// !mark(1:4)
+		if (existing && existing.peerId !== peerId) {
+			void this.#coordinator.send(peerId, { type: "shutdown" }).catch(() => {});
+			return;
+		}
+		if (
+			pending &&
+			(pending.peerId !== peerId || pending.token !== message.token || pending.child.pid !== message.pid)
+		) {
+			return;
+		}
+		if (existing) return;
+		let resolveTerminated!: (error: Error | undefined) => void;
+		const terminated = new Promise<Error | undefined>((resolve) => {
+			resolveTerminated = resolve;
+		});
+		const worker: WorkerRecord = {
+			peerId,
+			metadata: message.metadata,
+			pid: message.pid,
+			token: message.token,
+			pluginManifestPaths: Object.freeze([...message.pluginManifestPaths]),
+			terminated,
+			resolveTerminated,
+			attachmentIds: new Set(),
+			expectedStop: false,
+			stopping: false,
+		};
+		// !mark(1:3)
+		this.#workersBySession.set(message.sessionKey, worker);
+		this.#workersByPeer.set(peerId, worker);
+		this.workerPids.set(message.sessionId, message.pid);
+		if (pending) {
+			this.#pending.delete(message.sessionKey);
+			clearTimeout(pending.timer);
+			// !mark
+			pending.resolve(worker);
+		}
+		this.#notifyWorkerCountChanged();
+	}
+```
+
+## !!steps Attaching a client with a demand
+
+A client attachment gets an id and is added to the worker's set. Then `#applyDemand` sends a `session_demand` message and waits for `demand_applied`, so the worker knows how many clients want it.
+
+If the update times out while attaching, the manager sends a compensating demand with `attached` false, so a half-applied attachment is undone. If compensation fails too, the worker is stopped.
+
+```ts ! session-worker-manager.ts
+	async #attachClient(worker: WorkerRecord, context: Context): Promise<RoutedSessionAttachment> {
+		if (this.#detached || this.#shuttingDown || worker.stopping) {
+			throw new Error("Experimental Session worker is stopping");
+		}
+		if (this.#workersByPeer.get(worker.peerId) !== worker) {
+			throw new Error("Experimental Session worker is no longer available");
+		}
+		const attachmentId = randomUUID();
+		worker.attachmentIds.add(attachmentId);
+		try {
+			// !mark
+			await this.#applyDemand(worker, attachmentId, true, true, context);
+		} catch (error) {
+			worker.attachmentIds.delete(attachmentId);
+			throw error;
+		}
+		const scope = this.#operationScope(worker, attachmentId);
+	// ...
+	async #applyDemand(
+		worker: WorkerRecord,
+		attachmentId: string,
+		attached: boolean,
+		compensateOnTimeout: boolean,
+		_context: Context,
+	): Promise<void> {
+		if (worker.stopping || this.#workersByPeer.get(worker.peerId) !== worker) {
+			throw new Error("Experimental Session worker is stopping");
+		}
+		const requestId = randomUUID();
+		let resolve!: () => void;
+		let reject!: (error: Error) => void;
+		const applied = new Promise<void>((resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		});
+		// !mark(1:4)
+		const timer = setTimeout(() => {
+			if (compensateOnTimeout) void this.#reconcileDemandTimeout(requestId);
+			else this.#rejectDemand(requestId, new Error("Session worker demand update timed out"));
+		}, WORKER_DEMAND_TIMEOUT_MS);
+		timer.unref();
+		const pending = { attachmentId, attached, requestId, timer, worker, resolve, reject };
+		this.#pendingDemand.set(requestId, pending);
+		try {
+			// !mark
+			await this.#coordinator.send(worker.peerId, {
+				type: "session_demand",
+				serverConnectionId: this.#coordinator.serverConnectionId,
+				requestId,
+				attachmentId,
+				attached,
+			});
+		} catch (error) {
+			this.#rejectDemand(requestId, error instanceof Error ? error : new Error(String(error)));
+		}
+		return applied;
+	}
+```
+
+## !!steps Service calls and subscriptions
+
+`#invokeService` decodes control calls. A subscribe registers a listener under a scoped key before the call is sent, so updates that arrive before the response are not lost. If the call fails, the subscription is removed and the worker is told to unsubscribe in the background.
+
+`#invoke` sends an `operation` message and keeps resolve and reject in a pending map. An abort signal sends `operation_cancel` and rejects locally.
+
+```ts ! session-worker-manager.ts
+		const control = decodeServiceControlCall(call);
+		let addedSubscriptionKey: string | undefined;
+		// !mark
+		if (control?.type === "subscribe") {
+			const key = scopedServiceSubscriptionKey(scope, control.subscriptionId);
+			if (this.#serviceSubscriptions.has(key)) throw new Error("Service subscription ID is already active");
+			// !mark
+			this.#serviceSubscriptions.set(key, {
+				worker,
+				scope,
+				listener: (update, updateContext) => publish(control.subscriptionId, update, updateContext),
+				deliveryTail: Promise.resolve(),
+			});
+			addedSubscriptionKey = key;
+		}
+		let response: JsonValue | undefined;
+		try {
+			response = await this.#invoke(worker, scope, call, context);
+		} catch (error) {
+			// !mark
+			if (addedSubscriptionKey !== undefined && control?.type === "subscribe") {
+				this.#serviceSubscriptions.delete(addedSubscriptionKey);
+				void this.#invoke(
+					worker,
+					scope,
+					createServiceUnsubscribeCall(control.subscriptionId),
+					BACKGROUND_CONTEXT,
+				).catch(() => {});
+			}
+			throw error;
+		}
+		if (control?.type === "unsubscribe") {
+			this.#serviceSubscriptions.delete(scopedServiceSubscriptionKey(scope, control.subscriptionId));
+		}
+		return response;
+	}
+		// ...
+		if (context.abortSignal?.aborted) return Promise.reject(abortError(context.abortSignal));
+		const requestId = randomUUID();
+		let resolve!: (result: JsonValue | undefined) => void;
+		let reject!: (error: Error) => void;
+		const result = new Promise<JsonValue | undefined>((resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		});
+		const signal = context.abortSignal;
+		// !mark(1:4)
+		const onAbort = (): void => {
+			if (signal === undefined || !this.#pendingOperations.has(requestId)) return;
+			void this.#coordinator.send(worker.peerId, { type: "operation_cancel", requestId, scope }).catch(() => {});
+			this.#rejectOperation(requestId, abortError(signal));
+		};
+		if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
+		this.#pendingOperations.set(requestId, {
+			worker,
+			scope,
+			cleanup: () => signal?.removeEventListener("abort", onAbort),
+			resolve,
+			reject,
+		});
+		void this.#coordinator
+			.send(worker.peerId, { type: "operation", requestId, scope, call })
+			.catch((error: unknown) =>
+				this.#rejectOperation(requestId, error instanceof Error ? error : new Error(String(error))),
+			);
+		return result;
+	}
+```
+
+## !!steps Ordered delivery of updates
+
+Service updates from a worker are matched to a subscription by scope, peer, token and session key, parsed, and then chained on a per-subscription `deliveryTail`. This preserves order and isolates failures: a throwing listener is swallowed so later updates still flow.
+
+Parse errors silently drop the update.
+
+```ts ! session-worker-manager.ts
+	#handleServiceEvent(
+		peerId: string,
+		token: string,
+		sessionKey: string,
+		scope: WorkerOperationScope,
+		subscriptionId: string,
+		update: unknown,
+	): void {
+		// !mark
+		const entry = this.#serviceSubscriptions.get(scopedServiceSubscriptionKey(scope, subscriptionId));
+		if (
+			entry === undefined ||
+			entry.worker.peerId !== peerId ||
+			entry.worker.token !== token ||
+			entry.worker.metadata.path !== sessionKey ||
+			!sameScope(entry.scope, scope)
+		) {
+			return;
+		}
+		// !mark
+		let parsed: ServiceProviderUpdate;
+		try {
+			parsed = parseServiceProviderUpdate(update);
+		} catch {
+			return;
+		}
+		// !mark
+		entry.deliveryTail = entry.deliveryTail.then(() => entry.listener(parsed, TODO_CONTEXT)).catch(() => {});
+	}
+```
+
+## !!steps Stopping a worker
+
+`#stopWorker` caches its promise in `stopPromise`, so concurrent callers share one stop. The internal stop rejects pending operations, marks the worker as expected to stop, and sends a `shutdown` message.
+
+If the worker has not terminated within ten seconds, the manager kills it with SIGKILL, ignoring a missing process, and removes it itself.
+
+```ts ! session-worker-manager.ts
+	#stopWorker(worker: WorkerRecord, _context: Context): Promise<void> {
+		if (this.#detached || this.#workersByPeer.get(worker.peerId) !== worker) return Promise.resolve();
+		// !mark
+		worker.stopPromise ??= this.#stopWorkerInternal(worker);
+		return worker.stopPromise;
+	}
+
+	async #stopWorkerInternal(worker: WorkerRecord): Promise<void> {
+		this.#rejectWorkerOperations(worker, new Error("Session worker is stopping"));
+		// !mark(1:2)
+		worker.stopping = true;
+		worker.expectedStop = true;
+		void this.#coordinator.send(worker.peerId, { type: "shutdown" }).catch(() => {});
+		let timer: NodeJS.Timeout | undefined;
+		const timedOut = new Promise<boolean>((resolve) => {
+			timer = setTimeout(() => resolve(true), WORKER_SHUTDOWN_TIMEOUT_MS);
+			timer.unref();
+		});
+		try {
+			// !mark
+			if ((await Promise.race([worker.terminated.then(() => false), timedOut])) === true) {
+				try {
+					// !mark
+					process.kill(worker.pid, "SIGKILL");
+				} catch (error) {
+					if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+				}
+				this.#removeWorker(worker, undefined);
+				await worker.terminated;
+			}
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+```
+
+## !!steps Removing a worker and settling everything
+
+`#removeWorker` is the single teardown: it rejects the worker's operations and demands, drops its subscriptions, deletes it from both maps, and resolves `terminated` with the error (or `undefined` for an expected stop).
+
+The error choice matters: an unexpected disconnect or exit yields an error, which the routed handle's `terminated` promise passes to the server.
+
+```ts ! session-worker-manager.ts
+	#removeWorker(worker: WorkerRecord, error: Error | undefined): void {
+		// !mark
+		if (this.#workersByPeer.get(worker.peerId) !== worker) return;
+		this.#rejectWorkerOperations(worker, new Error("Session worker disconnected during an operation"));
+		this.#removeServiceSubscriptions((entry) => entry.worker === worker);
+		for (const pending of [...this.#pendingDemand.values()]) {
+			if (pending.worker === worker) {
+				this.#rejectDemand(pending.requestId, new Error("Session worker disconnected during demand update"));
+			}
+		}
+		this.#workersByPeer.delete(worker.peerId);
+		this.#workersBySession.delete(worker.metadata.path);
+		if (this.workerPids.get(worker.metadata.id) === worker.pid) this.workerPids.delete(worker.metadata.id);
+		// !mark
+		worker.resolveTerminated(error);
+		this.#notifyWorkerCountChanged();
+	}
+```
+
+## !!steps Shutdown versus detach
+
+`shutdown` marks the manager as shutting down, asks pending launches to exit with a SIGKILL fallback, stops every running worker and clears state. `detach` is for a replaced server: it rejects pending work but leaves the worker processes alive for the new server to discover.
+
+`discover` then asks peers to announce themselves and waits until the expected ones answer or five seconds pass.
+
+```ts ! session-worker-manager.ts
+	async discover(peerIds: ReadonlySet<string>): Promise<void> {
+		// !mark
+		if (this.#detached) return;
+		const undiscovered = new Set(
+			[...peerIds].filter((peerId) => !this.#workersByPeer.has(peerId) && !this.#pendingPeer(peerId)),
+		);
+		if (undiscovered.size === 0) return;
+		this.#discoveryPeers = undiscovered;
+		const discovered = new Promise<void>((resolve) => {
+			this.#resolveDiscovery = resolve;
+		});
+		// !mark
+		await this.#coordinator.broadcast({ type: "discover_workers" });
+		let timer: NodeJS.Timeout | undefined;
+		await Promise.race([
+			discovered,
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, WORKER_DISCOVERY_TIMEOUT_MS);
+				timer.unref();
+			}),
+		]);
+		if (timer) clearTimeout(timer);
+		this.#discoveryPeers = undefined;
+		this.#resolveDiscovery = undefined;
+	}
+	// ...
+	/** Forget workers without stopping them when this server is replaced. */
+	// !mark(1:2)
+	detach(): void {
+		if (this.#detached) return;
+		this.#detached = true;
+		for (const pending of this.#pending.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error("Experimental server was replaced"));
+		}
+		for (const requestId of [...this.#pendingOperations.keys()]) {
+			this.#rejectOperation(requestId, new Error("Experimental server was replaced during a worker operation"));
+		}
+		this.#detachState();
+	}
+```
+
+</Scrollycoding>
+
+The manager is the server-side half of a protocol whose worker half is [session-worker.ts](/docs/src/experimental/session-worker.ts). It is created by the experimental server in [server.ts](/docs/src/experimental/server.ts) and uses [session-catalog.ts](/docs/src/experimental/session-catalog.ts) metadata for every session it launches.
+
+Two small observations: `#applyDemand`, `#stopWorker` and `#launch` take a context parameter that they never use, and `workerPids` is a public mutable map.

@@ -1,0 +1,221 @@
+---
+title: "tools-manager.ts"
+description: "Locates or downloads the fd and ripgrep binaries that the find and grep tools depend on"
+source: "src/utils/tools-manager.ts"
+full: true
+---
+
+The `find` and `grep` tools shell out to `fd` and `rg`. Users may not have them installed, so this file finds them on the system or downloads the right release archive from GitHub into pi's bin directory, then extracts and installs the binary.
+
+It is the largest utility here because it must cope with three archive layouts, Windows versus Unix extraction tools, concurrent downloads at startup, offline mode, and Termux. Callers are [find.ts](/docs/src/core/tools/find.ts), [grep.ts](/docs/src/core/tools/grep.ts) and [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts). Network access goes through [management-http.ts](/docs/src/utils/management-http.ts), and the bin directory comes from [config.ts](/docs/src/config.ts), the same one [shell.ts](/docs/src/utils/shell.ts) adds to `PATH`.
+
+<Scrollycoding>
+
+## !!steps Tool table
+
+Each tool is described by its GitHub repo, binary name, tag prefix and a function that maps version, platform and architecture to the exact release asset name. The two tools differ in tag format (`v10.3.0` versus `14.1.0`) and in asset naming. `fd` also lists `fdfind`, the Debian package name, as an alternative system command.
+
+```ts ! tools-manager.ts
+interface ToolConfig {
+	name: string;
+	repo: string; // GitHub repo (e.g., "sharkdp/fd")
+	binaryName: string; // Name of the binary inside the archive
+	systemBinaryNames?: string[]; // Alternative system command names to try before downloading
+	tagPrefix: string; // Prefix for tags (e.g., "v" for v1.0.0, "" for 1.0.0)
+	getAssetName: (version: string, plat: string, architecture: string) => string | null;
+}
+
+const TOOLS: Record<string, ToolConfig> = {
+	fd: {
+		name: "fd",
+		repo: "sharkdp/fd",
+		binaryName: "fd",
+		systemBinaryNames: ["fd", "fdfind"],
+		tagPrefix: "v",
+```
+
+## !!steps Finding an existing binary
+
+`getToolPath` checks pi's own bin directory first, then the system `PATH` by actually running `cmd --version`. Only a spawn error such as `ENOENT` counts as missing; a non-zero exit still counts as present. For system commands it returns the bare command name rather than a full path.
+
+```ts ! tools-manager.ts
+export function getToolPath(tool: "fd" | "rg"): string | null {
+	const config = TOOLS[tool];
+	if (!config) return null;
+
+	// Check our tools directory first
+	const localPath = join(TOOLS_DIR, config.binaryName + (platform() === "win32" ? ".exe" : ""));
+	if (existsSync(localPath)) {
+		return localPath;
+	}
+
+	// Check system PATH - if found, just return the command name (it's in PATH)
+	const systemBinaryNames = config.systemBinaryNames ?? [config.binaryName];
+	for (const systemBinaryName of systemBinaryNames) {
+		if (commandExists(systemBinaryName)) {
+			return systemBinaryName;
+		}
+	}
+
+	return null;
+}
+```
+
+## !!steps Resolving the latest version without the API
+
+Instead of the rate-limited GitHub API, it requests the `releases/latest` web page with `redirect: "manual"` and reads the `Location` header, which points at the tagged release. The comment explains why: anonymous API quota is exhausted behind shared proxies and CI runners. The body is cancelled so the connection can be reused.
+
+```ts ! tools-manager.ts
+	const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+	if (!location) {
+		throw new Error(`Failed to resolve latest ${repo} release: HTTP ${response.status} without redirect`);
+	}
+
+	const tag = new URL(location, "https://github.com").pathname.split("/").pop();
+	if (!tag || !location.includes("/releases/tag/")) {
+		throw new Error(`Failed to resolve latest ${repo} release: unexpected redirect to ${location}`);
+	}
+	return decodeURIComponent(tag).replace(/^v/, "");
+```
+
+## !!steps Streaming the download
+
+The archive is streamed to disk by piping the web response body, converted with `Readable.fromWeb`, into a write stream, with a 120 second timeout budget. Non-OK status or a missing body raises an error.
+
+```ts ! tools-manager.ts
+async function downloadFile(url: string, dest: string): Promise<void> {
+	const response = await fetchWithRetry(url, undefined, { timeoutMs: DOWNLOAD_TIMEOUT_MS });
+
+	if (!response.ok) {
+		throw new Error(`Download failed with HTTP ${response.status}: ${url}`);
+	}
+
+	if (!response.body) {
+		throw new Error("No response body");
+	}
+
+	const fileStream = createWriteStream(dest);
+	await pipeline(Readable.fromWeb(response.body as any), fileStream);
+}
+```
+
+## !!steps Extraction with fallbacks
+
+Tarballs use `tar xzf`. Zips depend on platform: on Windows, `tar.exe` from System32 (bsdtar reads zips; Git Bash's GNU tar does not), then PowerShell `Expand-Archive`. On Unix, `unzip`, then `tar`. Each failure message is collected and reported together if every strategy fails.
+
+```ts ! tools-manager.ts
+function extractZipArchive(archivePath: string, extractDir: string, assetName: string): void {
+	const failures: string[] = [];
+
+	if (platform() === "win32") {
+		// Windows ships bsdtar as tar.exe, which supports zip files. Prefer the
+		// System32 binary over Git Bash's GNU tar, which does not handle zip archives.
+		const tarFailure = runExtractionCommand(getWindowsTarCommand(), ["xf", archivePath, "-C", extractDir]);
+		if (!tarFailure) return;
+		failures.push(tarFailure);
+```
+
+## !!steps Choosing a version and asset
+
+`fd` on macOS Intel is pinned to 10.3.0, skipping the network lookup, presumably because later releases dropped a prebuilt x64 macOS asset. If `getAssetName` returns null the platform is unsupported.
+
+```ts ! tools-manager.ts
+	const plat = platform();
+	const architecture = arch();
+
+	// fd is pinned on darwin/x64, so skip the version lookup there.
+	const version =
+		tool === "fd" && plat === "darwin" && architecture === "x64" ? "10.3.0" : await getLatestVersion(config.repo);
+
+	// Get asset name for this platform
+	const assetName = config.getAssetName(version, plat, architecture);
+	if (!assetName) {
+		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
+	}
+```
+
+## !!steps Unique extraction directory
+
+fd and rg downloads can run at the same time during startup, so each extraction uses a directory named with the binary, pid, timestamp and a random suffix. A fixed shared directory would race.
+
+```ts ! tools-manager.ts
+	// Extract into a unique temp directory. fd and rg downloads can run concurrently
+	// during startup, so sharing a fixed directory causes races.
+	const extractDir = join(
+		TOOLS_DIR,
+		`extract_tmp_${config.binaryName}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+	);
+	mkdirSync(extractDir, { recursive: true });
+```
+
+## !!steps Finding and installing the binary
+
+Archives differ: some nest under a folder named after the asset, some put the binary at the root. The code checks both candidates, then falls back to a depth-first search. The binary is renamed into the bin directory and made executable on Unix. The `finally` block removes both the archive and the extraction directory even on failure.
+
+```ts ! tools-manager.ts
+		const binaryFileName = config.binaryName + binaryExt;
+		const extractedDir = join(extractDir, assetName.replace(/\.(tar\.gz|zip)$/, ""));
+		const extractedBinaryCandidates = [join(extractedDir, binaryFileName), join(extractDir, binaryFileName)];
+		let extractedBinary = extractedBinaryCandidates.find((candidate) => existsSync(candidate));
+
+		if (!extractedBinary) {
+			extractedBinary = findBinaryRecursively(extractDir, binaryFileName) ?? undefined;
+		}
+
+		if (extractedBinary) {
+			renameSync(extractedBinary, binaryPath);
+		} else {
+			throw new Error(`Binary not found in archive: expected ${binaryFileName} under ${extractDir}`);
+		}
+```
+
+## !!steps ensureTool and its guards
+
+`ensureTool` is the public entry point. If the tool exists it returns immediately. Otherwise it stops with a warning in offline mode, and on Android prints a `pkg install` hint because Linux binaries do not run against Bionic libc. Only then does it download. All outcomes are reported through the optional `onStatus` callback.
+
+```ts ! tools-manager.ts
+	const existingPath = getToolPath(tool);
+	if (existingPath) {
+		return existingPath;
+	}
+
+	const config = TOOLS[tool];
+	if (!config) return undefined;
+
+	if (isOfflineModeEnabled()) {
+		onStatus?.({ type: "warning", message: `${config.name} not found. Offline mode enabled, skipping download.` });
+		return undefined;
+	}
+
+	// On Android/Termux, Linux binaries don't work due to Bionic libc incompatibility.
+	// Users must install via pkg.
+	if (platform() === "android") {
+		const pkgName = TERMUX_PACKAGES[tool] ?? tool;
+		onStatus?.({ type: "warning", message: `${config.name} not found. Install with: pkg install ${pkgName}` });
+		return undefined;
+	}
+```
+
+## !!steps Surfacing hidden error causes
+
+Node's `fetch` often fails with a bare "fetch failed" and keeps the useful reason (DNS, TLS, timeout) in `cause`. The failure handler walks the cause chain, capped at five levels to survive cycles, and joins the distinct messages.
+
+```ts ! tools-manager.ts
+		const messages: string[] = [];
+		for (
+			let current: unknown = e, depth = 0;
+			current instanceof Error && depth < 5;
+			current = current.cause, depth++
+		) {
+			if (!messages.includes(current.message)) messages.push(current.message);
+		}
+		onStatus?.({
+			type: "warning",
+			message: `Failed to download ${config.name}: ${messages.length > 0 ? messages.join(": ") : String(e)}`,
+		});
+		return undefined;
+```
+
+</Scrollycoding>
+
+Failure never throws out of `ensureTool`; it returns `undefined` and the tool code must degrade. Offline mode here is parsed locally (`1`, `true`, `yes`) while [version-check.ts](/docs/src/utils/version-check.ts) treats any non-empty `PI_OFFLINE` as offline, so the two disagree about values like `0` or `false`. No checksum or signature of the downloaded archive is verified.

@@ -1,0 +1,246 @@
+---
+title: "changelog.ts"
+description: "Parses CHANGELOG.md into version entries, selects unseen ones and rewrites relative links to tagged GitHub URLs"
+source: "src/utils/changelog.ts"
+full: true
+---
+
+`changelog.ts` powers the "what's new" display. It reads the project changelog, turns each `## [x.y.z]` section into an entry, filters entries newer than the last version the user saw, and rewrites relative markdown links so they point at the matching git tag on GitHub.
+
+The interactive UI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) calls these functions, and `getChangelogPath` is re-exported from [config.ts](/docs/src/config.ts).
+
+<Scrollycoding>
+
+## !!steps Entry type and link constants
+
+`ChangelogEntry` stores numeric major, minor and patch plus the raw markdown. Constants name the GitHub repo, the base path used to resolve relative links, and regexes for legacy repository URLs, URL schemes and inline markdown links.
+
+```ts ! changelog.ts
+export interface ChangelogEntry {
+	major: number;
+	minor: number;
+	patch: number;
+	content: string;
+}
+
+// !mark(1:2)
+const GITHUB_REPO = "earendil-works/pi";
+const CHANGELOG_LINK_BASE_PATH = "packages/coding-agent";
+const LEGACY_REPO_RE = /^https:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono(?=\/|$)/;
+const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
+const INLINE_MARKDOWN_LINK_RE = /(!?\[[^\]\n]+\]\()([^\s)]+)((?:\s+[^)]*)?\))/g;
+```
+
+## !!steps Version helpers
+
+`normalizeTag` accepts a string or an entry and returns a tag with a `v` prefix, which is how releases are tagged.
+
+```ts ! changelog.ts
+function entryVersion(entry: ChangelogEntry): string {
+	return `${entry.major}.${entry.minor}.${entry.patch}`;
+}
+
+function normalizeTag(version: string | ChangelogEntry): string {
+	const versionString = typeof version === "string" ? version : entryVersion(version);
+	return versionString.startsWith("v") ? versionString : `v${versionString}`;
+}
+```
+
+## !!steps Splitting a link target
+
+`splitLocalTarget` separates the path from its query and fragment so they can be reattached after the path is rewritten.
+
+```ts ! changelog.ts
+function splitLocalTarget(target: string): { fragment: string; pathPart: string; query: string } {
+	const hashIndex = target.indexOf("#");
+	const beforeHash = hashIndex === -1 ? target : target.slice(0, hashIndex);
+	const fragment = hashIndex === -1 ? "" : target.slice(hashIndex);
+	const queryIndex = beforeHash.indexOf("?");
+
+	if (queryIndex === -1) {
+		return { fragment, pathPart: beforeHash, query: "" };
+	}
+
+	return {
+		fragment,
+		pathPart: beforeHash.slice(0, queryIndex),
+		query: beforeHash.slice(queryIndex),
+	};
+}
+```
+
+## !!steps Resolving repository paths
+
+Backslashes become slashes. A target starting with a slash is root-relative; anything else is joined to `packages/coding-agent`. Results that would escape the repo are rejected with undefined. A target without a dot in its basename, or ending in a slash, is treated as a directory.
+
+```ts ! changelog.ts
+function normalizePathPart(value: string): string {
+	return value.replaceAll("\\", "/");
+}
+
+function resolveRepositoryPath(targetPath: string): string | undefined {
+	const normalizedTarget = normalizePathPart(targetPath);
+	const joined = normalizedTarget.startsWith("/")
+		? path.posix.normalize(normalizedTarget.replace(/^\/+/, ""))
+		: path.posix.normalize(path.posix.join(CHANGELOG_LINK_BASE_PATH, normalizedTarget));
+
+	// !mark(1:3)
+	if (joined === "." || joined.startsWith("../") || joined === "..") {
+		return undefined;
+	}
+
+	return joined;
+}
+
+function isDirectoryTarget(originalPath: string, repositoryPath: string): boolean {
+	if (originalPath.endsWith("/")) {
+		return true;
+	}
+
+	// !mark
+	const basename = path.posix.basename(repositoryPath);
+	return !basename.includes(".");
+}
+```
+
+## !!steps Normalizing a single link
+
+Legacy `pi-mono` URLs are rewritten to the current repo. Links to `main` or `master` blob and tree URLs are pinned to the release tag so they keep working. Fragments, protocol-relative URLs and schemes pass through; local paths become `blob` or `tree` URLs with `encodeURI`.
+
+```ts ! changelog.ts
+function normalizeChangelogLinkTarget(target: string, tag: string): string {
+	// !mark
+	let canonicalTarget = target.replace(LEGACY_REPO_RE, `https://github.com/${GITHUB_REPO}`);
+	const repoUrl = `https://github.com/${GITHUB_REPO}`;
+
+	// !mark(1:8)
+	for (const route of ["blob", "tree"]) {
+		for (const branch of ["main", "master"]) {
+			const floatingRefPrefix = `${repoUrl}/${route}/${branch}/`;
+			if (canonicalTarget.startsWith(floatingRefPrefix)) {
+				canonicalTarget = `${repoUrl}/${route}/${tag}/${canonicalTarget.slice(floatingRefPrefix.length)}`;
+			}
+		}
+	}
+
+	if (canonicalTarget.startsWith("#") || canonicalTarget.startsWith("//") || URL_SCHEME_RE.test(canonicalTarget)) {
+		return canonicalTarget;
+	}
+
+	const { fragment, pathPart, query } = splitLocalTarget(canonicalTarget);
+	if (!pathPart) {
+		return canonicalTarget;
+	}
+
+	const repositoryPath = resolveRepositoryPath(pathPart);
+	if (!repositoryPath) {
+		return canonicalTarget;
+	}
+
+	// !mark
+	const route = isDirectoryTarget(pathPart, repositoryPath) ? "tree" : "blob";
+	return `https://github.com/${GITHUB_REPO}/${route}/${tag}/${encodeURI(repositoryPath)}${query}${fragment}`;
+}
+```
+
+## !!steps normalizeChangelogLinks
+
+The public function applies this to every inline markdown link, keeping the link text prefix and optional title suffix untouched.
+
+```ts ! changelog.ts
+export function normalizeChangelogLinks(markdown: string, version: string | ChangelogEntry): string {
+	const tag = normalizeTag(version);
+	return markdown.replace(INLINE_MARKDOWN_LINK_RE, (_match, prefix, target, suffix) => {
+		return `${prefix}${normalizeChangelogLinkTarget(target, tag)}${suffix}`;
+	});
+}
+```
+
+## !!steps Parsing the file
+
+`parseChangelog` returns an empty list if the file is missing. Each `## ` line ends the previous entry; if the header matches a version it starts a new entry, otherwise lines are skipped until the next header. The last entry is flushed after the loop.
+
+```ts ! changelog.ts
+export function parseChangelog(changelogPath: string): ChangelogEntry[] {
+	if (!existsSync(changelogPath)) {
+		return [];
+	}
+
+	try {
+		const content = readFileSync(changelogPath, "utf-8");
+		const lines = content.split("\n");
+		const entries: ChangelogEntry[] = [];
+
+		let currentLines: string[] = [];
+		let currentVersion: { major: number; minor: number; patch: number } | null = null;
+// ...
+		for (const line of lines) {
+			// Check if this is a version header (## [x.y.z] ...)
+			// !mark
+			if (line.startsWith("## ")) {
+				// Save previous entry if exists
+				if (currentVersion && currentLines.length > 0) {
+					entries.push({
+						...currentVersion,
+						content: currentLines.join("\n").trim(),
+					});
+				}
+
+				// Try to parse version from this line
+				// !mark
+				const versionMatch = line.match(/##\s+\[?(\d+)\.(\d+)\.(\d+)\]?/);
+				if (versionMatch) {
+					currentVersion = {
+						major: Number.parseInt(versionMatch[1], 10),
+						minor: Number.parseInt(versionMatch[2], 10),
+						patch: Number.parseInt(versionMatch[3], 10),
+					};
+					currentLines = [line];
+				} else {
+					// Reset if we can't parse version
+					currentVersion = null;
+					currentLines = [];
+				}
+			} else if (currentVersion) {
+				// Collect lines for current version
+				currentLines.push(line);
+			}
+		}
+```
+
+## !!steps Comparing and filtering
+
+Versions compare numerically field by field. `getNewEntries` parses the last-seen version string, defaulting missing or non-numeric parts to 0, and keeps strictly newer entries. Pre-release suffixes are not understood by the header regex, so only the numeric part is read.
+
+```ts ! changelog.ts
+export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number {
+	if (v1.major !== v2.major) return v1.major - v2.major;
+	if (v1.minor !== v2.minor) return v1.minor - v2.minor;
+	return v1.patch - v2.patch;
+}
+
+/**
+ * Get entries newer than lastVersion
+ */
+// !mark
+export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] {
+	// Parse lastVersion
+	const parts = lastVersion.split(".").map(Number);
+	const last: ChangelogEntry = {
+		major: parts[0] || 0,
+		minor: parts[1] || 0,
+		patch: parts[2] || 0,
+		content: "",
+	};
+
+	// !mark
+	return entries.filter((entry) => compareVersions(entry, last) > 0);
+}
+
+// Re-export getChangelogPath from paths.ts for convenience
+export { getChangelogPath } from "../config.ts";
+```
+
+</Scrollycoding>
+
+The file has no state. Quirks worth knowing: `compareVersions` ignores pre-release tags, and parse failures are logged with `console.error` and treated as an empty changelog rather than raised.

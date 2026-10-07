@@ -1,0 +1,42 @@
+---
+title: "index.ts"
+description: "One-line barrel that exposes the separate pi-client package under the coding agent's client entry point"
+source: "src/client/index.ts"
+full: true
+---
+
+This file has a single statement. It re-exports everything from the
+`@earendil-works/pi-client` package, so consumers of the coding agent can import
+client functionality from `src/client` without depending on that package
+directly.
+
+<Scrollycoding>
+
+## !!steps A pure re-export
+
+`export *` forwards all named exports of the client package. There is no logic,
+no wrapping and no renaming, so the public client API is whatever that package
+exports at the installed version. Default exports are not forwarded by this
+form.
+
+```ts ! index.ts
+export * from "@earendil-works/pi-client";
+```
+
+## !!steps Why it exists
+
+A barrel like this gives the coding agent a stable subpath for client code. The
+server side of the same experiment lives in
+[server.ts](/docs/src/experimental/server.ts) and the client runtime in
+[client.ts](/docs/src/experimental/client.ts); this file just exposes the
+published client package alongside them.
+
+```ts ! index.ts
+export * from "@earendil-works/pi-client";
+```
+
+</Scrollycoding>
+
+Because the file is only a forwarder, there is nothing to test or maintain
+here beyond the dependency on the client package. Related command wiring is in
+[client.ts](/docs/src/cli/experimental/commands/client.ts).

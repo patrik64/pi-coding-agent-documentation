@@ -1,0 +1,209 @@
+---
+title: "trust-manager.ts"
+description: "The persistent project trust store: a locked JSON file mapping directories to trust decisions, with nearest-ancestor lookup"
+source: "src/core/trust-manager.ts"
+full: true
+---
+
+Project-local configuration such as extensions, skills, prompts and `settings.json` can run code or change behavior, so the agent asks before loading it from a directory it has not seen. This file stores the answers. A `trust.json` in the agent directory maps absolute paths to `true` or `false`, and a decision on a folder applies to everything beneath it.
+
+It also contains the logic that decides whether a directory has anything worth asking about, and the list of choices offered to the user. The policy that consumes it is in [project-trust.ts](/docs/src/core/project-trust.ts), and the interactive prompt is [trust-selector.ts](/docs/src/modes/interactive/components/trust-selector.ts).
+
+<Scrollycoding>
+
+## !!steps Decision types and the options offered
+
+A decision is `true`, `false` or `null`, where `null` means undecided and removes the entry. A `ProjectTrustOption` is one row in the prompt: a label, the resulting trust state, the list of store updates to apply, and the path that will be saved (shown to the user).
+
+`TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` lists what makes a project worth asking about: settings, MCP config, extensions, skills, prompts, themes and the two system prompt files.
+
+```ts ! trust-manager.ts
+export type ProjectTrustDecision = boolean | null;
+
+export interface ProjectTrustUpdate {
+	path: string;
+	decision: ProjectTrustDecision;
+}
+
+export interface ProjectTrustOption {
+	label: string;
+	trusted: boolean;
+	updates: ProjectTrustUpdate[];
+	savedPath?: string;
+}
+
+type TrustFile = Record<string, boolean | null | undefined>;
+
+const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES = [
+	"settings.json",
+	"mcp.json",
+// ...
+	"APPEND_SYSTEM.md",
+] as const;
+```
+
+## !!steps Nearest-ancestor lookup
+
+`findNearestTrustEntry` starts at the canonical working directory and walks up toward the filesystem root, returning the first explicit `true` or `false`. Paths are canonicalized first ([paths.ts](/docs/src/utils/paths.ts)) so symlinks do not create separate identities.
+
+This is what makes "trust parent folder" work: one entry covers every project below it, while a more specific entry deeper in the tree overrides it.
+
+```ts ! trust-manager.ts
+function findNearestTrustEntry(data: TrustFile, cwd: string): ProjectTrustStoreEntry | null {
+	let currentDir = normalizeCwd(cwd);
+	while (true) {
+		const value = data[currentDir];
+		// !mark(1:3)
+		if (value === true || value === false) {
+			return { path: currentDir, decision: value };
+		}
+
+		const parentDir = dirname(currentDir);
+		if (parentDir === currentDir) {
+			return null;
+		}
+		currentDir = parentDir;
+	}
+}
+```
+
+## !!steps The choices in the prompt
+
+Trusting the parent folder is a two-part update: trust the parent and clear any decision on the folder itself, so the broader grant is the only one in force. Session-only variants have an empty update list, so nothing is written and the choice lasts for the process. The parent option is absent at the filesystem root.
+
+```ts ! trust-manager.ts
+export function getProjectTrustOptions(cwd: string, options?: { includeSessionOnly?: boolean }): ProjectTrustOption[] {
+	const trustPath = normalizeCwd(cwd);
+	const trustOptions: ProjectTrustOption[] = [
+		{ label: "Trust", trusted: true, updates: [{ path: trustPath, decision: true }], savedPath: trustPath },
+	];
+	const parentPath = getProjectTrustParentPath(cwd);
+	if (parentPath !== undefined) {
+		trustOptions.push({
+			label: `Trust parent folder (${parentPath})`,
+			trusted: true,
+			// !mark(1:4)
+			updates: [
+				{ path: parentPath, decision: true },
+				{ path: trustPath, decision: null },
+			],
+			savedPath: parentPath,
+		});
+	}
+```
+
+## !!steps Reading and writing strictly
+
+`readTrustFile` returns an empty store when the file is missing, strips a BOM, and throws a descriptive error for malformed JSON, for non-object roots, and for any value that is not `true`, `false` or `null`. A corrupt file is therefore reported rather than silently treated as no trust.
+
+`writeTrustFile` sorts keys for stable diffs, drops invalid values, creates the directory and writes pretty JSON with a trailing newline.
+
+```ts ! trust-manager.ts
+function readTrustFile(path: string): TrustFile {
+	if (!existsSync(path)) {
+		return {};
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stripBom(readFileSync(path, "utf-8")));
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`Failed to read trust store ${path}: ${message}`);
+	}
+
+	// !mark(1:3)
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error(`Invalid trust store ${path}: expected an object`);
+	}
+```
+
+## !!steps A synchronous lock with a busy wait
+
+Several agent processes may write the trust file at once. `acquireTrustLockSync` takes a `proper-lockfile` lock on the directory, retrying up to ten times, 20 ms apart, and only when the error code is `ELOCKED`; any other error is rethrown at once.
+
+The sleep is a busy loop on `Date.now()`, a deliberate choice stated in the comment: it keeps the store API synchronous so no caller has to become async. `withTrustFileLock` guarantees release through `finally`.
+
+```ts ! trust-manager.ts
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			return lockfile.lockSync(trustDir, { realpath: false, lockfilePath: `${path}.lock` });
+		} catch (error) {
+// ...
+			if (code !== "ELOCKED" || attempt === maxAttempts) {
+				throw error;
+			}
+			lastError = error;
+			const start = Date.now();
+			// !mark(1:3)
+			while (Date.now() - start < delayMs) {
+				// Sleep synchronously to avoid changing trust store callers to async.
+			}
+		}
+	}
+```
+
+## !!steps Does this project need asking at all
+
+`hasTrustRequiringProjectResources` returns true if the working directory's config folder holds any trust-requiring entry, or if any ancestor has a `.agents/skills` directory. The user's own `~/.agents/skills` is excluded, even when cwd is the home directory, because it is a trusted user resource. The home directory honors `process.env.HOME` over `os.homedir()`.
+
+Note the asymmetry: config resources are checked only in the cwd, while agent skills are checked in every ancestor.
+
+```ts ! trust-manager.ts
+export function hasTrustRequiringProjectResources(cwd: string): boolean {
+	const homeDir = canonicalizePath(resolvePath(process.env.HOME || homedir()));
+	const userAgentsSkillsDir = join(homeDir, ".agents", "skills");
+	let currentDir = canonicalizePath(resolvePath(cwd));
+
+	const configDir = join(currentDir, CONFIG_DIR_NAME);
+	if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
+		return true;
+	}
+
+	while (true) {
+		const agentsSkillsDir = join(currentDir, ".agents", "skills");
+		// !mark
+		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
+			return true;
+		}
+```
+
+## !!steps The store class
+
+`ProjectTrustStore` resolves `trust.json` inside the agent directory. Every read and write goes through the lock. `get` collapses the nearest entry to a decision or `null`; `set` is a one-element `setMany`.
+
+`setMany` is a read-modify-write under a single lock, so the two updates of "trust parent" are applied atomically. A `null` decision deletes the key.
+
+```ts ! trust-manager.ts
+export class ProjectTrustStore {
+	private trustPath: string;
+
+	constructor(agentDir: string) {
+		this.trustPath = join(resolvePath(agentDir), "trust.json");
+	}
+
+	get(cwd: string): ProjectTrustDecision {
+		return this.getEntry(cwd)?.decision ?? null;
+	}
+// ...
+	setMany(decisions: ProjectTrustUpdate[]): void {
+		withTrustFileLock(this.trustPath, () => {
+			const data = readTrustFile(this.trustPath);
+			for (const { path, decision } of decisions) {
+				const key = normalizeCwd(path);
+				// !mark(1:5)
+				if (decision === null) {
+					delete data[key];
+				} else {
+					data[key] = decision;
+				}
+			}
+			writeTrustFile(this.trustPath, data);
+		});
+	}
+}
+```
+
+</Scrollycoding>
+
+The store is used by [project-trust.ts](/docs/src/core/project-trust.ts), which turns these primitives into a startup decision, and by the interactive mode and the MCP CLI. The config directory name comes from [config.ts](/docs/src/config.ts). Structurally the file is three layers: pure helpers for lookup and options, strict file IO, and a thin class that adds locking.

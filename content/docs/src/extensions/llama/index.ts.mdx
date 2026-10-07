@@ -1,0 +1,187 @@
+---
+title: "index.ts"
+description: "The llama.cpp extension: registers the provider and the interactive /llama command for loading, unloading and downloading router models."
+source: "src/extensions/llama/index.ts"
+full: true
+---
+
+This is the entry point of the built-in llama.cpp extension (listed in [extensions/index.ts](/docs/src/extensions/index.ts)). It does two things: it registers a model provider whose catalog mirrors the models of a llama.cpp router-mode server, and it adds a `/llama` slash command for managing those models from the terminal UI.
+
+The pieces it composes are the provider in [provider.ts](/docs/src/extensions/llama/provider.ts), the HTTP client in [client.ts](/docs/src/extensions/llama/client.ts), the Hugging Face search in [huggingface.ts](/docs/src/extensions/llama/huggingface.ts) and the dialogs in [ui.ts](/docs/src/extensions/llama/ui.ts). This file is mostly orchestration and error handling around them.
+
+<Scrollycoding>
+
+## !!steps Small helpers
+
+A model counts as loaded when it is `loaded` or `sleeping`. Connection errors are recognized by message text (fetch failed, timeout, network), and shown as a friendly message. `parseHuggingFaceModel` splits `repo:quantization` by looking for a colon after the slash of the repository name.
+
+```ts ! index.ts
+function modelIsLoaded(model: LlamaModelInfo): boolean {
+	return model.status.value === "loaded" || model.status.value === "sleeping";
+}
+
+function isConnectionError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const message = `${error.name} ${error.message}`.toLowerCase();
+	return message.includes("fetch failed") || message.includes("timeout") || message.includes("network");
+}
+
+function parseHuggingFaceModel(value: string): { repository: string; quantization?: string } {
+	const colon = value.indexOf(":", value.indexOf("/") + 1);
+	return colon < 0
+		? { repository: value }
+		: { repository: value.slice(0, colon), quantization: value.slice(colon + 1) };
+}
+```
+
+## !!steps Building a client from provider auth
+
+There is no separate llama setting. The server address and key come from the provider's stored auth, which the user sets with `/login`. The base URL can come from the `LLAMA_BASE_URL` entry of the auth environment, falling back to the auth's base URL, and is normalized. Without auth the command only shows a hint. The registry is the one in [model-registry.ts](/docs/src/core/model-registry.ts).
+
+```ts ! index.ts
+async function configuredClient(ctx: ExtensionCommandContext): Promise<LlamaClient | undefined> {
+	const result = await ctx.modelRegistry.getProviderAuth(LLAMA_PROVIDER_ID);
+	if (!result) {
+		ctx.ui.notify(`Configure llama.cpp with /login ${LLAMA_PROVIDER_ID}`, "warning");
+		return undefined;
+	}
+	const configuredUrl = result.env?.LLAMA_BASE_URL;
+	const serverUrl = normalizeLlamaServerUrl(
+		typeof configuredUrl === "string" && configuredUrl ? configuredUrl : (result.auth.baseUrl ?? ""),
+	);
+	return new LlamaClient(serverUrl, result.auth.apiKey);
+}
+```
+
+## !!steps Syncing the catalog into the registry
+
+`syncCatalog` is how server state reaches the rest of pi. It reads the catalog (or uses one passed in), hands it to the provider, and refreshes only the llama provider in the model registry. It sets `allowNetwork: true` on purpose: the user has already contacted the llama.cpp server explicitly, so the refresh should work even when `PI_OFFLINE` blocks other network use. An aborted refresh or a provider error is thrown to the caller.
+
+```ts ! index.ts
+	const syncCatalog = async (
+		ctx: ExtensionCommandContext,
+		client: LlamaClient,
+		catalog?: LlamaModelInfo[],
+	): Promise<LlamaModelInfo[]> => {
+		const signal = AbortSignal.timeout(15_000);
+		const current = catalog ?? (await client.list({ signal }));
+		provider.setCatalog(current, client.serverUrl);
+		const result = await ctx.modelRegistry.refresh({
+			providers: [LLAMA_PROVIDER_ID],
+			// /llama already contacted the configured llama.cpp server, so keep this refresh live even in PI_OFFLINE.
+			allowNetwork: true,
+			signal,
+		});
+		if (result.aborted) throw new Error("Model catalog refresh timed out.");
+```
+
+## !!steps Loading with a safety net
+
+If other models are loaded, the user chooses between unloading all, keeping them, or cancelling. Replacing is risky, because a failed or cancelled load would leave nothing running, so `restoreLoaded` reloads the previous models in that case.
+
+`runWithProgress` shows a dialog with a cancel confirmation. Cancelling restores previous models if they were unloaded; a thrown error does the same, ignoring a failure of the restore itself to preserve the original error.
+
+```ts ! index.ts
+		const restoreLoaded = async (): Promise<void> => {
+			ctx.ui.notify("Restoring previously loaded models");
+			for (const model of loaded) await client.loadAndWait(model.id, () => {});
+			await syncCatalog(ctx, client);
+		};
+		if (replace) {
+			for (const model of loaded) await client.unloadAndWait(model.id);
+		}
+
+		try {
+			const result = await runWithProgress(ui, {
+				title: "Loading model",
+				model: target.id,
+				initialMessage: "Starting…",
+				cancelTitle: "Stop loading?",
+				cancelMessage: target.id,
+				run: (signal, update) => client.loadAndWait(target.id, update, signal),
+				cancel: () => client.unload(target.id),
+			});
+```
+
+## !!steps Unloading
+
+Unloading asks for confirmation, waits until the server reports the model unloaded, resyncs the catalog and notifies. It is short because `unloadAndWait` in the client does the polling.
+
+```ts ! index.ts
+	const unloadModel = async (
+		ctx: ExtensionCommandContext,
+		ui: LlamaUi,
+		client: LlamaClient,
+		model: LlamaModelInfo,
+	): Promise<void> => {
+		if (!(await ui.confirm("Unload model?", model.id))) return;
+		await client.unloadAndWait(model.id);
+		await syncCatalog(ctx, client);
+		ctx.ui.notify(`Unloaded ${model.id}`);
+	};
+```
+
+## !!steps Gated repositories and quantization choice
+
+The download flow searches Hugging Face (with a token if one is found), fetches details, and handles two cases. For gated repositories it explains whether manual approval or accepting terms is needed, and reminds that the llama.cpp server itself needs `HF_TOKEN` with access, since the server performs the download. If the user typed no quantization, a list is shown with sizes and the recommended `Q4_K_M` marked.
+
+```ts ! index.ts
+		const huggingFace = new HuggingFaceClient(await findHuggingFaceToken());
+		const selected = await ui.searchModels((query, signal) => huggingFace.search(query, signal));
+		if (!selected) return;
+		const parsed = parseHuggingFaceModel(selected);
+		ui.showStatus("Loading model details", parsed.repository);
+		const details = await huggingFace.details(parsed.repository);
+		if (details.gated) {
+			const approval = details.gated === "manual" ? "Manual approval is required" : "Accept the access terms";
+			const choice = await ui.select(
+				`Hugging Face access required\n${details.id}\n\n${approval} at:\nhttps://huggingface.co/${details.id}\n\nThe llama.cpp server needs HF_TOKEN with access.`,
+				["Continue", "Back"],
+			);
+			if (choice !== "Continue") return;
+		}
+```
+
+## !!steps Running the download
+
+The chosen model is `repo:quantization`. The download runs with the same progress dialog helper. On success the catalog returned by `downloadAndWait` is passed straight to `syncCatalog`, which saves a second request.
+
+Note that the cancel callback is `client.unload(model)`, the same call used for load cancellation; this asks the server to unload the model, and whether that stops an in-progress download is not shown in this repository.
+
+```ts ! index.ts
+		const model = quantization ? `${details.id}:${quantization}` : details.id;
+		const result = await runWithProgress(ui, {
+			title: "Downloading model",
+			model,
+			initialMessage: "Starting…",
+			cancelTitle: "Stop download?",
+			cancelMessage: model,
+			run: (signal, update) => client.downloadAndWait(model, update, signal),
+			cancel: () => client.unload(model),
+		});
+		if (result.cancelled) return;
+		await syncCatalog(ctx, client, result.value);
+		ctx.ui.notify(`Downloaded ${model}`);
+```
+
+## !!steps The /llama command
+
+The command only runs in the interactive TUI mode. After building the client, it opens the UI and loops: read the catalog (retrying while the user chooses to retry after a connection error), show the model list, and act on the choice. Download opens the flow above, a loaded model is unloaded, an unloaded model is loaded, and any other state only notifies.
+
+Errors from an action are held until the catalog is refreshed, so the list is always current. Connection errors are not shown twice, because the retry dialog already covered them.
+
+```ts ! index.ts
+	pi.registerCommand("llama", {
+		description: "Manage llama.cpp router models",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/llama is available in interactive mode", "warning");
+				return;
+			}
+			const client = await configuredClient(ctx);
+			if (!client) return;
+```
+
+</Scrollycoding>
+
+The provider is registered at extension load time, so models already known from a previous catalog can be selected without opening `/llama`; the command is only for changing server state. The extension types come from [types.ts](/docs/src/core/extensions/types.ts).

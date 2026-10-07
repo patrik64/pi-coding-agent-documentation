@@ -1,0 +1,241 @@
+---
+title: "remote-catalog-provider.ts"
+description: "Wraps a built-in provider with a model list refreshed from the pi.dev catalog, using ETag revalidation and a persisted overlay"
+source: "src/core/remote-catalog-provider.ts"
+full: true
+---
+
+Built-in providers ship with a static model list generated at build time, which goes stale as providers add models. `withRemoteCatalog` decorates a provider so that newer models can be fetched from the pi.dev catalog, stored, and merged over the baseline without a release.
+
+The refresh protocol is careful about three things: offline operation (restore what was stored), network politeness (at most once per interval, with conditional requests), and never letting a bad response wipe a good cache. [model-runtime.ts](/docs/src/core/model-runtime.ts) applies the wrapper and the persisted entries live in [models-store.ts](/docs/src/core/models-store.ts).
+
+<Scrollycoding>
+
+## !!steps Constants and supported model types
+
+A request has a four second timeout per attempt, and the overlay is considered fresh for four hours. The client advertises the model types it understands (chat, image, classifier) through a `types` query parameter, so the server can return a richer shard. Models of unknown types are filtered out, and models with no type are treated as chat.
+
+```ts ! remote-catalog-provider.ts
+const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
+// !mark(1:2)
+const REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS = 4_000;
+export const REMOTE_CATALOG_REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
+/**
+ * Model types this client can consume. Sent as `?types=` so the catalog server
+ * returns the full-type shard instead of the chat-only one served to clients
+ * that predate model types. A server that ignores the parameter still returns
+ * the chat-only shard, which this client handles unchanged.
+ */
+// !mark
+export const REMOTE_CATALOG_MODEL_TYPES: readonly ModelType[] = ["chat", "image", "classifier"];
+
+function isSupportedModelType(model: { type?: unknown }): boolean {
+	return (
+		model.type === undefined ||
+		(typeof model.type === "string" && REMOTE_CATALOG_MODEL_TYPES.includes(model.type as ModelType))
+	);
+}
+```
+
+## !!steps Merging baseline and dynamic models
+
+Models are keyed by type and id, separated by a NUL character. Dynamic entries are placed after the baseline, so on collision the remote definition wins, while models only in the baseline are kept.
+
+```ts ! remote-catalog-provider.ts
+function mergeModels<TModel extends AnyModel>(baseline: readonly TModel[], dynamic: readonly TModel[]): TModel[] {
+	const merged = new Map<string, TModel>();
+// !mark
+	for (const model of [...baseline, ...dynamic]) merged.set(`${getModelType(model)}\0${model.id}`, model);
+	return [...merged.values()];
+}
+```
+
+## !!steps Tolerant catalog parsing
+
+The server response can be an array, an object with a `models` array, or a map of id to model. All three are accepted. Entries must be objects with an id and a supported type, and the provider field is overwritten with the local provider id, so a catalog cannot attribute models to another provider.
+
+```ts ! remote-catalog-provider.ts
+function parseCatalog(providerId: string, value: unknown): AnyModel[] {
+// !mark(1:8)
+	const entries = Array.isArray(value)
+		? value
+		: typeof value === "object" && value !== null && "models" in value && Array.isArray(value.models)
+			? value.models
+			: typeof value === "object" && value !== null
+				? Object.values(value)
+				: undefined;
+	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
+// !mark(1:4)
+	return entries
+		.filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && "id" in entry)
+		.filter(isSupportedModelType)
+		.map((model) => ({ ...model, provider: providerId }) as AnyModel);
+}
+```
+
+## !!steps Ignoring a catalog older than the build
+
+`localGeneratedAt` is when the built-in list was generated. A stored overlay whose last-modified time is not newer than that is discarded, since the baseline already includes it. This prevents an old cache from shadowing a newer release.
+
+```ts ! remote-catalog-provider.ts
+function remoteModels(entry: ModelsStoreEntry | undefined, localGeneratedAt: number | undefined): readonly AnyModel[] {
+	if (!entry) return [];
+// !mark
+	if (localGeneratedAt !== undefined && (entry.lastModified === undefined || entry.lastModified <= localGeneratedAt)) {
+		return [];
+	}
+	return entry.models;
+}
+```
+
+## !!steps The decorated provider
+
+The returned provider spreads the original and overrides the getters. `getModels` returns only chat models, merged. `getAllModels` includes every type. Both read the closure variable `dynamicModels`, which is empty until refresh publishes something.
+
+```ts ! remote-catalog-provider.ts
+/** Add a persisted pi.dev catalog overlay to a static built-in provider. */
+export function withRemoteCatalog(
+	provider: Provider,
+	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
+	localGeneratedAt?: number,
+): Provider {
+	let dynamicModels: readonly AnyModel[] = [];
+
+	return {
+		...provider,
+// !mark(1:6)
+		getModels: () =>
+			mergeModels(
+				provider.getModels(),
+				dynamicModels.filter((model) => isModelType(model, "chat")),
+			),
+// !mark
+		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+```
+
+## !!steps Restoring first, then deciding whether to fetch
+
+Refresh begins by publishing the stored overlay through `context.publish`, which applies the update only if the context is still current; a false return aborts. After that, the network is skipped if it is disallowed, aborted, or the stored entry was checked within the interval, unless a refresh is forced.
+
+```ts ! remote-catalog-provider.ts
+		refreshModels: async (context) => {
+			const stored = context.stored;
+// !mark(1:2)
+			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+// !mark(1:7)
+			if (
+				!(await context.publish({
+					update: () => {
+						dynamicModels = restored;
+					},
+				}))
+			) {
+				return;
+			}
+// !mark
+			if (!context.allowNetwork || context.signal.aborted) return;
+// !mark(1:6)
+			if (
+				!context.force &&
+				stored?.checkedAt !== undefined &&
+				stored.lastModified !== undefined &&
+				Date.now() - stored.checkedAt < REMOTE_CATALOG_REFRESH_INTERVAL_MS
+			) {
+				return;
+			}
+```
+
+## !!steps A conditional request
+
+The ETag is sent as `if-none-match` only when a cached body backs it, so a 304 can never leave the overlay empty. The URL encodes the provider id, and the request uses `fetchWithRetry` from [management-http.ts](/docs/src/utils/management-http.ts) with a user agent from [pi-user-agent.ts](/docs/src/utils/pi-user-agent.ts).
+
+```ts ! remote-catalog-provider.ts
+			// Only revalidate when a cached body backs the validator, so a 304 can never
+			// leave the overlay empty.
+// !mark
+			const validator = stored && stored.models.length > 0 ? stored.etag : undefined;
+			const url = new URL(`/api/models/providers/${encodeURIComponent(provider.id)}`, catalogBaseUrl);
+// !mark
+			url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
+			const response = await fetchWithRetry(
+				url,
+				{
+					headers: {
+						accept: "application/json",
+						"User-Agent": getPiUserAgent(VERSION),
+// !mark
+						...(validator ? { "if-none-match": validator } : {}),
+					},
+					signal: context.signal,
+				},
+				{ attemptTimeoutMs: REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS },
+			);
+```
+
+## !!steps Handling each outcome
+
+A 304 only advances `checkedAt`. A 404 or 501 means the server has no catalog for this provider: the entry is persisted with `lastModified` of zero and no etag, which makes it older than any build, so the overlay is empty whenever a build time is known, and the next attempt waits for the interval. Other failures keep the cached body and etag, record the check time, then throw so the caller sees the error.
+
+```ts ! remote-catalog-provider.ts
+			if (context.signal.aborted) return;
+			const checkedAt = Date.now();
+			// Unchanged: dynamicModels already holds the stored overlay, so only the
+			// freshness window moves.
+// !mark(1:4)
+			if (response.status === 304 && stored) {
+				await context.publish({ persist: { ...stored, checkedAt } });
+				return;
+			}
+// !mark(1:9)
+			if (response.status === 404 || response.status === 501) {
+				await context.publish({
+					persist: {
+						...(stored ?? { models: [] }),
+						checkedAt,
+						lastModified: 0,
+						etag: undefined,
+					},
+				});
+				return;
+			}
+// !mark(1:5)
+			if (!response.ok) {
+				// Transient failure: the cached body and its validator stay valid, so keep the
+				// etag and let the next refresh revalidate instead of downloading the catalog.
+				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
+				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+			}
+```
+
+## !!steps Publishing a fresh catalog
+
+A successful response is parsed, stamped with the server's Last-Modified (zero if absent or invalid) and ETag, filtered through the generation-time rule, and then persisted and swapped into the live list in a single `publish` call, so the stored and in-memory states cannot diverge.
+
+```ts ! remote-catalog-provider.ts
+			const refreshed = parseCatalog(provider.id, await response.json());
+// !mark
+			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
+			if (context.signal.aborted) return;
+			const entry: ModelsStoreEntry = {
+				models: refreshed,
+				checkedAt,
+// !mark(1:2)
+				lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
+				etag: response.headers.get("etag") ?? undefined,
+			};
+// !mark
+			const published = remoteModels(entry, localGeneratedAt);
+			await context.publish({
+				persist: entry,
+				update: () => {
+					dynamicModels = published;
+				},
+			});
+		},
+	};
+}
+```
+
+</Scrollycoding>
+
+The wrapper changes nothing about authentication or streaming. It only overrides the model lists and `refreshModels`, which is why it composes cleanly with [provider-composer.ts](/docs/src/core/provider-composer.ts), which layers user configuration on top.

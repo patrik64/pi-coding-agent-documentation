@@ -1,0 +1,103 @@
+---
+title: "skill-invocation-message.ts"
+description: "Chat component that shows an invoked skill as a collapsible block, one line collapsed and full markdown expanded"
+source: "src/modes/interactive/components/skill-invocation-message.ts"
+full: true
+---
+
+When a user message expands a skill, the agent session parses it into a `ParsedSkillBlock` (see [agent-session.ts](/docs/src/core/agent-session.ts)). This component renders that block in the transcript. The user's own message text is rendered separately, so only the skill part appears here.
+
+It extends `Box` with the same background as custom messages, so skills look like other injected content such as [custom-message.ts](/docs/src/modes/interactive/components/custom-message.ts).
+
+<Scrollycoding>
+
+## !!steps State and constructor
+
+The component remembers an expanded flag, the parsed block and a Markdown theme. It paints with the `customMessageBg` background and calls `updateDisplay` once to build children.
+
+```ts ! skill-invocation-message.ts
+export class SkillInvocationMessageComponent extends Box {
+	private expanded = false;
+	private skillBlock: ParsedSkillBlock;
+	private markdownTheme: MarkdownTheme;
+
+	constructor(skillBlock: ParsedSkillBlock, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
+		// !mark
+		super(1, 1, (t) => theme.bg("customMessageBg", t));
+		this.skillBlock = skillBlock;
+		this.markdownTheme = markdownTheme;
+		// !mark
+		this.updateDisplay();
+	}
+```
+
+## !!steps Toggle and theme refresh
+
+`setExpanded` is the public hook used by the global expand-tools key. `invalidate` rebuilds too, because the display string includes theme colors.
+
+```ts ! skill-invocation-message.ts
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+		this.updateDisplay();
+	}
+
+	// !mark(1:4)
+	override invalidate(): void {
+		super.invalidate();
+		this.updateDisplay();
+	}
+```
+
+## !!steps Expanded view
+
+Expanded shows a bold `[skill]` label and then a Markdown render of the skill name and the entire content, using the custom message text color.
+
+```ts ! skill-invocation-message.ts
+	private updateDisplay(): void {
+		this.clear();
+		const content = new Container();
+
+		// !mark(1:3)
+		if (this.expanded) {
+			// Expanded: label + skill name header + full content
+			const label = theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m`);
+			content.addChild(new Text(label, 0, 0));
+			const header = `**${this.skillBlock.name}**\n\n`;
+			content.addChild(
+				// !mark(1:3)
+				new Markdown(header + this.skillBlock.content, 0, 0, this.markdownTheme, {
+					color: (text: string) => theme.fg("customMessageText", text),
+				}),
+			);
+```
+
+## !!steps Collapsed view and click to toggle
+
+Collapsed is a single line with the skill name and a dim hint built from `keyText` in [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts). A `MouseRegion` wraps either view so a left click toggles it.
+
+```ts ! skill-invocation-message.ts
+		} else {
+			// Collapsed: single line - [skill] name (hint to expand)
+			// !mark(1:4)
+			const line =
+				theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
+				theme.fg("customMessageText", this.skillBlock.name) +
+				theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+			content.addChild(new Text(line, 0, 0));
+		}
+
+		// !mark(1:3)
+		this.addChild(
+			new MouseRegion(content, (event) => {
+				if (event.type !== "click" || event.button !== "left") return undefined;
+				this.setExpanded(!this.expanded);
+				return { handled: true };
+			}),
+		);
+	}
+}
+```
+
+</Scrollycoding>
+
+Sibling components such as [branch-summary-message.ts](/docs/src/modes/interactive/components/branch-summary-message.ts) and [compaction-summary-message.ts](/docs/src/modes/interactive/components/compaction-summary-message.ts) follow the same collapse pattern.

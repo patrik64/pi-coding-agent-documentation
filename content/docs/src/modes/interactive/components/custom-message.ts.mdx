@@ -1,0 +1,125 @@
+---
+title: "custom-message.ts"
+description: "Renders extension-sent custom messages, using the extension's renderer when it works and a purple labelled markdown box otherwise"
+source: "src/modes/interactive/components/custom-message.ts"
+full: true
+---
+
+Extensions can inject `CustomMessage` objects (defined in [messages.ts](/docs/src/core/messages.ts)) into the conversation and register a `MessageRenderer` for their `customType` (see [types.ts](/docs/src/core/extensions/types.ts)). `CustomMessageComponent` decides how each one appears in the transcript.
+
+It has two paths. A registered renderer gets first chance and controls its own styling. If there is none, returns nothing, or throws, the component falls back to a default box with a bold label and the message text rendered as markdown. Compare [custom-entry.ts](/docs/src/modes/interactive/components/custom-entry.ts), which shows an error box instead of falling back.
+
+<Scrollycoding>
+
+## !!steps Fields and the default box
+
+The constructor stores the message, optional renderer, markdown theme (defaulting to the theme module's) and an `outputPad` that is passed through to renderers. It adds a spacer and creates the default `Box` once with the `customMessageBg` background; `rebuild` later attaches or detaches that box.
+
+```ts ! custom-message.ts
+	constructor(
+		message: CustomMessage<unknown>,
+		customRenderer?: MessageRenderer,
+		markdownTheme: MarkdownTheme = getMarkdownTheme(),
+		outputPad = 1,
+	) {
+		super();
+		this.message = message;
+		this.customRenderer = customRenderer;
+		this.markdownTheme = markdownTheme;
+		this.outputPad = outputPad;
+
+		this.addChild(new Spacer(1));
+
+		// Create box with purple background (used for default rendering)
+		this.box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+
+		this.rebuild();
+	}
+```
+
+## !!steps Setters that trigger a rebuild
+
+Both `setExpanded` and `setOutputPad` rebuild only on an actual change, and `invalidate` always rebuilds so theme changes reach the renderer. Expansion is the usual transcript toggle for showing more detail.
+
+```ts ! custom-message.ts
+	setExpanded(expanded: boolean): void {
+		if (this._expanded !== expanded) {
+			this._expanded = expanded;
+			this.rebuild();
+		}
+	}
+
+	setOutputPad(outputPad: number): void {
+		if (this.outputPad !== outputPad) {
+			this.outputPad = outputPad;
+			this.rebuild();
+		}
+	}
+```
+
+## !!steps Trying the custom renderer
+
+`rebuild` first removes the previous content and the default box. If a renderer exists it is called with the message, the expanded and padding options, and the theme. A returned component is added and the method returns early. The catch block is deliberately empty, so a failing renderer silently degrades to the default view.
+
+```ts ! custom-message.ts
+		// Try custom renderer first - it handles its own styling
+		if (this.customRenderer) {
+			try {
+				const component = this.customRenderer(
+					this.message,
+					{ expanded: this._expanded, outputPad: this.outputPad },
+					theme,
+				);
+				if (component) {
+					// Custom renderer provides its own styled component
+					this.customComponent = component;
+					this.addChild(component);
+					return;
+				}
+			} catch {
+				// !mark
+				// Fall through to default rendering
+			}
+		}
+```
+
+## !!steps Default rendering
+
+The default box begins with a bold label such as the message `customType`, using raw ANSI bold codes inside the themed label color, then a spacer.
+
+```ts ! custom-message.ts
+		// Default rendering uses our box
+		this.addChild(this.box);
+		this.box.clear();
+
+		// Default rendering: label + content
+		const label = theme.fg("customMessageLabel", `\x1b[1m[${this.message.customType}]\x1b[22m`);
+		this.box.addChild(new Text(label, 0, 0));
+		this.box.addChild(new Spacer(1));
+```
+
+## !!steps Extracting the text
+
+Message content is either a string or an array of content blocks. Only text blocks are kept and joined with newlines, so images or other block types in a custom message are not shown by the default view. The text goes through the `Markdown` component with the custom message text color.
+
+```ts ! custom-message.ts
+		let text: string;
+		if (typeof this.message.content === "string") {
+			text = this.message.content;
+		} else {
+			text = this.message.content
+				.filter((c): c is TextContent => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+		}
+
+		this.box.addChild(
+			new Markdown(text, 0, 0, this.markdownTheme, {
+				color: (text: string) => theme.fg("customMessageText", text),
+			}),
+		);
+```
+
+</Scrollycoding>
+
+The interactive mode in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) builds these when replaying history and on live custom-message events. The theme tokens `customMessageBg`, `customMessageLabel` and `customMessageText` are defined in [theme.ts](/docs/src/modes/interactive/theme/theme.ts).

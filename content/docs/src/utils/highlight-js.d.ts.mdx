@@ -1,0 +1,71 @@
+---
+title: "highlight-js.d.ts"
+description: "Minimal ambient type declarations for the highlight.js entry points the project imports"
+source: "src/utils/highlight-js.d.ts"
+full: true
+---
+
+This declaration file gives the project just enough typing for highlight.js without depending on its bundled types. It declares the small subset of the API actually used, and the module paths that are imported.
+
+The consumer is [syntax-highlight.ts](/docs/src/utils/syntax-highlight.ts), which loads the core build and registers languages.
+
+<Scrollycoding>
+
+## !!steps The API subset
+
+Only a result with a string `value`, the options object with a `language`, and a language definition are described. The factory type matches how language modules export themselves: a function taking the hljs instance.
+
+```ts ! highlight-js.d.ts
+interface HighlightJsResult {
+	value: string;
+}
+
+interface HighlightJsOptions {
+	language: string;
+	ignoreIllegals?: boolean;
+}
+
+interface HighlightJsLanguageDefinition {
+	readonly name?: string;
+}
+
+type HighlightJsLanguageFactory = (hljs: HighlightJsApi) => HighlightJsLanguageDefinition;
+```
+
+## !!steps The hljs object
+
+`HighlightJsApi` lists the four methods used: `highlight`, `highlightAuto`, `getLanguage` and `registerLanguage`.
+
+```ts ! highlight-js.d.ts
+interface HighlightJsApi {
+	highlight(code: string, options: HighlightJsOptions): HighlightJsResult;
+	highlightAuto(code: string, languageSubset?: string[]): HighlightJsResult;
+	getLanguage(name: string): HighlightJsLanguageDefinition | undefined;
+	registerLanguage(name: string, language: HighlightJsLanguageFactory): void;
+}
+```
+
+## !!steps Module declarations
+
+The three `declare module` blocks cover the core build, the full index and a wildcard for any language file. The wildcard form `languages/*.js` lets one declaration serve all language imports, each default-exporting a factory.
+
+```ts ! highlight-js.d.ts
+declare module "highlight.js/lib/core.js" {
+	const hljs: HighlightJsApi;
+	export default hljs;
+}
+
+declare module "highlight.js/lib/index.js" {
+	const hljs: HighlightJsApi;
+	export default hljs;
+}
+
+declare module "highlight.js/lib/languages/*.js" {
+	const language: HighlightJsLanguageFactory;
+	export default language;
+}
+```
+
+</Scrollycoding>
+
+Because these are ambient declarations, nothing is emitted at runtime; they only let the TypeScript compiler accept the `.js` deep imports.

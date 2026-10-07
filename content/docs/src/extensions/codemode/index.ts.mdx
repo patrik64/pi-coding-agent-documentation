@@ -1,0 +1,93 @@
+---
+title: "index.ts"
+description: "Extension factory that registers the inactive codemode tool and wires it to settings, tool namespaces and session storage."
+source: "src/extensions/codemode/index.ts"
+full: true
+---
+
+This is the entry point of the codemode extension. The CLI loads it as a built-in (see [extensions/index.ts](/docs/src/extensions/index.ts)), and SDK users can add `createCodemodeExtension()` to their own extension factories.
+
+The file is glue. The tool itself is built in [tool.ts](/docs/src/extensions/codemode/tool.ts); this file supplies the callbacks that connect it to the extension API from [types.ts](/docs/src/core/extensions/types.ts) and to the settings from [settings-manager.ts](/docs/src/core/settings-manager.ts).
+
+<Scrollycoding>
+
+## !!steps Header and activation rule
+
+The header says the tool is registered inactive. Turning it on takes `--tools`, the `defaultTools` setting or `setActiveTools()`. The MCP extension ([index.ts](/docs/src/extensions/mcp/index.ts)) also activates it when MCP tools can only be reached from scripts.
+
+```ts ! index.ts
+/**
+ * The `codemode` tool as an extension. The CLI loads it as a built-in extension; SDK users
+ * add `createCodemodeExtension()` to their extension factories.
+ *
+ * `codemode` is registered inactive. Activate it with `--tools`, the `defaultTools` setting, or
+ * `setActiveTools()`; the MCP extension activates it when MCP tools are only reachable from scripts.
+ */
+```
+
+## !!steps Options that override settings
+
+Each option overrides a setting of the same name. `models` defaults to true in the factory below, which exposes the model catalog and classifiers to scripts as `models`.
+
+```ts ! index.ts
+export interface CodemodeExtensionOptions {
+	/** Overrides the `codemode.mode` setting. */
+	mode?: CodemodeMode;
+	/** Overrides the `codemode.inlineBudget` setting. */
+	inlineBudget?: number;
+	/** Expose the model catalog and classifiers to scripts as `models`. Default: `true`. */
+	models?: boolean;
+}
+```
+
+## !!steps Reading settings defensively
+
+Settings are read when needed, not at registration, so a changed setting takes effect. `readMode` maps anything other than `only` to `on`. `readInlineBudget` accepts only a finite number that is zero or more, and otherwise returns undefined so the default budget in tool.ts applies.
+
+```ts ! index.ts
+function readMode(pi: ExtensionAPI): CodemodeMode {
+	return pi.getSettings().codemode?.mode === "only" ? "only" : "on";
+}
+
+function readInlineBudget(pi: ExtensionAPI): number | undefined {
+	const budget = pi.getSettings().codemode?.inlineBudget;
+	return typeof budget === "number" && Number.isFinite(budget) && budget >= 0 ? budget : undefined;
+}
+```
+
+## !!steps Registering the tool
+
+The factory builds the definition with callbacks into the extension API: `appendEntry` persists `store()` writes into the session, `getToolNamespace` and `getToolGuidelines` look at all registered tools lazily, and `getMode` and `getInlineBudget` prefer the explicit option and fall back to settings.
+
+`defaultActive: false` is what makes the tool inactive until something enables it.
+
+```ts ! index.ts
+export function createCodemodeExtension(options: CodemodeExtensionOptions = {}): ExtensionFactory {
+	return (pi) => {
+		pi.registerTool({
+			...createCodemodeToolDefinition({
+				appendEntry: (customType, data) => pi.appendEntry(customType, data),
+				models: options.models ?? true,
+				getToolNamespace: (name) => pi.getAllTools().find((tool) => tool.name === name)?.namespace,
+				getToolGuidelines: () =>
+					new Map(pi.getAllTools().map((tool) => [tool.name, tool.promptGuidelines ?? []] as const)),
+				getMode: () => options.mode ?? readMode(pi),
+				getInlineBudget: () => options.inlineBudget ?? readInlineBudget(pi),
+			}),
+			defaultActive: false,
+		});
+	};
+}
+```
+
+## !!steps Default export
+
+The default export is a factory with no options, which is what the built-in list imports.
+
+```ts ! index.ts
+export default createCodemodeExtension();
+```
+
+</Scrollycoding>
+
+Everything else lives in sibling files: [tool.ts](/docs/src/extensions/codemode/tool.ts) for the description and loadout, [execute.ts](/docs/src/extensions/codemode/execute.ts) for running scripts, and [renderer.ts](/docs/src/extensions/codemode/renderer.ts) for the terminal presentation.

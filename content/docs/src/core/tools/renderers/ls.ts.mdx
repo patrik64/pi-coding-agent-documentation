@@ -1,0 +1,90 @@
+---
+title: "ls.ts"
+description: "Terminal presentation for the ls tool: a clickable path header and a 20-line directory listing with entry-limit warnings"
+source: "src/core/tools/renderers/ls.ts"
+full: true
+---
+
+This file renders the ls tool from [tools/ls.ts](/docs/src/core/tools/ls.ts). It sits in the renderers folder so display code can be imported without the tool's execution path.
+
+It is the only one of the search-style renderers that uses `renderToolPath` from [render-utils.ts](/docs/src/core/tools/render-utils.ts), which makes the directory a terminal hyperlink and applies a fallback of `.` for an empty path. Otherwise it mirrors [renderers/find.ts](/docs/src/core/tools/renderers/find.ts) and [renderers/grep.ts](/docs/src/core/tools/renderers/grep.ts).
+
+<Scrollycoding>
+
+## !!steps The call header
+
+The header is `ls <path>` plus an optional `(limit N)`. `emptyFallback: "."` means an omitted path renders as the current directory, matching what the tool does. Unlike find and grep it also needs the `cwd`, because the hyperlink target is resolved against it.
+
+```ts ! ls.ts
+function formatLsCall(args: { path?: string; limit?: number } | undefined, theme: Theme, cwd: string): string {
+	const limit = args?.limit;
+	// !mark
+	const pathDisplay = renderToolPath(str(args?.path), theme, cwd, { emptyFallback: "." });
+	let text = `${theme.fg("toolTitle", theme.bold("ls"))} ${pathDisplay}`;
+	if (limit !== undefined) {
+		text += theme.fg("toolOutput", ` (limit ${limit})`);
+	}
+	return text;
+}
+```
+
+## !!steps Listing preview
+
+Collapsed output shows the first 20 lines; expanded shows all. The remainder is summarized with the shared hint using [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+
+```ts ! ls.ts
+	const output = getTextOutput(result, showImages).trim();
+	let text = "";
+	if (output) {
+		const lines = output.split("\n");
+		// !mark
+		const maxLines = options.expanded ? lines.length : 20;
+		const displayLines = lines.slice(0, maxLines);
+		const remaining = lines.length - maxLines;
+		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+		if (remaining > 0) {
+			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+		}
+	}
+```
+
+## !!steps Entry limit and byte limit warnings
+
+`entryLimitReached` records that the tool stopped listing at its entry cap; `truncation` records the byte cap from [truncate.ts](/docs/src/core/tools/truncate.ts). Either yields a bracketed warning line.
+
+```ts ! ls.ts
+	const entryLimit = result.details?.entryLimitReached;
+	const truncation = result.details?.truncation;
+	if (entryLimit || truncation?.truncated) {
+		const warnings: string[] = [];
+		// !mark(1:2)
+		if (entryLimit) warnings.push(`${entryLimit} entries limit`);
+		if (truncation?.truncated) warnings.push(`${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit`);
+		text += `\n${theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)}`;
+	}
+	return text;
+```
+
+## !!steps The exported renderer pair
+
+`renderCall` passes `context.cwd` to the header builder; `renderResult` does not need it. Both reuse the prior `Text` component.
+
+```ts ! ls.ts
+export const lsRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
+	renderCall(args, theme, context) {
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		// !mark
+		text.setText(formatLsCall(args as any, theme, context.cwd));
+		return text;
+	},
+	renderResult(result, options, theme, context) {
+		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+		text.setText(formatLsResult(result as any, options, theme, context.showImages));
+		return text;
+	},
+};
+```
+
+</Scrollycoding>
+
+[renderers/index.ts](/docs/src/core/tools/renderers/index.ts) registers this under the name `ls`, and the type comes from [extensions/types.ts](/docs/src/core/extensions/types.ts). The file is stateless.

@@ -1,0 +1,493 @@
+---
+title: "config-selector.ts"
+description: "The /config dialog for enabling or disabling extensions, skills, prompts and themes, in global or project scope"
+source: "src/modes/interactive/components/config-selector.ts"
+full: true
+---
+
+This file implements the interactive resource manager: a searchable, grouped checklist of every extension, skill, prompt template and theme that pi has discovered, either as standalone files or inside packages. Toggling an item rewrites the relevant settings through [settings-manager.ts](/docs/src/core/settings-manager.ts), so the choice persists.
+
+It has two modes. Global mode edits the user settings. Project mode edits the project settings and shows global items as inherited, letting a project force-load or unload them. The list is the bulk of the file (`ResourceList`), with a small header and a container class around it. The command-line entry point that opens it is [config-selector.ts](/docs/src/cli/config-selector.ts), and it borrows [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) and [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for chrome.
+
+<Scrollycoding>
+
+## !!steps Data model
+
+The selector manages four resource types (extensions, skills, prompts, themes) that [resource-loader.ts](/docs/src/core/resource-loader.ts) and [package-manager.ts](/docs/src/core/package-manager.ts) resolve. Everything is organized as groups (one per origin, scope, source and base directory), subgroups (one per resource type) and items. Two write scopes exist: global edits the user settings, project edits the project settings file.
+
+```ts ! config-selector.ts
+type ResourceType = "extensions" | "skills" | "prompts" | "themes";
+type ConfigWriteScope = "global" | "project";
+type SettingsScope = "user" | "project";
+type ProjectOverrideState = "inherit" | "load" | "unload";
+export type ScopedResolvedPaths = Record<ConfigWriteScope, ResolvedPaths>;
+
+const RESOURCE_TYPES = ["extensions", "skills", "prompts", "themes"] as const satisfies readonly ResourceType[];
+
+const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
+	extensions: "Extensions",
+	skills: "Skills",
+	prompts: "Prompts",
+	themes: "Themes",
+};
+
+interface ResourceItem {
+	path: string;
+	enabled: boolean;
+	metadata: PathMetadata;
+	resourceType: ResourceType;
+	displayName: string;
+	groupKey: string;
+	subgroupKey: string;
+}
+
+interface ResourceSubgroup {
+	type: ResourceType;
+	label: string;
+	items: ResourceItem[];
+}
+
+interface ResourceGroup {
+	key: string;
+	label: string;
+	scope: "user" | "project" | "temporary";
+	origin: "package" | "top-level";
+	source: string;
+	subgroups: ResourceSubgroup[];
+}
+```
+
+## !!steps Naming groups
+
+`getGroupLabel` turns resolver metadata into a heading: packages show their source and scope, built-ins are labelled as such (with a note when a project overrides them), auto-discovered top-level resources show their base directory with the home folder shortened to a tilde, and anything else is just user or project settings.
+
+```ts ! config-selector.ts
+function getGroupLabel(metadata: PathMetadata, agentDir: string): string {
+	if (metadata.origin === "package") {
+		return `${metadata.source} (${metadata.scope})`;
+	}
+	// !mark
+	if (metadata.source === "builtin") {
+		return metadata.scope === "user" ? "Built-in" : "Built-in (project override)";
+	}
+	// Top-level resources
+	if (metadata.source === "auto") {
+		if (metadata.baseDir) {
+			return metadata.scope === "user"
+				? `User (${formatBaseDir(metadata.baseDir)})`
+				: `Project (${formatBaseDir(metadata.baseDir)})`;
+		}
+		return metadata.scope === "user" ? `User (${formatBaseDir(agentDir)})` : `Project (${CONFIG_DIR_NAME}/)`;
+	}
+	return metadata.scope === "user" ? "User settings" : "Project settings";
+}
+```
+
+## !!steps Building groups from resolved paths
+
+`buildGroups` flattens the resolver output. The group key combines origin, scope, source and base directory, so two directories from the same scope stay separate. The display name is chosen to be recognizable: built-ins strip their path prefix (from [source-info.ts](/docs/src/core/source-info.ts)), extensions in a subfolder show `folder/file`, and a skill file named SKILL.md is shown as its parent folder.
+
+```ts ! config-selector.ts
+	const addToGroup = (resources: ResolvedResource[], resourceType: ResourceType) => {
+		for (const res of resources) {
+			const { path, enabled, metadata } = res;
+			const groupKey = `${metadata.origin}:${metadata.scope}:${metadata.source}:${metadata.baseDir ?? ""}`;
+
+			if (!groupMap.has(groupKey)) {
+				groupMap.set(groupKey, {
+					key: groupKey,
+					label: getGroupLabel(metadata, agentDir),
+					scope: metadata.scope,
+					origin: metadata.origin,
+					source: metadata.source,
+					subgroups: [],
+				});
+			}
+
+			const group = groupMap.get(groupKey)!;
+			const subgroupKey = `${groupKey}:${resourceType}`;
+
+			let subgroup = group.subgroups.find((sg) => sg.type === resourceType);
+			if (!subgroup) {
+				subgroup = {
+					type: resourceType,
+					label: RESOURCE_TYPE_LABELS[resourceType],
+					items: [],
+				};
+				group.subgroups.push(subgroup);
+			}
+
+			const fileName = basename(path);
+			const parentFolder = basename(dirname(path));
+			let displayName: string;
+	// !mark
+			if (metadata.source === "builtin") {
+				displayName = path.slice(BUILTIN_PATH_PREFIX.length);
+			} else if (resourceType === "extensions" && parentFolder !== "extensions") {
+				displayName = `${parentFolder}/${fileName}`;
+			} else if (resourceType === "skills" && fileName === "SKILL.md") {
+				displayName = parentFolder;
+			} else {
+				displayName = fileName;
+			}
+			subgroup.items.push({
+				path,
+				enabled,
+				metadata,
+				resourceType,
+				displayName,
+				groupKey,
+				subgroupKey,
+			});
+		}
+	};
+```
+
+## !!steps Ordering
+
+Groups sort packages before top-level resources and user before project, then by source name. Inside a group, subgroups follow a fixed type order and items are sorted by display name. The result is converted later into a flat list of entries that each is a group header, subgroup header or selectable item.
+
+```ts ! config-selector.ts
+	// Sort groups: packages first, then top-level; user before project
+	const groups = Array.from(groupMap.values());
+	groups.sort((a, b) => {
+		if (a.origin !== b.origin) {
+			return a.origin === "package" ? -1 : 1;
+		}
+		if (a.scope !== b.scope) {
+			return a.scope === "user" ? -1 : 1;
+		}
+		return a.source.localeCompare(b.source);
+	});
+
+	// Sort subgroups within each group by type order, and items by name
+	const typeOrder: Record<ResourceType, number> = { extensions: 0, skills: 1, prompts: 2, themes: 3 };
+	for (const group of groups) {
+		group.subgroups.sort((a, b) => typeOrder[a.type] - typeOrder[b.type]);
+		for (const subgroup of group.subgroups) {
+			subgroup.items.sort((a, b) => a.displayName.localeCompare(b.displayName));
+		}
+	}
+
+	return groups;
+}
+
+type FlatEntry =
+	| { type: "group"; group: ResourceGroup }
+	| { type: "subgroup"; subgroup: ResourceSubgroup; group: ResourceGroup }
+	| { type: "item"; item: ResourceItem };
+```
+
+## !!steps Header with scope hint
+
+The header shows which settings file is being edited and the keys that apply. The project mode label changes the space key hint to a three-state cycle. The tab hint is only shown when project mode is available, and the second line names the settings file in question.
+
+```ts ! config-selector.ts
+	render(width: number): string[] {
+		const title = theme.bold(this.writeScope === "project" ? "Project Local Resources" : "Global Resources");
+		const sep = theme.fg("muted", " · ");
+		const switchHint = this.projectModeAvailable ? keyHint("tui.input.tab", "switch mode") + sep : "";
+		const actionHint =
+			this.writeScope === "project" ? rawKeyHint("space", "cycle inherit/+/-") : rawKeyHint("space", "toggle");
+		const hint = switchHint + actionHint + sep + rawKeyHint("esc", "close");
+		const spacing = Math.max(1, width - visibleWidth(title) - visibleWidth(hint));
+		const scopeHint =
+			this.writeScope === "project"
+				? theme.fg("muted", `${CONFIG_DIR_NAME}/settings.json · inherited global resources are dimmed`)
+				: theme.fg("muted", `~/${CONFIG_DIR_NAME}/agent/settings.json`);
+
+		return [
+			truncateToWidth(`${title}${" ".repeat(spacing)}${hint}`, width, ""),
+			truncateToWidth(scopeHint, width, ""),
+		];
+	}
+```
+
+## !!steps Flat list and filtering
+
+`ResourceList` keeps the flat entries and a filtered copy. The initial selection skips headers. Search matches display name, resource type or path, then keeps only the groups and subgroups that contain a match, so headers never appear without items. `findNextItem` moves the cursor over headers, staying put at the ends.
+
+```ts ! config-selector.ts
+	private buildFlatList(): void {
+		this.flatItems = [];
+		for (const group of this.groups) {
+			this.flatItems.push({ type: "group", group });
+			for (const subgroup of group.subgroups) {
+				this.flatItems.push({ type: "subgroup", subgroup, group });
+				for (const item of subgroup.items) {
+					this.flatItems.push({ type: "item", item });
+				}
+			}
+		}
+		// Start selection on first item (not header)
+		this.selectedIndex = this.flatItems.findIndex((e) => e.type === "item");
+		if (this.selectedIndex < 0) this.selectedIndex = 0;
+	}
+
+	private findNextItem(fromIndex: number, direction: 1 | -1): number {
+		let idx = fromIndex + direction;
+		while (idx >= 0 && idx < this.filteredItems.length) {
+			if (this.filteredItems[idx].type === "item") {
+				return idx;
+			}
+			idx += direction;
+		}
+		return fromIndex; // Stay at current if no item found
+	}
+	// ...
+		const lowerQuery = query.toLowerCase();
+		const matchingItems = new Set<ResourceItem>();
+		const matchingSubgroups = new Set<ResourceSubgroup>();
+		const matchingGroups = new Set<ResourceGroup>();
+
+		for (const entry of this.flatItems) {
+			if (entry.type === "item") {
+				const item = entry.item;
+				if (
+					item.displayName.toLowerCase().includes(lowerQuery) ||
+					item.resourceType.toLowerCase().includes(lowerQuery) ||
+					item.path.toLowerCase().includes(lowerQuery)
+				) {
+					matchingItems.add(item);
+				}
+			}
+		}
+```
+
+## !!steps Rendering a window of the list
+
+The visible window is centered on the selection and clamped to the list. Group and subgroup headers have no cursor; in project mode, inherited global groups are dimmed. Items get a cursor, a checkbox and the display name, and a counter such as 3/12 appears when the list scrolls. `maxVisible` was computed from the terminal height minus eight lines of chrome.
+
+```ts ! config-selector.ts
+		// Calculate visible range
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredItems.length - this.maxVisible),
+		);
+		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredItems.length);
+
+		for (let i = startIndex; i < endIndex; i++) {
+			const entry = this.filteredItems[i];
+			const isSelected = i === this.selectedIndex;
+
+			if (entry.type === "group") {
+				// Main group header (no cursor)
+				const inherited = this.writeScope === "project" && entry.group.scope === "user";
+				const label = theme.bold(`${entry.group.label}${inherited ? " · inherited global" : ""}`);
+				const groupLine = theme.fg(inherited ? "dim" : "accent", label);
+				lines.push(truncateToWidth(`  ${groupLine}`, width, ""));
+			} else if (entry.type === "subgroup") {
+				// Subgroup header (indented, no cursor)
+				const color = this.writeScope === "project" && entry.group.scope === "user" ? "dim" : "muted";
+				const subgroupLine = theme.fg(color, entry.subgroup.label);
+				lines.push(truncateToWidth(`    ${subgroupLine}`, width, ""));
+	// ...
+		// Scroll indicator
+		if (startIndex > 0 || endIndex < this.filteredItems.length) {
+			const itemCount = this.filteredItems.filter((e) => e.type === "item").length;
+			const currentItemIndex =
+				this.filteredItems.slice(0, this.selectedIndex).filter((e) => e.type === "item").length + 1;
+			lines.push(theme.fg("dim", `  (${currentItemIndex}/${itemCount})`));
+		}
+```
+
+## !!steps Key handling
+
+Navigation keys use the shared keybinding ids. Escape closes, Ctrl+C exits the whole app, and the tab key flips scope. Space or confirm toggles the selected item, but only when it is allowed: in global mode only user-scoped items can be changed, in project mode any item can. After a toggle, the item is updated in place and `onToggle` triggers a repaint. Any other key goes to the search box and re-filters.
+
+```ts ! config-selector.ts
+		if (data === " " || kb.matches(data, "tui.select.confirm")) {
+			const entry = this.filteredItems[this.selectedIndex];
+	// !mark
+			if (entry?.type === "item" && (this.writeScope === "project" || this.getItemScope(entry.item) === "user")) {
+				const newEnabled = this.toggleResource(entry.item);
+				if (newEnabled !== undefined) {
+					this.updateItem(entry.item, newEnabled);
+					this.onToggle?.(entry.item, newEnabled);
+				}
+			}
+			return;
+		}
+
+		// Pass to search input
+		this.searchInput.handleInput(data);
+		this.filterItems(this.searchInput.getValue());
+	}
+```
+
+## !!steps Toggling top-level resources
+
+Settings store resource lists as patterns, with a leading plus to force-enable and minus to disable. To toggle, the code removes any existing entry for the same pattern (ignoring the prefix) and appends the new one. The updated array is then written back through the matching setter of [settings-manager.ts](/docs/src/core/settings-manager.ts) for the right scope and type.
+
+```ts ! config-selector.ts
+	private toggleTopLevelResource(item: ResourceItem, enabled: boolean): void {
+		const scope = item.metadata.scope as "user" | "project";
+		const settings =
+			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+
+		const arrayKey = item.resourceType as "extensions" | "skills" | "prompts" | "themes";
+		const current = (settings[arrayKey] ?? []) as string[];
+
+		// Generate pattern for this resource
+	// !mark
+		const pattern = this.getResourcePattern(item);
+		const disablePattern = `-${pattern}`;
+		const enablePattern = `+${pattern}`;
+
+		// Filter out existing patterns for this resource
+		const updated = current.filter((p) => {
+			const stripped = p.startsWith("!") || p.startsWith("+") || p.startsWith("-") ? p.slice(1) : p;
+			return stripped !== pattern;
+		});
+
+		if (enabled) {
+			updated.push(enablePattern);
+		} else {
+			updated.push(disablePattern);
+		}
+	// ...
+		if (scope === "project") {
+			if (arrayKey === "extensions") {
+				this.settingsManager.setProjectExtensionPaths(updated);
+			} else if (arrayKey === "skills") {
+				this.settingsManager.setProjectSkillPaths(updated);
+			} else if (arrayKey === "prompts") {
+				this.settingsManager.setProjectPromptTemplatePaths(updated);
+			} else if (arrayKey === "themes") {
+				this.settingsManager.setProjectThemePaths(updated);
+			}
+```
+
+## !!steps Toggling package resources
+
+Package entries can be a plain string or an object with per-type filters. A string is promoted to an object when a filter is needed, and after the update, if no filter remains, the entry collapses back to the plain source string so settings stay tidy.
+
+```ts ! config-selector.ts
+		if (pkgIndex === -1) return;
+
+		let pkg = packages[pkgIndex];
+
+		// Convert string to object form if needed
+		if (typeof pkg === "string") {
+			pkg = { source: pkg };
+			packages[pkgIndex] = pkg;
+		}
+
+	// ...
+		(pkg as Record<string, unknown>)[arrayKey] = updated.length > 0 ? updated : undefined;
+
+		// Clean up empty filter object
+		const hasFilters = ["extensions", "skills", "prompts", "themes"].some(
+			(k) => (pkg as Record<string, unknown>)[k] !== undefined,
+		);
+		if (!hasFilters) {
+			packages[pkgIndex] = (pkg as { source: string }).source;
+		}
+
+		if (scope === "project") {
+			this.settingsManager.setProjectPackages(packages);
+		} else {
+			this.settingsManager.setPackages(packages);
+		}
+	}
+```
+
+## !!steps Project overrides: three states
+
+Project mode cycles through inherit, load and unload. `getNextOverrideState` depends on whether the global setting enables the item: an enabled item goes inherit, then unload, then load, then back to inherit; a disabled one goes inherit, load, unload, then inherit. `renderCheckbox` shows plus for load, minus for unload, and a dim checkbox for inherit.
+
+```ts ! config-selector.ts
+	private getNextOverrideState(item: ResourceItem): ProjectOverrideState {
+		const state = this.getProjectOverrideState(item);
+		const inheritedEnabled = this.getInheritedEnabled(item);
+		if (state === "inherit") return inheritedEnabled ? "unload" : "load";
+		if (state === "unload") return inheritedEnabled ? "load" : "inherit";
+		return inheritedEnabled ? "inherit" : "unload";
+	}
+	// ...
+	private renderCheckbox(item: ResourceItem): string {
+		if (this.writeScope === "project") {
+			const state = this.getProjectOverrideState(item);
+			if (state === "load") return theme.fg("success", "[+]");
+			if (state === "unload") return theme.fg("warning", "[-]");
+			return theme.fg("dim", item.enabled ? "[x]" : "[ ]");
+		}
+		return item.enabled ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+	}
+```
+
+## !!steps Writing project overrides
+
+For top-level resources the project file receives entries that name the inherited file and then a plus or minus entry, replacing earlier entries for the same target. Built-in paths need no naming entry. Package overrides create a package entry with `autoload` false if none exists, and when all filters vanish the entry is either removed (autoload false) or collapsed to its source string.
+
+```ts ! config-selector.ts
+	private setProjectTopLevelOverride(item: ResourceItem, state: ProjectOverrideState): boolean {
+		const current = (this.settingsManager.getProjectSettings()[item.resourceType] ?? []) as string[];
+		const pattern = this.isInheritedGlobalItem(item) ? item.path : this.getResourcePatternForScope(item, "project");
+		const patterns = this.getTopLevelOverridePatterns(item, "project");
+		const updated = current.filter((entry) => {
+			const target = this.getPatternEntryTarget(entry);
+			if ((entry.startsWith("!") || entry.startsWith("+") || entry.startsWith("-")) && patterns.has(target))
+				return false;
+			return !(state === "inherit" && this.isInheritedGlobalItem(item) && target === pattern);
+		});
+		if (state !== "inherit") {
+			// Project entries name inherited files to override them. Built-in paths need no entry.
+			if (this.isInheritedGlobalItem(item) && item.metadata.source !== "builtin" && !updated.includes(pattern))
+				updated.push(pattern);
+			updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		}
+		this.setProjectTopLevelPaths(item.resourceType, updated);
+		return true;
+	}
+	// ...
+		if (state !== "inherit") updated.push(`${state === "load" ? "+" : "-"}${pattern}`);
+		(pkg as Record<string, unknown>)[item.resourceType] = updated.length > 0 ? updated : undefined;
+		if (!RESOURCE_TYPES.some((key) => (pkg as Record<string, unknown>)[key] !== undefined)) {
+			if (pkg.autoload === false) packages.splice(pkgIndex, 1);
+			else packages[pkgIndex] = pkg.source;
+		}
+		this.settingsManager.setProjectPackages(packages);
+		return true;
+```
+
+## !!steps The container component
+
+`ConfigSelectorComponent` assembles the dialog: border, header, the resource list and a closing border. It builds groups for both scopes up front, so switching scope is instant. `onToggle` requests a render and tab calls `switchWriteScope`, which updates both the header and the list.
+
+```ts ! config-selector.ts
+		const groupsByScope = {
+			global: buildGroups(resolvedPaths.global, agentDir),
+			project: buildGroups(resolvedPaths.project, agentDir),
+		};
+
+	// ...
+		this.resourceList = new ResourceList(
+			groupsByScope,
+			settingsManager,
+			cwd,
+			agentDir,
+			terminalHeight,
+			this.writeScope,
+		);
+		this.resourceList.onCancel = onClose;
+		this.resourceList.onExit = onExit;
+		this.resourceList.onToggle = () => requestRender();
+		if (projectModeAvailable) {
+			this.resourceList.onSwitchMode = () => {
+				this.switchWriteScope();
+				requestRender();
+			};
+		}
+		this.addChild(this.resourceList);
+	// ...
+	private switchWriteScope(): void {
+		this.writeScope = this.writeScope === "global" ? "project" : "global";
+		this.header.setWriteScope(this.writeScope);
+		this.resourceList.setWriteScope(this.writeScope);
+	}
+```
+
+</Scrollycoding>
+
+The pattern helpers at the bottom of `ResourceList` (relative paths against a base directory, canonical keys for matching inherited items) are what let the same file be recognized across the global and project views. Be aware that the toggling logic is duplicated in a few forms (top-level versus package, global versus project), so a change to the pattern format must touch all of them.

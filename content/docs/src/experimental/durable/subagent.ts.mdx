@@ -1,0 +1,87 @@
+---
+title: "subagent.ts"
+description: "A foreground subagent tool for the durable Harness: delegate a task to a child conversation and return its answer"
+source: "src/experimental/durable/subagent.ts"
+full: true
+---
+
+This file defines a single extension that gives the model a `subagent` tool. Calling it creates a child conversation, sends the task there as a user input, waits for the child to finish and returns its final text.
+
+Because the Harness persists everything to SQLite, the tool is written to survive a crash in the middle of a call: a rerun finds the child it already created instead of making another. This is experimental code, used by [runtime.ts](/docs/src/experimental/durable/runtime.ts) and shown in [tui.ts](/docs/src/experimental/durable/tui.ts).
+
+<Scrollycoding>
+
+## !!steps Reading the child answer
+
+`answerText` reads the assistant entry that answered the input, inside a commit, and joins its text blocks. Non-text content such as thinking or tool calls is skipped, and a missing entry gives an empty string.
+
+```ts ! subagent.ts
+async function answerText(api: ToolExecutionApi, answer: EntryId, context: Context): Promise<string> {
+	const entry = await api.commit((tx) => tx.entry(AssistantEntry, answer), context);
+	const message = entry?.model?.[0] as AssistantMessage | undefined;
+	return message?.content.flatMap((content) => (content.type === "text" ? [content.text] : [])).join("") ?? "";
+}
+```
+
+## !!steps Contract of the extension
+
+The doc comment lists the semantics: one child conversation per call, owned by the call's task, so aborting the call aborts the child. The child outlives the call, which is what lets the user switch to it with the agents command in the TUI and keep talking.
+
+```ts ! subagent.ts
+/**
+ * A foreground subagent: each call creates a child conversation owned by the call's task, runs the task there, and
+ * returns the child's answer. Aborting the call aborts the child. The child outlives the call, so the user can switch
+ * to it and keep talking.
+ */
+export const Subagent: Extension = defineExtension({
+	name: "subagent",
+	tools: [
+```
+
+## !!steps Idempotent child creation
+
+`replay: "safe"` tells the Harness the tool may be rerun after a crash. The first commit scans for a conversation already owned by this task and reuses it. Otherwise it creates one with task ownership.
+
+The child starts as a copy of the parent's agent, but `configure` removes the `Subagent` extension from it, so subagents cannot spawn further subagents.
+
+```ts ! subagent.ts
+			// A rerun after a crash finds the child it created and the submission it made.
+			// !mark
+			replay: "safe",
+			execute: async (args, api, context) => {
+				const child = await api.commit(async (tx) => {
+					// !mark
+					const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
+					if (existing !== undefined) return existing.id;
+					// Starts as a copy of this conversation's agent; without this extension it cannot delegate further.
+					const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
+					// !mark
+					await configure(tx, created.id, { extensions: { remove: [Subagent] } });
+					return created.id;
+				}, context);
+```
+
+## !!steps Submitting and waiting
+
+`api.details` records the child id on the running tool slot, which is how the TUI knows to display a pointer to the child. The input request id is derived from the task id, so a rerun submits the same request and the Harness can deduplicate it.
+
+Any outcome other than a finished input throws, which turns into a tool error for the parent model. On success the answer text is returned along with the child id as details.
+
+```ts ! subagent.ts
+				await api.details({ conversationId: child }, context);
+				const handle = (await api.conversation(child, context))!;
+				// !mark
+				const request = { type: "input", content: args.task, requestId: `subagent:${api.taskId}` } as const;
+				const settled = await (await handle.submit(request, context)).wait(context);
+				// !mark
+				if (settled.status !== "done" || settled.type !== "input") {
+					throw new Error(`Subagent ${child} failed: ${settled.status}`);
+				}
+				const text = await answerText(api, settled.answer, context);
+				return { content: [{ type: "text", text }], details: { conversationId: child } };
+			},
+```
+
+</Scrollycoding>
+
+The tool depends on `pi-durable` primitives only. Its description string (not shown here as a line is long) tells the model to give the subagent everything it needs because it does not see the parent conversation.

@@ -1,0 +1,78 @@
+---
+title: "index.ts"
+description: "Barrel and registry for the built-in tool renderers, importable without pulling in the tools themselves"
+source: "src/core/tools/renderers/index.ts"
+full: true
+---
+
+The tool implementations bring a large module graph with them, including typebox parameter schemas. A UI that only draws tool calls and results does not need any of that. This file exposes just the renderers, so a presentation process can import it instead of the tools barrel in [tools/index.ts](/docs/src/core/tools/index.ts).
+
+It does two jobs: collect the per-tool renderers into one table keyed by tool name, and merge those built-in renderers into a tool definition that does not bring its own.
+
+<Scrollycoding>
+
+## !!steps Imports and re-exports
+
+Each renderer is defined next to its siblings: [bash.ts](/docs/src/core/tools/renderers/bash.ts), [edit.ts](/docs/src/core/tools/renderers/edit.ts), [find.ts](/docs/src/core/tools/renderers/find.ts), [grep.ts](/docs/src/core/tools/renderers/grep.ts), [ls.ts](/docs/src/core/tools/renderers/ls.ts), [read.ts](/docs/src/core/tools/renderers/read.ts) and [write.ts](/docs/src/core/tools/renderers/write.ts). The `ToolName` import is type-only, so it costs nothing at runtime. The header comment puts a number on the saving: about 17 MB of module graph.
+
+```ts ! index.ts
+import type { ToolRenderers } from "../../extensions/types.ts";
+import type { ToolName } from "../index.ts";
+import { createShellRenderers } from "./bash.ts";
+import { editRenderers } from "./edit.ts";
+import { findRenderers } from "./find.ts";
+import { grepRenderers } from "./grep.ts";
+import { lsRenderers } from "./ls.ts";
+import { readRenderers } from "./read.ts";
+import { writeRenderers } from "./write.ts";
+
+export type { ToolRenderers };
+```
+
+## !!steps The table of built-in renderers
+
+`createAllToolRenderers` returns a record keyed by `ToolName`, so the compiler forces an entry for every built-in tool. Bash and PowerShell share one factory and differ only in the prompt string. Note that a fresh table, including fresh shell renderers, is built on every call.
+
+```ts ! index.ts
+/** Renderers for every built-in tool, keyed by tool name. */
+export function createAllToolRenderers(): Record<ToolName, ToolRenderers> {
+	return {
+		read: readRenderers,
+		// !mark(1:2)
+		bash: createShellRenderers("$"),
+		powershell: createShellRenderers("PS>"),
+		edit: editRenderers,
+		write: writeRenderers,
+		grep: grepRenderers,
+		find: findRenderers,
+		ls: lsRenderers,
+	};
+}
+```
+
+## !!steps Merging into a definition
+
+`withBuiltInRenderers` looks up the built-in renderers for a name. With no definition it returns the built-ins alone. With a definition but no built-in (a custom or extension tool) it returns the definition untouched. With both, the definition wins per hook: its own `renderCall` or `renderResult` is kept and only a missing one is filled in.
+
+Per the doc comment, `ToolExecutionComponent` used to do this lookup itself, which forced every presentation to import the tool implementations. Moving it to callers is what makes renderer-only imports possible.
+
+```ts ! index.ts
+export function withBuiltInRenderers<TDefinition extends ToolRenderers>(
+	toolName: string,
+	definition: TDefinition | undefined,
+): TDefinition | ToolRenderers | undefined {
+	const builtIn = createAllToolRenderers()[toolName as ToolName];
+	if (!definition) return builtIn;
+	if (!builtIn) return definition;
+	return {
+		...definition,
+		// !mark(1:2)
+		renderCall: definition.renderCall ?? builtIn.renderCall,
+		renderResult: definition.renderResult ?? builtIn.renderResult,
+	};
+}
+```
+
+</Scrollycoding>
+
+The `ToolRenderers` type is defined in [extensions/types.ts](/docs/src/core/extensions/types.ts) and re-exported here. Because the lookup is by name string with an unchecked cast, an extension tool named like a built-in inherits missing hooks from that built-in.

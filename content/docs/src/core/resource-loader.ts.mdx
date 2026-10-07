@@ -1,0 +1,283 @@
+---
+title: "resource-loader.ts"
+description: "Gathers everything the agent loads from disk and packages: extensions, skills, prompt templates, themes, AGENTS.md context files and system prompt overrides"
+source: "src/core/resource-loader.ts"
+full: true
+---
+
+A session needs more than a model. It needs extensions, skills, prompt templates, themes, project context files such as `AGENTS.md`, and optional `SYSTEM.md` overrides. `DefaultResourceLoader` is the one place that discovers all of them, applies the user's `--no-*` flags, tags each result with where it came from, and exposes them through the small `ResourceLoader` interface.
+
+Discovery of installed packages is delegated to [package-manager.ts](/docs/src/core/package-manager.ts), which returns lists of paths with metadata and an enabled flag. This file turns those paths into loaded objects by calling [skills.ts](/docs/src/core/skills.ts), [prompt-templates.ts](/docs/src/core/prompt-templates.ts) and the extension [loader.ts](/docs/src/core/extensions/loader.ts), then merges, de-duplicates and annotates the results.
+
+<Scrollycoding>
+
+## !!steps The interface everyone else uses
+
+Consumers do not depend on the class. They use `ResourceLoader`, which has synchronous getters over already-loaded state plus `reload` and `extendResources`. Nothing is loaded until `reload` has been awaited, and getters return the last loaded snapshot.
+
+Skills, prompts and themes return their own diagnostics next to the data, so a load problem shows up as a message rather than an exception.
+
+```ts ! resource-loader.ts
+export interface ResourceLoader {
+	getExtensions(): LoadExtensionsResult;
+	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
+	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
+	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
+	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
+	getSystemPrompt(): string | undefined;
+	getSystemPromptSource(): { path: string } | undefined;
+	getAppendSystemPrompt(): string[];
+	getAppendSystemPromptSources(): Array<{ path: string }>;
+	extendResources(paths: ResourceExtensionPaths): void;
+	reload(options?: ResourceLoaderReloadOptions): Promise<void>;
+}
+```
+
+## !!steps Context files: global first, then ancestors
+
+`loadProjectContextFiles` builds the list of instruction files the system prompt will include. Within each directory the first existing candidate wins, in the order `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`. Directories that match but are not regular files are skipped.
+
+The agent directory's file comes first, then every ancestor from the filesystem root down to the cwd (`unshift` reverses the upward walk), so the most specific context is last. A `seenPaths` set avoids duplicates.
+
+```ts ! resource-loader.ts
+function loadContextFileFromDir(dir: string): { path: string; content: string } | null {
+	const candidates = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+	for (const filename of candidates) {
+		const filePath = join(dir, filename);
+		if (existsSync(filePath)) {
+			try {
+				if (!statSync(filePath).isFile()) {
+					continue;
+				}
+				return {
+					path: filePath,
+					content: stripBom(readFileSync(filePath, "utf-8")),
+				};
+```
+
+## !!steps Not loading a worktree's context twice
+
+A linked git worktree nested inside its main repository (for example `repo/.worktrees/feat`) has its own copy of `AGENTS.md`, and the ancestor walk would also find the main repo's. Loading both applies the same context twice, so `findShadowedContextFile` identifies the main repo's file to skip.
+
+It bails out in the cases where the layout does not match: an ordinary repo, a sibling worktree outside the main repo, a bare layout, and submodules. Paths are canonicalized because git writes realpaths while the cwd may be symlinked, as with macOS `/tmp`. The git lookup uses `findGitPaths` from [footer-data-provider.ts](/docs/src/core/footer-data-provider.ts).
+
+```ts ! resource-loader.ts
+	const commonGitDir = canonicalizePath(gitPaths.commonGitDir);
+	const worktreeRoot = canonicalizePath(gitPaths.repoDir);
+	const mainRepoRoot = dirname(commonGitDir);
+	// False for an ordinary repo, where the two are the same dir, and for a sibling
+	// worktree (`git worktree add ../feat`), whose main repo is not an ancestor.
+	if (!worktreeRoot.startsWith(`${mainRepoRoot}${sep}`)) return undefined;
+	// dirname of the common git dir is the main worktree root only when that dir is
+	// itself checked out from the same repo. In a bare layout (`proj/.bare` +
+	// `proj/main`) it is just the directory holding `.bare`, which tracks nothing; a
+	// submodule's gitdir has no `commondir`, so it lands under `.git/modules`.
+	if (canonicalizePath(join(mainRepoRoot, ".git")) !== commonGitDir) return undefined;
+	const worktreeContextFile = loadContextFileFromDir(worktreeRoot);
+	return worktreeContextFile ? join(mainRepoRoot, basename(worktreeContextFile.path)) : undefined;
+```
+
+## !!steps Options: opt-outs and overrides
+
+The options object has three families. The `additional*Paths` entries come from CLI flags. The `no*` flags disable the automatic discovery of one resource type (CLI-provided paths still load). And every type has an `*Override` function that receives the loaded base value and returns a replacement, which the SDK and tests use to filter or inject resources.
+
+`disabledBuiltinExtensions` names built-in extensions to skip even if settings or `-e` enable them.
+
+```ts ! resource-loader.ts
+export interface DefaultResourceLoaderOptions {
+	cwd: string;
+	agentDir: string;
+	settingsManager?: SettingsManager;
+	eventBus?: EventBus;
+	additionalExtensionPaths?: string[];
+	additionalSkillPaths?: string[];
+	additionalPromptTemplatePaths?: string[];
+	additionalThemePaths?: string[];
+	extensionFactories?: InlineExtension[];
+	noExtensions?: boolean;
+	/** Built-in extensions not to load, by name (such as `mcp`), even when settings or `-e` enable them. */
+	disabledBuiltinExtensions?: string[];
+	noSkills?: boolean;
+```
+
+## !!steps The constructor wires a package manager
+
+The constructor resolves paths, creates a [settings-manager.ts](/docs/src/core/settings-manager.ts) if none was passed, and builds a `DefaultPackageManager` sharing that settings object. Inline extension inputs are split into two groups: plain factories, and built-in extensions, which are registered by name so a `builtin:name` path can later be mapped to code.
+
+All loaded state starts empty. This is why getters are safe to call before `reload`.
+
+```ts ! resource-loader.ts
+		this.cwd = resolvePath(options.cwd);
+		this.agentDir = resolvePath(options.agentDir);
+		this.settingsManager = options.settingsManager ?? SettingsManager.create(this.cwd, this.agentDir);
+		this.eventBus = options.eventBus ?? createEventBus();
+		const factories = options.extensionFactories ?? [];
+		this.extensionFactories = factories.filter((input) => !isBuiltinExtension(input));
+		this.builtinExtensions = new Map(factories.filter(isBuiltinExtension).map((input) => [input.name, input]));
+		this.packageManager = new DefaultPackageManager({
+			cwd: this.cwd,
+			agentDir: this.agentDir,
+			settingsManager: this.settingsManager,
+			builtinExtensions: [...this.builtinExtensions.keys()],
+		});
+```
+
+## !!steps Reload with a project-trust pass
+
+Project-local settings can add extensions and packages that execute code, so trust must be decided before they load. When `resolveProjectTrust` is supplied, `reload` first calls `loadProjectTrustExtensions`, which forces the project untrusted, reloads settings and loads only user-level and CLI extensions.
+
+Those pre-trust extensions are shown to the callback, which answers whether to trust the project. The answer is stored on the settings manager (see [project-trust.ts](/docs/src/core/project-trust.ts)) and settings are reloaded for the final pass.
+
+```ts ! resource-loader.ts
+		let preTrustExtensions: LoadExtensionsResult | undefined;
+		if (options?.resolveProjectTrust) {
+			preTrustExtensions = await this.loadProjectTrustExtensions();
+			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+			this.settingsManager.setProjectTrusted(projectTrusted);
+		}
+
+		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+		await this.settingsManager.reload();
+		const resolvedPaths = await this.packageManager.resolve();
+		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
+			temporary: true,
+		});
+```
+
+## !!steps Merging CLI and configured paths
+
+Each resource type follows one recipe. Paths from CLI `-e`-style sources (resolved as temporary packages) come first, then enabled configured paths, then the explicit `additional*` paths. `mergePaths` resolves and canonicalizes each path and drops duplicates, so earlier sources win.
+
+With `noExtensions`, only CLI extension paths survive. Built-in extensions named in `disabledBuiltinExtensions` are filtered out by their `builtin:` prefix.
+
+```ts ! resource-loader.ts
+		const extensionPaths = (
+			this.noExtensions ? cliEnabledExtensions : this.mergePaths(cliEnabledExtensions, enabledExtensions)
+		).filter(
+			(path) =>
+				!path.startsWith(BUILTIN_PATH_PREFIX) ||
+				!this.disabledBuiltinExtensions.has(path.slice(BUILTIN_PATH_PREFIX.length)),
+		);
+
+		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
+		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
+```
+
+## !!steps Loading the final extension set
+
+`loadFinalExtensionSet` avoids loading anything twice. Extensions already loaded in the pre-trust pass are reused by resolved path, and paths whose pre-trust load failed are not retried. Only the remaining paths load, with `builtin:` paths mapped to their factory and marked hidden.
+
+Results are reordered to match `extensionPaths`, inline extensions are appended, and `omitReplacedExtensions` drops replaceable built-ins that clash with another extension's tool, command or flag, adding a warning that tells the user how to enable the built-in.
+
+```ts ! resource-loader.ts
+		const orderedExtensions = extensionPaths
+			.map((path) => loadedByPath.get(this.resolveExtensionLoadPath(path)))
+			.filter((extension): extension is Extension => extension !== undefined);
+		orderedExtensions.push(...inlineExtensions.extensions);
+
+		const replacementWarnings: Array<{ path: string; warning: string }> = [];
+		const extensionsResult: LoadExtensionsResult = {
+			extensions: omitReplacedExtensions(orderedExtensions, replacementWarnings),
+			errors: [...(preTrustExtensions?.errors ?? []), ...remainingExtensions.errors, ...inlineExtensions.errors],
+			warnings: [...(preTrustExtensions?.warnings ?? []), ...(remainingExtensions.warnings ?? [])],
+			runtime: remainingExtensions.runtime,
+		};
+```
+
+## !!steps Warning about host-provided packages
+
+Extensions may import pi's own packages, but if an extension package lists them under `dependencies`, npm installs a second copy and the extension can bypass the loader, creating duplicate runtime modules. `collectExtensionPackageWarnings` reads each extension package's `package.json` and warns when any host-provided name appears in `dependencies`.
+
+The correct place is `peerDependencies` with a `*` range. Warnings are keyed by `package.json` path and merged by `mergeExtensionWarnings`, which de-duplicates through a `Map`.
+
+```ts ! resource-loader.ts
+const HOST_PROVIDED_EXTENSION_PACKAGES = new Set([
+	"@earendil-works/pi-agent-core",
+	"@earendil-works/pi-ai",
+	"@earendil-works/pi-coding-agent",
+	"@earendil-works/pi-tui",
+	"@mariozechner/pi-agent-core",
+	"@mariozechner/pi-ai",
+	"@mariozechner/pi-coding-agent",
+	"@mariozechner/pi-tui",
+	"@sinclair/typebox",
+	"typebox",
+]);
+```
+
+## !!steps Attaching source info
+
+Every loaded skill, prompt, theme, extension, command and tool carries a `SourceInfo` describing where it came from (package, local, CLI, scope). [source-info.ts](/docs/src/core/source-info.ts) defines the type; here `findSourceInfoForPath` fills it.
+
+It checks extension-registered roots first, then exact metadata, then any metadata whose path is a parent directory of the resource. If nothing matches, `getDefaultSourceInfoForPath` classifies by location: under the agent directory is user scope, under the project config directory is project scope, otherwise temporary.
+
+```ts ! resource-loader.ts
+		const normalizedPath = resolve(filePath);
+		const agentRoots = [
+			join(this.agentDir, "skills"),
+			join(this.agentDir, "prompts"),
+			join(this.agentDir, "themes"),
+			join(this.agentDir, "extensions"),
+		];
+		const projectRoots = [
+			join(this.cwd, CONFIG_DIR_NAME, "skills"),
+			join(this.cwd, CONFIG_DIR_NAME, "prompts"),
+			join(this.cwd, CONFIG_DIR_NAME, "themes"),
+			join(this.cwd, CONFIG_DIR_NAME, "extensions"),
+		];
+```
+
+## !!steps Name collisions are diagnostics, not errors
+
+Prompts and themes are keyed by name. `dedupePrompts` keeps the first one it sees and records a `collision` diagnostic naming both the winner and loser paths, so which file takes effect is deterministic and visible. Themes work the same way, defaulting a missing name to `unnamed`.
+
+Extension conflicts are handled differently: all extensions stay loaded, and a clash on a tool or flag name becomes an error entry, with precedence settled by load order.
+
+```ts ! resource-loader.ts
+		for (const prompt of prompts) {
+			const existing = seen.get(prompt.name);
+			if (existing) {
+				diagnostics.push({
+					type: "collision",
+					message: `name "/${prompt.name}" collision`,
+					path: prompt.filePath,
+					collision: {
+						resourceType: "prompt",
+						name: prompt.name,
+						winnerPath: existing.filePath,
+						loserPath: prompt.filePath,
+					},
+				});
+			} else {
+				seen.set(prompt.name, prompt);
+			}
+		}
+```
+
+## !!steps System prompt files and trust
+
+`SYSTEM.md` and `APPEND_SYSTEM.md` are discovered in the project config directory first, but the project copy is used only when `isProjectTrusted()` is true. Otherwise the agent directory copy is used. This stops an untrusted repository from replacing the system prompt.
+
+An explicit `systemPrompt` option wins over discovery, and `resolvePromptInput` treats the value as a file path if it exists and as literal text if it does not. The result then feeds [system-prompt.ts](/docs/src/core/system-prompt.ts).
+
+```ts ! resource-loader.ts
+	private discoverSystemPromptFile(): string | undefined {
+		const projectPath = join(this.cwd, CONFIG_DIR_NAME, "SYSTEM.md");
+		if (this.settingsManager.isProjectTrusted() && existsSync(projectPath)) {
+			return projectPath;
+		}
+
+		const globalPath = join(this.agentDir, "SYSTEM.md");
+		if (existsSync(globalPath)) {
+			return globalPath;
+		}
+
+		return undefined;
+	}
+```
+
+</Scrollycoding>
+
+[package-manager.ts](/docs/src/core/package-manager.ts) supplies the raw path lists, [skills.ts](/docs/src/core/skills.ts) and [prompt-templates.ts](/docs/src/core/prompt-templates.ts) parse them, and [sdk.ts](/docs/src/core/sdk.ts) and [agent-session-services.ts](/docs/src/core/agent-session-services.ts) construct a loader and pass it to the session. Extensions can add paths after startup through `extendResources`, which merges them into the remembered `last*Paths` and reloads only that resource type.
+
+Structurally the class is a pipeline in `reload`, followed by private helpers grouped by resource type. Theme loading is the one hand-written loader in the file because themes need the terminal color mode from the settings manager.

@@ -1,0 +1,58 @@
+---
+title: "model-search.ts"
+description: "Builds the searchable text strings for models so fuzzy matching ranks provider-qualified queries sensibly"
+source: "src/modes/interactive/model-search.ts"
+full: true
+---
+
+Model pickers and the `/model` autocomplete use fuzzy matching over a single string per model. How that string is composed decides which results float to the top. This tiny file centralizes two such recipes, so the different pickers agree.
+
+`getModelSearchText` is used by autocomplete in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and by [scoped-models-selector.ts](/docs/src/modes/interactive/components/scoped-models-selector.ts); `getModelSelectorSearchText` is used by [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts).
+
+<Scrollycoding>
+
+## !!steps The minimal model shape
+
+Only an id, a provider and an optional display name are needed, so callers can pass either a full model or a stripped object.
+
+```ts ! model-search.ts
+export interface ModelSearchItem {
+	id: string;
+	provider: string;
+	name?: string;
+}
+```
+
+## !!steps Search text that repeats on purpose
+
+The string contains the id, the provider, the `provider/id` form, and again provider and id, then the name if present. The repetition is intentional: it lets a query such as `anthropic opus` or `anthropic/claude` match in several orders and positions.
+
+```ts ! model-search.ts
+export function getModelSearchText(item: ModelSearchItem): string {
+	const { id, provider } = item;
+	const name = item.name ? ` ${item.name}` : "";
+	// !mark
+	return `${id} ${provider} ${provider}/${id} ${provider} ${id}${name}`;
+}
+```
+
+## !!steps The selector variant drops the leading id
+
+The comment explains the problem: proxy providers such as OpenRouter expose ids like `openrouter/openai/gpt-5`. If the bare id led the text, a query for `openai/gpt-5` would rank those proxy entries ahead of the real provider. Starting the string with the provider keeps exact provider-prefixed queries first.
+
+```ts ! model-search.ts
+/**
+ * The /model selector search should rank exact provider-prefixed queries before proxy-provider IDs
+ * like openrouter/openai/gpt-5, so keep the bare model ID out of the leading position.
+ */
+export function getModelSelectorSearchText(item: ModelSearchItem): string {
+	const { id, provider } = item;
+	const name = item.name ? ` ${item.name}` : "";
+	// !mark
+	return `${provider} ${provider}/${id} ${provider} ${id}${name}`;
+}
+```
+
+</Scrollycoding>
+
+The two functions differ only in the leading `id `. Nothing here tests ranking; the behavior depends entirely on the fuzzy matcher in pi-tui, so changing either string should be checked against that matcher.

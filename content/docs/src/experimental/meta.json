@@ -1,0 +1,26 @@
+{
+  "title": "experimental",
+  "pages": [
+    "durable",
+    "plugins",
+    "services",
+    "vacation",
+    "cli.ts",
+    "client-runtime.ts",
+    "client-tui-chat.ts",
+    "client-tui.ts",
+    "client.ts",
+    "commands.ts",
+    "coordinator-entry.ts",
+    "coordinator.ts",
+    "plugin.ts",
+    "process.ts",
+    "radius-auth.ts",
+    "radius-relay.ts",
+    "server.ts",
+    "session-catalog.ts",
+    "session-worker-manager.ts",
+    "session-worker.ts",
+    "source-resolver.ts"
+  ]
+}

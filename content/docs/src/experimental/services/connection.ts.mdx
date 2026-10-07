@@ -1,0 +1,402 @@
+---
+title: "connection.ts"
+description: "Remote service sources that bind the client's server-scoped and Session-scoped RPC services to a pi-client connection and publish connection and attachment state."
+source: "src/experimental/services/connection.ts"
+full: true
+---
+
+The experimental client consumes server features (session directory, plugins) and Session features (models, agent control, transcript) as Chord remote services. Something has to decide when those service handles are live, which catalogue they validate against, and what happens when the socket drops or the user attaches to a different Session. This file is that something.
+
+It exports two factories, `createServerServiceSource` and `createSessionServiceSource`. Each wraps a `Client` from `@earendil-works/pi-client`, exposes a replicated state value that the UI can render, and hands out bindings to facets. Both share one internal class, `RoutedServiceBinding`. The hosts that publish the matching services are [server.ts](/docs/src/experimental/services/server.ts) and [worker.ts](/docs/src/experimental/services/worker.ts), and the consumer is [client-runtime.ts](/docs/src/experimental/client-runtime.ts).
+
+<Scrollycoding>
+
+## !!steps State types and source interfaces
+
+Connection state is a three-way union with attempt counts and timestamps; attachment state adds `attaching` and `degraded` so the UI can tell a half-finished attach from a failed one. The Session source adds `whenAttached` and `whenDetached`, which let callers wait for hydration or for the previous generation to be released.
+
+```ts ! connection.ts
+export type ServerConnectionState =
+	| { status: "connecting"; attempt: number }
+	| { status: "connected"; since: string }
+	| { status: "disconnected"; since: string; reason: string; retryAt: string | null };
+
+// !mark(1:3)
+export type SessionAttachmentState =
+	| { status: "detached" }
+	| { status: "attaching" | "attached" | "degraded"; sessionId: string };
+
+export interface ServerServiceSource extends RemoteServiceSource {
+	readonly connection: ReplicatedState<ServerConnectionState>;
+	dispose(context: Context): Promise<void>;
+}
+
+export interface SessionServiceSource extends RemoteServiceSource {
+	readonly attachment: ReplicatedState<SessionAttachmentState>;
+// !mark
+	/** Wait for the exact current attachment generation to finish hydrating. */
+	whenAttached(sessionId: string, context: Context): Promise<void>;
+// !mark
+	/** Wait for every binding to finish releasing the previous attachment. */
+	whenDetached(context: Context): Promise<void>;
+	dispose(context: Context): Promise<void>;
+}
+```
+
+## !!steps A binding that can be rebound
+
+`RoutedServiceBinding` wraps Chord's `createRemoteServiceBinding` and always starts unbound. Callers never see the inner binding; `use` and `observe` are forwarded, and `updateBound` only rebinds once the binding has been activated, so early connection events cannot bind a facet that is still being set up.
+
+```ts ! connection.ts
+class RoutedServiceBinding implements RemoteServices {
+	readonly #services: RemoteServiceBinding;
+	readonly #getBound: () => boolean;
+	readonly #onActivate: (context: Context) => Promise<void>;
+	readonly #remove: () => void;
+	#activated = false;
+	#activationComplete = false;
+
+	constructor(options: {
+		readonly services: readonly { readonly id: string }[];
+		readonly transport: RemoteServiceTransport;
+		readonly getBound: () => boolean;
+		readonly assertAccess: () => void;
+		readonly onError: (error: Error) => void;
+		readonly onActivate?: (context: Context) => Promise<void>;
+		readonly remove: () => void;
+	}) {
+// !mark
+		this.#services = createRemoteServiceBinding({
+			services: options.services,
+			transport: options.transport,
+// !mark
+			bound: false,
+			assertAccess: options.assertAccess,
+			onError: options.onError,
+		});
+		this.#getBound = options.getBound;
+		this.#onActivate = options.onActivate ?? (() => Promise.resolve());
+		this.#remove = options.remove;
+	}
+```
+
+## !!steps Activation order in ready
+
+`ready` binds once, on first call, using the current `getBound()`; then waits for services; then runs the optional `onActivate` hook exactly once. The Session source uses that hook to wait for the current attachment generation to finish hydrating.
+
+```ts ! connection.ts
+	async ready(context: Context): Promise<void> {
+		if (!this.#activated) {
+// !mark
+			this.#activated = true;
+			await this.#services.rebind(this.#getBound(), context);
+		}
+		await this.serviceReady(context);
+// !mark
+		if (!this.#activationComplete) {
+			await this.#onActivate(context);
+			this.#activationComplete = true;
+		}
+	}
+
+	serviceReady(context: Context): Promise<void> {
+		return this.#services.ready(context);
+	}
+
+	updateBound(bound: boolean, context: Context): Promise<void> {
+		return this.#activated ? this.#services.rebind(bound, context) : Promise.resolve();
+	}
+
+	async dispose(context: Context): Promise<void> {
+		this.#remove();
+		await this.#services.dispose(context);
+	}
+}
+```
+
+## !!steps Server source tracks connection state
+
+The server source seeds a replicated `connection` value from the client and subscribes to connection changes. Every change publishes a fresh state, then queues a rebind of all bindings on a promise chain so transitions never overlap. Failures from several bindings are collected with `Promise.allSettled` and reported together through `onError`.
+
+```ts ! connection.ts
+	#transition = Promise.resolve();
+	#connectionAttempt: number;
+	#disposed = false;
+
+	constructor(client: Client, options: ServiceSourceOptions) {
+		this.#client = client;
+		this.#transport = createClientServiceTransport(client, () => ({ serverId: client.serverId }));
+		this.#onError = options.onError ?? (() => {});
+		this.#connectionAttempt = client.connectionState === "connecting" ? 1 : 0;
+		const connectionState = replicatedState<ServerConnectionState>(
+			toServerConnectionState(client, this.#connectionAttempt),
+		);
+		this.connection = connectionState;
+// !mark
+		this.#removeConnectionListener = client.onConnectionStateChange(({ state, error }) => {
+			if (state === "connecting") this.#connectionAttempt += 1;
+			publishReplacement(
+				connectionState,
+				toServerConnectionState(client, this.#connectionAttempt, error),
+				BACKGROUND_CONTEXT,
+			);
+// !mark
+			this.#transition = this.#transition
+				.then(async () => {
+					const results = await Promise.allSettled(
+// !mark
+						[...this.#bindings].map((binding) => binding.updateBound(state === "connected", BACKGROUND_CONTEXT)),
+					);
+					const failures = results.filter(
+						(result): result is PromiseRejectedResult => result.status === "rejected",
+					);
+// !mark
+					if (failures.length > 0) throw new AggregateError(failures.map(({ reason }) => reason));
+				})
+				.catch((transitionError: unknown) => this.#onError(toError(transitionError)));
+		});
+	}
+```
+
+## !!steps Server catalogue, open and dispose
+
+The catalogue comes from the server by id. `acceptsUnavailableServices` is a constant `false` here because the server is the root: a missing service is an error. `open` registers the binding in a set and removes it when the binding is disposed; `dispose` stops listening, drains the transition chain, then disposes every binding.
+
+```ts ! connection.ts
+// !mark
+	readonly acceptsUnavailableServices = false;
+// ...
+	catalogue(context: Context) {
+		return this.#client.serviceCatalogue({ serverId: this.#client.serverId }, context.abortSignal);
+	}
+
+	open(options: {
+		readonly services: readonly { readonly id: string }[];
+		assertAccess(): void;
+		onError(error: Error): void;
+	}): RemoteServices {
+// !mark
+		if (this.#disposed) throw new Error("Server service source is disposed");
+		let binding!: RoutedServiceBinding;
+		binding = new RoutedServiceBinding({
+			services: options.services,
+			transport: this.#transport,
+			getBound: () => this.#client.connected,
+			assertAccess: options.assertAccess,
+			onError: options.onError,
+			remove: () => this.#bindings.delete(binding),
+		});
+		this.#bindings.add(binding);
+		return binding;
+	}
+
+	async dispose(context: Context): Promise<void> {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#removeConnectionListener();
+// !mark
+		await this.#transition;
+		const bindings = [...this.#bindings];
+		this.#bindings.clear();
+		const results = await Promise.allSettled(bindings.map((binding) => binding.dispose(context)));
+		throwFailures(results, "Failed to dispose server service source");
+	}
+```
+
+## !!steps Session source and unavailable services
+
+Before any Session is attached and before a catalogue has been cached, the Session source tells the host to accept unresolved requirements as unavailable. After the first attachment the cached catalogue is used for later detached generations, as the README in [README.md](/docs/src/experimental/services/README.md) describes. A revision counter guards every asynchronous step.
+
+```ts ! connection.ts
+class SessionServiceSourceImpl implements SessionServiceSource {
+	readonly attachment: ReplicatedState<SessionAttachmentState>;
+	readonly #client: Client;
+	readonly #transport: RemoteServiceTransport;
+	readonly #attachmentState: MutableReplicatedState<SessionAttachmentState>;
+	readonly #bindings = new Set<RoutedServiceBinding>();
+	readonly #removeAttachmentListener: () => void;
+	readonly #onError: (error: Error) => void;
+	readonly #transitions = new Set<Promise<void>>();
+	#catalogue: readonly ServiceCatalogueEntry[] | undefined;
+// !mark
+	#attachmentRevision = 0;
+	#disposed = false;
+
+// !mark(1:3)
+	get acceptsUnavailableServices(): boolean {
+		return this.#client.attachment === undefined && this.#catalogue === undefined;
+	}
+
+	constructor(client: Client, options: ServiceSourceOptions) {
+		this.#client = client;
+		this.#transport = createClientServiceTransport(client, () => client.attachment);
+		this.#onError = options.onError ?? (() => {});
+		this.#attachmentState = replicatedState<SessionAttachmentState>(
+			client.attachment === undefined
+				? { status: "detached" }
+				: { status: "attaching", sessionId: client.attachment.sessionId },
+		);
+		this.attachment = this.#attachmentState;
+```
+
+## !!steps Attachment changes
+
+Each attachment change bumps `#attachmentRevision`, publishes `attaching`, fetches the catalogue in the background, and rebinds all bindings. When the rebind finishes the state becomes `attached` or `detached`; if it fails, `degraded` plus `onError`. Both outcomes are skipped when the revision or the attachment no longer matches, so a stale transition cannot overwrite a newer one.
+
+```ts ! connection.ts
+		this.#removeAttachmentListener = client.onAttachmentChange((attachment) => {
+// !mark
+			const revision = ++this.#attachmentRevision;
+			if (attachment !== undefined) {
+				publishReplacement(
+					this.#attachmentState,
+					{ status: "attaching", sessionId: attachment.sessionId },
+					BACKGROUND_CONTEXT,
+				);
+				void this.#client.serviceCatalogue(attachment).then(
+					(catalogue) => {
+// !mark
+						if (this.#attachmentRevision === revision && sameAttachment(this.#client.attachment, attachment)) {
+							this.#catalogue = catalogue;
+						}
+					},
+					(error: unknown) => this.#onError(toError(error)),
+				);
+			}
+			const transition = this.#rebind(attachment !== undefined, BACKGROUND_CONTEXT);
+// ...
+				() => {
+					this.#transitions.delete(transition);
+// !mark(1:2)
+					if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment))
+						return;
+					publishReplacement(
+						this.#attachmentState,
+						attachment === undefined
+							? { status: "detached" }
+							: { status: "attached", sessionId: attachment.sessionId },
+						BACKGROUND_CONTEXT,
+					);
+				},
+				(error: unknown) => {
+					this.#transitions.delete(transition);
+					if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment))
+						return;
+// !mark
+					publishReplacement(
+						this.#attachmentState,
+						attachment === undefined
+							? { status: "detached" }
+							: { status: "degraded", sessionId: attachment.sessionId },
+						BACKGROUND_CONTEXT,
+					);
+					this.#onError(toError(error));
+				},
+			);
+		});
+```
+
+## !!steps Session catalogue and open
+
+Without an attachment `catalogue` returns the cached entries or an empty list; with one it fetches fresh entries and caches them. `open` creates bindings whose bound flag is whether an attachment exists, and whose activation hook waits for attach or detach to settle.
+
+```ts ! connection.ts
+	async catalogue(context: Context): Promise<readonly ServiceCatalogueEntry[]> {
+		const target = this.#client.attachment;
+// !mark
+		if (target === undefined) return this.#catalogue ?? [];
+		const catalogue = await this.#client.serviceCatalogue(target, context.abortSignal);
+		this.#catalogue = catalogue;
+		return catalogue;
+	}
+
+	open(options: {
+		readonly services: readonly { readonly id: string }[];
+		assertAccess(): void;
+		onError(error: Error): void;
+	}): RemoteServices {
+		if (this.#disposed) throw new Error("Session service source is disposed");
+		let binding!: RoutedServiceBinding;
+		binding = new RoutedServiceBinding({
+			services: options.services,
+			transport: this.#transport,
+			getBound: () => this.#client.attachment !== undefined,
+// !mark(1:4)
+			onActivate: async (context) => {
+				const attachment = this.#client.attachment;
+				if (attachment === undefined) await this.#whenDetached(this.#attachmentRevision, context);
+				else await this.#whenAttached(attachment, this.#attachmentRevision, context);
+			},
+			assertAccess: options.assertAccess,
+			onError: options.onError,
+			remove: () => this.#bindings.delete(binding),
+		});
+		this.#bindings.add(binding);
+		return binding;
+	}
+```
+
+## !!steps Waiting for hydration
+
+`#whenAttached` waits for every binding's services to be ready. If they fail it marks the attachment `degraded`, but only if it is still the current one. After success it re-checks the revision, throws if the Session was replaced mid-attach, and finally publishes `attached` if no one else has.
+
+```ts ! connection.ts
+	async #whenAttached(attachment: SessionTarget, revision: number, context: Context): Promise<void> {
+		try {
+			await Promise.all([...this.#bindings].map((binding) => binding.serviceReady(context)));
+		} catch (error) {
+// !mark
+			if (this.#attachmentRevision === revision && sameAttachment(this.#client.attachment, attachment)) {
+				publishReplacement(this.#attachmentState, { status: "degraded", sessionId: attachment.sessionId }, context);
+			}
+			throw error;
+		}
+// !mark(1:3)
+		if (this.#attachmentRevision !== revision || !sameAttachment(this.#client.attachment, attachment)) {
+			throw new Error(`Session ${attachment.sessionId} was replaced while attaching`);
+		}
+		const state = this.#attachmentState.value;
+// !mark
+		if (state.status !== "attached" || state.sessionId !== attachment.sessionId) {
+			publishReplacement(this.#attachmentState, { status: "attached", sessionId: attachment.sessionId }, context);
+		}
+	}
+
+	async #whenDetached(revision: number, context: Context): Promise<void> {
+		await Promise.all([...this.#bindings].map((binding) => binding.serviceReady(context)));
+		if (this.#attachmentRevision !== revision || this.#client.attachment !== undefined) {
+			throw new Error("The Session attachment changed while detaching");
+		}
+		if (this.#attachmentState.value.status !== "detached") {
+			publishReplacement(this.#attachmentState, { status: "detached" }, context);
+		}
+	}
+```
+
+## !!steps Small helpers
+
+`publishReplacement` is a thin wrapper over `state.replace`. `sameAttachment` compares server id, session id and attachment id, which is what makes stale callbacks detectable. `throwFailures` rethrows a single error as is and several as an `AggregateError`.
+
+```ts ! connection.ts
+function publishReplacement<T extends object>(state: MutableReplicatedState<T>, value: T, context: Context): void {
+	state.replace(context, value);
+}
+// ...
+function sameAttachment(left: SessionTarget | undefined, right: SessionTarget | undefined): boolean {
+// !mark
+	if (left === undefined || right === undefined) return left === right;
+	return (
+		left.serverId === right.serverId && left.sessionId === right.sessionId && left.attachmentId === right.attachmentId
+	);
+}
+
+function throwFailures(results: readonly PromiseSettledResult<unknown>[], message: string): void {
+	const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+	if (errors.length === 1) throw errors[0];
+	if (errors.length > 1) throw new AggregateError(errors, message);
+}
+```
+
+</Scrollycoding>
+
+The two sources are intentionally parallel. The server source is simple because there is one socket and one catalogue; the Session source needs revisions, a cached catalogue and a wait API because attachments come and go. Note that `retryAt` in the disconnected state is always `null` here, since reconnect scheduling lives elsewhere, for example in the Radius reconnect logic in [radius-relay.ts](/docs/src/experimental/radius-relay.ts).

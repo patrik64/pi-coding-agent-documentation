@@ -1,0 +1,385 @@
+---
+title: "compaction.ts"
+description: "Pure logic for shrinking a long session: token estimation, choosing where to cut, and asking the model for a structured summary of what is dropped"
+source: "src/core/compaction/compaction.ts"
+full: true
+---
+
+When a conversation approaches the model's context window, pi replaces the oldest part of it with a summary and keeps the most recent part verbatim. This file holds the decision logic for that. It says when to compact, where to cut, what to hand the summarizing model, and what the resulting checkpoint looks like.
+
+The header comment is explicit that these are pure functions. Nothing here writes to disk. [session-manager.ts](/docs/src/core/session-manager.ts) owns the entries and their persistence, and [agent-session.ts](/docs/src/core/agent-session.ts) decides when to call in and what to do with the `CompactionResult`. The only I/O in this file is the summarization request itself, sent through `completeSimple` or a caller-supplied stream function.
+
+The flow has three phases. Estimate how big the context is. Pick a cut point and slice the session into "summarize" and "keep" halves with `prepareCompaction`. Then `compact` turns the summarize half into text. Helpers shared with branch summaries (serialization, file-operation tracking) live in [utils.ts](/docs/src/core/compaction/utils.ts).
+
+<Scrollycoding>
+
+## !!steps Settings and the trigger condition
+
+Compaction is governed by three numbers. `reserveTokens` is headroom kept free for the next prompt and answer, and `keepRecentTokens` is how much recent conversation survives verbatim. `enabled` is the master switch.
+
+`shouldCompact` is a one-line comparison: compact when the context exceeds the window minus the reserve. Note that it is a threshold on the whole window, not a percentage. Reserve also feeds the summarizer's own output budget later, so one setting governs both headroom and summary size.
+
+```ts ! compaction.ts
+export interface CompactionSettings {
+	enabled: boolean;
+	reserveTokens: number;
+	keepRecentTokens: number;
+}
+
+export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
+	enabled: true,
+	reserveTokens: 16384,
+	keepRecentTokens: 20000,
+};
+// ...
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	// !mark
+	return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+
+## !!steps Trusting provider usage, but not blindly
+
+The most accurate token count is the one the provider reported on the last assistant message. `getAssistantUsage` only accepts it from messages that actually completed. Aborted and errored turns, and anything with an all-zero usage block, are skipped, since their counts do not describe a full request.
+
+`calculateContextTokens` prefers the provider's `totalTokens` and falls back to summing input, output and both cache counters. The `||` means a reported total of zero also triggers the fallback.
+
+```ts ! compaction.ts
+export function calculateContextTokens(usage: Usage): number {
+	// !mark
+	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+// ...
+function getAssistantUsage(msg: AgentMessage): Usage | undefined {
+	if (msg.role === "assistant" && "usage" in msg) {
+		const assistantMsg = msg as AssistantMessage;
+		// !mark(1:5)
+		if (
+			assistantMsg.stopReason !== "aborted" &&
+			assistantMsg.stopReason !== "error" &&
+			assistantMsg.usage &&
+			calculateContextTokens(assistantMsg.usage) > 0
+		) {
+			return assistantMsg.usage;
+		}
+	}
+	return undefined;
+}
+```
+
+## !!steps Hybrid estimate: last usage plus a heuristic tail
+
+`estimateContextTokens` walks backwards to the newest valid usage, takes that as ground truth for everything up to and including that message, and estimates only the messages after it. With no usage anywhere, it estimates everything.
+
+The result keeps the parts separate (`usageTokens`, `trailingTokens`, `lastUsageIndex`) so callers such as the footer can tell how much of the number is measured and how much is guessed.
+
+```ts ! compaction.ts
+export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);
+
+	if (!usageInfo) {
+		let estimated = 0;
+		for (const message of messages) {
+			estimated += estimateTokens(message);
+		}
+		return {
+			tokens: estimated,
+			usageTokens: 0,
+			trailingTokens: estimated,
+			lastUsageIndex: null,
+		};
+	}
+
+	// !mark(1:5)
+	const usageTokens = calculateContextTokens(usageInfo.usage);
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i < messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);
+	}
+```
+
+## !!steps When recorded usage goes stale
+
+A usage figure describes the context as it was when that response was generated. If the session later had a compaction or a `context_edit` entry, the figure overstates the context. `estimateProjectedContextTokens` maps the usage message back to its source entry and compares its position with the newest invalidating entry on the branch.
+
+If the usage entry is newer than every compaction or edit, the hybrid estimate stands. Otherwise the function discards usage entirely and estimates the whole projected transcript, counting only the current system message once. That conservative fallback is what `prepareCompaction` uses for `tokensBefore`.
+
+The projection types come from [session-manager.ts](/docs/src/core/session-manager.ts).
+
+```ts ! compaction.ts
+		const usageEntryIndex = usageEntryId ? branchEntries.findIndex((entry) => entry.id === usageEntryId) : -1;
+		let latestInvalidatingEntryIndex = -1;
+		for (let i = branchEntries.length - 1; i >= 0; i--) {
+			const entry = branchEntries[i];
+			// !mark
+			if (entry.type === "context_edit" || entry.type === "compaction") {
+				latestInvalidatingEntryIndex = i;
+				break;
+			}
+		}
+		// !mark
+		if (usageEntryIndex > latestInvalidatingEntryIndex) return estimate;
+	}
+
+	const currentSystem = getCurrentSystemMessage(projection.messages);
+	let tokens = currentSystem ? estimateTokens(currentSystem) : 0;
+	for (const message of projection.messages) {
+		if (message.role !== "system") tokens += estimateTokens(message);
+	}
+	return { tokens, usageTokens: 0, trailingTokens: tokens, lastUsageIndex: null };
+```
+
+## !!steps The chars-divided-by-four heuristic
+
+`estimateTokens` sizes a message as characters over four, rounded up. Images are charged a flat `ESTIMATED_IMAGE_CHARS`. Assistant messages count text, thinking, and each tool call as its name plus its JSON-serialized arguments. System messages additionally count their prompt sections and added tool declarations.
+
+The doc comment calls the heuristic conservative, meaning it tends to overestimate. Roles with no case fall through to a final `return 0`, so an unknown message type never counts toward the budget.
+
+```ts ! compaction.ts
+export function estimateTokens(message: AgentMessage): number {
+	let chars = 0;
+
+	switch (message.role) {
+		// ...
+		case "assistant": {
+			const assistant = message as AssistantMessage;
+			for (const block of assistant.content) {
+				// !mark(1:5)
+				if (block.type === "text") {
+					chars += block.text.length;
+				} else if (block.type === "thinking") {
+					chars += block.thinking.length;
+				} else if (block.type === "toolCall") {
+					chars += block.name.length + JSON.stringify(block.arguments).length;
+				}
+			}
+			return Math.ceil(chars / 4);
+		}
+```
+
+## !!steps Where a cut is allowed
+
+Not every entry is a legal place to start the kept half. `isCutPointMessage` rejects tool results, because a result is meaningless without the assistant tool call that produced it. Cutting at that assistant message instead keeps the call and its following results together.
+
+A separate predicate, `isTurnStartMessage`, identifies the messages that begin a turn: user input, bash executions, custom messages and summaries. An assistant reply is never a turn start. The difference between the two predicates is what makes "split turns" possible later.
+
+```ts ! compaction.ts
+function isCutPointMessage(message: AgentMessage): boolean {
+	switch (message.role) {
+		case "user":
+		case "assistant":
+		case "bashExecution":
+		case "custom":
+		case "branchSummary":
+		case "compactionSummary":
+			return true;
+		// !mark
+		case "toolResult":
+			return false;
+	}
+	return false;
+}
+```
+
+## !!steps Walking backwards to spend the keep budget
+
+`findCutPoint` accumulates estimated sizes from the newest entry backwards until the total reaches `keepRecentTokens`. It then snaps forward to the closest valid cut point at or after that entry, or to the last one if even trailing tool results blow the budget alone.
+
+Afterwards it slides the cut backwards over adjacent entries that contribute nothing to context (model changes, labels and so on), so those metadata entries travel with the kept half. It stops at compaction boundaries and at anything context-visible.
+
+```ts ! compaction.ts
+	for (let i = endIndex - 1; i >= startIndex; i--) {
+		const entry = entries[i];
+		const messageTokens = sessionEntryToContextMessages(entry).reduce(
+			(sum, message) => sum + estimateTokens(message),
+			0,
+		);
+		if (messageTokens === 0) continue;
+		accumulatedTokens += messageTokens;
+
+		// Check if we've exceeded the budget
+		if (accumulatedTokens >= keepRecentTokens) {
+			// Prefer the closest valid cut point at or after this entry. If trailing
+			// tool results exceed the budget by themselves, keep their preceding
+			// assistant tool call instead of falling back to the first message.
+			// !mark
+			cutIndex = cutPoints.find((candidate) => candidate >= i) ?? cutPoints[cutPoints.length - 1];
+			break;
+		}
+	}
+```
+
+## !!steps Cutting in the middle of a turn
+
+The cut may land on an assistant message, so the kept half can begin mid-turn. `findCutPoint` reports this through `CutPointResult`. If the cut entry does not itself start a turn, `findTurnStartIndex` looks backwards for the user-like message that did, and `isSplitTurn` is set.
+
+A split turn matters because the kept tail would otherwise start with an assistant reply to a question nobody can see. Downstream, the early part of that turn is summarized separately.
+
+This index-based `findCutPoint` and `findTurnStartIndex` are exported from [index.ts](/docs/src/index.ts) and tested, but `prepareCompaction` uses the projected variant shown later.
+
+```ts ! compaction.ts
+	// Determine if this is a split turn
+	const cutEntry = entries[cutIndex];
+	const startsTurn = isTurnStartEntry(cutEntry);
+	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		// !mark
+		isSplitTurn: !startsTurn && turnStartIndex !== -1,
+	};
+```
+
+## !!steps One choke point for every summarization call
+
+`completeSummarization` is shared with [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts). It forces `cacheRetention: "none"`, since a one-off summary should not pay for cache writes, and supplies a fresh `uuidv7()` session id when the caller has none.
+
+It then calls either the supplied `streamFn` or `completeSimple`, wrapped in `retryAssistantCall` so transient stream drops follow the configured retry policy instead of failing the whole compaction on the first error. `getSummarizationFailure`, just above it in the source, turns an `error` stop reason or a `length` stop reason into a message. A truncated summary must never become a checkpoint.
+
+```ts ! compaction.ts
+	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
+	// callers without a session ID, including branch summaries, receive a fresh routing ID.
+	const requestOptions: SimpleStreamOptions = {
+		...options,
+		cacheRetention: "none",
+		sessionId: options.sessionId ?? uuidv7(),
+	};
+	const produce = async (): Promise<AssistantMessage> =>
+		streamFn
+			? (await streamFn(model, context, requestOptions)).result()
+			: completeSimple(model, context, requestOptions);
+	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
+```
+
+## !!steps Building the summary request
+
+`generateSummaryWithUsage` caps output at 80 percent of `reserveTokens` and at the model's own `maxTokens` when that is positive. If a previous summary exists it switches to the update prompt, which instructs the model to preserve everything and move finished items from In Progress to Done. That is how a summary stays cumulative across several compactions.
+
+The conversation is serialized to plain text inside `conversation` tags rather than sent as real messages. The comment gives the reason: the model should summarize the transcript, not try to continue it. `generateSummary` above it is a thin wrapper that returns only the text.
+
+```ts ! compaction.ts
+	const maxTokens = Math.min(
+		Math.floor(0.8 * reserveTokens),
+		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+	);
+
+	// Use update prompt if we have a previous summary, otherwise initial prompt
+	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+
+	// Serialize conversation to text so model doesn't try to continue it
+	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
+	const llmMessages = convertToLlm(currentMessages);
+	const conversationText = serializeConversation(llmMessages);
+```
+
+## !!steps The projected cut point and recovery attempts
+
+`prepareCompaction` works on the session projection rather than raw entries, so `findProjectedCutPoint` repeats the backwards walk over projected entries. Its extra logic handles a case the plain version cannot see: an assistant attempt that was later omitted from context by `context_edit` entries.
+
+When the budget was exceeded and everything after the chosen cut is either invisible or an omitted attempt, with no replacement coming from elsewhere, the cut moves one entry forward. The comment says the point is to avoid cutting just before an unsent recovery input while still not letting arbitrary metadata push the cut past live context.
+
+```ts ! compaction.ts
+	// A recovery attempt and its omission edits are context-invisible after the last
+	// visible input. Advance only for a closed suffix containing an omitted assistant
+	// attempt; arbitrary metadata must not move the cut past unsent input.
+	const suffix = entries.slice(cutIndex + 1, endIndex);
+	// ...
+	const isRecoveryOmissionSuffix =
+		exceededBudget &&
+		!hasExternalReplacement &&
+		suffix.some(
+			(entry) =>
+				entry.sourceEntry.type === "message" && entry.sourceEntry.message.role === "assistant" && isOmitted(entry),
+		) &&
+		suffix.every(
+			(entry) => entry.sourceEntry.type !== "compaction" && (!isIntrinsicallyVisible(entry) || isOmitted(entry)),
+		);
+	// !mark
+	if (isRecoveryOmissionSuffix) cutIndex++;
+```
+
+## !!steps Preparing the split for extensions and the summarizer
+
+`prepareCompaction` is exported separately from `compact` on purpose: the result, `CompactionPreparation`, is what [types.ts](/docs/src/core/extensions/types.ts) hands to `session_before_compact` handlers, which can cancel or supply their own summary.
+
+It returns `undefined` when the branch already ends in a compaction, when no kept entry has an id, or when there is nothing to summarize. Otherwise it determines the previous summary from the newest projected compaction, sets the history boundary just after it, and slices the messages. In a split turn the history ends at the turn start and the turn prefix is collected separately.
+
+```ts ! compaction.ts
+	const boundaryEnd = projectedEntries.length;
+	const tokensBefore = estimateProjectedContextTokens(projection, pathEntries).tokens;
+	const cutPoint = findProjectedCutPoint(projectedEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+
+	const firstKeptEntry = projectedEntries[cutPoint.firstKeptEntryIndex]?.sourceEntry;
+	if (!firstKeptEntry?.id) return undefined;
+	const firstKeptEntryId = firstKeptEntry.id;
+	// !mark
+	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
+
+	const messagesToSummarize = projectedEntries
+		.slice(boundaryStart, historyEnd)
+		.flatMap(getMessagesFromProjectedEntryForCompaction);
+	const turnPrefixMessages = cutPoint.isSplitTurn
+		? projectedEntries
+				.slice(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
+				.flatMap(getMessagesFromProjectedEntryForCompaction)
+		: [];
+```
+
+## !!steps Compacting a split turn
+
+In the split case `compact` makes two requests: one for the history, which reuses the previous summary, and a smaller one for the turn prefix with its own prompt and half the reserve as output budget. If there is no history to summarize, the prior summary text or the literal "No prior history." stands in.
+
+The two parts are joined under a `Turn Context (split turn)` heading into one summary string, and their usage is combined with `combineUsage` from [usage-totals.ts](/docs/src/core/usage-totals.ts), so the session can account for the cost of both calls.
+
+```ts ! compaction.ts
+	if (isSplitTurn && turnPrefixMessages.length > 0) {
+		let historyText = previousSummary ?? "No prior history.";
+		let historyUsage: Usage | undefined;
+		if (messagesToSummarize.length > 0) {
+			// ...
+			historyText = historyResult.text;
+			historyUsage = historyResult.usage;
+		}
+		// ...
+		// Merge into single summary
+		// !mark
+		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
+		summaryUsage = historyUsage ? combineUsage(historyUsage, turnPrefixResult.usage) : turnPrefixResult.usage;
+	} else {
+```
+
+## !!steps Appending file lists and returning the result
+
+After the text summary exists, `compact` appends a formatted list of read and modified files computed by `computeFileLists`. These file sets were seeded from the previous compaction's `details` and extended from tool calls in the summarized messages, so they accumulate across compactions.
+
+The returned `CompactionResult` carries the summary, `firstKeptEntryId`, `tokensBefore`, usage, and the file lists as `details`. As the type comment notes, the session manager adds ids and parent links when it stores the entry.
+
+```ts ! compaction.ts
+	// Compute file lists and append to summary
+	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+	summary += formatFileOperations(readFiles, modifiedFiles);
+
+	// !mark(1:3)
+	if (!firstKeptEntryId) {
+		throw new Error("First kept entry has no UUID - session may need migration");
+	}
+
+	return {
+		summary,
+		firstKeptEntryId,
+		tokensBefore,
+		usage: summaryUsage,
+		details: { readFiles, modifiedFiles } as CompactionDetails,
+	};
+```
+
+</Scrollycoding>
+
+The file is layered. Estimation functions feed `shouldCompact`. Cut-point functions feed `prepareCompaction`, which produces the plain data that extensions can inspect. `compact` then spends model calls on that data. Branch summaries reuse `estimateTokens` and `completeSummarization` from here, and the extension event types in [types.ts](/docs/src/core/extensions/types.ts) embed `CompactionPreparation` and `CompactionResult` directly.
+
+One structural note: there are two parallel implementations of cut-point search, one over raw `SessionEntry` arrays and one over projected entries. The raw one stays exported, but only the projected one is used by the compaction path.

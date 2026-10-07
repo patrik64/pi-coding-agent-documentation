@@ -1,0 +1,35 @@
+---
+title: "pi-user-agent.ts"
+description: "Builds the User-Agent string pi sends on its own HTTP requests"
+source: "src/utils/pi-user-agent.ts"
+full: true
+---
+
+A four-line helper that formats a consistent `User-Agent` header. It lets servers such as the pi.dev version endpoint see which pi version, platform, runtime and CPU architecture is calling.
+
+Its caller in this folder is [version-check.ts](/docs/src/utils/version-check.ts), which passes the current version into it. HTTP retry and timeout behavior live in [management-http.ts](/docs/src/utils/management-http.ts).
+
+<Scrollycoding>
+
+## !!steps Detect the runtime
+
+pi runs under both Node and Bun (compiled binaries). `process.versions.bun` exists only under Bun, so its presence selects the `bun/` label; otherwise `process.version` supplies the Node version.
+
+```ts ! pi-user-agent.ts
+export function getPiUserAgent(version: string): string {
+	// !mark
+	const runtime = process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`;
+```
+
+## !!steps Assemble the string
+
+The result looks like `pi/1.2.3 (darwin; node/v22.0.0; arm64)`. The version is passed in rather than read here, so this file has no dependency on package metadata.
+
+```ts ! pi-user-agent.ts
+	return `pi/${version} (${process.platform}; ${runtime}; ${process.arch})`;
+}
+```
+
+</Scrollycoding>
+
+The string reveals OS and architecture but nothing user-specific. It is also used implicitly as the version-check client identity; the GitHub release lookup in [tools-manager.ts](/docs/src/utils/tools-manager.ts) uses a simpler agent built from the app name instead.

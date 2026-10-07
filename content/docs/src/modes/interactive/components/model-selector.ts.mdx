@@ -1,0 +1,328 @@
+---
+title: "model-selector.ts"
+description: "The searchable model picker dialog with all/scoped views, a default marker and a background catalog refresh"
+source: "src/modes/interactive/components/model-selector.ts"
+full: true
+---
+
+`ModelSelectorComponent` is the dialog behind the model switch command. It shows models that are currently available, filters them with fuzzy search, and returns the chosen one through callbacks. It optionally offers a second action that selects a model and also saves it as the default.
+
+It renders immediately from a cached snapshot of [model-runtime.ts](/docs/src/core/model-runtime.ts) and then refreshes provider catalogs in the background through [model-catalog-refresh.ts](/docs/src/modes/interactive/model-catalog-refresh.ts), so the dialog never waits on the network. Search text comes from [model-search.ts](/docs/src/modes/interactive/model-search.ts). The related list of cycling models is edited in [scoped-models-selector.ts](/docs/src/modes/interactive/components/scoped-models-selector.ts).
+
+<Scrollycoding>
+
+## !!steps State and the all or scoped choice
+
+The component keeps four lists: all models, the scoped models, the `activeModels` for the current scope, and the `filteredModels` after search. The scope starts as `scoped` whenever scoped models exist.
+
+```ts ! model-selector.ts
+type ModelScope = "all" | "scoped";
+
+/**
+ * Component that renders a model selector with search
+ */
+export class ModelSelectorComponent extends Container implements Focusable {
+	private listContainer: Container;
+	private allModels: ModelItem[] = [];
+	private scopedModelItems: ModelItem[] = [];
+	private activeModels: ModelItem[] = [];
+	private filteredModels: ModelItem[] = [];
+	private selectedIndex: number = 0;
+	private currentModel?: Model<any>;
+	private modelRuntime: ModelRuntime;
+	private onSelectCallback: (model: Model<any>) => void;
+	private onSelectAsDefaultCallback?: (model: Model<any>) => void;
+	private onCancelCallback: () => void;
+	private errorMessage?: string;
+	private refreshStatusMessage = "Refreshing model catalogs…";
+	private refreshStatusSuccess = false;
+	private tui: TUI;
+	private scopedModels: ReadonlyArray<ScopedModelItem>;
+	private defaultModel?: DefaultModelReference;
+	private scope: ModelScope = "all";
+	private scopeText?: Text;
+	private scopeHintText?: Text;
+	private readonly refreshAbortController = new AbortController();
+	private refreshTimeout?: ReturnType<typeof setTimeout>;
+	private closed = false;
+
+```
+
+## !!steps Layout and immediate render
+
+The constructor builds borders, a scope header (or a warning to use `/login` when nothing is scoped), the search input, a list container and an optional key hint. It renders from the snapshot first and only then starts the refresh with `void this.refreshModels()`.
+
+```ts ! model-selector.ts
+		// Add top border
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+
+		// Add hint about model filtering
+		if (scopedModels.length > 0) {
+			this.scopeText = new Text(this.getScopeText(), 0, 0);
+			this.addChild(this.scopeText);
+			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
+			this.addChild(this.scopeHintText);
+		} else {
+			const hintText = "Only showing models from configured providers. Use /login to add providers.";
+			this.addChild(new Text(theme.fg("warning", hintText), 0, 0));
+		}
+		this.addChild(new Spacer(1));
+// ...
+		// Render the current snapshot immediately, then refresh in the background.
+		this.loadModelsFromSnapshot();
+		if (initialSearchInput) this.filterModels(initialSearchInput);
+		else this.updateList();
+		this.tui.requestRender();
+		void this.refreshModels();
+	}
+```
+
+## !!steps Reading the snapshot
+
+`loadModelsFromSnapshot` pulls available models from the runtime and sorts them. Scoped entries are re-resolved against the runtime so they pick up refreshed model data. The initial selection lands on the current model if it is in the list.
+
+```ts ! model-selector.ts
+	private loadModelsFromSnapshot(): void {
+		const models = this.modelRuntime.getAvailableSnapshot().map((model: Model<any>) => ({
+			provider: model.provider,
+			id: model.id,
+			model,
+		}));
+		this.allModels = this.sortModels(models);
+		this.scopedModels = this.scopedModels.map((scoped) => {
+			const refreshed = this.modelRuntime.getModel(scoped.model.provider, scoped.model.id);
+			return refreshed ? { ...scoped, model: refreshed } : scoped;
+		});
+		this.scopedModelItems = this.scopedModels.map((scoped) => ({
+			provider: scoped.model.provider,
+			id: scoped.model.id,
+			model: scoped.model,
+		}));
+		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
+		this.filteredModels = this.activeModels;
+		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
+		this.selectedIndex =
+			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+	}
+```
+
+## !!steps Background refresh with a timeout
+
+A 15 second timer aborts the refresh. The outcome is turned into a status line: timeout, one failed catalog, several failed catalogs, or success. After that the snapshot is reloaded and the current search is reapplied. A `closed` flag prevents updates after the dialog is gone, and the `finally` always clears the timer.
+
+```ts ! model-selector.ts
+	private async refreshModels(): Promise<void> {
+		const timeoutMs = 15_000;
+		let timedOut = false;
+		this.refreshTimeout = setTimeout(() => {
+			timedOut = true;
+			this.refreshAbortController.abort();
+		}, timeoutMs);
+		try {
+			const result = await refreshModelCatalogs(this.modelRuntime, this.refreshAbortController.signal);
+			if (this.closed) return;
+			this.refreshStatusMessage = "";
+			if (result.aborted && timedOut) {
+				this.errorMessage = "Model refresh timed out; showing cached models.";
+			} else if (result.errors.size === 1) {
+				this.errorMessage = `Could not refresh ${result.errors.keys().next().value}; showing cached models.`;
+			} else if (result.errors.size > 1) {
+				this.errorMessage = `Could not refresh ${result.errors.size} model catalogs (${[...result.errors.keys()].join(", ")}); showing cached models.`;
+			} else {
+				this.errorMessage = this.modelRuntime.getError();
+				if (!this.errorMessage) {
+					this.refreshStatusMessage = "Model catalogs refreshed.";
+					this.refreshStatusSuccess = true;
+				}
+			}
+			this.loadModelsFromSnapshot();
+			this.filterModels(this.searchInput.getValue());
+			this.tui.requestRender();
+		} catch (error) {
+			if (this.closed) return;
+			this.refreshStatusMessage = "";
+			this.errorMessage = timedOut
+				? "Model refresh timed out; showing cached models."
+				: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`;
+			this.updateList();
+			this.tui.requestRender();
+		} finally {
+			if (this.refreshTimeout) clearTimeout(this.refreshTimeout);
+		}
+	}
+```
+
+## !!steps Sorting and disposal
+
+The current model sorts first, the default model second, then providers alphabetically. `dispose` is idempotent and aborts any in-flight refresh; every exit path (select, cancel, set default) calls it.
+
+```ts ! model-selector.ts
+	dispose(): void {
+		if (this.closed) return;
+		this.closed = true;
+		if (this.refreshTimeout) clearTimeout(this.refreshTimeout);
+		this.refreshAbortController.abort();
+	}
+
+	private sortModels(models: ModelItem[]): ModelItem[] {
+		const sorted = [...models];
+		// Sort: current model first, default model second, then by provider.
+		sorted.sort((a, b) => {
+			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
+			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
+			if (aIsCurrent && !bIsCurrent) return -1;
+			if (!aIsCurrent && bIsCurrent) return 1;
+			const aIsDefault = this.isDefaultModel(a.model);
+			const bIsDefault = this.isDefaultModel(b.model);
+			if (aIsDefault && !bIsDefault) return -1;
+			if (!aIsDefault && bIsDefault) return 1;
+			return a.provider.localeCompare(b.provider);
+		});
+		return sorted;
+	}
+```
+
+## !!steps Filtering, including the word default
+
+Search text is built from id, provider and name, plus the word `default` for the default model. Typing a prefix of `default` additionally pins the default model to the top. A non-empty query moves the selection to the first row.
+
+```ts ! model-selector.ts
+	private isDefaultModel(model: Model<any>): boolean {
+		return this.defaultModel?.provider === model.provider && this.defaultModel.id === model.id;
+	}
+
+	private isDefaultSearch(query: string): boolean {
+		const normalized = query.trim().toLowerCase();
+		return normalized.length > 0 && "default".startsWith(normalized);
+	}
+	private filterModels(query: string): void {
+		if (query) {
+			const filtered = fuzzyFilter(this.activeModels, query, (item) => {
+				const defaultText = this.isDefaultModel(item.model) ? " default" : "";
+				return `${getModelSelectorSearchText({ id: item.id, provider: item.provider, name: item.model.name })}${defaultText}`;
+			});
+			if (this.isDefaultSearch(query)) {
+				const defaultItems = this.activeModels.filter((item) => this.isDefaultModel(item.model));
+				const defaultKeys = new Set(defaultItems.map((item) => `${item.provider}\0${item.id}`));
+				this.filteredModels = [
+					...defaultItems,
+					...filtered.filter((item) => !defaultKeys.has(`${item.provider}\0${item.id}`)),
+				];
+			} else {
+				this.filteredModels = filtered;
+			}
+		} else {
+			this.filteredModels = this.activeModels;
+		}
+		// When filtering by a query, move the selector to the top row so the best
+		// match is highlighted. When the query is cleared, keep the current position
+		// clamped to the (restored) list length.
+		this.selectedIndex = query ? 0 : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+		this.updateList();
+	}
+```
+
+## !!steps Drawing the list
+
+The list is a window of 10 rows centered on the selection. Each row shows a cursor, a check for the current model, the id, a provider badge and a default badge. Below it come a scroll counter, then an error, a no-results message or the selected model's full name, and finally the refresh status.
+
+```ts ! model-selector.ts
+	private updateList(): void {
+		this.listContainer.clear();
+
+		const maxVisible = 10;
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredModels.length - maxVisible),
+		);
+		const endIndex = Math.min(startIndex + maxVisible, this.filteredModels.length);
+
+		// Show visible slice of filtered models
+		for (let i = startIndex; i < endIndex; i++) {
+			const item = this.filteredModels[i];
+			if (!item) continue;
+
+			const isSelected = i === this.selectedIndex;
+			const isCurrent = modelsAreEqual(this.currentModel, item.model);
+			const isDefault = this.isDefaultModel(item.model);
+			const defaultBadge = isDefault ? theme.fg("muted", " · default") : "";
+
+			const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
+			const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
+			const modelText = isSelected ? theme.fg("accent", item.id) : item.id;
+			const providerBadge = theme.fg("muted", `[${item.provider}]`);
+			const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${defaultBadge}`;
+
+			this.listContainer.addChild(new Text(line, 0, 0));
+		}
+// ...
+		// Show error message or "no results" if empty
+		if (this.errorMessage) {
+			// Show error in red
+			const errorLines = this.errorMessage.split("\n");
+			for (const line of errorLines) {
+				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
+			}
+		} else if (this.filteredModels.length === 0) {
+			this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+		} else {
+			const selected = this.filteredModels[this.selectedIndex];
+			this.listContainer.addChild(new Spacer(1));
+			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+		}
+```
+
+## !!steps Keys
+
+Up and down wrap around. Enter selects; the save key selects and persists as default, but only if that callback was given. Cancel disposes and calls back. Tab toggles scope only if scoped models exist. Everything else goes to the search box and refilters.
+
+```ts ! model-selector.ts
+	handleInput(keyData: string): void {
+		const kb = getKeybindings();
+		if (kb.matches(keyData, "tui.input.tab")) {
+			if (this.scopedModelItems.length > 0) {
+				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
+				this.setScope(nextScope);
+				if (this.scopeHintText) {
+					this.scopeHintText.setText(this.getScopeHintText());
+				}
+			}
+			return;
+// ...
+		// Enter
+		else if (kb.matches(keyData, "tui.select.confirm")) {
+			const selectedModel = this.filteredModels[this.selectedIndex];
+			if (selectedModel) {
+				this.handleSelect(selectedModel.model);
+			}
+		}
+		// Escape or Ctrl+C
+		else if (kb.matches(keyData, "tui.select.cancel")) {
+			this.dispose();
+			this.onCancelCallback();
+		}
+		// Select and save as default
+		else if (kb.matches(keyData, "app.models.save") && this.onSelectAsDefaultCallback) {
+			const selectedModel = this.filteredModels[this.selectedIndex];
+			if (selectedModel) {
+				this.dispose();
+				this.onSelectAsDefaultCallback(selectedModel.model);
+			}
+		}
+		// Pass everything else to search input
+		else {
+			this.searchInput.handleInput(keyData);
+			this.filterModels(this.searchInput.getValue());
+		}
+	}
+
+	private handleSelect(model: Model<any>): void {
+		this.dispose();
+		this.onSelectCallback(model);
+	}
+```
+
+</Scrollycoding>
+
+The caller in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) supplies the callbacks. One structural note: the search input's own submit handler duplicates what the confirm key does, since the input may swallow Enter before the component sees it.

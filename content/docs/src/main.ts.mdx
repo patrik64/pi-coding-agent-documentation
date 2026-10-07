@@ -1,0 +1,354 @@
+---
+title: "main.ts"
+description: "The CLI orchestrator: routes subcommands, resolves the session and project trust, builds the agent runtime, then picks interactive, print or RPC mode"
+source: "src/main.ts"
+full: true
+---
+
+`main` is the one place where everything the user typed becomes a running
+agent. It does not run the agent loop itself. Its job is sequencing: handle the
+commands that never need a session (`auth`, `install`, `mcp`, `--export`),
+decide which of four app modes applies, pick or create a session, build the
+runtime through the SDK, and finally hand control to a mode.
+
+The flags come from [args.ts](/docs/src/cli/args.ts). The runtime comes from
+[agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) and
+[agent-session-services.ts](/docs/src/core/agent-session-services.ts), and the
+modes it dispatches to are [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts),
+[print-mode.ts](/docs/src/modes/print-mode.ts) and
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts). Most of the length is
+ordering constraints, which the comments explain well; this walkthrough follows
+the order of execution.
+
+<Scrollycoding>
+
+## !!steps Choosing the app mode
+
+Four modes exist: `interactive`, `print`, `json` and `rpc`. An explicit
+`--mode rpc` or `--mode json` always wins. Otherwise the TTY state decides:
+`-p`, a piped stdin, or a redirected stdout all mean print mode, and only a
+fully interactive terminal gets the TUI.
+
+`toPrintOutputMode` then collapses the app mode to the two output styles
+print mode understands. `isPlainRuntimeMetadataCommand` marks `--help` and
+`--list-models`, which must write to the real stdout even in a non-interactive
+mode.
+
+```ts ! main.ts
+function resolveAppMode(parsed: Args, stdinIsTTY: boolean, stdoutIsTTY: boolean): AppMode {
+	if (parsed.mode === "rpc") {
+		return "rpc";
+	}
+	if (parsed.mode === "json") {
+		return "json";
+	}
+	if (parsed.print || !stdinIsTTY || !stdoutIsTTY) {
+		return "print";
+	}
+	return "interactive";
+}
+
+function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
+	return appMode === "json" ? "json" : "text";
+}
+```
+
+## !!steps Subcommands run before anything is parsed
+
+The first thing `main` does is try the commands that are not a chat at all.
+`--offline` is detected by scanning raw `args`, before parsing, because it
+also sets environment variables that other modules read.
+`runAuthCommand` is tried first, with its own `parseArgs` call on the subcommand's
+arguments and its own exit codes: `check` returns 0 for ready, 1 for not ready,
+2 for invalid.
+
+Then packages (`install`, `update`, ...), `config` and `mcp` get their turn. Each
+returns a boolean saying whether it consumed the invocation.
+
+```ts ! main.ts
+export async function main(args: string[], options?: MainOptions) {
+	resetTimings();
+	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
+	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
+	if (offlineMode) {
+		process.env.PI_OFFLINE = "1";
+		process.env.PI_SKIP_VERSION_CHECK = "1";
+	}
+
+	if (await runAuthCommand(args)) {
+		return;
+	}
+// ...
+	if (await handleConfigCommand(args, { extensionFactories })) {
+		return;
+	}
+
+	if (args[0] === "mcp") {
+		const { runMcpCommand } = await loadMcpCommand();
+		process.exitCode = await runMcpCommand(args.slice(1), { cwd, agentDir });
+		return;
+	}
+```
+
+## !!steps Diagnostics, early exits, and taking over stdout
+
+Parsing returns diagnostics instead of exiting, so `main` prints them and
+exits only when one is an error. `--version` and `--export` then exit
+immediately, since they need no session. For `--export`, the first positional
+message doubles as the output path.
+
+Only after that does stdout get claimed. Non-interactive modes call
+`takeOverStdout`, so the later output belongs to print or RPC mode. The one
+exception is plain help or model listing, which should print normally. RPC
+also refuses `@file` arguments up front, because stdin is reserved for the protocol.
+
+```ts ! main.ts
+	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
+	if (shouldTakeOverStdout) {
+		takeOverStdout();
+	}
+
+	if (parsed.mode === "rpc" && parsed.fileArgs.length > 0) {
+		console.error(chalk.red("Error: @file arguments are not supported in RPC mode"));
+		process.exit(1);
+	}
+
+	validateForkFlags(parsed);
+	validateSessionIdFlags(parsed);
+```
+
+## !!steps Turning a session argument into a file
+
+`--session`, `--fork` and friends accept either a path or an id. A value
+containing a slash or ending in `.jsonl` is a path. Anything else is an id: an
+exact match in the current project is tried first because it only reads session
+headers, then a prefix match among local sessions, then a global search across
+all projects. The result type tells the caller whether the session belongs to
+another project.
+
+The lookups are done by [session-manager.ts](/docs/src/core/session-manager.ts).
+
+```ts ! main.ts
+async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
+	// If it looks like a file path, resolve it before handing it to the session manager.
+	if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+		return { type: "path", path: resolvePath(sessionArg, cwd) };
+	}
+
+	// Exact IDs only require reading session headers. Fall back to the full
+	// metadata listing for prefix matches.
+	const exactLocalMatch = findLocalSessionByExactId(sessionArg, cwd, sessionDir);
+	if (exactLocalMatch) {
+		return exactLocalMatch;
+	}
+```
+
+## !!steps Creating the SessionManager
+
+`createSessionManager` is a priority ladder: in-memory for `--no-session`
+(and for help or listing, so they never write a file), then `--fork`, `--session`, `--resume`,
+`--continue`, and finally a new session. A session found under a different
+project is not opened in place; the user is asked whether to fork it into the
+current directory, and declining exits with status 0.
+
+With `--session-id`, an existing project session is reopened and a missing one
+is created with that id and a warning.
+
+```ts ! main.ts
+	if (parsed.session) {
+		const resolved = await resolveSessionPath(parsed.session, cwd, sessionDir);
+
+		switch (resolved.type) {
+			case "path":
+			case "local":
+				return openSessionOrExit(resolved.path, sessionDir);
+
+			case "global": {
+				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
+				const shouldFork = await promptConfirm("Fork this session into current directory?");
+				if (!shouldFork) {
+					console.log(chalk.dim("Aborted."));
+					process.exit(0);
+				}
+				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+			}
+```
+
+## !!steps Why the session comes before the runtime
+
+A session can point at a different working directory than the shell's, for
+example with `--resume`. Project settings, resources, extensions and models are
+all cwd-bound, so they must be resolved only after the session's cwd is known.
+The settings manager created at startup is used just to find the session
+directory.
+
+The precedence for that directory is the `--session-dir` flag, then the
+environment variable, then settings. If the session's recorded cwd no longer
+exists, interactive mode offers to continue in a fallback directory, while other
+modes fail.
+
+```ts ! main.ts
+	// Decide the final runtime cwd before creating cwd-bound runtime services.
+	// --session and --resume may select a session from another project, so project-local
+	// settings, resources, provider registrations, and models must be resolved only after
+	// the target session cwd is known. The startup-cwd settings manager is used only for
+	// sessionDir lookup during session selection.
+	const envSessionDir = process.env[ENV_SESSION_DIR];
+	const sessionDir =
+		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
+		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+		startupSettingsManager.getSessionDir();
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
+```
+
+## !!steps Turning flags into session options
+
+`buildSessionOptions` translates parsed flags into `CreateAgentSessionOptions`.
+`--provider` without `--model` is an error diagnostic. A model pattern may carry
+a thinking suffix, as in `sonnet:high`, and an explicit `--thinking` overrides
+it. With no model flag, a brand-new session starts from the `--models` scope: the
+saved default if it is in scope, otherwise the first scoped model.
+
+Note that these are diagnostics, not exits. They are gathered and reported
+together once the runtime exists. Model resolution itself lives in
+[model-resolver.ts](/docs/src/core/model-resolver.ts).
+
+```ts ! main.ts
+	if (!options.model && scopedModels.length > 0 && !hasExistingSession) {
+		// Check if saved default is in scoped models - use it if so, otherwise first scoped model
+		const savedProvider = settingsManager.getDefaultProvider();
+		const savedModelId = settingsManager.getDefaultModel();
+		const savedModel = savedProvider && savedModelId ? modelRuntime.getModel(savedProvider, savedModelId) : undefined;
+		const savedInScope = savedModel ? scopedModels.find((sm) => modelsAreEqual(sm.model, savedModel)) : undefined;
+
+		if (savedInScope) {
+			options.model = savedInScope.model;
+			// Use thinking level from scoped model config if explicitly set
+			if (!parsed.thinking && savedInScope.thinkingLevel) {
+				options.thinkingLevel = savedInScope.thinkingLevel;
+			}
+		} else {
+```
+
+## !!steps Project trust is resolved lazily
+
+Project-local files such as extensions can run code, so they require trust.
+Inside the runtime factory, trust is `false` while the resource loader first
+discovers what the project contains. If there is anything trust-requiring and no
+`--approve` or `--no-approve` override, a `resolveProjectTrust` callback asks
+(through [trust-manager.ts](/docs/src/core/trust-manager.ts) and
+[project-trust.ts](/docs/src/core/project-trust.ts)) and the answer is cached
+per cwd.
+
+The factory is called again for every new runtime, such as after `/new` or a
+session switch, which is why it keeps `projectTrustByCwd` outside itself.
+
+```ts ! main.ts
+		const isInitialRuntime = sessionStartEvent === undefined;
+		const projectTrustDiagnostics: AgentSessionRuntimeDiagnostic[] = [];
+		const cachedProjectTrust = projectTrustByCwd.get(cwd);
+		const hasTrustRequiringResources = hasTrustRequiringProjectResources(cwd);
+		const shouldResolveProjectTrust =
+			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustRequiringResources;
+		const projectTrusted = shouldResolveProjectTrust
+			? false
+			: (cachedProjectTrust ??
+				parsed.projectTrustOverride ??
+				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
+		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
+```
+
+## !!steps Collecting diagnostics while building services
+
+Services are created with the CLI's resource flags (extra extension, skill,
+prompt-template and theme paths, the `--no-*` switches, system prompt text) and
+extension flag values taken from `unknownFlags`. After that, every kind of
+problem is merged into one diagnostics list: trust warnings, service
+diagnostics, settings diagnostics, and extension load errors and warnings.
+
+Extension failures count as errors, so a broken extension aborts startup with a
+hint to retry with `-ne`.
+
+```ts ! main.ts
+		const { settingsManager, modelRuntime, resourceLoader } = services;
+		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
+			...projectTrustDiagnostics,
+			...services.diagnostics,
+			...collectSettingsDiagnostics(settingsManager),
+			...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
+				type: "error" as const,
+				message: `Failed to load extension "${path}": ${error}`,
+			})),
+			...(resourceLoader.getExtensions().warnings ?? []).map(({ path, warning }) => ({
+				type: "warning" as const,
+				message: `Extension package "${path}": ${warning}`,
+			})),
+		];
+```
+
+## !!steps Help, model list and piped input
+
+With the runtime built, help can finally list extension flags, and
+`--list-models` can query the model runtime. Both exit right away.
+
+Piped stdin is then read, except in RPC mode where stdin belongs to the
+protocol. If input was piped into what would have been interactive mode, the
+mode is downgraded to print, since there is no terminal to type into.
+
+```ts ! main.ts
+	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
+	let stdinContent: string | undefined;
+	if (appMode !== "rpc") {
+		stdinContent = await readPipedStdin();
+		if (stdinContent !== undefined && appMode === "interactive") {
+			appMode = "print";
+		}
+	}
+	time("readPipedStdin");
+
+	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinContent);
+	time("prepareInitialMessage");
+```
+
+## !!steps Dispatching to a mode
+
+Last, the diagnostics are shown (interactive mode defers them to its own
+UI unless something is fatal) and the process exits if any is an error. Non
+interactive modes also require a model at this point.
+
+Then the three branches. RPC starts a background catalog refresh and runs
+forever. Interactive builds an `InteractiveMode` with the startup context.
+Print mode runs to completion, restores stdout, and sets `process.exitCode`
+rather than exiting directly.
+
+```ts ! main.ts
+	if (appMode === "rpc") {
+		printTimings();
+		await runRpcMode(runtime);
+	} else if (appMode === "interactive") {
+		const interactiveMode = new InteractiveMode(runtime, {
+			migratedProviders,
+			startupDiagnostics,
+			modelFallbackMessage,
+			autoTrustOnReloadCwd,
+			initialMessage,
+			initialImages,
+			initialMessages: parsed.messages,
+			verbose: parsed.verbose,
+			tuiMode: parsed.tuiMode,
+			initialThemeSetting: parsed.useTheme,
+		});
+```
+
+</Scrollycoding>
+
+The flow is a funnel: cheap, session-free commands first, then session and
+trust resolution, then one runtime build, then a single mode call. Everything
+mode-specific lives in the files named above; `main.ts` is imported by
+[cli.ts](/docs/src/cli.ts) and by [rpc-entry.ts](/docs/src/rpc-entry.ts), and
+exports `createSessionManager` and `MainOptions` for reuse. The CLI helpers it
+leans on, such as [auth-command.ts](/docs/src/cli/auth-command.ts) and
+[session-picker.ts](/docs/src/cli/session-picker.ts), keep it from growing
+further.

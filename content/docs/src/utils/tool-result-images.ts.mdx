@@ -1,0 +1,83 @@
+---
+title: "tool-result-images.ts"
+description: "Resizes oversized images in tool results before they enter session history"
+source: "src/utils/tool-result-images.ts"
+full: true
+---
+
+Tools return content blocks that may include base64 images. For the built-in `read` tool, images are already processed. But extensions, MCP bridges and screenshot tools can hand back arbitrary payloads, and those go straight into session history and every later provider request. A single oversized image can make the provider reject the whole conversation, so this module normalizes them once as they enter history.
+
+The heavy lifting is delegated to `processImage` in [image-process.ts](/docs/src/utils/image-process.ts). The caller is [agent-session.ts](/docs/src/core/agent-session.ts), which runs tool results through `normalizeToolResultImages`. Resize internals are in [image-resize.ts](/docs/src/utils/image-resize.ts).
+
+<Scrollycoding>
+
+## !!steps Types and options
+
+Content is either text or image blocks from the AI package. Resizing is on by default, and `resizeOptions` lets a model-specific profile override the conservative built-in limits.
+
+```ts ! tool-result-images.ts
+export type ToolResultContent = TextContent | ImageContent;
+
+export interface NormalizeToolResultImagesOptions {
+	/** Whether oversized images are resized to inline provider limits. Default: true */
+	autoResizeImages?: boolean;
+	/** Model-specific resize profile. Uses the conservative built-in defaults when omitted. */
+	resizeOptions?: ModelImageResizeOptions;
+}
+```
+
+## !!steps Cheap early exit
+
+If there are no image blocks, the original array is returned untouched. The function always preserves identity when nothing changes, so callers can skip rewriting the stored result.
+
+```ts ! tool-result-images.ts
+	if (!content.some((block) => block.type === "image")) {
+		return content;
+	}
+
+	const autoResizeImages = options?.autoResizeImages ?? true;
+	const normalized: ToolResultContent[] = [];
+	let changed = false;
+```
+
+## !!steps Failure keeps the original image
+
+For each image, the base64 data is decoded and processed. Unlike `read`, a processing failure keeps the original block rather than dropping it. The tool already produced the image and the failure may just mean no image backend is available, so passing it through preserves existing behavior.
+
+```ts ! tool-result-images.ts
+		const processed = await processImage(Buffer.from(block.data, "base64"), block.mimeType, {
+			autoResizeImages,
+			resizeOptions: options?.resizeOptions,
+		});
+		if (!processed.ok) {
+			// Unlike `read`, keep the original block. The tool already produced this image and the
+			// failure may just be an unavailable image backend, so passing it through preserves the
+			// behavior tools have today instead of silently deleting their output.
+			normalized.push(block);
+			continue;
+		}
+```
+
+## !!steps Replace and annotate
+
+If nothing changed (same data, same mime type, no hints), the original block is reused. Otherwise the new image is pushed, followed by a text block of hints (for example a note that the image was downscaled) so the model knows what it is looking at. The updated array is returned only if something changed.
+
+```ts ! tool-result-images.ts
+		if (processed.data === block.data && processed.mimeType === block.mimeType && processed.hints.length === 0) {
+			normalized.push(block);
+			continue;
+		}
+
+		normalized.push({ type: "image", data: processed.data, mimeType: processed.mimeType });
+		if (processed.hints.length > 0) {
+			normalized.push({ type: "text", text: processed.hints.join("\n") });
+		}
+		changed = true;
+	}
+
+	return changed ? normalized : content;
+```
+
+</Scrollycoding>
+
+Images are processed one at a time in order with `await`, so a result with many large images is handled sequentially. Extra fields on the original image block (anything beyond type, data and mime type) are not copied when a block is replaced.

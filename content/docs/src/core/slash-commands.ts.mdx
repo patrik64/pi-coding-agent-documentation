@@ -1,0 +1,105 @@
+---
+title: "slash-commands.ts"
+description: "Types for slash commands and the static table of built-in commands that the interactive UI offers for autocomplete"
+source: "src/core/slash-commands.ts"
+full: true
+---
+
+Slash commands are typed into the prompt as `/name`. Some are built into the
+app, and others come from extensions, prompt templates or skills. This file
+declares the shared shapes for those sources and holds the built-in list.
+
+The list is only metadata: a name, a description and an optional argument hint.
+The behavior of each command lives in the interactive mode, which is the only
+consumer of `BUILTIN_SLASH_COMMANDS` in the source tree
+([interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts)).
+
+<Scrollycoding>
+
+## !!steps Where a command can come from
+
+`SlashCommandSource` has three values and no `builtin`, because built-ins are
+a separate type. A discovered command carries a `SourceInfo` from
+[source-info.ts](/docs/src/core/source-info.ts), which says which file or
+package provided it, so the UI can show that origin next to the name.
+
+```ts ! slash-commands.ts
+export type SlashCommandSource = "extension" | "prompt" | "skill";
+
+export interface SlashCommandInfo {
+	name: string;
+	description?: string;
+	source: SlashCommandSource;
+	sourceInfo: SourceInfo;
+}
+
+export interface BuiltinSlashCommand {
+	name: string;
+	description: string;
+	argumentHint?: string;
+}
+```
+
+## !!steps Session and model commands
+
+The table is a readonly array, so it cannot be mutated by accident. The first
+group covers settings, model choice and the session tree. `argumentHint` is
+display-only text such as `<provider/model>` shown during autocomplete; nothing
+here parses arguments. The `/export` description mentions both formats; the
+JSONL path goes through [session-export.ts](/docs/src/core/session-export.ts).
+
+```ts ! slash-commands.ts
+export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+	{ name: "settings", description: "Open settings menu" },
+	// !mark
+	{ name: "model", description: "Select model (opens selector UI)", argumentHint: "<provider/model>" },
+	{ name: "tree", description: "Navigate session tree (switch branches)" },
+	{ name: "thinking", description: "Set thinking level", argumentHint: "<level>" },
+	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
+	{ name: "export", description: "Export session (HTML default, or specify path: .html/.jsonl)" },
+	{ name: "import", description: "Import and resume a session from a JSONL file" },
+	{ name: "share", description: "Share session as a secret GitHub gist" },
+```
+
+## !!steps Reporting, forking and authentication
+
+The middle of the table mixes information commands (`session`, `changelog`,
+`hotkeys`), branching (`fork`, `clone`) and credential management
+(`login`, `logout`). `trust` saves a project trust decision, which is handled by
+[project-trust.ts](/docs/src/core/project-trust.ts).
+
+```ts ! slash-commands.ts
+	{ name: "bug", description: "Report a bug to the Pi developers", argumentHint: "<description>" },
+	{ name: "copy", description: "Copy last agent message to clipboard" },
+	{ name: "name", description: "Set session display name" },
+	{ name: "session", description: "Show session info and stats" },
+	{ name: "changelog", description: "Show changelog entries" },
+	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
+	{ name: "fork", description: "Create a new fork from a previous user message" },
+	{ name: "clone", description: "Duplicate the current session at the current position" },
+	{ name: "trust", description: "Save project trust decision for future sessions" },
+	{ name: "login", description: "Configure provider authentication", argumentHint: "<provider>" },
+	{ name: "logout", description: "Remove provider authentication" },
+```
+
+## !!steps Lifecycle commands and the app name
+
+The last group manages the session lifecycle. Only `quit` is a template string,
+reading `APP_NAME` from `config.ts` so a rebranded build shows its own name.
+
+```ts ! slash-commands.ts
+	{ name: "new", description: "Start a new session" },
+	{ name: "compact", description: "Manually compact the session context" },
+	{ name: "resume", description: "Resume a different session" },
+	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, themes, and context files" },
+	// !mark
+	{ name: "quit", description: `Quit ${APP_NAME}` },
+];
+```
+
+</Scrollycoding>
+
+Extensions, prompt templates ([prompt-templates.ts](/docs/src/core/prompt-templates.ts))
+and skills ([skills.ts](/docs/src/core/skills.ts)) add their own commands at
+runtime and are described with `SlashCommandInfo`. The built-ins stay a static
+table so the list is available before any resource loading finishes.

@@ -1,0 +1,372 @@
+---
+title: "agent-session-runtime.ts"
+description: "Owns the live AgentSession and swaps it out for /new, /resume, /fork and import, tearing the old one down first"
+source: "src/core/agent-session-runtime.ts"
+full: true
+---
+
+An [AgentSession](/docs/src/core/agent-session.ts) is bound to one session
+file, one cwd and one set of extensions. Anything that changes one of those
+(starting a new session, resuming another, forking, importing a JSONL file)
+therefore means building a whole new session. `AgentSessionRuntime` is the
+owner that does that swap, so the UI holds one stable object while the session
+inside it changes.
+
+Every replacement follows the same recipe: ask extensions for permission, work
+out the next `SessionManager`, shut the old session down, call the stored
+factory to build the next runtime, and let the host rebind its UI. The
+differences between the four flows are only in how the next session manager is
+chosen.
+
+<Scrollycoding>
+
+## !!steps The factory the runtime closes over
+
+The runtime never builds sessions itself. It is handed a
+`CreateAgentSessionRuntimeFactory`, which takes a cwd, an agent dir, a
+[session-manager.ts](/docs/src/core/session-manager.ts) and an optional
+`session_start` event, and returns the session plus its services and
+diagnostics.
+
+The factory closes over process-global inputs (CLI flags, auth) while
+rebuilding everything cwd-bound, using
+[agent-session-services.ts](/docs/src/core/agent-session-services.ts) and
+[sdk.ts](/docs/src/core/sdk.ts) internally.
+
+```ts ! agent-session-runtime.ts
+export interface CreateAgentSessionRuntimeResult extends CreateAgentSessionResult {
+	services: AgentSessionServices;
+	diagnostics: AgentSessionRuntimeDiagnostic[];
+}
+// ...
+export type CreateAgentSessionRuntimeFactory = (options: {
+	cwd: string;
+	agentDir: string;
+	sessionManager: SessionManager;
+	sessionStartEvent?: SessionStartEvent;
+	projectTrustContext?: ProjectTrustContext;
+}) => Promise<CreateAgentSessionRuntimeResult>;
+```
+
+## !!steps Holding state and two host callbacks
+
+The class keeps the current session, services, diagnostics and the model
+fallback message, and exposes them through getters. Two optional callbacks let
+the host cooperate with replacement.
+
+`rebindSession` runs after the new session exists so the UI can re-subscribe.
+`beforeSessionInvalidate` is deliberately synchronous: it runs after
+`session_shutdown` handlers but before the old extension context goes stale,
+which is the only safe moment to detach extension-provided TUI components.
+
+```ts ! agent-session-runtime.ts
+export class AgentSessionRuntime {
+	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private beforeSessionInvalidate?: () => void;
+	private _session: AgentSession;
+	private _services: AgentSessionServices;
+	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
+	private _diagnostics: AgentSessionRuntimeDiagnostic[];
+	private _modelFallbackMessage?: string;
+	// ...
+	/**
+	 * Set a synchronous callback that runs after `session_shutdown` handlers finish
+	 * but before the current session is invalidated.
+	 *
+	 * This is for host-owned UI teardown that must not yield to the event loop,
+	 * such as detaching extension-provided TUI components before the old extension
+	 * context becomes stale.
+	 */
+	// !mark
+	setBeforeSessionInvalidate(beforeSessionInvalidate?: () => void): void {
+		this.beforeSessionInvalidate = beforeSessionInvalidate;
+	}
+```
+
+## !!steps Letting extensions veto a switch
+
+Before anything is touched, `session_before_switch` (for new and resume) or
+`session_before_fork` is emitted. If no extension registered a handler the
+method returns immediately without constructing an event. A handler returning
+`cancel: true` aborts the whole replacement and the caller gets
+`{ cancelled: true }`.
+
+The event types come from [types.ts](/docs/src/core/extensions/types.ts) and
+dispatch goes through the session's
+[runner.ts](/docs/src/core/extensions/runner.ts).
+
+```ts ! agent-session-runtime.ts
+	private async emitBeforeSwitch(
+		reason: "new" | "resume",
+		targetSessionFile?: string,
+	): Promise<{ cancelled: boolean }> {
+		const runner = this.session.extensionRunner;
+		// !mark(1:3)
+		if (!runner.hasHandlers("session_before_switch")) {
+			return { cancelled: false };
+		}
+
+		const result = await runner.emit({
+			type: "session_before_switch",
+			reason,
+			targetSessionFile,
+		});
+		// !mark
+		return { cancelled: result?.cancel === true };
+	}
+```
+
+## !!steps Tearing down the outgoing session
+
+Order matters here. First `abort()` settles any in-flight response so the
+aborted turn, tool results included, is persisted to the session that is about
+to be left. Then `session_shutdown` is emitted with the reason and the target
+file, the host's synchronous hook runs, and only then is the session disposed.
+
+`apply` afterwards just swaps four fields from the factory result. Note that
+failures are not caught: if the factory throws after teardown, the runtime is
+left pointing at a disposed session and the error goes to the caller.
+
+```ts ! agent-session-runtime.ts
+	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		// Settle any active response first so the aborted turn (including tool
+		// results) is persisted to the outgoing session before it is replaced.
+		// !mark
+		await this.session.abort();
+		await emitSessionShutdownEvent(this.session.extensionRunner, {
+			type: "session_shutdown",
+			reason,
+			targetSessionFile,
+		});
+		// !mark(1:2)
+		this.beforeSessionInvalidate?.();
+		this.session.dispose();
+	}
+
+	private apply(result: CreateAgentSessionRuntimeResult): void {
+		this._session = result.session;
+		this._services = result.services;
+		this._diagnostics = result.diagnostics;
+		this._modelFallbackMessage = result.modelFallbackMessage;
+	}
+```
+
+## !!steps Resuming another session
+
+`switchSession` opens the target file with an optional cwd override, then
+calls `assertSessionCwdExists` (see
+[session-cwd.ts](/docs/src/core/session-cwd.ts)) so a session recorded in a
+directory that no longer exists fails before the old session is destroyed.
+
+The new runtime is created with the session's own cwd, not the current one,
+which is how resuming across projects rebuilds cwd-bound services. The
+`session_start` event carries `reason: "resume"` and the previous file.
+Resume is the only flow that can take a `projectTrustContextFactory`, since
+only it can land in a different project.
+
+```ts ! agent-session-runtime.ts
+		const previousSessionFile = this.session.sessionFile;
+		// !mark(1:2)
+		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+		assertSessionCwdExists(sessionManager, this.cwd);
+		await this.teardownCurrent("resume", sessionManager.getSessionFile());
+		this.apply(
+			await this.createRuntime({
+				// !mark
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+			}),
+		);
+		await this.finishSessionReplacement(options?.withSession);
+		return { cancelled: false };
+```
+
+## !!steps Starting a new session
+
+`newSession` keeps the current cwd and the same session directory. If the
+current session is persisted it creates a new file there; otherwise it makes
+another in-memory manager, so a `--no-session` run stays ephemeral.
+
+An optional `parentSession` records lineage before teardown. After the new
+runtime is applied, a `setup` callback can seed the session (for example with
+extension-provided entries) and `refreshContext` is called so the agent's
+visible messages reflect what setup appended.
+
+```ts ! agent-session-runtime.ts
+		const previousSessionFile = this.session.sessionFile;
+		const sessionDir = this.session.sessionManager.getSessionDir();
+		// !mark(1:3)
+		const sessionManager = this.session.sessionManager.isPersisted()
+			? SessionManager.create(this.cwd, sessionDir)
+			: SessionManager.inMemory(this.cwd);
+		if (options?.parentSession) {
+			sessionManager.newSession({ parentSession: options.parentSession });
+		}
+
+		await this.teardownCurrent("new", sessionManager.getSessionFile());
+		this.apply(
+			await this.createRuntime({
+				cwd: this.cwd,
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+			}),
+		);
+		if (options?.setup) {
+			await options.setup(this.session.sessionManager);
+			// !mark
+			this.session.refreshContext();
+		}
+```
+
+## !!steps Forking: choosing the new leaf
+
+`fork` takes an entry ID and a position. With `"before"` (the default) the
+entry must be a user message: the new leaf is its parent and the message text
+is returned as `selectedText` so the UI can put it back in the editor. With
+`"at"` any entry works and the leaf is that entry.
+
+Invalid IDs throw `Invalid entry ID for forking`. A null leaf means forking
+from before the first message, which later becomes an empty new session that
+only records its parent.
+
+```ts ! agent-session-runtime.ts
+		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+		if (!selectedEntry) {
+			throw new Error("Invalid entry ID for forking");
+		}
+
+		if (position === "at") {
+			targetLeafId = selectedEntry.id;
+		} else {
+			// !mark
+			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+				throw new Error("Invalid entry ID for forking");
+			}
+			targetLeafId = selectedEntry.parentId;
+			selectedText = extractUserMessageText(selectedEntry.message.content);
+		}
+```
+
+## !!steps Forking: persisted versus in-memory
+
+The persisted branch has two sub-cases. A null leaf creates a fresh session
+file with `parentSession` pointing at the current one. Otherwise the current
+file is reopened and `createBranchedSession` writes the new file containing
+only the path to the leaf; a session that has never been saved (file missing)
+is rejected with a message telling the user to send a message first.
+
+The in-memory branch is different: it reuses the same `SessionManager`
+object, mutating it in place with `newSession` or `createBranchedSession`
+after teardown, because there is no file to open.
+
+```ts ! agent-session-runtime.ts
+			if (!existsSync(currentSessionFile)) {
+				throw new Error("This session has not been saved yet. Send a message before cloning or forking it.");
+			}
+			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+			// !mark
+			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+			if (!forkedSessionPath) {
+				throw new Error("Failed to create forked session");
+			}
+			await this.teardownCurrent("fork", sessionManager.getSessionFile());
+			// ...
+		}
+
+		// !mark(1:6)
+		const sessionManager = this.session.sessionManager;
+		await this.teardownCurrent("fork", sessionManager.getSessionFile());
+		if (!targetLeafId) {
+			sessionManager.newSession({ parentSession: previousSessionFile });
+		} else {
+			sessionManager.createBranchedSession(targetLeafId);
+		}
+```
+
+## !!steps Importing a JSONL file
+
+`importFromJsonl` copies an external session file into the current session
+directory and then resumes it. The destination keeps the file's basename; on a
+collision a `-1`, `-2` suffix is appended until the name is free. If the
+source already lives in the session dir it is opened in place and not copied.
+
+The copy happens after the `session_before_switch` check, so a cancelled
+import leaves nothing behind, and uses `COPYFILE_EXCL` as a last guard against
+overwriting. A missing input throws `SessionImportFileNotFoundError`.
+
+```ts ! agent-session-runtime.ts
+		let destinationPath = join(sessionDir, basename(resolvedPath));
+		const sourceAlreadyStored = resolve(destinationPath) === resolvedPath;
+		if (!sourceAlreadyStored) {
+			const { name, ext } = parse(destinationPath);
+			let suffix = 1;
+			// !mark(1:3)
+			while (existsSync(destinationPath)) {
+				destinationPath = join(sessionDir, `${name}-${suffix++}${ext}`);
+			}
+		}
+		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
+		if (beforeResult.cancelled) {
+			return beforeResult;
+		}
+
+		const previousSessionFile = this.session.sessionFile;
+		if (!sourceAlreadyStored) {
+			// !mark
+			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
+		}
+```
+
+## !!steps Finishing a replacement and the initial runtime
+
+After `apply`, `finishSessionReplacement` first calls the host's
+`rebindSession`, then the optional `withSession` callback with a fresh
+`ReplacedSessionContext`. That is the supported place for an extension to do
+post-switch work, since the old context it captured is stale.
+
+`createAgentSessionRuntime` is the entry point: it validates the cwd, calls the
+factory once, and stores the same factory for every later swap. `dispose`
+emits `session_shutdown` with reason `quit`.
+
+```ts ! agent-session-runtime.ts
+	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
+		if (this.rebindSession) {
+			await this.rebindSession(this.session);
+		}
+		if (withSession) {
+			// !mark
+			await withSession(this.session.createReplacedSessionContext());
+		}
+	}
+// ...
+export async function createAgentSessionRuntime(
+	createRuntime: CreateAgentSessionRuntimeFactory,
+	options: {
+		cwd: string;
+		agentDir: string;
+		sessionManager: SessionManager;
+		sessionStartEvent?: SessionStartEvent;
+	},
+): Promise<AgentSessionRuntime> {
+	// !mark
+	assertSessionCwdExists(options.sessionManager, options.cwd);
+	const result = await createRuntime(options);
+```
+
+</Scrollycoding>
+
+The runtime is the layer between the modes (interactive, print, RPC under
+[modes/index.ts](/docs/src/modes/index.ts)) and the session: the modes hold a
+runtime and call `switchSession`, `newSession`, `fork` and `importFromJsonl`
+from their slash commands. The file's last lines re-export the services API so
+callers can import everything from one module, and
+[main.ts](/docs/src/main.ts) builds the factory and calls
+`createAgentSessionRuntime`.
+
+Structurally, all four replacement methods repeat the same
+create-manager, teardown, apply, finish sequence rather than sharing a helper,
+which is why fork in particular has three near-identical blocks.

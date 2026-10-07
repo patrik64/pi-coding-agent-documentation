@@ -1,0 +1,386 @@
+---
+title: "footer.ts"
+description: "The two-or-three line status footer: working directory, token and cost totals, context-window usage, model name and extension statuses"
+source: "src/modes/interactive/components/footer.ts"
+full: true
+---
+
+The footer is the permanent strip under the prompt. Its first line is the working directory with git branch and session name; the second is a stats line with cumulative tokens, cache numbers, cost and context-window percentage on the left and the active model on the right; extension-provided statuses go on an optional third line.
+
+It renders on every frame, so the file is organized around two concerns: a cache that avoids rescanning the whole session each frame, and width arithmetic that degrades gracefully in narrow terminals. Git branch and extension statuses come from [footer-data-provider.ts](/docs/src/core/footer-data-provider.ts); usage sums come from [usage-totals.ts](/docs/src/core/usage-totals.ts); everything else is read from the [agent-session.ts](/docs/src/core/agent-session.ts) object.
+
+<Scrollycoding>
+
+## !!steps Formatting helpers
+
+`sanitizeStatusText` flattens extension status strings to a single line by replacing newlines, tabs and carriage returns with spaces and collapsing runs of spaces. `formatTokens` picks a compact form by magnitude: raw below 1000, one decimal up to 10k, rounded thousands below a million, and the same pattern in millions. It is exported.
+
+```ts ! footer.ts
+/**
+ * Sanitize text for display in a single-line status.
+ * Removes newlines, tabs, carriage returns, and other control characters.
+ */
+// !mark
+function sanitizeStatusText(text: string): string {
+	// Replace newlines, tabs, carriage returns with space, then collapse multiple spaces
+	return text
+		.replace(/[\r\n\t]/g, " ")
+		.replace(/ +/g, " ")
+		.trim();
+}
+
+/**
+ * Format token counts for compact footer display.
+ */
+// !mark
+export function formatTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+```
+
+## !!steps Shortening the working directory
+
+`formatCwdForFooter` replaces the home directory with `~` but only when the cwd is really inside it. It uses `path.relative` and rejects results that are exactly `..`, start with `..` plus a separator, or are absolute (a different drive on Windows). A path like `/home/user2` therefore is not mistaken for being under `/home/user`, which a naive prefix check would get wrong. With no home value the cwd is returned untouched.
+
+```ts ! footer.ts
+export function formatCwdForFooter(cwd: string, home: string | undefined): string {
+	if (!home) return cwd;
+
+	const resolvedCwd = resolve(cwd);
+	const resolvedHome = resolve(home);
+	const relativeToHome = relative(resolvedHome, resolvedCwd);
+// !mark(1:3)
+	const isInsideHome =
+		relativeToHome === "" ||
+		(relativeToHome !== ".." && !relativeToHome.startsWith(`..${sep}`) && !isAbsolute(relativeToHome));
+
+// !mark
+	if (!isInsideHome) return cwd;
+	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
+}
+```
+
+## !!steps Component state and no-ops
+
+The component holds the session, the footer data provider, and a cached `SessionStats`. `setSession` lets the interactive mode swap sessions without recreating the footer. `invalidate` and `dispose` are intentionally empty: caching and the git watcher moved into the provider, and the methods remain only because call sites still invoke them (the comments say so).
+
+```ts ! footer.ts
+export class FooterComponent implements Component {
+	private autoCompactEnabled = true;
+	private session: AgentSession;
+	private footerData: ReadonlyFooterDataProvider;
+	private sessionStats?: SessionStats;
+
+	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
+		this.session = session;
+		this.footerData = footerData;
+	}
+
+// !mark
+	setSession(session: AgentSession): void {
+		this.session = session;
+	}
+
+	setAutoCompactEnabled(enabled: boolean): void {
+		this.autoCompactEnabled = enabled;
+	}
+
+	/**
+	 * No-op: git branch caching now handled by provider.
+	 * Kept for compatibility with existing call sites in interactive-mode.
+	 */
+// !mark
+	invalidate(): void {
+		// No-op: git branch is cached/invalidated by provider
+	}
+
+	/**
+	 * Clean up resources.
+	 * Git watcher cleanup now handled by provider.
+	 */
+// !mark
+	dispose(): void {
+		// Git watcher cleanup handled by provider
+	}
+```
+
+## !!steps A cache keyed on the session's shape
+
+Summing usage over every entry on each frame would be costly in long sessions. The comment gives the invariant that makes caching safe: entries are append-only and every append moves the leaf, so the result can change only if the session object, id, leaf, entry count or the model providing limits changes. `limitsModel` prefers a routed model, so a virtual model's context window is tracked correctly. If every key matches, the previous object is returned.
+
+```ts ! footer.ts
+	/**
+	 * Usage totals and context usage scan the whole session, and the footer renders on every frame.
+	 * Entries are append-only and every append moves the leaf, so the results only change with the
+	 * session, leaf, entry count, or the model whose context window applies.
+	 */
+	private getSessionStats(): SessionStats {
+		const sessionManager = this.session.sessionManager;
+		const entryCount = sessionManager.getEntryCount();
+		const sessionId = sessionManager.getSessionId();
+		const leafId = sessionManager.getLeafId();
+// !mark
+		const limitsModel = this.session.routedModel?.model ?? this.session.model;
+		const cached = this.sessionStats;
+// !mark
+		if (
+			cached &&
+			cached.session === this.session &&
+			cached.sessionId === sessionId &&
+			cached.leafId === leafId &&
+			cached.entryCount === entryCount &&
+			cached.limitsModel === limitsModel
+		) {
+			return cached;
+		}
+```
+
+## !!steps Accumulating usage across entry types
+
+Cost and token totals are not just assistant messages. Standalone `usage` entries, tool-result messages carrying usage, and branch-summary or compaction entries are added too, so spend from summarization is not lost. Cache hit rate is derived from the latest assistant message only: cache read divided by input plus cache read plus cache write, and it resets to undefined when the prompt had no tokens. Context usage is asked of the session itself, because after compaction only the session knows tokens are unknown until the next response.
+
+```ts ! footer.ts
+		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
+		const usageTotals = createUsageTotals();
+		let latestCacheHitRate: number | undefined;
+
+		for (const entry of sessionManager.getEntries()) {
+			if (entry.type === "usage") {
+				addUsageToTotals(usageTotals, entry.usage);
+			} else if (entry.type === "message" && entry.message.role === "assistant") {
+				addUsageToTotals(usageTotals, entry.message.usage);
+
+// !mark(1:4)
+				const latestPromptTokens =
+					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
+				latestCacheHitRate =
+					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
+// !mark
+			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+				addUsageToTotals(usageTotals, entry.message.usage);
+// !mark
+			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+				addUsageToTotals(usageTotals, entry.usage);
+			}
+		}
+
+		// Calculate context usage from session (handles compaction correctly).
+		// After compaction, tokens are unknown until the next LLM response.
+		const contextUsage = this.session.getContextUsage();
+		this.sessionStats = {
+			session: this.session,
+			sessionId,
+			leafId,
+			entryCount,
+			limitsModel,
+			usageTotals,
+			latestCacheHitRate,
+			contextUsage,
+		};
+		return this.sessionStats;
+```
+
+## !!steps Building the first line
+
+`render` first reads the context window from the session's usage, falling back to the model and then to zero. The first line is the shortened cwd, then the git branch in parentheses, then a bullet and the session name when set. The line is truncated later with a dim ellipsis, so long paths simply get cut.
+
+```ts ! footer.ts
+	render(width: number): string[] {
+		const state = this.session.state;
+		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
+// !mark
+		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
+		const contextPercentValue = contextUsage?.percent ?? 0;
+// !mark
+		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+
+		// Replace home directory with ~
+// !mark
+		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+
+		// Add git branch if available
+		const branch = this.footerData.getGitBranch();
+// !mark(1:3)
+		if (branch) {
+			pwd = `${pwd} (${branch})`;
+		}
+
+		// Add session name if set
+		const sessionName = this.session.sessionManager.getSessionName();
+		if (sessionName) {
+			pwd = `${pwd} • ${sessionName}`;
+		}
+```
+
+## !!steps Stats pieces and cost
+
+Parts are only added when non-zero: input and output arrows, cache read and write prefixed `R` and `W`, and a cache hit percentage `CH` when any cache activity exists. Cost shows with three decimals, and an `(sub)` suffix appears for subscription-backed providers. That check is a hardcoded provider id (`kimi-coding`) plus a query to the model runtime, because Kimi uses an API key but is billed as a subscription.
+
+```ts ! footer.ts
+		// Build stats line
+		const statsParts = [];
+// !mark(1:5)
+		if (usageTotals.input) statsParts.push(`↑${formatTokens(usageTotals.input)}`);
+		if (usageTotals.output) statsParts.push(`↓${formatTokens(usageTotals.output)}`);
+		if (usageTotals.cacheRead) statsParts.push(`R${formatTokens(usageTotals.cacheRead)}`);
+		if (usageTotals.cacheWrite) statsParts.push(`W${formatTokens(usageTotals.cacheWrite)}`);
+		if ((usageTotals.cacheRead > 0 || usageTotals.cacheWrite > 0) && latestCacheHitRate !== undefined) {
+			statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+		}
+
+		// Kimi Coding is subscription-backed despite using API-key authentication.
+		const usingSubscription = state.model
+			? state.model.provider === "kimi-coding" || this.session.modelRuntime.isUsingSubscription(state.model.provider)
+			: false;
+		if (usageTotals.cost || usingSubscription) {
+// !mark
+			const costStr = `$${usageTotals.cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`;
+			statsParts.push(costStr);
+		}
+```
+
+## !!steps Context percentage and warning colors
+
+The context text is `percent/window` plus an `(auto)` marker when auto-compaction is on, or `?` when the percent is unknown. Above 70 percent it turns warning-colored and above 90 percent error-colored. When experimental features are enabled (see [experimental.ts](/docs/src/core/experimental.ts)) a bold `xp` badge is appended.
+
+```ts ! footer.ts
+		// Colorize context percentage based on usage
+		let contextPercentStr: string;
+		const autoIndicator = this.autoCompactEnabled ? " (auto)" : "";
+		const contextPercentDisplay =
+			contextPercent === "?"
+				? `?/${formatTokens(contextWindow)}${autoIndicator}`
+				: `${contextPercent}%/${formatTokens(contextWindow)}${autoIndicator}`;
+// !mark
+		if (contextPercentValue > 90) {
+			contextPercentStr = theme.fg("error", contextPercentDisplay);
+// !mark
+		} else if (contextPercentValue > 70) {
+			contextPercentStr = theme.fg("warning", contextPercentDisplay);
+		} else {
+			contextPercentStr = contextPercentDisplay;
+		}
+		statsParts.push(contextPercentStr);
+// !mark(1:3)
+		if (areExperimentalFeaturesEnabled()) {
+			statsParts.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
+		}
+```
+
+## !!steps The model on the right
+
+The right-hand text is the model id, plus its thinking level when the model supports reasoning, plus an arrow to the routed model when a virtual model is in use. The provider name is prefixed only if more than one provider is available and the line still fits. Stats on the left are truncated first if they alone exceed the width.
+
+```ts ! footer.ts
+		// Add model name on the right side, plus thinking level if model supports it
+		const modelName = state.model?.id || "no-model";
+
+		let statsLeftWidth = visibleWidth(statsLeft);
+
+		// If statsLeft is too wide, truncate it
+		if (statsLeftWidth > width) {
+			statsLeft = truncateToWidth(statsLeft, width, "...");
+			statsLeftWidth = visibleWidth(statsLeft);
+		}
+
+		// Calculate available space for padding (minimum 2 spaces between stats and model)
+		const minPadding = 2;
+
+		// Add thinking level indicator if model supports reasoning
+		let rightSideWithoutProvider = modelName;
+		if (state.model?.reasoning) {
+			const thinkingLevel = state.thinkingLevel || "off";
+			rightSideWithoutProvider =
+				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+		}
+		// A virtual model routes each request; show where the latest response went.
+// !mark
+		const routed = this.session.routedModel;
+		if (routed) {
+			const level = routed.thinkingLevel ? ` • ${routed.thinkingLevel}` : "";
+			rightSideWithoutProvider += ` → ${routed.model.id}${level}`;
+		}
+
+		// Prepend the provider in parentheses if there are multiple providers and there's enough room
+		let rightSide = rightSideWithoutProvider;
+// !mark
+		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
+			rightSide = `(${state.model!.provider}) ${rightSideWithoutProvider}`;
+// !mark
+			if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
+				// Too wide, fall back
+				rightSide = rightSideWithoutProvider;
+			}
+		}
+```
+
+## !!steps Fitting both sides
+
+If left, a two-space minimum gap and the right side all fit, padding right-aligns the model. Otherwise the right side is truncated to the remaining width (with no ellipsis); if there is no room at all, only the stats are shown.
+
+```ts ! footer.ts
+		const rightSideWidth = visibleWidth(rightSide);
+		const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
+
+		let statsLine: string;
+// !mark
+		if (totalNeeded <= width) {
+			// Both fit - add padding to right-align model
+			const padding = " ".repeat(width - statsLeftWidth - rightSideWidth);
+			statsLine = statsLeft + padding + rightSide;
+		} else {
+			// Need to truncate right side
+// !mark
+			const availableForRight = width - statsLeftWidth - minPadding;
+			if (availableForRight > 0) {
+				const truncatedRight = truncateToWidth(rightSide, availableForRight, "");
+				const truncatedRightWidth = visibleWidth(truncatedRight);
+				const padding = " ".repeat(Math.max(0, width - statsLeftWidth - truncatedRightWidth));
+				statsLine = statsLeft + padding + truncatedRight;
+			} else {
+// !mark
+				// Not enough space for right side at all
+				statsLine = statsLeft;
+			}
+		}
+```
+
+## !!steps Dimming and extension statuses
+
+A single dim wrapper would be cancelled by the reset code that ends the colored context percentage, so the left stats and the padding plus right side are dimmed separately. `statsLine.slice(statsLeft.length)` can do this because the line starts with `statsLeft`. Extension statuses are sorted by key, sanitized, joined on one line and truncated to the width.
+
+```ts ! footer.ts
+		// Apply dim to each part separately. statsLeft may contain color codes (for context %)
+		// that end with a reset, which would clear an outer dim wrapper. So we dim the parts
+		// before and after the colored section independently.
+// !mark(1:3)
+		const dimStatsLeft = theme.fg("dim", statsLeft);
+		const remainder = statsLine.slice(statsLeft.length); // padding + rightSide
+		const dimRemainder = theme.fg("dim", remainder);
+
+		const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
+		const lines = [pwdLine, dimStatsLeft + dimRemainder];
+
+		// Add extension statuses on a single line, sorted by key alphabetically
+		const extensionStatuses = this.footerData.getExtensionStatuses();
+		if (extensionStatuses.size > 0) {
+// !mark
+			const sortedStatuses = Array.from(extensionStatuses.entries())
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([, text]) => sanitizeStatusText(text));
+			const statusLine = sortedStatuses.join(" ");
+			// Truncate to terminal width with dim ellipsis for consistency with footer style
+			lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+		}
+
+		return lines;
+	}
+```
+
+</Scrollycoding>
+
+The footer is created in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and is exported through the barrel [index.ts](/docs/src/modes/interactive/components/index.ts). It is a plain `Component` rather than a `Container`, so it builds its output strings itself. Colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and its session-stat shapes mirror the entry types in [session-manager.ts](/docs/src/core/session-manager.ts).

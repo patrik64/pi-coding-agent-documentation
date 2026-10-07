@@ -1,0 +1,60 @@
+---
+title: "main.ts"
+description: "The executable entry point of the vacation demo: parse arguments, open the durable runtime, run the TUI, and always close"
+source: "src/experimental/vacation/main.ts"
+full: true
+---
+
+A twenty-line script. It is the file that the README tells you to run with node, which is why it has a shebang line. It parses a single flag, opens the durable runtime from [runtime.ts](/docs/src/experimental/vacation/runtime.ts), hands the result to the TUI in [tui.ts](/docs/src/experimental/vacation/tui.ts), and closes the runtime whatever happens.
+
+It is experimental demo code and nothing imports it.
+
+<Scrollycoding>
+
+## !!steps Imports and the shebang
+
+The shebang makes the file executable as a script. Both imports use the `.ts` extension, because Node strips types and resolves files literally. The two collaborators are `openDurable` and its options type from the runtime, and `runDurableTui` from the TUI.
+
+```ts ! main.ts
+#!/usr/bin/env node
+
+import { type OpenDurableOptions, openDurable } from "./runtime.ts";
+import { runDurableTui } from "./tui.ts";
+```
+
+## !!steps Argument parsing
+
+The only recognized arguments are `--continue` and `-c`. Anything else throws, so a typo cannot silently start a fresh session. The result is the options object that `openDurable` takes; `cwd` is left unset so the runtime uses the current directory.
+
+```ts ! main.ts
+function parseArgs(argv: readonly string[]): OpenDurableOptions {
+	let continueSession = false;
+	for (const arg of argv) {
+		// !mark(1:2)
+		if (arg === "--continue" || arg === "-c") continueSession = true;
+		else throw new Error(`Unknown argument: ${arg}`);
+	}
+	return { continueSession };
+}
+```
+
+## !!steps Open, run, close
+
+Top-level await opens the session. The TUI runs until the user exits, and the `finally` block closes the runtime so the Harness is shut down and the session lock from [sessions.ts](/docs/src/experimental/vacation/sessions.ts) is released.
+
+The close does not record an outcome for a running turn, so an interrupted turn resumes on the next `--continue`.
+
+```ts ! main.ts
+// !mark
+const durable = await openDurable(parseArgs(process.argv.slice(2)));
+try {
+	await runDurableTui(durable.view, durable.controller, durable.settings);
+} finally {
+	// !mark
+	await durable.close();
+}
+```
+
+</Scrollycoding>
+
+The flow is the same in the durable coding agent's [main.ts](/docs/src/experimental/durable/main.ts); only the modules it imports differ. If `openDurable` throws (for example when the session is locked by another process), the error propagates as an unhandled rejection from top-level await, since there is no catch.

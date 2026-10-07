@@ -1,0 +1,94 @@
+---
+title: "README.md"
+description: "Guide to the experimental durable coding agent: one process, a SQLite-backed durable Harness, and a TUI that only renders the conversation view"
+source: "src/experimental/durable/README.md"
+full: true
+---
+
+This README describes a small, separate experiment inside the experimental folder: a local coding agent built on the `pi-durable` package. Unlike the client/server experiments around [server.ts](/docs/src/experimental/server.ts), everything runs in one process that owns the model runtime, the durable Harness, its SQLite storage and the terminal UI.
+
+It reuses a lot of regular pi: the model runtime, authentication, settings, system prompt, keybindings, theme and interactive components. What is new is that the agent state lives in a durable store, and the UI is a pure renderer of it. The code is experimental. The entry point is [main.ts](/docs/src/experimental/durable/main.ts).
+
+<Scrollycoding>
+
+## !!steps Running it
+
+The document is run straight from source through a Node `--import` hook, [source-resolver.ts](/docs/src/experimental/source-resolver.ts), which lets the TypeScript files load directly. `--continue` reopens the newest session for the current directory, and a new session otherwise starts with pi's default model and thinking level from `settings.json`.
+
+```bash ! README.md
+node --import ./packages/coding-agent/src/experimental/source-resolver.ts packages/coding-agent/src/experimental/durable/main.ts
+node --import ./packages/coding-agent/src/experimental/source-resolver.ts packages/coding-agent/src/experimental/durable/main.ts --continue
+```
+
+## !!steps Where sessions live and how they are locked
+
+Each session is a SQLite file under a directory keyed by a hash of the working directory. A lock keeps a second process out. A lock left by a crash goes stale after 10 seconds, so a restart right after a crash waits briefly. Credentials are shared with regular pi, so there is no `/login` here. The code for this is [sessions.ts](/docs/src/experimental/durable/sessions.ts).
+
+```md ! README.md
+session for the current directory. Sessions live under
+`~/.pi/agent/experimental/durable-sessions/<cwd-hash>/<session>/session.sqlite`; a lock keeps a second process out
+(a lock left by a crash goes stale after 10 seconds, and the next start waits for that). Log in with pi itself;
+credentials are shared.
+```
+
+## !!steps Durability: recovery is not the UI's job
+
+Every streamed partial, tool output, queue and turn is committed. If the process is killed during a tool call, restarting with `--continue` gives the interrupted call an interrupted result and finishes the turn. The TUI contains no recovery logic. The Harness is configured in [harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts) and [runtime.ts](/docs/src/experimental/durable/runtime.ts).
+
+```md ! README.md
+- **Durability:** every streamed partial, tool output, queue, and turn is committed. Kill the process in the middle
+  of a tool call and start it again with `--continue`: the interrupted call gets an interrupted result and the turn
+  finishes. Nothing in the TUI handles recovery; it only renders the conversation view.
+```
+
+## !!steps One view for the whole screen
+
+The TUI renders a single value, `Conversation.viewState()`: the transcript plus built-in documents named `pi.live`, `pi.inbox`, `pi.agent` and `pi.usage`. Streaming, tool progress, the queue, retries, compaction status, the model and usage all come from it. The rendering is in [tui.ts](/docs/src/experimental/durable/tui.ts), and the client-server TUI in [client-tui-chat.ts](/docs/src/experimental/client-tui-chat.ts) consumes the same document names.
+
+```md ! README.md
+- **One view:** the TUI renders `Conversation.viewState()`, the structural mount of the transcript and the built-in
+  documents (`pi.live`, `pi.inbox`, `pi.agent`, `pi.usage`). Streaming, tool progress, the queue, retries,
+  compaction status, the model, and usage all come from it.
+```
+
+## !!steps Subagents and the task graph
+
+The `subagent` tool, in [subagent.ts](/docs/src/experimental/durable/subagent.ts), runs a task in a child conversation owned by the call. `/agents` switches the view to any conversation, even while its subagent works, and the editor then talks to that conversation. Esc aborts the shown conversation, and aborting the main turn aborts its subagents. A live task panel shows `Harness.taskGraph()`, toggled by `/tasks`.
+
+```md ! README.md
+- **Subagents:** the `subagent` tool runs a task in a child conversation owned by the call. `/agents` switches the
+  view to any conversation, also while the subagent works, and the editor then talks to it: steer it while busy, or
+  keep chatting after the call returned. Esc aborts the shown conversation; aborting the main turn aborts its
+  subagents.
+```
+
+## !!steps Commands and keys
+
+Submit sends a prompt when idle and steers when busy, mirroring the behavior of the client TUI. Ctrl+C or Ctrl+D exits at once, unlike regular pi where Ctrl+C first clears the editor, which is safe because work in flight resumes with `--continue`.
+
+```md ! README.md
+- submit: prompt while idle, steer while busy
+- follow-up key (`app.message.followUp`): queue a follow-up
+- Esc: abort the shown conversation's work, including a manual compaction
+- `/model` or the model key: select a model for the shown conversation
+- thinking key (Shift+Tab): cycle thinking levels
+```
+
+## !!steps File layout and what is missing
+
+Six files make up the experiment, and the README ends with an explicit list of features that are not implemented. Compaction thresholds, retry policy and timeouts come from pi's `settings.json` as loaded at startup. The system prompt sections are rebuilt as one extension in [prompt.ts](/docs/src/experimental/durable/prompt.ts).
+
+```md ! README.md
+| file | role |
+| --- | --- |
+| `main.ts` | arguments, open, run, close |
+| `sessions.ts` | session directories and the lock |
+| `runtime.ts` | Harness, registry, settings, environments; the plain `DurableView` and `DurableController` |
+| `prompt.ts` | pi's system prompt sections (tools, rules, docs, AGENTS.md, skills, cwd) as one extension |
+| `subagent.ts` | the foreground subagent tool |
+| `tui.ts` | rendering with pi's interactive components |
+```
+
+</Scrollycoding>
+
+Not here: a sessions list and resume picker, forks and tree navigation, extensions, prompt templates, images and `/login`. Note that the layout table lists six files but the folder also contains [harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts), so the table is slightly out of date.

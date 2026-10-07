@@ -1,0 +1,138 @@
+---
+title: "write.ts"
+description: "The write tool: create or overwrite a file, creating parent directories, serialized per path and safe against mid-write aborts"
+source: "src/core/tools/write.ts"
+full: true
+---
+
+The smallest of the built-in file tools, and a good template for the others. It accepts a path and full contents, makes sure the parent directory exists, and writes the file. Everything interesting is in how it is wrapped: file access goes through a replaceable `WriteOperations` object, writes to the same path are serialized, and aborts are handled so they cannot leave a half-finished operation behind.
+
+The sibling tools [edit.ts](/docs/src/core/tools/edit.ts) and [read.ts](/docs/src/core/tools/read.ts) follow the same shape: a schema, an operations interface with a local default, a `createXToolDefinition` factory and a thin `createXTool` wrapper.
+
+<Scrollycoding>
+
+## !!steps Schema and prompt contribution
+
+The input is just `path` and `content`. The exported `writeToolSystemPromptContribution` is the text the system prompt builder uses for this tool: a one-line snippet and a guideline that steers the model toward `edit` for anything short of a new file or a complete rewrite. See [system-prompt.ts](/docs/src/core/system-prompt.ts).
+
+```ts ! write.ts
+const writeSchema = Type.Object({
+	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
+	content: Type.String({ description: "Content to write to the file" }),
+});
+
+export const writeToolSystemPromptContribution = {
+	snippet: "Create or overwrite files",
+	guidelines: ["Use write only for new files or complete rewrites."],
+} as const;
+
+export type WriteToolInput = Static<typeof writeSchema>;
+```
+
+## !!steps Pluggable operations
+
+`WriteOperations` is the seam for remote filesystems. An SSH or container backend supplies its own `writeFile` and `mkdir`, and the tool logic stays the same. The local defaults write UTF-8 and create directories recursively; the trailing `then` discards the first-created-path value that `mkdir` returns, so the signature stays `Promise<void>`.
+
+```ts ! write.ts
+/**
+ * Pluggable operations for the write tool.
+ * Override these to delegate file writing to remote systems (for example SSH).
+ */
+export interface WriteOperations {
+	/** Write content to a file */
+	writeFile: (absolutePath: string, content: string) => Promise<void>;
+	/** Create directory recursively */
+	mkdir: (dir: string) => Promise<void>;
+}
+
+const defaultWriteOperations: WriteOperations = {
+	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
+};
+
+export interface WriteToolOptions {
+	/** Custom operations for file writing. Default: local filesystem */
+	operations?: WriteOperations;
+}
+```
+
+## !!steps Definition and path resolution
+
+The factory returns a `ToolDefinition`, the richer form used by the extension system (see [types.ts](/docs/src/core/extensions/types.ts)). The `description` is what the model reads. `constrainedSampling` asks providers that support it to enforce the JSON schema strictly when they can.
+
+Inside `execute`, the path is resolved against the extension context's working directory when one is present, falling back to the `cwd` given at construction. Relative, absolute and home-prefixed handling lives in [path-utils.ts](/docs/src/core/tools/path-utils.ts).
+
+```ts ! write.ts
+export function createWriteToolDefinition(
+	cwd: string,
+	options?: WriteToolOptions,
+): ToolDefinition<typeof writeSchema, undefined> {
+	const ops = options?.operations ?? defaultWriteOperations;
+	return {
+		name: "write",
+		label: "write",
+		description:
+			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+		promptSnippet: writeToolSystemPromptContribution.snippet,
+		promptGuidelines: [...writeToolSystemPromptContribution.guidelines],
+		parameters: writeSchema,
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
+// ...
+		) {
+			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const dir = dirname(absolutePath);
+			return withFileMutationQueue(absolutePath, async () => {
+				// Do not reject from an abort event listener here: that would release the
+```
+
+## !!steps Serialized writes and abort checks
+
+`withFileMutationQueue` from [file-mutation-queue.ts](/docs/src/core/tools/file-mutation-queue.ts) makes concurrent mutations of the same path run one after another, which matters because the agent can issue parallel tool calls.
+
+The comment explains a deliberate choice. Rejecting from an abort event listener would resolve the caller early and release the queue lock while a filesystem call may still be running. Instead the code checks `signal.aborted` between awaits, so the lock is held until the current operation really finishes. The consequence is that an abort during the final write is reported as an error even though the file has already been written.
+
+```ts ! write.ts
+			return withFileMutationQueue(absolutePath, async () => {
+				// Do not reject from an abort event listener here: that would release the
+				// mutation queue while an in-flight filesystem operation may still finish.
+				// Checking signal.aborted after each await observes the same aborts while
+				// keeping the queue locked until the current operation has settled.
+				const throwIfAborted = (): void => {
+					if (signal?.aborted) throw new Error("Operation aborted");
+				};
+
+				throwIfAborted();
+				// Create parent directories if needed.
+				await ops.mkdir(dir);
+				throwIfAborted();
+
+				// Write the file contents.
+				await ops.writeFile(absolutePath, content);
+				throwIfAborted();
+```
+
+## !!steps Result and the tool wrapper
+
+The result text echoes the path as the model supplied it. `details` is `undefined`, since there is nothing to render beyond the message. The renderers from [write.ts](/docs/src/core/tools/renderers/write.ts) are spread in last so the TUI can draw the call and result.
+
+`createWriteTool` converts the definition into the plain `AgentTool` form with `wrapToolDefinition` from [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts).
+
+```ts ! write.ts
+				return {
+					content: [{ type: "text", text: `Successfully wrote to ${path}` }],
+					details: undefined,
+				};
+			});
+		},
+		...writeRenderers,
+	};
+}
+
+export function createWriteTool(cwd: string, options?: WriteToolOptions): AgentTool<typeof writeSchema> {
+	return wrapToolDefinition(createWriteToolDefinition(cwd, options));
+}
+```
+
+</Scrollycoding>
+
+[index.ts](/docs/src/core/tools/index.ts) re-exports these factories and builds the default coding tool set from them. The write tool never reads the existing file, so it cannot preserve a BOM or line-ending style; that is why the guidelines send the model to edit for partial changes.

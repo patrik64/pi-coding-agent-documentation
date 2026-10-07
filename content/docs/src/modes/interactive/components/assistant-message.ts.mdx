@@ -1,0 +1,251 @@
+---
+title: "assistant-message.ts"
+description: "Renders one assistant message as markdown text and collapsible thinking blocks, with stop-reason errors"
+source: "src/modes/interactive/components/assistant-message.ts"
+full: true
+---
+
+`AssistantMessageComponent` turns a model reply into terminal output. It is
+rebuilt in full whenever the message changes, which is how streaming works:
+the caller passes a new partial `AssistantMessage` to `updateContent` as tokens
+arrive and the container is cleared and refilled.
+
+Tool calls are not drawn here; they are separate components such as
+[tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts).
+Markdown is post-processed through [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts)
+using transformers from [extensions/types.ts](/docs/src/core/extensions/types.ts),
+and the component is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+
+<Scrollycoding>
+
+## !!steps Shell prompt markers and state
+
+The three OSC 133 constants are semantic prompt markers (zone start, end and
+final) that supporting terminals use to know where a block of output begins and
+ends. The fields hold display settings plus `lastMessage`, so the component can
+re-render itself, and a per-run map of user toggles for thinking blocks.
+
+```ts ! assistant-message.ts
+const OSC133_ZONE_START = "\x1b]133;A\x07";
+const OSC133_ZONE_END = "\x1b]133;B\x07";
+const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+/**
+ * Component that renders a complete assistant message
+ */
+export class AssistantMessageComponent extends Container {
+	private contentContainer: Container;
+	private hideThinkingBlock: boolean;
+	private markdownTheme: MarkdownTheme;
+	private hiddenThinkingLabel: string;
+	private outputPad: number;
+	private markdownTransformers: readonly MarkdownTransformer[];
+	private lastMessage?: AssistantMessage;
+	private hasToolCalls = false;
+	private isStreaming = false;
+	private thinkingVisibilityOverrides = new Map<number, boolean>();
+```
+
+## !!steps Re-rendering on every change
+
+Each setter stores its value and rebuilds from `lastMessage`. `invalidate` does
+the same, so a theme change re-renders content with new colors. Changing the
+global `hideThinkingBlock` clears the per-block overrides, so the global
+setting wins again.
+
+```ts ! assistant-message.ts
+	override invalidate(): void {
+		super.invalidate();
+		if (this.lastMessage) {
+			this.updateContent(this.lastMessage);
+		}
+	}
+
+	setHideThinkingBlock(hide: boolean): void {
+		this.hideThinkingBlock = hide;
+		this.thinkingVisibilityOverrides.clear();
+		if (this.lastMessage) {
+			this.updateContent(this.lastMessage);
+		}
+	}
+
+	setHiddenThinkingLabel(label: string): void {
+		this.hiddenThinkingLabel = label;
+		if (this.lastMessage) {
+			this.updateContent(this.lastMessage);
+		}
+	}
+```
+
+## !!steps Marking the output zone
+
+`render` wraps the output in OSC 133 markers, but only when the message has no
+tool calls. Messages with tool calls are followed by tool output, so marking
+them would end the zone in the wrong place.
+
+```ts ! assistant-message.ts
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		if (this.hasToolCalls || lines.length === 0) {
+			return lines;
+		}
+
+		lines[0] = OSC133_ZONE_START + lines[0];
+		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		return lines;
+	}
+```
+
+## !!steps Text blocks in order
+
+`updateContent` clears the container and adds a leading spacer only if there is
+visible text or thinking. Then it walks the content array in order. Text
+blocks become `Markdown` components with zero vertical padding, trimmed, and
+with a transform keyed by role and streaming state.
+
+```ts ! assistant-message.ts
+	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
+		this.lastMessage = message;
+		this.isStreaming = isStreaming;
+
+		// Clear content container
+		this.contentContainer.clear();
+
+		const hasVisibleContent = message.content.some(
+			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
+		);
+
+		if (hasVisibleContent) {
+			this.contentContainer.addChild(new Spacer(1));
+		}
+
+		// Render content in order
+		let thinkingRunIndex = 0;
+		for (let i = 0; i < message.content.length; i++) {
+			const content = message.content[i];
+			if (content.type === "text" && content.text.trim()) {
+				// Assistant text messages with no background - trim the text
+				// Set paddingY=0 to avoid extra spacing before tool executions
+				this.contentContainer.addChild(
+					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
+						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
+					}),
+				);
+```
+
+## !!steps Grouping consecutive thinking blocks
+
+Adjacent thinking blocks are merged into a single run: the inner loop consumes
+them, and `i--` hands the first non-thinking block back to the outer loop. Empty
+thinking is dropped. A trailing spacer is added only when more visible content
+follows, avoiding a blank line before tool execution blocks.
+
+```ts ! assistant-message.ts
+			} else if (content.type === "thinking") {
+				const thinkingBlocks: string[] = [];
+				for (; i < message.content.length; i++) {
+					const thinkingContent = message.content[i];
+					if (thinkingContent.type !== "thinking") {
+						break;
+					}
+					const thinking = thinkingContent.thinking.trim();
+					if (thinking) {
+						thinkingBlocks.push(thinking);
+					}
+				}
+				i--;
+
+				if (thinkingBlocks.length === 0) {
+					continue;
+				}
+
+				// Add spacing only when another visible assistant content block follows.
+				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
+				const hasVisibleContentAfter = message.content
+					.slice(i + 1)
+					.some((c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
+
+```
+
+## !!steps Click to toggle thinking
+
+Each run is either a dimmed italic label or full markdown in the thinking color.
+Which one wins is the per-run override, falling back to the global flag. A
+`MouseRegion` wraps it so a left click flips only that run and re-renders.
+
+```ts ! assistant-message.ts
+				const runIndex = thinkingRunIndex++;
+				const hidden = this.thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock;
+				const thinkingComponent = hidden
+					? new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0)
+					: new Markdown(
+							thinkingBlocks.join("\n\n"),
+							this.outputPad,
+							0,
+							this.markdownTheme,
+							{
+								color: (text: string) => theme.fg("thinkingText", text),
+								italic: true,
+							},
+							{
+								transform: createMarkdownTransform(
+									"assistant-thinking",
+									this.isStreaming,
+									this.markdownTransformers,
+								),
+							},
+						);
+				this.contentContainer.addChild(
+					new MouseRegion(thinkingComponent, (event) => {
+						if (event.type !== "click" || event.button !== "left") return undefined;
+						this.thinkingVisibilityOverrides.set(runIndex, !hidden);
+						if (this.lastMessage) this.updateContent(this.lastMessage);
+						return { handled: true };
+					}),
+				);
+				if (hasVisibleContentAfter) {
+					this.contentContainer.addChild(new Spacer(1));
+				}
+			}
+```
+
+## !!steps Truncation, abort and error
+
+After the content, the stop reason adds a footer. `length` is always shown, even
+with tool calls, because a truncated reply may stop before the tool call is
+complete. `aborted` and `error` are shown only without tool calls, since tool
+execution components display those errors. The default "Request was aborted"
+message is replaced by "Operation aborted".
+
+```ts ! assistant-message.ts
+		// Check if incomplete/failed - show after partial content.
+		// For aborted/error tool calls, tool execution components show the error.
+		// Length stops can happen before a tool call is complete, so surface them here too.
+		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
+		this.hasToolCalls = hasToolCalls;
+		if (message.stopReason === "length") {
+			this.contentContainer.addChild(new Spacer(1));
+			this.contentContainer.addChild(
+				new Text(theme.fg("error", "Response was truncated before completion."), this.outputPad, 0),
+			);
+		} else if (!hasToolCalls) {
+			if (message.stopReason === "aborted") {
+				const abortMessage =
+					message.errorMessage && message.errorMessage !== "Request was aborted"
+						? message.errorMessage
+						: "Operation aborted";
+				this.contentContainer.addChild(new Spacer(1));
+				this.contentContainer.addChild(new Text(theme.fg("error", abortMessage), this.outputPad, 0));
+			} else if (message.stopReason === "error") {
+				const errorMsg = message.errorMessage || "Unknown error";
+				this.contentContainer.addChild(new Spacer(1));
+				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad, 0));
+			}
+		}
+```
+
+</Scrollycoding>
+
+The design is stateless in the sense that the message is the only source of
+truth: every setter funnels into `updateContent`, so there is no incremental
+patching to keep consistent. The cost is rebuilding the whole tree per token.

@@ -1,0 +1,205 @@
+---
+title: "template.css"
+description: "The stylesheet for exported session pages: layout, sidebar tree, message cards, tool output, syntax colors, mobile and print rules"
+source: "src/core/export-html/template.css"
+full: true
+---
+
+This stylesheet is inlined into every exported session by [index.ts](/docs/src/core/export-html/index.ts). It is not static: the first rule is a template whose theme tokens are replaced with colors from the user's active theme, so an export looks like the terminal it came from.
+
+The file is long but regular. Most rules are small classes for pieces that [template.js](/docs/src/core/export-html/template.js) emits as HTML strings, in the same order as the page: layout, sidebar, messages, tools, highlighting, responsive rules.
+
+<Scrollycoding>
+
+## !!steps Theme tokens injected at export time
+
+The first block declares the variables that the generator fills in: theme colors, plus the page, card and info backgrounds. Everything else in the file reads colors through `var(--...)`, which is why one stylesheet serves every theme. See [theme.ts](/docs/src/modes/interactive/theme/theme.ts) for where the colors come from.
+
+```css ! template.css
+    :root {
+      {{THEME_VARS}}
+      --body-bg: {{BODY_BG}};
+      --container-bg: {{CONTAINER_BG}};
+      --info-bg: {{INFO_BG}};
+    }
+```
+
+## !!steps Base sizing and the two-column layout
+
+The page is monospace at 12px with an 18px line height held in a variable, and many paddings are multiples of that so text aligns on a grid. The app is a flex row of sidebar, resizer and content.
+
+```css ! template.css
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --line-height: 18px; /* 12px font * 1.5 */
+      --sidebar-width: 400px;
+      --sidebar-min-width: 240px;
+      --sidebar-max-width: 840px;
+      --sidebar-resizer-width: 6px;
+    }
+
+    body {
+      font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+      font-size: 12px;
+      line-height: var(--line-height);
+      color: var(--text);
+      background: var(--body-bg);
+    }
+
+    body.sidebar-resizing {
+      cursor: col-resize;
+      user-select: none;
+    }
+
+    #app {
+      display: flex;
+      min-height: 100vh;
+    }
+```
+
+## !!steps Sticky sidebar
+
+The sidebar is sticky and full viewport height, with the sidebar width taken from a variable. The drag handle in [template.js](/docs/src/core/export-html/template.js) changes that variable on the root element, so resizing needs no layout code.
+
+```css ! template.css
+    #sidebar {
+      width: var(--sidebar-width);
+      min-width: var(--sidebar-width);
+      max-width: var(--sidebar-width);
+      background: var(--container-bg);
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      border-right: 1px solid var(--dim);
+```
+
+## !!steps Expandable tool output
+
+Collapsed and expanded states are two sibling blocks, preview and full. A single class on the container flips which one is displayed, which is all the click handler has to do.
+
+```css ! template.css
+    .tool-output.expandable {
+      cursor: pointer;
+    }
+
+    .tool-output.expandable:hover {
+      opacity: 0.9;
+    }
+
+    .tool-output.expandable .output-full {
+      display: none;
+    }
+
+    .tool-output.expandable.expanded .output-preview {
+      display: none;
+    }
+
+    .tool-output.expandable.expanded .output-full {
+      display: block;
+    }
+
+    .ansi-line {
+      white-space: pre;
+    }
+```
+
+## !!steps Diff colors
+
+Edit tool diffs reuse the diff theme colors and keep whitespace with `white-space: pre`, scrolling horizontally rather than wrapping.
+
+```css ! template.css
+    /* Diff */
+    .tool-diff {
+      font-size: 11px;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .diff-added { color: var(--toolDiffAdded); }
+    .diff-removed { color: var(--toolDiffRemoved); }
+    .diff-context { color: var(--toolDiffContext); }
+```
+
+## !!steps Syntax highlighting palette
+
+highlight.js ships no theme here. Its token classes are mapped to the session theme's syntax colors, so code blocks match the rest of the page. The comments note that highlight.js 11 uses compound class names for functions and classes.
+
+```css ! template.css
+    .hljs { background: transparent; color: var(--text); }
+    .hljs-comment, .hljs-quote { color: var(--syntaxComment); }
+    .hljs-keyword, .hljs-selector-tag { color: var(--syntaxKeyword); }
+    .hljs-number, .hljs-literal { color: var(--syntaxNumber); }
+    .hljs-string, .hljs-doctag { color: var(--syntaxString); }
+    /* Function names: hljs v11 uses .hljs-title.function_ compound class */
+    .hljs-function, .hljs-title, .hljs-title.function_, .hljs-section, .hljs-name { color: var(--syntaxFunction); }
+    /* Types: hljs v11 uses .hljs-title.class_ for class names */
+    .hljs-type, .hljs-class, .hljs-title.class_, .hljs-built_in { color: var(--syntaxType); }
+    .hljs-attr, .hljs-variable, .hljs-variable.language_, .hljs-params, .hljs-property { color: var(--syntaxVariable); }
+    .hljs-meta, .hljs-meta .hljs-keyword, .hljs-meta .hljs-string { color: var(--syntaxKeyword); }
+    .hljs-operator { color: var(--syntaxOperator); }
+    .hljs-punctuation { color: var(--syntaxPunctuation); }
+    .hljs-subst { color: var(--text); }
+
+    /* Footer */
+    .footer {
+      margin-top: 48px;
+      padding: 20px;
+```
+
+## !!steps Mobile and print
+
+Below 900px the sidebar becomes an off-canvas drawer that slides in with a transform, the resizer disappears, and the hamburger and close button appear. A separate print block at the end of the file hides the sidebar and removes the content width limit.
+
+```css ! template.css
+    @media (max-width: 900px) {
+      #sidebar {
+        position: fixed;
+        left: 0;
+        width: min(var(--sidebar-width), 100vw);
+        min-width: min(var(--sidebar-width), 100vw);
+        max-width: min(var(--sidebar-width), 100vw);
+        top: 0;
+        bottom: 0;
+        height: 100vh;
+        z-index: 99;
+        transform: translateX(-100%);
+        transition: transform 0.3s;
+      }
+
+      #sidebar.open {
+        transform: translateX(0);
+      }
+
+      #sidebar-resizer {
+        display: none;
+      }
+
+      #sidebar-overlay.open {
+        display: block;
+      }
+
+      #hamburger {
+        display: block;
+      }
+
+      .sidebar-close {
+        display: block;
+      }
+
+      #content {
+        padding: var(--line-height) 16px;
+      }
+
+      #content > * {
+        max-width: 100%;
+      }
+    }
+```
+
+</Scrollycoding>
+
+The stylesheet carries no knowledge of session data, only of the class names the script generates. Keep the two in step: a renamed class in the JS silently loses its styling. Note the print rule hides `#sidebar-toggle`, an id that does not appear in [template.html](/docs/src/core/export-html/template.html).

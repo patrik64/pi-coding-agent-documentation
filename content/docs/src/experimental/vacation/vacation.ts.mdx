@@ -1,0 +1,206 @@
+---
+title: "vacation.ts"
+description: "Experimental vacation-planner demo for pi-durable: a slow replay-safe search tool and a background research subagent that reports back as a task."
+source: "src/experimental/vacation/vacation.ts"
+full: true
+---
+
+This file is part of the experimental durable-agent demos. It is not used by the regular CLI. It defines two extensions for the `@earendil-works/pi-durable` runtime: `Search`, which gives a subagent one fake slow tool, and `Vacation`, which gives the main conversation a `research` tool that starts that subagent in the background.
+
+The demo exists to show crash recovery. Every piece is built so a process crash at any moment can be resumed: the search tool declares itself safe to rerun, the task is a small state machine with committed checkpoints, and every message submission carries a stable `requestId` so a rerun gets the same submission back instead of sending a duplicate.
+
+The runnable wiring lives next to it in [main.ts](/docs/src/experimental/vacation/main.ts), [harness-setup.ts](/docs/src/experimental/vacation/harness-setup.ts), [runtime.ts](/docs/src/experimental/vacation/runtime.ts), [sessions.ts](/docs/src/experimental/vacation/sessions.ts) and [tui.ts](/docs/src/experimental/vacation/tui.ts), described in the [README](/docs/src/experimental/vacation/README.md).
+
+<Scrollycoding>
+
+## !!steps Canned search data
+
+Instead of a real search backend the demo has a table of canned results. Each topic has a different `seconds` value (6, 10 and 30), so when the model asks for all three in parallel they finish at different times and a crash can land between them.
+
+`as const` keeps the topic names as literal types, which the tool schema below reuses.
+
+```ts ! vacation.ts
+/** Canned results; each topic takes a different time, so a crash can land between them. */
+const SEARCHES = {
+	weather: {
+		seconds: 6,
+		results: ["Saturday: 24°C and sunny", "Sunday: 21°C, a short shower around 3 pm"],
+	},
+	museums: {
+		seconds: 10,
+		results: [
+			"Kunsthistorisches Museum: open 10-18, book a time slot",
+			"Belvedere: Klimt's The Kiss, quietest before 11",
+			"Albertina: Monet to Picasso, open until 21 on Friday",
+		],
+	},
+// ...
+```
+
+## !!steps The search tool
+
+`defineTool` declares a name, a description, a TypeBox parameter schema and an `execute` function. The topic is a union of literals, so the model cannot ask for anything that is not in the table.
+
+`replay: "safe"` is the important line. It tells the durable runtime that this tool only reads, so a call that was in flight during a crash can simply be run again. A tool that sent an email would need a different setting.
+
+```ts ! vacation.ts
+const search = defineTool({
+	name: "search",
+	description:
+		"Search travel information about a city. Topics: weather, museums, trains. Slow; call several in parallel.",
+	parameters: Type.Object({
+		topic: Type.Union([Type.Literal("weather"), Type.Literal("museums"), Type.Literal("trains")]),
+		city: Type.String(),
+	}),
+	// Only reads, so a call cut off by a crash simply runs again.
+	// !mark
+	replay: "safe",
+```
+
+## !!steps Streaming progress
+
+`execute` walks through the search in two-second steps and prints a progress line with `api.output` for each, then prints the results. The sleep takes `context.abortSignal`, so aborting the call stops the wait immediately rather than after the next step.
+
+The tool returns an empty object because everything the model needs was already emitted through `api.output`.
+
+```ts ! vacation.ts
+	execute: async (args, api, context) => {
+		const found = SEARCHES[args.topic];
+		const steps = Math.ceil(found.seconds / 2);
+		for (let step = 1; step <= steps; step++) {
+			api.output(`searching ${args.topic} in ${args.city}: source ${step}/${steps}\n`);
+			// !mark
+			await sleep(2000, undefined, { signal: context.abortSignal });
+		}
+		for (const result of found.results) api.output(`- ${result}\n`);
+		return {};
+	},
+});
+
+/** What the research subagent gets: only `search`. */
+export const Search = defineExtension({ name: "vacation-search", tools: [search] });
+```
+
+## !!steps The research task state machine
+
+`Research` is a durable task with two phases, `deliver` and `report`. The state type is a union, so the second phase can only be reached with a report string attached. `initial` starts in `deliver`.
+
+A task is the unit that survives crashes: the runtime stores its phase and checkpoint, and on restart calls the function for the current phase again.
+
+```ts ! vacation.ts
+type ResearchState = { phase: "deliver" } | { phase: "report"; report: string };
+
+/** Delivers the task to its subagent and posts the report to the main conversation as a new message. */
+const Research = defineTask<{ task: string }, ResearchState, null>({
+	name: "vacation.research",
+	version: 1,
+	initial: () => ({ phase: "deliver" }),
+	phases: {
+```
+
+## !!steps Deliver phase
+
+The subagent's conversation is owned by this task, so the phase first finds it with `tx.scanConversations({ ownerTaskId })` inside a commit. The comment notes a rule: no Session call may run inside a commit, so the conversation is looked up in the commit but used outside it.
+
+The request is submitted with `requestId: research:` plus the task id. If the process crashes after submitting and the phase reruns, the same request id returns the existing submission instead of starting a second research run. `wait` then blocks until the subagent settles.
+
+```ts ! vacation.ts
+		deliver: async (task, runtime, context) => {
+			// The subagent's conversation is owned by this task. No Session call may run inside a commit.
+			let owned: ConversationId | undefined;
+			await runtime.commit(async (tx) => {
+				owned = (await tx.scanConversations({ ownerTaskId: task.id }, 1)).items[0]?.id;
+				return undefined;
+			}, context);
+			const child = await runtime.conversation(owned!, context);
+			// A rerun after a crash gets the same submission back.
+			// !mark
+			const request = { type: "input", content: task.input.task, requestId: `research:${task.id}` } as const;
+			const settled = await (await child!.submit(request, context)).wait(context);
+```
+
+## !!steps Turning the answer into a checkpoint
+
+Once the subagent has settled, a second commit builds the report. A failure becomes a report that says the research failed, with the reason when the status is `unanswered`. A successful run reads the assistant entry from the transaction and joins its text parts.
+
+The commit returns `status: "running"` with a new checkpoint whose phase is `report`. This is the crash-safe handoff: after this commit the report text is stored, so the subagent never needs to be asked again.
+
+```ts ! vacation.ts
+			await runtime.commit(async (tx) => {
+				let report = `[research report] The research failed: ${settled.status === "unanswered" ? settled.reason : "?"}`;
+				if (settled.status === "done" && settled.type === "input") {
+					const message = (await tx.entry(AssistantEntry, settled.answer))?.model?.[0];
+					const text =
+						message?.role === "assistant"
+							? message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("")
+							: "";
+					report = `[research report] ${text}`;
+				}
+				// !mark
+				return { status: "running", checkpoint: { phase: "report", report } };
+			}, context);
+```
+
+## !!steps Report phase and abort
+
+The `report` phase posts the stored text into the main conversation. `whenBusy: "followUp"` queues it behind whatever the user is currently doing instead of interrupting, and the `research-report:` request id makes the post idempotent. Only after the post does the task commit a terminal `completed` outcome.
+
+`abort` simply commits a terminal `aborted` outcome, for example when the owning conversation goes away.
+
+```ts ! vacation.ts
+		report: async (task, runtime, context) => {
+			const main = await runtime.conversation(runtime.conversationId, context);
+			// !mark
+			const report = { type: "input", content: task.state.checkpoint.report, whenBusy: "followUp" } as const;
+			await main!.submit({ ...report, requestId: `research-report:${task.id}` }, context);
+			await runtime.commit(() => ({ status: "terminal", outcome: { status: "completed", result: null } }), context);
+		},
+	},
+	abort: (_task, runtime, context) =>
+		runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
+});
+```
+
+## !!steps The research tool
+
+The model-facing `research` tool does everything in one commit so that it is atomic: it creates the task (`background: true`, owned by the conversation, so the main chat stays usable), creates a child conversation owned by that task, and configures the child with the `Search` extension and its instructions.
+
+Because the task and conversation are created together, a crash cannot leave a task without its subagent. The tool returns immediately with a short text; the real result arrives later as a message.
+
+```ts ! vacation.ts
+	execute: async (args, api, context) => {
+		await api.commit(async (tx) => {
+			// Background: the main conversation stays free while the research runs.
+			const owner = await tx.createTask(
+				Research,
+				{ task: args.task },
+				{ ownership: { kind: "conversation" }, background: true },
+			);
+			const child = await tx.createConversation({ ownership: { kind: "task", taskId: owner } });
+			await configure(tx, child.id, {
+				extensions: [Search],
+// ...
+```
+
+## !!steps The Vacation extension
+
+`Vacation` bundles the pieces for the main conversation: the `research` tool, the `Research` task definition (the runtime needs it registered to resume the task) and a system prompt section. The `preamble` section tells the model to delegate research and to turn a `[research report]` message into a plan.
+```ts ! vacation.ts
+export const Vacation = defineExtension({
+	name: "vacation",
+	tools: [research],
+	tasks: [Research],
+	sections: [
+		section(
+			"preamble",
+			() =>
+				"You are a friendly vacation planning assistant. Keep answers short. Hand all research to the research tool; while it runs, keep chatting with the user. When a [research report] arrives, turn it into a short plan.",
+			{ tag: false },
+		),
+	],
+});
+```
+
+</Scrollycoding>
+
+The two exports form a small hierarchy: `Vacation` is loaded into the main conversation, and `Search` is loaded only into the subagent that `research` creates, so the main model cannot call the slow tool directly. A matching but separate durable sample sits under [durable](/docs/src/experimental/durable/main.ts).

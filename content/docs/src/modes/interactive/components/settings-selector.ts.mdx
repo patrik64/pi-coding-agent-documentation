@@ -1,0 +1,561 @@
+---
+title: "settings-selector.ts"
+description: "The /settings dialog: one searchable list of about thirty settings, typed config and callbacks, and a theme submenu with automatic light/dark mode"
+source: "src/modes/interactive/components/settings-selector.ts"
+full: true
+---
+
+This is the main settings screen of the interactive mode. It does no persistence. It receives a `SettingsConfig` snapshot of current values and a `SettingsCallbacks` object with one function per setting, and calls back when the user changes something. The persisting side is [settings-manager.ts](/docs/src/core/settings-manager.ts), and the callbacks are wired up in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+
+Most entries are simple value cycles. A few open submenus built from [settings-submenu.ts](/docs/src/modes/interactive/components/settings-submenu.ts): warnings, per-model thinking levels and the theme picker. The list is a `SettingsList` from the TUI package, framed by [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts).
+
+<Scrollycoding>
+
+## !!steps Config and callbacks contract
+
+Every setting appears twice: a field in `SettingsConfig` and an `onXChange` callback. The dialog never touches the settings file itself.
+
+```ts ! settings-selector.ts
+export interface SettingsConfig {
+	// !mark
+	autoCompact: boolean;
+	defaultModel: string;
+	currentModel?: Model<any>;
+	availableDefaultModels: readonly Model<any>[];
+	showImages: boolean;
+	imageWidthCells: number;
+	autoResizeImages: boolean;
+	blockImages: boolean;
+	enableSkillCommands: boolean;
+	steeringMode: "all" | "one-at-a-time";
+	followUpMode: "all" | "one-at-a-time";
+	transport: Transport;
+	httpIdleTimeoutMs: number;
+	cacheWarmingMode: CacheWarmingMode;
+	thinkingLevel: ThinkingLevel;
+	availableThinkingLevels: ThinkingLevel[];
+	modelThinkingLevels: Record<string, ThinkingLevel>;
+	// ...
+	warnings: WarningSettings;
+}
+```
+
+## !!steps Callback surface
+
+The callbacks interface continues with image, display, tree, trust and fullscreen settings. `onThemePreview` is the only optional one, used for live theme preview. `onCancel` closes the dialog.
+
+```ts ! settings-selector.ts
+export interface SettingsCallbacks {
+	onAutoCompactChange: (enabled: boolean) => void;
+	onShowImagesChange: (enabled: boolean) => void;
+	onImageWidthCellsChange: (width: number) => void;
+	onAutoResizeImagesChange: (enabled: boolean) => void;
+	onBlockImagesChange: (blocked: boolean) => void;
+	onEnableSkillCommandsChange: (enabled: boolean) => void;
+	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
+	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
+	onTransportChange: (transport: Transport) => void;
+	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
+	onCacheWarmingModeChange: (mode: CacheWarmingMode) => void;
+	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
+	onModelThinkingLevelRemove: (provider: string, modelId: string) => void;
+	onThemeChange: (theme: string) => void;
+	// !mark
+	onThemePreview?: (theme: string) => void;
+	onHideThinkingBlockChange: (hidden: boolean) => void;
+	// ...
+	onShowTerminalProgressChange: (enabled: boolean) => void;
+	onTuiModeChange: (mode: TuiMode) => void;
+	onFullscreenExitOutputChange: (output: FullscreenExitOutput) => void;
+	onFullscreenScrollbarChange: (mode: ScrollViewScrollbar) => void;
+	onFullscreenCopyOnSelectChange: (enabled: boolean) => void;
+	onFullscreenWheelScrollLinesChange: (lines: WheelScrollLines) => void;
+	onWarningsChange: (warnings: WarningSettings) => void;
+	// !mark
+	onCancel: () => void;
+}
+```
+
+## !!steps A small submenu for warnings
+
+`WarningSettingsSubmenu` wraps a nested `SettingsList` holding one toggle, anthropic extra usage. It keeps a local copy of the warnings object and reports a fresh copy on each change. A missing value counts as enabled.
+
+```ts ! settings-selector.ts
+class WarningSettingsSubmenu extends Container {
+	private settingsList: SettingsList;
+	private state: WarningSettings;
+
+	constructor(warnings: WarningSettings, onChange: (warnings: WarningSettings) => void, onCancel: () => void) {
+		super();
+
+		this.state = { ...warnings };
+
+		const items: SettingItem[] = [
+			{
+				id: "anthropic-extra-usage",
+				label: "Anthropic extra usage",
+				description: "Warn when Anthropic subscription auth may use paid extra usage",
+				// !mark
+				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
+				values: ["true", "false"],
+			},
+		];
+
+		this.settingsList = new SettingsList(
+			items,
+			Math.min(items.length, 10),
+			getSettingsListTheme(),
+			(id, newValue) => {
+				switch (id) {
+					case "anthropic-extra-usage":
+						// !mark(1:2)
+						this.state = { ...this.state, anthropicExtraUsage: newValue === "true" };
+						onChange({ ...this.state });
+						break;
+				}
+			},
+			onCancel,
+		);
+
+		this.addChild(this.settingsList);
+	}
+
+	handleInput(data: string): void {
+		this.settingsList.handleInput(data);
+	}
+}
+```
+
+## !!steps Per-model override helpers
+
+Models are keyed as provider and id. A sentinel value stands for clearing an override, and the summary just counts configured entries.
+
+```ts ! settings-selector.ts
+// !mark
+const CLEAR_OVERRIDE_VALUE = "__clear__";
+
+function modelSettingKey(model: Model<any>): string {
+	return `${model.provider}/${model.id}`;
+}
+
+function modelDisplayLabel(model: Model<any>): string {
+	return `${model.id} [${model.provider}]`;
+}
+
+// !mark(1:5)
+function modelThinkingOverridesSummary(overrides: Record<string, ThinkingLevel>): string {
+	const count = Object.keys(overrides).length;
+	if (count === 0) return "none";
+	return `${count} configured`;
+}
+
+function modelItemLabel(model: Model<any>): string {
+	return `${model.id} ${theme.fg("muted", `[${model.provider}]`)}`;
+}
+```
+
+## !!steps Theme list helpers
+
+Theme items mark the current theme with a check. The system theme is moved to the top, followed by a pseudo entry whose value is a slash that means automatic mode.
+
+```ts ! settings-selector.ts
+function themeItems(availableThemes: string[], currentTheme: string): SelectItem[] {
+	return availableThemes.map((name) => ({
+		value: name,
+		label: `${name === currentTheme ? "✓ " : "  "}${name}`,
+		...(name === SYSTEM_THEME_NAME ? { description: "Theme created from your terminal's colors" } : {}),
+	}));
+}
+
+// !mark
+const AUTOMATIC_THEME_VALUE = "/";
+
+/** The system theme comes first, then automatic mode, then the remaining themes. */
+function singleModeThemeItems(availableThemes: string[], currentTheme: string): SelectItem[] {
+	const items = themeItems(availableThemes, currentTheme);
+	// !mark(1:2)
+	const systemIndex = items.findIndex((item) => item.value === SYSTEM_THEME_NAME);
+	const system = systemIndex === -1 ? [] : items.splice(systemIndex, 1);
+	return [
+		...system,
+		{
+			value: AUTOMATIC_THEME_VALUE,
+			label: "  automatic",
+			description: "Use separate themes for light and dark terminal appearance",
+		},
+		...items,
+	];
+}
+```
+
+## !!steps Choosing starting themes
+
+`defaultAutomaticThemes` returns the parsed light/dark pair if the setting already is one. Otherwise both themes start as the fixed one, with a fallback to the system theme and then the first available.
+
+```ts ! settings-selector.ts
+function preferredTheme(availableThemes: string[], preferred: string | undefined, fallback: string): string {
+	// !mark(1:3)
+	if (preferred && availableThemes.includes(preferred)) return preferred;
+	if (availableThemes.includes(fallback)) return fallback;
+	return availableThemes[0] ?? fallback;
+}
+
+function defaultAutomaticThemes(
+	currentThemeSetting: string,
+	availableThemes: string[],
+): { lightTheme: string; darkTheme: string } {
+	// !mark(1:2)
+	const autoTheme = parseAutoThemeSetting(currentThemeSetting);
+	if (autoTheme) return autoTheme;
+
+	const currentFixedTheme = currentThemeSetting.includes("/") ? undefined : currentThemeSetting;
+	const themeName = preferredTheme(availableThemes, currentFixedTheme, SYSTEM_THEME_NAME);
+	return { lightTheme: themeName, darkTheme: themeName };
+}
+```
+
+## !!steps ThemeSubmenu modes
+
+The submenu has a single mode and an automatic mode. The constructor works out the starting mode from the saved setting, and picks the single theme even when the current setting is automatic by using whichever theme matches the terminal now.
+
+```ts ! settings-selector.ts
+class ThemeSubmenu extends Container {
+	private inputComponent: Component | undefined;
+	private readonly callbacks: SettingsCallbacks;
+	private readonly availableThemes: string[];
+	private readonly terminalTheme: TerminalTheme;
+	private readonly onDone: (selectedValue?: string) => void;
+	private readonly originalThemeSetting: string;
+	private mode: "single" | "automatic";
+	private singleTheme: string;
+	private lightTheme: string;
+	private darkTheme: string;
+
+	constructor(
+		currentThemeSetting: string,
+		terminalTheme: TerminalTheme,
+		availableThemes: string[],
+		callbacks: SettingsCallbacks,
+		onDone: (selectedValue?: string) => void,
+	) {
+		super();
+		this.callbacks = callbacks;
+		this.availableThemes = availableThemes;
+		this.terminalTheme = terminalTheme;
+		this.onDone = onDone;
+		this.originalThemeSetting = currentThemeSetting;
+		// !mark(1:5)
+		const autoTheme = parseAutoThemeSetting(currentThemeSetting);
+		const automaticThemes = defaultAutomaticThemes(currentThemeSetting, availableThemes);
+		const fixedTheme = autoTheme || currentThemeSetting.includes("/") ? undefined : currentThemeSetting;
+		this.mode = autoTheme ? "automatic" : "single";
+		this.lightTheme = automaticThemes.lightTheme;
+		this.darkTheme = automaticThemes.darkTheme;
+		// !mark(1:5)
+		this.singleTheme = preferredTheme(
+			availableThemes,
+			fixedTheme ?? (autoTheme ? this.getActiveAutomaticTheme() : undefined),
+			SYSTEM_THEME_NAME,
+		);
+
+		if (this.mode === "automatic") {
+			this.showAutomaticMenu();
+		} else {
+			this.showSingleMenu();
+		}
+	}
+```
+
+## !!steps Single and automatic menus
+
+The single menu is a `SelectSubmenu` whose highlight changes drive preview. Choosing the automatic entry switches mode. The automatic menu is a `SettingsList` with light theme, dark theme, apply and a switch back to single mode.
+
+```ts ! settings-selector.ts
+	private showSingleMenu(): void {
+		this.mode = "single";
+		const menu = new SelectSubmenu(
+			"Theme",
+			"Select a theme, or choose automatic to follow terminal appearance.",
+			singleModeThemeItems(this.availableThemes, this.singleTheme),
+			this.singleTheme,
+			(value) => {
+				// !mark
+				if (value === AUTOMATIC_THEME_VALUE) {
+					this.mode = "automatic";
+					this.callbacks.onThemePreview?.(this.getThemeSetting());
+					this.showAutomaticMenu();
+					return;
+				}
+
+				this.singleTheme = value;
+				this.apply(value);
+			},
+			() => this.cancel(),
+			(value) => {
+				// !mark
+				this.callbacks.onThemePreview?.(value === AUTOMATIC_THEME_VALUE ? this.getAutomaticThemeSetting() : value);
+			},
+		);
+		this.setContent(menu);
+	}
+		// ...
+		const settingsList = new SettingsList(
+			items,
+			Math.min(items.length, 10),
+			getSettingsListTheme(),
+			// !mark(1:3)
+			(id) => {
+				switch (id) {
+					case "single-mode":
+						this.mode = "single";
+						this.singleTheme = this.getActiveAutomaticTheme();
+						this.callbacks.onThemePreview?.(this.singleTheme);
+						this.showSingleMenu();
+						break;
+					case "apply":
+						this.apply(this.getAutomaticThemeSetting());
+						break;
+				}
+			},
+			() => this.cancel(),
+		);
+		content.addChild(settingsList);
+		this.setContent(content, settingsList);
+	}
+```
+
+## !!steps Preview, apply and cancel
+
+The theme setting is a plain string: a theme name, or light slash dark. Cancel restores the original setting through the preview callback before closing, so a half-previewed theme never lingers.
+
+```ts ! settings-selector.ts
+	private getThemeSetting(): string {
+		return this.mode === "automatic" ? this.getAutomaticThemeSetting() : this.singleTheme;
+	}
+
+	private getActiveAutomaticTheme(): string {
+		return this.terminalTheme === "light" ? this.lightTheme : this.darkTheme;
+	}
+
+	// !mark(1:3)
+	private getAutomaticThemeSetting(): string {
+		return `${this.lightTheme}/${this.darkTheme}`;
+	}
+
+	private apply(themeSetting: string): void {
+		this.onDone(themeSetting);
+	}
+
+	// !mark(1:3)
+	private cancel(): void {
+		this.callbacks.onThemePreview?.(this.originalThemeSetting);
+		this.onDone();
+	}
+```
+
+## !!steps Building the item list
+
+The constructor snapshots warnings and per-model levels so submenus can update them locally. Items are a mix of boolean toggles with string values, enums and numbers stored as strings.
+
+```ts ! settings-selector.ts
+	constructor(config: SettingsConfig, callbacks: SettingsCallbacks) {
+		super();
+
+		const supportsImages = getCapabilities().images;
+		const followUpKey = keyDisplayText("app.message.followUp");
+		const cycleThinkingKey = keyDisplayText("app.thinking.cycle");
+		// !mark(1:2)
+		let currentWarnings = { ...config.warnings };
+		const currentModelThinkingLevels = { ...config.modelThinkingLevels };
+		const defaultModelByValue = new Map(
+			config.availableDefaultModels.map((model) => [modelSettingKey(model), model]),
+		);
+		const currentDefaultModelKey = defaultModelByValue.has(config.defaultModel) ? config.defaultModel : undefined;
+		const currentModelKey = config.currentModel ? modelSettingKey(config.currentModel) : undefined;
+
+		// !mark
+		const items: SettingItem[] = [
+			{
+				id: "autocompact",
+				label: "Auto-compact",
+				description: "Automatically compact context when it gets too large",
+				currentValue: config.autoCompact ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
+				id: "steering-mode",
+				label: "Steering mode",
+				description:
+					"Enter while streaming queues steering messages. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.",
+				currentValue: config.steeringMode,
+				values: ["one-at-a-time", "all"],
+			},
+			{
+				id: "follow-up-mode",
+				label: "Follow-up mode",
+				description: `${followUpKey} queues follow-up messages until agent stops. 'one-at-a-time': deliver one, wait for response. 'all': deliver all at once.`,
+				currentValue: config.followUpMode,
+				values: ["one-at-a-time", "all"],
+			},
+```
+
+## !!steps Thinking level per model
+
+This submenu is a two-step `SteppedSubmenu` with `loop: true`: pick a model (searchable, current model first), then a level. A clear-override option is offered only when one exists. Each completed pair calls the change or remove callback and updates the local copy for the summary.
+
+```ts ! settings-selector.ts
+				submenu: (_currentValue, done) => {
+					const steps: SteppedSubmenuStep[] = [
+						{
+							// !mark(1:2)
+							key: "model",
+							title: "Per-Model Thinking Level",
+							description: "Select a model to configure",
+							options: () => {
+								const sorted = [...config.availableDefaultModels].sort((a, b) => {
+									const aKey = modelSettingKey(a);
+									const bKey = modelSettingKey(b);
+									if (aKey === currentModelKey) return -1;
+									if (bKey === currentModelKey) return 1;
+									if (aKey === currentDefaultModelKey) return -1;
+					// ...
+					const summary = () => modelThinkingOverridesSummary(currentModelThinkingLevels);
+
+					return new SteppedSubmenu(
+						steps,
+						(selections) => {
+							const model = defaultModelByValue.get(selections.model);
+							if (!model) return;
+							// !mark
+							if (selections.level === CLEAR_OVERRIDE_VALUE) {
+								callbacks.onModelThinkingLevelRemove(model.provider, model.id);
+								delete currentModelThinkingLevels[selections.model];
+							} else {
+								callbacks.onModelThinkingLevelChange(
+									model.provider,
+									model.id,
+									selections.level as ThinkingLevel,
+								);
+								currentModelThinkingLevels[selections.model] = selections.level as ThinkingLevel;
+							}
+						},
+						() => {
+							done(summary());
+						},
+						// !mark
+						{ loop: true },
+					);
+				},
+```
+
+## !!steps Inserting conditional items
+
+Image options only exist when the terminal supports images, so they are spliced in after the first entry. Later items are spliced after a previously inserted id found with `findIndex`, which keeps order stable whichever conditional items exist.
+
+```ts ! settings-selector.ts
+		// Only show image toggle if terminal supports it
+		// !mark
+		if (supportsImages) {
+			// Insert after autocompact
+			items.splice(1, 0, {
+				id: "show-images",
+				label: "Show images",
+				description: "Render images inline in terminal",
+				currentValue: config.showImages ? "true" : "false",
+				values: ["true", "false"],
+			});
+			items.splice(2, 0, {
+				id: "image-width-cells",
+				label: "Image width",
+				description: "Preferred inline image width in terminal cells",
+				currentValue: String(config.imageWidthCells),
+				values: ["60", "80", "120"],
+			});
+		}
+
+		// Image auto-resize toggle (always available, affects both attached and read images)
+		// !mark
+		items.splice(supportsImages ? 3 : 1, 0, {
+			id: "auto-resize-images",
+			label: "Auto-resize images",
+			description: "Resize large images to 2000x2000 max for better model compatibility",
+			currentValue: config.autoResizeImages ? "true" : "false",
+			values: ["true", "false"],
+		});
+
+		// Block images toggle (always available, insert after auto-resize-images)
+		// !mark(1:2)
+		const autoResizeIndex = items.findIndex((item) => item.id === "auto-resize-images");
+		items.splice(autoResizeIndex + 1, 0, {
+			id: "block-images",
+			label: "Block images",
+			description: "Prevent images from being sent to LLM providers",
+			currentValue: config.blockImages ? "true" : "false",
+			values: ["true", "false"],
+		});
+```
+
+## !!steps Dispatching changes
+
+One switch maps item ids back to typed callbacks. Booleans compare to the string `true`, numbers use `parseInt`, and enums are cast. Search is enabled for the list.
+
+```ts ! settings-selector.ts
+		this.settingsList = new SettingsList(
+			items,
+			10,
+			getSettingsListTheme(),
+			(id, newValue) => {
+				switch (id) {
+					case "autocompact":
+						// !mark
+						callbacks.onAutoCompactChange(newValue === "true");
+						break;
+					case "show-images":
+						callbacks.onShowImagesChange(newValue === "true");
+						break;
+					case "image-width-cells":
+						callbacks.onImageWidthCellsChange(parseInt(newValue, 10));
+						break;
+					case "auto-resize-images":
+						callbacks.onAutoResizeImagesChange(newValue === "true");
+					// ...
+					case "tui-mode":
+						callbacks.onTuiModeChange(newValue as TuiMode);
+						break;
+					case "fullscreen-exit-output":
+						callbacks.onFullscreenExitOutputChange(newValue as FullscreenExitOutput);
+						break;
+					case "fullscreen-scrollbar":
+						callbacks.onFullscreenScrollbarChange(newValue as ScrollViewScrollbar);
+						break;
+					case "fullscreen-copy-on-select":
+						callbacks.onFullscreenCopyOnSelectChange(newValue === "true");
+						break;
+					case "fullscreen-wheel-scroll-lines":
+						callbacks.onFullscreenWheelScrollLinesChange(newValue === "auto" ? "auto" : parseInt(newValue, 10));
+						break;
+					case "theme":
+						callbacks.onThemeChange(newValue);
+						break;
+				}
+			},
+			callbacks.onCancel,
+			// !mark
+			{ enableSearch: true },
+		);
+
+		this.addChild(this.settingsList);
+		this.addChild(new DynamicBorder());
+	}
+
+	getSettingsList(): SettingsList {
+		return this.settingsList;
+	}
+}
+```
+
+</Scrollycoding>
+
+The dialog is opened from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts); color and theme helpers are in [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+Structure note: the settings list is built by ordered `splice` calls with ids found by `findIndex`, so reordering inserts is fragile. The `double-escape-action` case casts to fork or tree even though the type also allows `none`.

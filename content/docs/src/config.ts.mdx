@@ -1,0 +1,280 @@
+---
+title: "config.ts"
+description: "Runtime and install detection, shipped-asset paths, app identity read from package.json, and the per-user directory layout"
+source: "src/config.ts"
+full: true
+---
+
+Nearly every other module imports something from this file, and it imports
+almost nothing in return. It answers three questions that must be settled at
+load time: how was pi installed and run (Bun binary, bundled Node, npm and
+friends), where are the files shipped with it, and what is the app called and
+where does the user's data live.
+
+The identity part matters because pi can be rebranded: name, config directory
+and environment variable prefix all derive from `piConfig` in `package.json`.
+Path helpers rely on [paths.ts](/docs/src/utils/paths.ts) and
+[child-process.ts](/docs/src/utils/child-process.ts).
+
+<Scrollycoding>
+
+## !!steps Detecting the runtime
+
+Three flags describe how the code is running. A Bun compiled binary shows up
+as a virtual filesystem in `import.meta.url`, Bun as a runtime is just
+`process.versions.bun`, and the bundled Node build gets a compile-time constant
+that is declared but may be missing, so it is checked with `typeof`.
+
+```ts ! config.ts
+export const isBunBinary =
+	import.meta.url.includes("$bunfs") || import.meta.url.includes("~BUN") || import.meta.url.includes("%7EBUN");
+
+/** Detect if Bun is the runtime (compiled binary or bun run) */
+export const isBunRuntime = !!process.versions.bun;
+
+/** Detect the esbuild-bundled Node.js distribution. */
+declare const PI_BUNDLED_NODE: boolean;
+export const isBundledNode = typeof PI_BUNDLED_NODE !== "undefined" && PI_BUNDLED_NODE;
+```
+
+## !!steps Guessing the package manager from paths
+
+`detectInstallMethod` has no authoritative source, so it lowercases the module
+directory plus the executable path and looks for telltale segments. The order
+is the logic: pnpm and yarn are checked before the generic `node_modules` test
+for npm, and Bun wins when the runtime is Bun. Anything else is `unknown`.
+
+```ts ! config.ts
+export function detectInstallMethod(): InstallMethod {
+	if (isBunBinary) {
+		return "bun-binary";
+	}
+
+	const resolvedPath = `${__dirname}\0${process.execPath || ""}`.toLowerCase().replace(/\\/g, "/");
+
+	if (resolvedPath.includes("/pnpm/") || resolvedPath.includes("/.pnpm/")) {
+		return "pnpm";
+	}
+	if (resolvedPath.includes("/yarn/") || resolvedPath.includes("/.yarn/")) {
+		return "yarn";
+	}
+	if (isBunRuntime || resolvedPath.includes("/install/global/node_modules/")) {
+		return "bun";
+	}
+	if (resolvedPath.includes("/npm/") || resolvedPath.includes("/node_modules/")) {
+		return "npm";
+	}
+
+	return "unknown";
+}
+```
+
+## !!steps Building the update command
+
+For each method there is a command to install the new version globally, with
+`--ignore-scripts` everywhere and the release-age gate switched off, because
+the site announces releases immediately. When the update target has a different
+package name than the installed one (a rename), an uninstall step for the old
+name is prepended and the display string chains both with `&&`.
+
+```ts ! config.ts
+		case "bun":
+			return makeSelfUpdateCommand(
+				makeSelfUpdateCommandStep("bun", [
+					"install",
+					"-g",
+					"--ignore-scripts",
+					"--minimum-release-age=0",
+					target.installSpec,
+				]),
+				target.packageName === installedPackageName
+					? undefined
+					: makeSelfUpdateCommandStep("bun", ["uninstall", "-g", installedPackageName]),
+			);
+```
+
+## !!steps Only self-update what we own
+
+`getSelfUpdateCommand` returns a command only when three things hold: the
+method has a command, the running package lives under that manager's global
+root, and the package directory and its parent are writable. Otherwise it
+returns undefined and
+`getSelfUpdateUnavailableInstruction` explains why, for example that the path
+is not writable, with the command the user can run themselves.
+
+```ts ! config.ts
+export function getSelfUpdateCommand(
+	packageName: string,
+	npmCommand?: string[],
+	updatePackageTarget: SelfUpdatePackageTarget = packageName,
+): SelfUpdateCommand | undefined {
+	const method = detectInstallMethod();
+	const command = getSelfUpdateCommandForMethod(method, packageName, updatePackageTarget, npmCommand);
+	// !mark
+	if (!command || !isManagedByGlobalPackageManager(method, packageName, npmCommand) || !isSelfUpdatePathWritable()) {
+		return undefined;
+	}
+	return command;
+}
+```
+
+## !!steps Finding the package directory
+
+Assets (themes, docs, README) are located relative to the package root. An
+environment variable overrides everything, for store-based systems like Nix. A
+Bun binary uses the executable's directory. Otherwise the code walks up from
+this file to the nearest `package.json`, with one twist: if that directory is
+`dist` and its parent also has a `package.json`, the parent is used, so asset
+paths do not become `dist/dist`.
+
+```ts ! config.ts
+export function findNodePackageDir(startDir: string): string {
+	let dir = startDir;
+	while (dir !== dirname(dir)) {
+		if (existsSync(join(dir, "package.json"))) {
+			const parent = dirname(dir);
+			// build:binary places Bun's metadata inside dist/. Node still needs the
+			// package root so its dist-relative asset paths do not become dist/dist/.
+			if (basename(dir) === "dist" && existsSync(join(parent, "package.json"))) {
+				return parent;
+			}
+			return dir;
+		}
+		dir = dirname(dir);
+	}
+	return startDir;
+}
+```
+
+## !!steps Source versus built layout
+
+Shipped asset directories live under `src` in a checkout and `dist` in a build.
+The helpers decide by checking whether the package has a `src` directory, and
+the Bun binary uses flat sibling folders instead. Themes are consumed by
+[theme.ts](/docs/src/modes/interactive/theme/theme.ts), and HTML export
+templates by [session-export.ts](/docs/src/core/session-export.ts).
+
+```ts ! config.ts
+export function getThemesDir(): string {
+	if (isBunBinary) {
+		return join(getPackageDir(), "theme");
+	}
+	// Theme is in modes/interactive/theme/ relative to src/ or dist/
+	const packageDir = getPackageDir();
+	const srcOrDist = existsSync(join(packageDir, "src")) ? "src" : "dist";
+	return join(packageDir, srcOrDist, "modes", "interactive", "theme");
+}
+```
+
+## !!steps Codemode worker and the in-memory copy
+
+The codemode feature needs a worker file. For a bundled Node build the worker
+is read once and turned into a base64 `data:` URL. The comment gives the
+reason: an update can delete the file while this process is still running, and
+spawning from memory keeps working.
+
+```ts ! config.ts
+export function getCodemodeWorkerSpecifier(): string | URL | undefined {
+	const runtime = isBunBinary ? "bun-binary" : isBundledNode ? "bundled-node" : "unbundled";
+	const specifier = resolveCodemodeWorkerSpecifier(runtime, import.meta.url);
+	if (runtime !== "bundled-node" || !(specifier instanceof URL)) return specifier;
+	// Spawn workers from an in-memory copy. An update replaces or deletes the file while this
+	// process keeps running (#10439). The bundle build keeps the worker free of relative imports
+	// and import.meta, so it runs from a data: URL.
+	codemodeWorkerDataUrl ??= new URL(`data:text/javascript;base64,${readFileSync(specifier).toString("base64")}`);
+	return codemodeWorkerDataUrl;
+}
+```
+
+## !!steps Noticing that the install changed
+
+`detectInstallChange` compares the version in the startup `package.json` with
+the one on disk now. A missing file means the install was removed; a different
+version means it was updated, for example by another terminal. It reads the
+remembered startup path rather than searching again, because a search could
+walk past a deleted install and find an unrelated file. Bun binaries are
+exempt since their code is embedded. This is useful to
+[version-check.ts](/docs/src/utils/version-check.ts) style warnings.
+
+```ts ! config.ts
+export function detectInstallChange(packageJsonPath = startupPackageJsonPath): InstallChange | undefined {
+	// The Bun binary embeds its code, so replacing the executable does not affect this process.
+	if (isBunBinary || !packageJsonPath) return undefined;
+	let installed: PackageJson;
+	try {
+		installed = JSON.parse(stripBom(readFileSync(packageJsonPath, "utf-8"))) as PackageJson;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "removed" } : undefined;
+	}
+	return installed.version && installed.version !== VERSION
+		? { kind: "updated", version: installed.version }
+		: undefined;
+}
+```
+
+## !!steps App identity from package.json
+
+At import time the package file is read synchronously. A missing file is
+tolerated (defaults apply), but any other error is rethrown. The exported
+constants then derive from `piConfig`: the name defaults to `pi`, the config
+directory to `.pi`, and the version to `0.0.0`. The environment variable names
+are built from the upper-cased app name, so a rebrand named `tau` would read
+`TAU_CODING_AGENT_DIR`.
+
+```ts ! config.ts
+let pkg: PackageJson = {};
+/** The package.json this process started from, if one existed. */
+let startupPackageJsonPath: string | undefined;
+try {
+	const packageJsonPath = getPackageJsonPath();
+	pkg = JSON.parse(stripBom(readFileSync(packageJsonPath, "utf-8"))) as PackageJson;
+	startupPackageJsonPath = packageJsonPath;
+} catch (e: unknown) {
+	const err = e as NodeJS.ErrnoException;
+	if (err.code !== "ENOENT") throw e;
+}
+
+const piConfigName: string | undefined = pkg.piConfig?.name;
+export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
+export const APP_NAME: string = piConfigName || "pi";
+export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
+export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
+export const VERSION: string = pkg.version || "0.0.0";
+```
+
+## !!steps The user directory layout
+
+Everything the user owns hangs off the agent directory, which defaults to the
+config directory under the home folder, or the app-specific environment
+variable with `~` expanded. The helpers return the settings, auth, models,
+sessions, tools and similar paths, which the managers such as
+[settings-manager.ts](/docs/src/core/settings-manager.ts) and
+[auth-storage.ts](/docs/src/core/auth-storage.ts) consume.
+
+```ts ! config.ts
+export function getAgentDir(): string {
+	const envDir = process.env[ENV_AGENT_DIR];
+	if (envDir) {
+		return expandTildePath(envDir);
+	}
+	return join(homedir(), CONFIG_DIR_NAME, "agent");
+}
+
+/** Get path to user's custom themes directory */
+export function getCustomThemesDir(): string {
+	return join(getAgentDir(), "themes");
+}
+
+/** Get path to models.json */
+export function getModelsPath(): string {
+	return join(getAgentDir(), "models.json");
+}
+```
+
+</Scrollycoding>
+
+The file is read top to bottom as a dependency order: runtime flags first,
+then install logic that uses them, then the package-root lookup, and finally
+the identity constants that depend on that lookup. One structural note is that
+constants such as `VERSION` are evaluated at module load, so importing this
+module performs file IO.

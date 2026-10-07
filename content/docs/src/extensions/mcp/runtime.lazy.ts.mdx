@@ -1,0 +1,33 @@
+---
+title: "runtime.lazy.ts"
+description: "A one-line dynamic import that defers loading the MCP client, transports and OAuth code until a server is actually used"
+source: "src/extensions/mcp/runtime.lazy.ts"
+full: true
+---
+
+The MCP runtime pulls in the protocol client, transports and OAuth machinery, which is a lot of code to load for sessions that never use MCP. This file is the seam that keeps it out of startup: it exports a function returning a dynamic `import()` of [runtime.ts](/docs/src/extensions/mcp/runtime.ts).
+
+The same pattern appears for the CLI side in [cli.lazy.ts](/docs/src/extensions/mcp/cli.lazy.ts). The extension entry point [index.ts](/docs/src/extensions/mcp/index.ts) imports this file statically and calls `loadMcpRuntime` only when it needs a connection.
+
+<Scrollycoding>
+
+## !!steps The deferred import
+
+The doc comment names the purpose: load the client, transports and OAuth on first use. Because the function returns the promise of the module, callers can `await` it and cache the result themselves; repeated calls are cheap since the module system caches the import.
+
+```ts ! runtime.lazy.ts
+/** Loads the MCP client, transports, and OAuth sign-in on first use (see runtime.ts). */
+export const loadMcpRuntime = () => import("./runtime.ts");
+```
+
+## !!steps Why a separate file
+
+Keeping the `import()` in its own file means the importing module never names runtime.ts statically, so bundlers and the type checker treat it as a lazy chunk boundary. The type of the returned module still flows through, so callers get full typing without a cast.
+
+```ts ! runtime.lazy.ts
+export const loadMcpRuntime = () => import("./runtime.ts");
+```
+
+</Scrollycoding>
+
+Nothing else lives here by design. Any logic that should run before the runtime loads belongs in index.ts or [config.ts](/docs/src/extensions/mcp/config.ts), and everything that needs the client lives behind this boundary in runtime.ts.

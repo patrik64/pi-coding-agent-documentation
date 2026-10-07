@@ -1,0 +1,124 @@
+---
+title: "image-convert.ts"
+description: "Converts arbitrary image bytes to PNG with Photon and wires that conversion into the Kitty terminal image renderer"
+source: "src/utils/image-convert.ts"
+full: true
+---
+
+Terminals that speak the Kitty graphics protocol only accept PNG, while images arrive as JPEG, WebP and so on. This file performs the conversion using Photon, which is loaded lazily by [photon.ts](/docs/src/utils/photon.ts), and respects EXIF rotation through [exif-orientation.ts](/docs/src/utils/exif-orientation.ts).
+
+It also registers the converter with the terminal UI library. [image-process.ts](/docs/src/utils/image-process.ts) reuses the byte-level conversion for formats models cannot take directly.
+
+<Scrollycoding>
+
+## !!steps Encoding one image
+
+`encodePng` decodes the bytes, applies EXIF orientation and returns PNG bytes. The raw image is freed when rotation produced a new one, and the final image is freed in a `finally`, because Photon objects live in WASM memory and are not garbage collected. Any failure returns null.
+
+```ts ! image-convert.ts
+function encodePng(photon: Photon, bytes: Uint8Array): Uint8Array | null {
+	try {
+		const rawImage = photon.PhotonImage.new_from_byteslice(bytes);
+		const image = applyExifOrientation(photon, rawImage, bytes);
+		if (image !== rawImage) rawImage.free();
+		try {
+			return new Uint8Array(image.get_bytes());
+		} finally {
+			image.free();
+		}
+	} catch {
+		// Conversion failed
+		return null;
+	}
+}
+```
+
+## !!steps Byte and base64 entry points
+
+`convertImageBytesToPng` returns null when Photon cannot load. `convertToPng` short-circuits for `image/png`, skipping both decode and re-encode, otherwise round-trips through base64.
+
+```ts ! image-convert.ts
+export async function convertImageBytesToPng(bytes: Uint8Array): Promise<Uint8Array | null> {
+	const photon = await loadPhoton();
+	if (!photon) {
+		// Photon not available, can't convert
+		return null;
+	}
+	return encodePng(photon, bytes);
+}
+
+/**
+ * Convert image to PNG format for terminal display.
+ * Kitty graphics protocol requires PNG format (f=100).
+ */
+export async function convertToPng(
+	base64Data: string,
+	mimeType: string,
+): Promise<{ data: string; mimeType: string } | null> {
+	// Already PNG, no conversion needed
+	if (mimeType === "image/png") {
+		return { data: base64Data, mimeType };
+	}
+
+	const bytes = new Uint8Array(Buffer.from(base64Data, "base64"));
+	const pngBytes = await convertImageBytesToPng(bytes);
+	if (!pngBytes) {
+		return null;
+	}
+
+	return {
+		data: Buffer.from(pngBytes).toString("base64"),
+		mimeType: "image/png",
+	};
+}
+```
+
+## !!steps A synchronous transcoder
+
+The TUI library wants a synchronous function, so `loadPngTranscoder` awaits Photon once and returns a closure over it.
+
+```ts ! image-convert.ts
+/**
+ * Load photon and return a synchronous PNG transcoder for pi-tui's Kitty image rendering.
+ * Returns undefined if photon cannot be loaded.
+ */
+export async function loadPngTranscoder(): Promise<ImageTranscoder | undefined> {
+	const photon = await loadPhoton();
+	if (!photon) return undefined;
+	return (base64Data) => {
+		const pngBytes = encodePng(photon, new Uint8Array(Buffer.from(base64Data, "base64")));
+		return pngBytes ? Buffer.from(pngBytes).toString("base64") : null;
+	};
+}
+```
+
+## !!steps Registering once
+
+`ensurePngTranscoder` only acts on terminals whose reported image capability is `kitty`. The load promise is cached with `??=`, so concurrent calls share one load. The `onRegistered` callback is invoked after each call's promise resolves successfully, letting the UI re-render images that previously showed a text fallback. Because the then-callback is attached on every call made before registration completes, the callback runs once per such call.
+
+```ts ! image-convert.ts
+let pngTranscoderLoad: Promise<boolean> | undefined;
+let pngTranscoderRegistered = false;
+
+/**
+ * On Kitty-protocol terminals, register photon as pi-tui's image transcoder so non-PNG images render.
+ * Loads photon once. `onRegistered` runs after registration so callers can re-render images that
+ * showed text fallbacks; it is not called if the transcoder was already registered or cannot load.
+ */
+export function ensurePngTranscoder(onRegistered: () => void): void {
+	if (pngTranscoderRegistered || getCapabilities().images !== "kitty") return;
+	pngTranscoderLoad ??= loadPngTranscoder().then((transcoder) => {
+		if (!transcoder) return false;
+		setImageTranscoder(transcoder);
+		pngTranscoderRegistered = true;
+		return true;
+	});
+	void pngTranscoderLoad.then((registered) => {
+		if (registered) onRegistered();
+	});
+}
+```
+
+</Scrollycoding>
+
+This is the bridge between the image utilities and the terminal renderer. Failure is always soft: no Photon means no conversion and the UI keeps its text fallback.

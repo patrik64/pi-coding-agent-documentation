@@ -1,0 +1,184 @@
+---
+title: "extension-editor.ts"
+description: "A bordered multi-line editor dialog for extensions, with Ctrl+G hand-off to the user's external editor"
+source: "src/modes/interactive/components/extension-editor.ts"
+full: true
+---
+
+This component is the multi-line sibling of the single-line prompts: an extension supplies a title, optional prefill text and two callbacks, and the user edits text in a bordered box that behaves like the main prompt editor. Enter submits, Shift+Enter inserts a newline, and the external-editor key suspends the TUI and opens `$VISUAL` or `$EDITOR`.
+
+The interesting parts are how it chooses an editor command, and how it stops and restarts the TUI around the external process. It builds on [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts), [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), [external-editor.ts](/docs/src/modes/interactive/external-editor.ts) and the shared editor theme from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+<Scrollycoding>
+
+## !!steps Fields and focus delegation
+
+The class extends `Container` and implements `Focusable`. The `focused` setter mirrors the flag onto the wrapped `Editor`, so the real cursor appears inside the text area rather than on the container. `ExtensionEditorOptions` extends the pi-tui editor options with a description line, which the constructor removes before passing the rest on.
+
+```ts ! extension-editor.ts
+// !mark
+export interface ExtensionEditorOptions extends EditorOptions {
+	description?: string;
+}
+
+export class ExtensionEditorComponent extends Container implements Focusable {
+	private editor: Editor;
+	private onSubmitCallback: (value: string) => void;
+	private onCancelCallback: () => void;
+	private tui: TUI;
+	private keybindings: KeybindingsManager;
+	private externalEditorCommand: string;
+
+	private _focused = false;
+	get focused(): boolean {
+		return this._focused;
+	}
+// !mark(1:3)
+	set focused(value: boolean) {
+		this._focused = value;
+		this.editor.focused = value;
+	}
+```
+
+## !!steps Choosing the external editor
+
+The command is resolved with a fixed precedence: an explicitly passed command, then `VISUAL`, then `EDITOR`, then a platform default of `notepad` on Windows and `nano` elsewhere. The editor options are split from the description with a rest destructure so unknown option keys flow through to pi-tui untouched.
+
+```ts ! extension-editor.ts
+	constructor(
+		tui: TUI,
+		keybindings: KeybindingsManager,
+		title: string,
+		prefill: string | undefined,
+		onSubmit: (value: string) => void,
+		onCancel: () => void,
+		options?: ExtensionEditorOptions,
+		externalEditorCommand?: string,
+	) {
+		super();
+
+		this.tui = tui;
+		this.keybindings = keybindings;
+// !mark(1:5)
+		this.externalEditorCommand =
+			externalEditorCommand ||
+			process.env.VISUAL ||
+			process.env.EDITOR ||
+			(process.platform === "win32" ? "notepad" : "nano");
+		this.onSubmitCallback = onSubmit;
+		this.onCancelCallback = onCancel;
+// !mark
+		const { description, ...editorOptions } = options ?? {};
+```
+
+## !!steps Frame, title and editor
+
+The layout is added top to bottom: border, spacer, accent title, an optional description, then the `Editor` itself. Prefill text is set only when truthy. The submit callback is wired directly to the editor's `onSubmit`, which is why Enter and Shift+Enter behave as in the main editor.
+
+```ts ! extension-editor.ts
+		// Add top border
+// !mark
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+
+		// Add title and optional description
+		this.addChild(new Text(theme.fg("accent", title), 1, 0));
+		if (description) {
+			this.addChild(new Spacer(1));
+			this.addChild(new Text(theme.fg("text", description), 1, 0));
+		}
+		this.addChild(new Spacer(1));
+
+		// Create editor
+// !mark
+		this.editor = new Editor(tui, getEditorTheme(), editorOptions);
+		if (prefill) {
+			this.editor.setText(prefill);
+		}
+		// Wire up Enter to submit (Shift+Enter for newlines, like the main editor)
+// !mark(1:3)
+		this.editor.onSubmit = (text: string) => {
+			this.onSubmitCallback(text);
+		};
+		this.addChild(this.editor);
+```
+
+## !!steps Hint line
+
+Four hints are joined: submit, newline, cancel and external editor. The first three use TUI-level actions and the last an application-level one, so the text follows whichever keys the user has configured. The component closes with a spacer and a second border.
+
+```ts ! extension-editor.ts
+		// Add hint
+// !mark
+		const hint =
+			keyHint("tui.select.confirm", "submit") +
+			"  " +
+			keyHint("tui.input.newLine", "newline") +
+			"  " +
+			keyHint("tui.select.cancel", "cancel") +
+			`  ${keyHint("app.editor.external", "external editor")}`;
+		this.addChild(new Text(hint, 1, 0));
+
+		this.addChild(new Spacer(1));
+
+		// Add bottom border
+		this.addChild(new DynamicBorder());
+	}
+```
+
+## !!steps Routing keys
+
+Cancel is checked first, then the external-editor binding, and everything else goes to the inner editor. Notice the two lookups differ: cancel uses the global `getKeybindings()` while the external-editor check uses the injected `KeybindingsManager`, because it is an app-level action registered in [keybindings.ts](/docs/src/core/keybindings.ts). The async handler is launched with `void` since key handling is synchronous.
+
+```ts ! extension-editor.ts
+	handleInput(keyData: string): void {
+// !mark
+		const kb = getKeybindings();
+		// Escape or Ctrl+C to cancel
+		if (kb.matches(keyData, "tui.select.cancel")) {
+			this.onCancelCallback();
+			return;
+		}
+
+		// External editor (app keybinding)
+// !mark
+		if (this.keybindings.matches(keyData, "app.editor.external")) {
+			void this.handleOpenExternalEditor();
+			return;
+		}
+
+		// Forward to editor
+// !mark
+		this.editor.handleInput(keyData);
+	}
+```
+
+## !!steps Handing off to the external editor
+
+The current text is read first, then the TUI is stopped so the child process gets the terminal. The result only replaces the editor text when its status is `complete`, so a cancelled or failed session keeps what the user had typed. The `finally` block always restarts the TUI and requests a full render (`true` forces a complete repaint), which matters because the external program has scribbled over the screen.
+
+```ts ! extension-editor.ts
+	private async handleOpenExternalEditor(): Promise<void> {
+		const content = this.editor.getText();
+// !mark
+		this.tui.stop();
+		try {
+			const result = await editInExternalEditor({
+				command: this.externalEditorCommand,
+				content,
+			});
+// !mark(1:2)
+			if (result.status === "complete") {
+				this.editor.setText(result.content);
+			}
+		} finally {
+// !mark(1:2)
+			this.tui.start();
+			this.tui.requestRender(true);
+		}
+	}
+```
+
+</Scrollycoding>
+
+This component is exported from the components barrel [index.ts](/docs/src/modes/interactive/components/index.ts) and, through the package entry [index.ts](/docs/src/index.ts), to extensions. [bug-report.ts](/docs/src/modes/interactive/bug-report.ts) uses it to collect a free-form description. Unlike [extension-input.ts](/docs/src/modes/interactive/components/extension-input.ts) it has no countdown and so needs no `dispose`.

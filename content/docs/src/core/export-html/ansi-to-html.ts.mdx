@@ -1,0 +1,179 @@
+---
+title: "ansi-to-html.ts"
+description: "Converts terminal ANSI SGR color and style escape codes into HTML spans with inline styles"
+source: "src/core/export-html/ansi-to-html.ts"
+full: true
+---
+
+Session export to HTML needs to reproduce what custom tools showed in the terminal. Those tools render to ANSI-colored lines, so this module turns the escape codes into `span` elements with inline CSS. It handles only SGR sequences (those ending in `m`): colors, bold, dim, italic and underline.
+
+[tool-renderer.ts](/docs/src/core/export-html/tool-renderer.ts) is the caller that feeds it TUI output, and the resulting markup ends up inside the page assembled by [index.ts](/docs/src/core/export-html/index.ts) and styled by [template.css](/docs/src/core/export-html/template.css).
+
+<Scrollycoding>
+
+## !!steps Palettes
+
+The first sixteen colors are a fixed table. Note these are the classic VGA-style values, not the user's actual terminal theme, so exported colors can differ from what was on screen.
+
+```ts ! ansi-to-html.ts
+// Standard ANSI color palette (0-15)
+const ANSI_COLORS = [
+	"#000000", // 0: black
+	"#800000", // 1: red
+	"#008000", // 2: green
+	"#808000", // 3: yellow
+	"#000080", // 4: blue
+	"#800080", // 5: magenta
+	"#008080", // 6: cyan
+	"#c0c0c0", // 7: white
+	"#808080", // 8: bright black
+	"#ff0000", // 9: bright red
+```
+
+## !!steps The 256-color palette
+
+Indexes 0-15 come from the table, 16-231 are a 6x6x6 cube where each channel step maps to 0 or `55 + n * 40`, and 232-255 are a grayscale ramp.
+
+```ts ! ansi-to-html.ts
+function color256ToHex(index: number): string {
+	// Standard colors (0-15)
+	if (index < 16) {
+		return ANSI_COLORS[index];
+	}
+
+	// Color cube (16-231): 6x6x6 = 216 colors
+	if (index < 232) {
+		const cubeIndex = index - 16;
+		const r = Math.floor(cubeIndex / 36);
+		const g = Math.floor((cubeIndex % 36) / 6);
+		const b = cubeIndex % 6;
+		const toComponent = (n: number) => (n === 0 ? 0 : 55 + n * 40);
+		const toHex = (n: number) => toComponent(n).toString(16).padStart(2, "0");
+		return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+	}
+
+	// Grayscale (232-255): 24 shades
+	const gray = 8 + (index - 232) * 10;
+	const grayHex = gray.toString(16).padStart(2, "0");
+	return `#${grayHex}${grayHex}${grayHex}`;
+}
+```
+
+## !!steps Escaping and style state
+
+Text between escape codes is HTML-escaped, which is the security-relevant part since tool output is untrusted. A mutable `TextStyle` tracks the current attributes, and `styleToInlineCSS` renders them. Dim is approximated with 0.6 opacity.
+
+```ts ! ansi-to-html.ts
+function escapeHtml(text: string): string {
+	return text
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#039;");
+}
+
+// ...
+function styleToInlineCSS(style: TextStyle): string {
+	const parts: string[] = [];
+	if (style.fg) parts.push(`color:${style.fg}`);
+	if (style.bg) parts.push(`background-color:${style.bg}`);
+	if (style.bold) parts.push("font-weight:bold");
+	if (style.dim) parts.push("opacity:0.6");
+	if (style.italic) parts.push("font-style:italic");
+	if (style.underline) parts.push("text-decoration:underline");
+	return parts.join(";");
+}
+```
+
+## !!steps Applying SGR codes
+
+A single escape may carry many semicolon-separated codes. The loop walks them with an index so the extended forms `38;5;N` and `38;2;R;G;B` can consume their extra arguments. Code 0 clears everything, and 22 clears bold and dim together.
+
+```ts ! ansi-to-html.ts
+function applySgrCode(params: number[], style: TextStyle): void {
+	let i = 0;
+	while (i < params.length) {
+		const code = params[i];
+
+		if (code === 0) {
+			// Reset all
+			style.fg = null;
+			style.bg = null;
+			style.bold = false;
+			style.dim = false;
+			style.italic = false;
+			style.underline = false;
+		} else if (code === 1) {
+			style.bold = true;
+		} else if (code === 2) {
+			style.dim = true;
+		} else if (code === 3) {
+			style.italic = true;
+		} else if (code === 4) {
+			style.underline = true;
+```
+
+## !!steps Extended colors
+
+For 38 and 48 the next parameter chooses the mode. If there are too few parameters the code is silently ignored and the loop moves on. Truecolor values are not clamped to 0-255.
+
+```ts ! ansi-to-html.ts
+		} else if (code === 38) {
+			// Extended foreground color
+			if (params[i + 1] === 5 && params.length > i + 2) {
+				// 256-color: 38;5;N
+				style.fg = color256ToHex(params[i + 2]);
+				i += 2;
+			} else if (params[i + 1] === 2 && params.length > i + 4) {
+				// RGB: 38;2;R;G;B
+				const r = params[i + 2];
+				const g = params[i + 3];
+				const b = params[i + 4];
+				style.fg = `rgb(${r},${g},${b})`;
+				i += 4;
+			}
+```
+
+## !!steps Main conversion loop
+
+The regex finds each `ESC[...m`. Text before it is escaped and appended, any open span is closed, the codes are applied, and a new span is opened only if some styling remains. Spans therefore never nest. An empty parameter list, as in `ESC[m`, is treated as a reset.
+
+```ts ! ansi-to-html.ts
+// Match ANSI escape sequences: ESC[ followed by params and ending with 'm'
+const ANSI_REGEX = /\x1b\[([\d;]*)m/g;
+
+/**
+ * Convert ANSI-escaped text to HTML with inline styles.
+ */
+export function ansiToHtml(text: string): string {
+	const style = createEmptyStyle();
+	let result = "";
+	let lastIndex = 0;
+	let inSpan = false;
+
+	// Reset regex state
+	ANSI_REGEX.lastIndex = 0;
+
+	let match = ANSI_REGEX.exec(text);
+	while (match !== null) {
+		// Add text before this escape sequence
+		const beforeText = text.slice(lastIndex, match.index);
+		if (beforeText) {
+			result += escapeHtml(beforeText);
+		}
+```
+
+## !!steps Line wrapper
+
+Each line becomes a `div` with class `ansi-line`. Empty lines turn into a non-breaking space so they keep their height. Style state is fresh per line, so a color that was meant to span lines does not carry over.
+
+```ts ! ansi-to-html.ts
+export function ansiLinesToHtml(lines: string[]): string {
+	return lines.map((line) => `<div class="ansi-line">${ansiToHtml(line) || "&nbsp;"}</div>`).join("");
+}
+```
+
+</Scrollycoding>
+
+Only SGR is understood; cursor movement and other CSI sequences are left in the text. A module-level global regex is shared, which is why `lastIndex` is reset at the start of each call.

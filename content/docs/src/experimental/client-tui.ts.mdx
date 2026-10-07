@@ -1,0 +1,246 @@
+---
+title: "client-tui.ts"
+description: "Full-screen experimental terminal client: facet-based plugin host, session selection and attach, prompt/steer/follow-up input, and Radius reconnect recovery"
+source: "src/experimental/client-tui.ts"
+full: true
+---
+
+This is the interactive presentation for the experimental client/server architecture. Where the regular interactive mode owns an agent, this one owns none: it attaches to a session on a server (local socket or Radius relay), subscribes to the replicated transcript, and sends prompts through remote services. It is experimental code, started from [commands.ts](/docs/src/experimental/commands.ts) when stdin and stdout are terminals and no prompt was given.
+
+The file has three layers. `runClientTui` builds the terminal and settings. `prepareClientSession` decides which session to open. The `ExperimentalClientTui` class is the component that wires services, plugin facets, input and recovery together. Rendering of the conversation is delegated to [client-tui-chat.ts](/docs/src/experimental/client-tui-chat.ts).
+
+<Scrollycoding>
+
+## !!steps Layout containers and the input editor
+
+The component is a stack of containers: document (heading plus transcript), queued messages, status, editor and footer. It reuses the interactive-mode `CustomEditor` and `createChatViewport` from [chat-viewport.ts](/docs/src/modes/interactive/chat-viewport.ts). Key actions are bound in the constructor: Enter submits, Escape interrupts, Ctrl+D and the clear action finish the UI, the model key runs `/model`, and the follow-up key queues the text instead of sending it as a steer.
+
+```ts ! client-tui.ts
+	private constructor(ui: TUI, requestRender: () => void, finish: () => void, loadedFacets: LoadedFacets) {
+		this.#ui = ui;
+		this.#requestRender = requestRender;
+		this.#finish = finish;
+		this.#sharedFacets = loadedFacets;
+		setKeybindings(this.#keybindings);
+		this.#chatInput = new CustomEditor(ui, getEditorTheme(), this.#keybindings, { paddingX: 1 });
+		// !mark(1:4)
+		this.#chatInput.onSubmit = (message) => void this.#runPrompt(message);
+		this.#chatInput.onEscape = () => this.#interrupt();
+		this.#chatInput.onCtrlD = finish;
+		this.#chatInput.onAction("app.clear", finish);
+		this.#chatInput.onAction("app.model.select", () => void this.#executeSlashCommand("model", ""));
+```
+
+## !!steps Choosing which session to open
+
+`prepareClientSession` opens directory, management and plugin services on every server, then picks a session. An explicit id must match exactly one server and is created on a single local server if missing (never on Radius). `--continue` or `--resume` picks the newest session by `createdAt`, with ids as tie-breakers. With neither, a new session is created, which requires exactly one server.
+
+```ts ! client-tui.ts
+		if (command.sessionId !== undefined) {
+			const matches = features.flatMap((feature) =>
+				(feature.directory.state.value?.sessions ?? [])
+					.filter((session) => session.sessionId === command.sessionId)
+					.map((summary) => ({
+						server: feature.server,
+						management: feature.management,
+						plugins: feature.plugins,
+						summary,
+					})),
+			);
+			// !mark
+			if (matches.length > 1) throw new Error(`Session ${command.sessionId} is available from more than one server`);
+			selected = matches[0];
+			if (selected === undefined) {
+				if (command.connect?.transport === "radius") {
+					throw new Error(`Remote server does not contain Session ${command.sessionId}`);
+				}
+```
+
+## !!steps Attaching and handing the plugin payload on
+
+Once chosen, the session's plugins are prepared with any `--plugin` package paths resolved to absolute paths. The result is the JSON payload that later configures the presentation facets. Then the client attaches and waits for the session services to appear. The temporary service handles are disposed in `finally`, because the long-lived ones are opened later by the facet host.
+
+```ts ! client-tui.ts
+		const presentationPlugins = await selected.plugins.prepareSession(
+			{
+				sessionId: selected.summary.sessionId,
+				packagePaths: command.pluginPackages?.map((packagePath) => resolve(packagePath)) ?? null,
+			},
+			BACKGROUND_CONTEXT,
+		);
+		await selected.management.attach(selected.summary.sessionId, BACKGROUND_CONTEXT);
+		await selected.server.session.whenAttached(selected.summary.sessionId, BACKGROUND_CONTEXT);
+		return {
+			server: selected.server,
+			summary: selected.summary,
+			presentationPlugins,
+		};
+	} finally {
+		await Promise.allSettled(opened.map(({ services }) => services.dispose(BACKGROUND_CONTEXT)));
+	}
+```
+
+## !!steps Startup with cleanup on failure
+
+`create` is an async factory because a constructor cannot await. It prepares the session, loads shared facets, builds the component, then runs `#start` and `#openPreparedSession`. If either fails, `close()` runs before the error is rethrown. If cleanup also fails, both errors are reported together in an `AggregateError`.
+
+```ts ! client-tui.ts
+		const prepared = await prepareClientSession(options.command, options.servers);
+		const loadedFacets = await combineFacetLoaders(
+			options.facetLoader === undefined ? [] : [options.facetLoader],
+		).load();
+		const component = new ExperimentalClientTui(options.ui, options.requestRender, options.finish, loadedFacets);
+		try {
+			await component.#start(prepared);
+			await component.#openPreparedSession(prepared);
+			return component;
+		} catch (error) {
+			try {
+				await component.close();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Experimental TUI startup and cleanup failed");
+			}
+			throw error;
+		}
+```
+
+## !!steps Plugins as hot-reloadable facets
+
+Presentation plugins are loaded as facets and hosted by `createFacetHost`. `reloadPresentationPlugins` serializes reloads on `#facetReloadTail`, loads a candidate generation, asks the host to swap to it, and only then disposes the old generation. If the swap fails the candidate is disposed and the old one stays active. This is what the built-in `/reload` command calls.
+
+```ts ! client-tui.ts
+		const reloadPresentationPlugins = (data: JsonValue): Promise<void> => {
+			const operation = this.#facetReloadTail.then(async () => {
+				const candidate = await combineFacetLoaders(createPresentationFacetLoaders(data)).load();
+				try {
+					await facetHost.reload(candidate.facets);
+				} catch (error) {
+					try {
+						await candidate.dispose();
+					} catch (cleanupError) {
+						throw new AggregateError([error, cleanupError], "TUI plugin reload and cleanup failed");
+					}
+					throw error;
+				}
+				const retired = presentationFacets;
+				presentationFacets = candidate;
+				this.#presentationFacets = candidate;
+				await retired.dispose();
+			});
+```
+
+## !!steps The bridge facet connecting plugins to the UI
+
+An internal facet, `@pi/presentation-bridge`, gives plugins the `PresentationUI` service (a selector prompt and a status line), and pulls the slash-command, agent-controller and transcript services into the component. Its `onActivate` hook fails if services are already active, and `env.own` registers undo callbacks so deactivation clears the fields. Radius connections additionally subscribe to connection and attachment state for recovery. See [presentation-ui.ts](/docs/src/experimental/services/presentation-ui.ts) and [slash-commands.ts](/docs/src/experimental/services/slash-commands.ts).
+
+```ts ! client-tui.ts
+		const presentationBridgeFacet = defineFacet({
+			id: "@pi/presentation-bridge",
+			setup: (env) => {
+				env.provide(PresentationUI, {
+					select: (title, items, selectedValue) =>
+						this.#select(
+							title,
+							items.map((item) => ({ ...item })),
+							selectedValue,
+						),
+					showStatus: (status) => {
+						this.#status = status;
+						this.#rebuild();
+					},
+				});
+				const commands = env.use(SlashCommands);
+				const controller = env.use(AgentController);
+				const transcript = env.use(Transcript);
+```
+
+## !!steps Opening and closing the lane
+
+The "lane" is the live subscription to the transcript service. `#openLane` first closes any previous lane, builds a fresh `ExperimentalChatView`, and subscribes: each new snapshot goes through `view.apply` and then a rebuild of the surrounding layout. Closing unsubscribes, disposes the view and empties the containers.
+
+```ts ! client-tui.ts
+	async #openLane(feature: SessionFeature): Promise<void> {
+		await this.#closeLane();
+		const view = new ExperimentalChatView(this.#ui, process.cwd());
+		this.#chatView = view;
+		this.#documentContainer.addChild(this.#sessionHeading);
+		this.#documentContainer.addChild(view.transcript);
+		this.#pendingMessagesContainer.addChild(view.pendingMessages);
+		this.#laneUnsubscribe = feature.transcript.state.subscribe((value) => {
+			view.apply(value);
+			this.#rebuild();
+		});
+		if (feature.transcript.state.value === undefined) {
+			await this.#closeLane();
+			throw new Error("Transcript has no initialized view");
+		}
+	}
+```
+
+## !!steps Prompt, steer, follow-up and abort
+
+Input is dispatched by text. A leading slash is a command looked up in the slash-command service, so `/model` and plugin commands share one path. Plain text is a prompt when the conversation has no active run, and a steering message while one is running, decided from `pi.live`. The follow-up key always queues. Escape calls abort only while a run exists, and the "Aborting" status is cleared afterwards only if nothing replaced it.
+
+```ts ! client-tui.ts
+	async #submitPrompt(prompt: string): Promise<void> {
+		const controller = this.#selectedController();
+		if (controller === undefined) throw new Error("No Session AgentController service is available");
+		const view = this.#conversationView();
+		const running = view !== undefined && liveOf(view).run !== undefined;
+		this.#status = running ? "Queueing steering message…" : "Running turn…";
+		this.#rebuild();
+		// !mark(1:2)
+		if (running) this.#reportQueue(await controller.steer({ message: prompt, images: null }, BACKGROUND_CONTEXT));
+		else this.#reportOperation(await controller.prompt({ message: prompt, images: null }, BACKGROUND_CONTEXT));
+	}
+```
+
+## !!steps Surviving a Radius disconnect
+
+When the relay connection drops, the UI marks itself busy, closes the lane and shows a reconnect status. While busy, `handleInput` accepts only exit keys. When the session reattaches, the lane is reopened and the UI unlocked. Recovery steps are chained through `#queueRecovery`, a promise chain that skips work after close and surfaces failures as a status line.
+
+```ts ! client-tui.ts
+	#handleConnectionState(serverId: string, state: ServerConnectionState): void {
+		if (this.#closed || this.#selectedServerId !== serverId) return;
+		if (state.status === "connected") {
+			if (this.#laneUnsubscribe === undefined) {
+				this.#busy = true;
+				this.#status = "Reattaching Session…";
+				this.#rebuild();
+			}
+			return;
+		}
+		this.#busy = true;
+		this.#status = state.status === "connecting" ? "Reconnecting to Radius…" : "Radius disconnected; retrying…";
+		this.#queueRecovery(() => this.#closeLane());
+		this.#rebuild();
+	}
+```
+
+## !!steps Terminal setup in runClientTui
+
+The runner loads settings and a resource loader with extensions, skills, prompt templates and context files all switched off, so only themes are loaded. It opens the client runtime from [client-runtime.ts](/docs/src/experimental/client-runtime.ts), starts a fullscreen TUI via [tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts), and waits on `finished`. The `finally` block disposes in order: theme controller, theme watcher, TUI, component, runtime.
+
+```ts ! client-tui.ts
+export async function runClientTui(command: ClientCommand, options: RunClientTuiOptions = {}): Promise<void> {
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const resourceLoader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager,
+		// !mark(1:4)
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noContextFiles: true,
+	});
+	await resourceLoader.reload();
+	setRegisteredThemes(resourceLoader.getThemes().themes);
+	const runtime = await openClientRuntime(command, options);
+```
+
+</Scrollycoding>
+
+Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts) and key bindings from [keybindings.ts](/docs/src/core/keybindings.ts). One structural note: `#selectedSlashCommands` and `#selectedController` are trivial accessors that just return a field, so the indirection currently adds nothing; exactly one server is selected up front in `prepareClientSession`.

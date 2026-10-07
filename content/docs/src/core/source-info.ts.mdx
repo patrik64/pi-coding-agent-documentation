@@ -1,0 +1,101 @@
+---
+title: "source-info.ts"
+description: "The provenance record attached to every loaded resource, plus helpers for paths that name no real file"
+source: "src/core/source-info.ts"
+full: true
+---
+
+Skills, prompt templates, extensions and themes can come from the user's
+config directory, the project, an installed package, or from code with no file
+at all. `SourceInfo` records where one came from and with what scope, so the UI
+can label it and the loader can resolve collisions sensibly.
+
+The file defines that record, the convention for synthetic paths such as
+`builtin:read` and `<inline:name>`, and two factories. The path metadata it
+consumes is produced by [package-manager.ts](/docs/src/core/package-manager.ts).
+
+<Scrollycoding>
+
+## !!steps The shape of a source
+
+`scope` says who owns the resource: the user, the current project, or something
+temporary. `origin` says whether it arrived through an installed package or as
+a top-level entry in config. `baseDir` is the directory relative paths inside
+the resource resolve against, and it is optional.
+
+```ts ! source-info.ts
+export type SourceScope = "user" | "project" | "temporary";
+export type SourceOrigin = "package" | "top-level";
+
+export interface SourceInfo {
+	path: string;
+	source: string;
+	scope: SourceScope;
+	origin: SourceOrigin;
+	baseDir?: string;
+}
+```
+
+## !!steps Synthetic paths
+
+Two conventions exist for resources that are not files. A `builtin:` prefix
+marks built-in tools and extensions. An angle-bracket form like `<inline:name>`
+marks code supplied programmatically. `getSyntheticPathSource` extracts the
+source label: `builtin` for the prefix, or the text before the first colon
+inside the brackets, falling back to `temporary` when that is empty. Real file
+paths return `undefined`.
+
+Note the asymmetry: `isSyntheticPath` only checks that the path starts with
+`<`, while `getSyntheticPathSource` also requires a closing `>`. A path like
+`<broken` is synthetic by the first test but has no source by the second.
+[resource-loader.ts](/docs/src/core/resource-loader.ts) uses both to skip
+filesystem resolution for such paths.
+
+```ts ! source-info.ts
+export const BUILTIN_PATH_PREFIX = "builtin:";
+
+export function getSyntheticPathSource(path: string): string | undefined {
+	// !mark
+	if (path.startsWith(BUILTIN_PATH_PREFIX)) return "builtin";
+	if (path.startsWith("<") && path.endsWith(">")) return path.slice(1, -1).split(":")[0] || "temporary";
+	return undefined;
+}
+
+export function isSyntheticPath(path: string): boolean {
+	return path.startsWith(BUILTIN_PATH_PREFIX) || path.startsWith("<");
+}
+```
+
+## !!steps Creating source info
+
+`createSourceInfo` copies fields from package metadata. The synthetic factory
+fills defaults: scope `temporary` and origin `top-level`, so a caller only has
+to supply a path and a source label.
+
+```ts ! source-info.ts
+export function createSyntheticSourceInfo(
+	path: string,
+	options: {
+		source: string;
+		scope?: SourceScope;
+		origin?: SourceOrigin;
+		baseDir?: string;
+	},
+): SourceInfo {
+	return {
+		path,
+		source: options.source,
+		scope: options.scope ?? "temporary",
+		origin: options.origin ?? "top-level",
+		baseDir: options.baseDir,
+	};
+}
+```
+
+</Scrollycoding>
+
+[skills.ts](/docs/src/core/skills.ts) uses the synthetic factory even for real
+files, passing `local` as the source for user and project skills.
+[slash-commands.ts](/docs/src/core/slash-commands.ts) embeds a `SourceInfo`
+in each discovered command. The synthetic factory is also re-exported from the
+package index for extension authors.

@@ -1,0 +1,65 @@
+---
+title: "rpc-entry.ts"
+description: "Executable entry point that boots the coding agent directly in RPC mode for programmatic clients"
+source: "src/rpc-entry.ts"
+full: true
+---
+
+`rpc-entry.ts` is a thirteen-line launcher. Instead of making a host process pass `--mode rpc` through the general CLI entry ([cli.ts](/docs/src/cli.ts)), this file hard-codes that flag and then hands off to `main`.
+
+It exists so embedders can spawn a binary whose only job is to speak the JSON-lines protocol implemented in [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) and consumed by [rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts).
+
+<Scrollycoding>
+
+## !!steps Process identity and environment
+
+The file starts with a node shebang. It renames the process to the app name plus `-rpc` so it is recognisable in process lists, and sets `PI_CODING_AGENT` and `AI_AGENT` so child processes and tools can tell they are running under the agent. [config.ts](/docs/src/config.ts) supplies `APP_NAME`.
+
+```ts ! rpc-entry.ts
+#!/usr/bin/env node
+import { APP_NAME } from "./config.ts";
+import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { main } from "./main.ts";
+
+// !mark
+process.title = `${APP_NAME}-rpc`;
+// !mark(1:2)
+process.env.PI_CODING_AGENT = "true";
+process.env.AI_AGENT = "pi";
+process.emitWarning = (() => {}) as typeof process.emitWarning;
+```
+
+## !!steps Silencing warnings
+
+`process.emitWarning` is replaced with a no-op. In RPC mode stdout and stderr belong to the protocol and to the host, so Node warnings such as deprecations would only be noise. Note that this swallows every warning, not only known ones.
+
+```ts ! rpc-entry.ts
+// !mark
+process.emitWarning = (() => {}) as typeof process.emitWarning;
+```
+
+## !!steps Wiring the HTTP dispatcher
+
+`configureHttpDispatcher` from [http-dispatcher.ts](/docs/src/core/http-dispatcher.ts) is called before anything makes a request, so proxy and dispatcher settings apply to all later network calls.
+
+```ts ! rpc-entry.ts
+import { configureHttpDispatcher } from "./core/http-dispatcher.ts";
+// ...
+// !mark
+configureHttpDispatcher();
+```
+
+## !!steps Delegating to main
+
+The final line forwards to `main` in [main.ts](/docs/src/main.ts), prepending `--mode rpc` and then appending the caller's own arguments. Because the flag comes first, a later `--mode` supplied by the caller could in principle override it, depending on how the argument parser treats repeated flags.
+
+```ts ! rpc-entry.ts
+import { main } from "./main.ts";
+// ...
+// !mark
+main(["--mode", "rpc", ...process.argv.slice(2)]);
+```
+
+</Scrollycoding>
+
+This file has no exports and no logic of its own. It sets up the process, then `main` does all the work, so behaviour in RPC mode is identical to running the normal CLI with `--mode rpc` apart from the silenced warnings.

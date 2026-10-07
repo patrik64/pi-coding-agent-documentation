@@ -1,0 +1,98 @@
+---
+title: "tool-definition-wrapper.ts"
+description: "Converts between extension-style ToolDefinition objects and the plain AgentTool objects the agent core runs"
+source: "src/core/tools/tool-definition-wrapper.ts"
+full: true
+---
+
+Two shapes describe a tool in this codebase. A `ToolDefinition` (from [extensions/types.ts](/docs/src/core/extensions/types.ts)) is the rich form: schema, prompt metadata, renderers and an `execute` that receives an extension context. An `AgentTool` is the lean form the agent core runs. This file converts in both directions.
+
+[AgentSession](/docs/src/core/agent-session.ts) keeps its registry definition-first, so plain tools passed in by an SDK caller are lifted into definitions with `createToolDefinitionFromAgentTool`. Tool factories such as [powershell.ts](/docs/src/core/tools/powershell.ts) use `wrapToolDefinition` directly.
+
+<Scrollycoding>
+
+## !!steps The context factory type
+
+Extension tools get a context object on each call. The factory builds one for a given tool call id and abort signal. It is optional in the wrappers: built-in tools do not need a context.
+
+```ts ! tool-definition-wrapper.ts
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { ExtensionToolContext, ToolDefinition } from "../extensions/types.ts";
+
+/** Creates the context for one tool call. */
+export type ToolContextFactory = (toolCallId: string, signal: AbortSignal | undefined) => ExtensionToolContext;
+```
+
+## !!steps Definition to AgentTool
+
+`wrapToolDefinition` copies the fields the core cares about: name, label, description, parameter schema, output schema, constrained sampling flag, argument preparation and execution mode. Everything else on the definition (prompt snippets, guidelines, renderers) is dropped, which is why [powershell.ts](/docs/src/core/tools/powershell.ts) copies the prompt fields back by hand.
+
+The wrapped `execute` resolves its context in order: a context passed by the caller, else one built by the factory, else `undefined` cast to the context type.
+
+```ts ! tool-definition-wrapper.ts
+export function wrapToolDefinition<TDetails = unknown>(
+	definition: ToolDefinition<any, TDetails>,
+	ctxFactory?: ToolContextFactory,
+): AgentTool<any, TDetails> {
+	return {
+		name: definition.name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		outputSchema: definition.outputSchema,
+		constrainedSampling: definition.constrainedSampling,
+		prepareArguments: definition.prepareArguments,
+		executionMode: definition.executionMode,
+		// !mark(1:7)
+		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionToolContext) =>
+			definition.execute(
+				toolCallId,
+				params,
+				signal,
+				onUpdate,
+				ctx ?? (ctxFactory?.(toolCallId, signal) as ExtensionToolContext),
+			),
+	};
+}
+```
+
+## !!steps Wrapping a batch
+
+A convenience map that applies one factory to many definitions. Nothing else in the package calls it, so it is an unused export.
+
+```ts ! tool-definition-wrapper.ts
+/** Wrap multiple ToolDefinitions into AgentTools for the core runtime. */
+export function wrapToolDefinitions(
+	definitions: ToolDefinition<any, any>[],
+	ctxFactory?: ToolContextFactory,
+): AgentTool<any>[] {
+	return definitions.map((definition) => wrapToolDefinition(definition, ctxFactory));
+}
+```
+
+## !!steps AgentTool back to a definition
+
+The reverse direction produces a minimal definition: same core fields, no prompt metadata, no renderers. Its `execute` drops the context argument entirely and calls the agent tool with four arguments, so a plain tool never sees an extension context.
+
+The doc comment states the purpose: keep the session's internal registry definition-first even when a caller supplies plain overrides.
+
+```ts ! tool-definition-wrapper.ts
+export function createToolDefinitionFromAgentTool(tool: AgentTool<any>): ToolDefinition<any, unknown> {
+	return {
+		name: tool.name,
+		label: tool.label,
+		description: tool.description,
+		parameters: tool.parameters as any,
+		outputSchema: tool.outputSchema,
+		constrainedSampling: tool.constrainedSampling,
+		prepareArguments: tool.prepareArguments,
+		executionMode: tool.executionMode,
+		// !mark
+		execute: async (toolCallId, params, signal, onUpdate) => tool.execute(toolCallId, params, signal, onUpdate),
+	};
+}
+```
+
+</Scrollycoding>
+
+The field lists in the two directions are written out by hand, so adding a new core field to the agent tool type requires updating both functions. The renderers that definitions may carry come from the [renderers folder](/docs/src/core/tools/renderers/index.ts), merged in by callers via `withBuiltInRenderers`.

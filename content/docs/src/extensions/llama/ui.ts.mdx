@@ -1,0 +1,329 @@
+---
+title: "ui.ts"
+description: "Terminal UI for the /llama command: model list, Hugging Face download search, confirmations, and a cancellable progress screen."
+source: "src/extensions/llama/ui.ts"
+full: true
+---
+
+This file holds all the terminal rendering for the llama.cpp manager. The command logic in [index.ts](/docs/src/extensions/llama/index.ts) never touches TUI components directly. It talks to the small `LlamaUi` interface, which this file implements with one custom full-screen view.
+
+That separation keeps the command flow testable and lets a single view swap its content between screens (model list, search, status, progress) while staying mounted. The view is built from pi-tui components, themed through [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and uses [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) for its frame and [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for footer hints. Data types come from [client.ts](/docs/src/extensions/llama/client.ts) and [huggingface.ts](/docs/src/extensions/llama/huggingface.ts).
+
+<Scrollycoding>
+
+## !!steps Describing models in the list
+
+`contextLabel` shows a short context size such as `32k`. It prefers the runtime or training metadata and falls back to a `--ctx-size` style launch argument. `modelDescription` joins the status and context with a middle dot.
+
+Context is shown only for loaded or sleeping models, and the status word is hidden for `unloaded`, so most rows are either empty or short.
+
+```ts ! ui.ts
+function contextLabel(model: LlamaModelInfo): string | undefined {
+	const context = model.meta?.n_ctx ?? model.meta?.n_ctx_train;
+	if (context) return context >= 1000 ? `${Math.round(context / 1000)}k` : String(context);
+	const args = model.status.args ?? [];
+	for (let index = 0; index < args.length - 1; index++) {
+		if (args[index] !== "--ctx-size" && args[index] !== "-c" && args[index] !== "-ctx") continue;
+		const value = Number(args[index + 1]);
+		if (Number.isFinite(value) && value > 0) return value >= 1000 ? `${Math.round(value / 1000)}k` : String(value);
+	}
+	return undefined;
+}
+
+function modelDescription(model: LlamaModelInfo): string {
+	const details: string[] = [];
+	// !mark(1:3)
+	const loaded = model.status.value === "loaded" || model.status.value === "sleeping";
+	if (loaded) details.push("loaded");
+	else if (model.status.value !== "unloaded") details.push(model.status.value);
+	const context = loaded ? contextLabel(model) : undefined;
+	if (context) details.push(`${context} context`);
+	return details.join(" · ");
+}
+```
+
+## !!steps Frame and the LlamaUi contract
+
+Every screen is wrapped by `frame`: a colored border, a bold title, the body, an optional dim footer, and a closing border. The `LlamaUi` interface lists everything the command flow can ask for. Each prompt-like method returns a promise that resolves when the user picks something, which makes the flow in [index.ts](/docs/src/extensions/llama/index.ts) read like ordinary async code.
+
+`showModels` resolves to a `LlamaManagerAction`: a chosen model, a request to download, or close.
+
+```ts ! ui.ts
+function frame(theme: Theme, title: string, body: Component[], footer?: string): Container {
+	const container = new Container();
+	container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+	container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+	for (const child of body) container.addChild(child);
+	if (footer) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("dim", footer), 1, 0));
+	}
+	container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+	return container;
+}
+
+export interface LlamaUi {
+	// !mark(1:4)
+	showModels(serverUrl: string, models: LlamaModelInfo[]): Promise<LlamaManagerAction>;
+	select(title: string, options: string[]): Promise<string | undefined>;
+	confirm(title: string, message: string): Promise<boolean>;
+	connectionError(serverUrl: string, message: string): Promise<"retry" | "close">;
+```
+
+## !!steps The search component state
+
+`HuggingFaceSearch` is a focusable container with an input and a results list. Its fields cover the debounce timer, an `AbortController` for the in-flight request, a shared result cache, and a `closed` flag that guards against late async results.
+
+Focus is forwarded to the inner `Input` so the cursor shows correctly when the view receives focus.
+
+```ts ! ui.ts
+class HuggingFaceSearch extends Container implements Focusable {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly keybindings: KeybindingsManager;
+	private readonly search: (query: string, signal: AbortSignal) => Promise<HuggingFaceModel[]>;
+	// !mark
+	private readonly cache: Map<string, HuggingFaceModel[]>;
+	private readonly onSelectModel: (model: string | undefined) => void;
+	private readonly input = new Input();
+	private readonly resultsContainer = new Container();
+	private results: HuggingFaceModel[] = [];
+	private filteredResults: HuggingFaceModel[] = [];
+	private selectedIndex = 0;
+	private query = "";
+	private status = "Type at least 2 characters";
+	// !mark(1:3)
+	private debounce: ReturnType<typeof setTimeout> | undefined;
+	private request: AbortController | undefined;
+	private closed = false;
+	private _focused = false;
+```
+
+## !!steps Scheduling a search
+
+Each keystroke that changes the query calls `scheduleSearch`. It first cancels the pending timer and aborts any request in flight. Queries under two characters just show a hint. A cache hit is served immediately, with no network call.
+
+Otherwise the status becomes "Searching Hugging Face…" and the real request starts after a 500 ms debounce. The cache key is lowercased, so case differences do not cause extra requests.
+
+```ts ! ui.ts
+	private scheduleSearch(): void {
+		if (this.debounce) clearTimeout(this.debounce);
+		this.request?.abort();
+		this.request = undefined;
+		if (this.query.length < 2) {
+			this.status = "Type at least 2 characters";
+			this.filterResults();
+			return;
+		}
+		// !mark(1:5)
+		const cached = this.cache.get(this.query.toLowerCase());
+		if (cached) {
+			this.results = cached;
+			this.status = cached.length === 0 ? "No GGUF models found" : "";
+			this.filterResults();
+			return;
+		}
+		this.status = "Searching Hugging Face…";
+		this.filterResults();
+		// !mark
+		this.debounce = setTimeout(() => void this.runSearch(this.query), 500);
+	}
+```
+
+## !!steps Running and discarding results
+
+`runSearch` stores its own `AbortController` and writes results into the cache even if they are stale, which is cheap and useful later. It applies them to the screen only when the component is open, the request was not aborted, and the query has not changed meanwhile.
+
+Errors follow the same staleness check and are shown as the status text. The `finally` clears `request` only if it is still the same request.
+
+```ts ! ui.ts
+	private async runSearch(query: string): Promise<void> {
+		const request = new AbortController();
+		this.request = request;
+		try {
+			const results = await this.search(query, request.signal);
+			// !mark
+			this.cache.set(query.toLowerCase(), results);
+			// !mark
+			if (this.closed || request.signal.aborted || this.query !== query) return;
+			this.results = results;
+			this.selectedIndex = 0;
+			this.status = results.length === 0 ? "No GGUF models found" : "";
+			this.filterResults();
+		} catch (error) {
+			if (this.closed || request.signal.aborted || this.query !== query) return;
+			this.results = [];
+			this.status = error instanceof Error ? error.message : String(error);
+			this.filterResults();
+		} finally {
+			if (this.request === request) this.request = undefined;
+		}
+	}
+```
+
+## !!steps Keys and the exact-name shortcut
+
+Arrow keys wrap around the list. On confirm, a query that already looks like `owner/repo` or `owner/repo:quant` is returned as typed, so users can download a model that the search did not list. Otherwise the highlighted result is used.
+
+Key matching goes through the [keybindings.ts](/docs/src/core/keybindings.ts) manager, so user remaps of the select keys apply here too. Anything else is forwarded to the input, and a changed trimmed value triggers a new search.
+
+```ts ! ui.ts
+		if (this.keybindings.matches(data, "tui.select.confirm")) {
+			// !mark(1:2)
+			const exact = /^[^/\s]+\/[^:\s]+(?::[^\s:]+)?$/u.test(this.query) ? this.query : undefined;
+			const selected = exact ?? this.filteredResults[this.selectedIndex]?.id;
+			if (selected) this.close(selected);
+			return;
+		}
+		if (this.keybindings.matches(data, "tui.select.cancel")) {
+			this.close(undefined);
+			return;
+		}
+		this.input.handleInput(data);
+		const query = this.input.getValue().trim();
+		if (query === this.query) return;
+		this.query = query;
+		this.scheduleSearch();
+```
+
+## !!steps The model list screen
+
+`showModels` sorts loaded models first, then alphabetically, and appends a "Download model…" row with a sentinel value that cannot clash with a model id because it starts with a NUL character. The returned promise resolves from the list's select and cancel callbacks.
+
+`setContent` swaps the visible screen and hands input to the list, so the view itself never knows what is on screen.
+
+```ts ! ui.ts
+	showModels(serverUrl: string, models: LlamaModelInfo[]): Promise<LlamaManagerAction> {
+		const sorted = [...models].sort((left, right) => {
+			// !mark
+			const loaded = Number(right.status.value === "loaded") - Number(left.status.value === "loaded");
+			return loaded || left.id.localeCompare(right.id);
+		});
+		const byId = new Map(sorted.map((model) => [model.id, model]));
+		const items: SelectItem[] = [
+			...sorted.map((model) => ({
+				value: model.id,
+				label: model.id,
+				description: modelDescription(model),
+			})),
+			// !mark
+			{ value: DOWNLOAD_VALUE, label: "Download model…", description: "Hugging Face owner/repository[:quant]" },
+		];
+```
+
+## !!steps Content swapping
+
+`setContent` resets any progress state, unfocuses the previous input target, installs the new content, and gives focus to the new target if the view itself is focused. This is what lets one view host a list, a search box, and a progress screen in turn.
+
+`confirm` and `connectionError` are built on `select`, so they need no components of their own.
+
+```ts ! ui.ts
+	private setContent(
+		content: Container,
+		inputHandler?: { handleInput?(data: string): void },
+		inputTarget?: Focusable,
+	): void {
+		// !mark(1:2)
+		if (this.inputTarget) this.inputTarget.focused = false;
+		this.progressPromise = undefined;
+		this.progressResolver = undefined;
+		this.showingProgress = false;
+		this.content = content;
+		this.inputHandler = inputHandler;
+		this.inputTarget = inputTarget;
+		if (this.inputTarget) this.inputTarget.focused = this._focused;
+		this.tui.requestRender();
+	}
+```
+
+## !!steps The progress screen
+
+`progress` returns a promise that resolves only when the user presses the cancel key, and `updateProgress` redraws the screen. The bar is 40 cells wide with the ratio clamped between 0 and 1.
+
+When no ratio is known the bar is skipped, and an optional detail line is added. Updates are ignored unless the progress screen is showing, so a late update cannot overwrite a screen that replaced it.
+
+```ts ! ui.ts
+	updateProgress(state: ProgressState): void {
+		// !mark
+		if (!this.showingProgress) return;
+		const body = [
+			new Text(this.theme.fg("text", state.model), 1, 0),
+			new Spacer(1),
+			new Text(this.theme.fg("muted", state.message), 1, 0),
+		];
+		if (state.ratio !== undefined) {
+			const available = 40;
+			// !mark
+			const filled = Math.round(Math.max(0, Math.min(1, state.ratio)) * available);
+			body.push(
+```
+
+## !!steps Rendering and input routing
+
+`handleInput` first checks for the cancel key while a progress promise is pending, which resolves it. Everything else goes to the current handler. `render` truncates any line wider than the terminal, so a long model id cannot break the layout.
+
+`showLlamaUi` is the entry point used by the command. It mounts the view with `ctx.ui.custom`, runs the supplied flow, and closes the view when the flow ends. A thrown error becomes an error notification, not a crash.
+
+```ts ! ui.ts
+	render(width: number): string[] {
+		return this.content
+			.render(width)
+			.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "") : line));
+	}
+
+	invalidate(): void {
+		this.content.invalidate();
+	}
+}
+
+export async function showLlamaUi(ctx: ExtensionCommandContext, run: (ui: LlamaUi) => Promise<void>): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+		const view = new LlamaView(tui, theme, keybindings);
+		// !mark(1:7)
+		void run(view).then(
+			() => done(),
+			(error: unknown) => {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				done();
+			},
+		);
+		return view;
+	});
+}
+```
+
+## !!steps Cancellable long operations
+
+`runWithProgress` runs a load or download while showing progress and offering cancel. It starts the work with a fresh `AbortController`, merges progress updates into one state object, and races the finished work against the user pressing cancel.
+
+On cancel it asks for confirmation. If confirmed, it calls the caller's `cancel()` (to tell the server), aborts locally, waits for the work to settle, and returns `cancelled: true`. A "no" or a finish during the dialog simply loops again. Errors from the work are rethrown at the end.
+
+```ts ! ui.ts
+	while (!completed) {
+		const outcome = await Promise.race([
+			settled.then(() => "settled" as const),
+			ui.progress(state).then(() => "stop" as const),
+		]);
+		if (outcome === "settled") break;
+		const stop = await ui.confirm(options.cancelTitle, options.cancelMessage);
+		// !mark
+		if (!stop || completed) continue;
+		try {
+			await options.cancel();
+		} finally {
+			controller.abort(new Error("Cancelled"));
+		}
+		await settled;
+		return { cancelled: true };
+	}
+
+	const result = await settled;
+	if (!result.ok) throw result.error;
+	return { cancelled: false, value: result.value };
+```
+
+</Scrollycoding>
+
+The view is a thin state machine: `setContent` chooses the screen, promises carry the answers back, and [index.ts](/docs/src/extensions/llama/index.ts) drives the sequence. Download search results come from [huggingface.ts](/docs/src/extensions/llama/huggingface.ts), and the model data from [client.ts](/docs/src/extensions/llama/client.ts).
+
+One structural note: `HuggingFaceSearch` reuses the view's `searchCache`, so repeat searches in the same session cost nothing even after leaving and re-entering the download screen.

@@ -1,0 +1,183 @@
+---
+title: "bash.ts"
+description: "Terminal presentation for the bash and powershell tools: command header, tail-preview of output, truncation warnings and a live elapsed timer"
+source: "src/core/tools/renderers/bash.ts"
+full: true
+---
+
+This file renders shell tool calls and results. It is split from the execution code in [tools/bash.ts](/docs/src/core/tools/bash.ts) so a process that only displays tool output does not have to load the execution path or its parameter schema. The header comment says the execution file spreads these renderers into its tool definition, so the public shape of the tool is unchanged.
+
+One factory serves both shells. `createShellRenderers(prompt)` takes the prompt string (`$` or `PS>`) and returns `renderCall` and `renderResult`. [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) calls it for bash and powershell, and [powershell.ts](/docs/src/core/tools/powershell.ts) shares the same display behavior through that factory.
+
+<Scrollycoding>
+
+## !!steps Constants and the duration formatter
+
+Collapsed output shows the last five visual lines. `BASH_UPDATE_THROTTLE_MS` is exported so the execution side can throttle streaming updates to the same 100 ms cadence.
+
+`formatDuration` has three bands: seconds with one decimal under a minute, `Xm Ys` under an hour, and `Xh Ym Zs` beyond that. The minute and hour bands floor the seconds first, so there is no fractional part past the first minute.
+
+```ts ! bash.ts
+const BASH_PREVIEW_LINES = 5;
+export const BASH_UPDATE_THROTTLE_MS = 100;
+function formatDuration(ms: number): string {
+	const seconds = ms / 1000;
+	// !mark
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
+}
+```
+
+## !!steps The call line
+
+The header is the prompt followed by the command, in bold title style, with an optional muted `(timeout Ns)` suffix. The three cases for the command come from `str`: `null` (wrong type) shows `[invalid arg]`, an empty string shows `...` (arguments still streaming), otherwise the command itself.
+
+`str` and `invalidArgText` come from [render-utils.ts](/docs/src/core/tools/render-utils.ts).
+
+```ts ! bash.ts
+function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {
+	const command = str(args?.command);
+	const timeout = args?.timeout as number | undefined;
+	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
+	// !mark
+	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
+	return theme.fg("toolTitle", theme.bold(`${prompt} ${commandDisplay}`)) + timeoutSuffix;
+}
+```
+
+## !!steps Stripping the duplicate truncation footer
+
+The execution side appends a footer such as a bracketed note about the full output file to the text it returns to the model. The renderer shows its own warning line, so it removes that footer from the display text. It does this only for a final (not partial) result that is truncated, has a full-output path, and whose text ends with `]`.
+
+The footer is located by the last blank line followed by `[`, and is cut only if it actually mentions the output path. That guard prevents trimming real command output that happens to end in a bracket.
+
+```ts ! bash.ts
+	component.clear();
+
+	let output = getTextOutput(result as any, showImages).trim();
+	const truncation = result.details?.truncation;
+	const fullOutputPath = result.details?.fullOutputPath;
+	// !mark(1:6)
+	if (!options.isPartial && truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+		const footerStart = output.lastIndexOf("\n\n[");
+		if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+			output = output.slice(0, footerStart).trimEnd();
+		}
+	}
+```
+
+## !!steps Expanded versus collapsed output
+
+Expanded mode prints every line. Collapsed mode hands the text to `VisualLinePreview` with `keep: "end"`, so the user sees the most recent five visual lines (wrapped lines count as several), which is what matters for a running command. The hint line reports how many earlier lines are hidden and which key expands, using [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts). The preview component lives in [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts).
+
+```ts ! bash.ts
+	if (output) {
+		const styledOutput = output
+			.split("\n")
+			.map((line) => theme.fg("toolOutput", line))
+			.join("\n");
+
+		if (options.expanded) {
+			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
+		} else {
+			component.addChild(new Spacer(1));
+			component.addChild(
+				// !mark(1:3)
+				new VisualLinePreview({
+					text: styledOutput,
+					maxVisualLines: BASH_PREVIEW_LINES,
+					keep: "end",
+					formatHint: (hidden) =>
+						theme.fg("muted", `... (${hidden} earlier lines,`) +
+						` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+				}),
+			);
+		}
+	}
+```
+
+## !!steps Truncation warnings and elapsed time
+
+If output was truncated or spilled to a file, a single yellow bracketed line lists the full output path and how the cut happened: by lines (showing N of M) or by bytes (the limit from [truncate.ts](/docs/src/core/tools/truncate.ts), defaulting to `DEFAULT_MAX_BYTES`).
+
+The last line is the timer. While the result is partial the label is `Elapsed` and the end time falls back to the current clock; when final it says `Took`.
+
+```ts ! bash.ts
+	if (truncation?.truncated || fullOutputPath) {
+		const warnings: string[] = [];
+		if (fullOutputPath) {
+			warnings.push(`Full output: ${fullOutputPath}`);
+		}
+		if (truncation?.truncated) {
+			// !mark(1:5)
+			if (truncation.truncatedBy === "lines") {
+				warnings.push(`Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`);
+			} else {
+				warnings.push(
+					`Truncated: ${truncation.outputLines} lines shown (${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit)`,
+				);
+			}
+		}
+		component.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+	}
+
+	if (startedAt !== undefined) {
+		const label = options.isPartial ? "Elapsed" : "Took";
+		const endTime = endedAt ?? Date.now();
+		component.addChild(new Text(`\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`, 0, 0));
+	}
+```
+
+## !!steps The call renderer records the start time
+
+`createShellRenderers` returns the two hooks. `renderCall` runs repeatedly as arguments stream in; the first time `executionStarted` is true it stamps `state.startedAt` on the per-call state object and clears `endedAt`. It reuses the previous `Text` component when one exists instead of allocating a new one on each update.
+
+```ts ! bash.ts
+export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> {
+	return {
+		renderCall(args, _theme, context) {
+			const state = context.state;
+			// !mark(1:4)
+			if (context.executionStarted && state.startedAt === undefined) {
+				state.startedAt = Date.now();
+				state.endedAt = undefined;
+			}
+			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+			text.setText(formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt));
+			return text;
+		},
+```
+
+## !!steps The result renderer drives a one-second timer
+
+While a result is partial and the clock has started, `renderResult` starts a one-second interval that calls `context.invalidate()`, forcing a re-render so the elapsed time ticks even when the command prints nothing. When the result is final, or errored, it fixes `endedAt` with `??=` and clears the interval.
+
+The component is rebuilt from scratch on every call, then invalidated, which is simpler than diffing and cheap for a handful of children. The interval lives on `state`, so a remounted component can still clear it.
+
+```ts ! bash.ts
+		renderResult(result, options, _theme, context) {
+			const state = context.state;
+			// !mark(1:3)
+			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
+				state.interval = setInterval(() => context.invalidate(), 1000);
+			}
+			// !mark
+			if (!options.isPartial || context.isError) {
+				state.endedAt ??= Date.now();
+				if (state.interval) {
+					clearInterval(state.interval);
+					state.interval = undefined;
+				}
+			}
+			const component = (context.lastComponent as Container | undefined) ?? new Container();
+```
+
+</Scrollycoding>
+
+The type for the hooks comes from [extensions/types.ts](/docs/src/core/extensions/types.ts), the same `ToolDefinition` that extension authors implement, so built-in and custom tools render through one interface. Structurally the file is a pure view: no I/O, all state passed through the render context. One quirk: `formatDuration` and the other helpers are module-private, and the theme is imported as a singleton here while the sibling renderers receive it as a parameter.

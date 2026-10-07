@@ -1,0 +1,218 @@
+---
+title: "tool.ts"
+description: "Defines the codemode tool: schema, model-facing description with a token-budgeted tool catalog, and the loadout logic for on and only modes."
+source: "src/extensions/codemode/tool.ts"
+full: true
+---
+
+Codemode lets the model write a JavaScript script that calls other tools, instead of emitting many separate tool calls. This file defines the tool the model sees: its one-field input schema, its types, and above all its description. The description is generated, because it has to tell the model how to call every other tool from a script.
+
+Running the script is not done here. `execute` delegates to [execute.ts](/docs/src/extensions/codemode/execute.ts) through [execute.lazy.ts](/docs/src/extensions/codemode/execute.lazy.ts), and presentation comes from [renderer.ts](/docs/src/extensions/codemode/renderer.ts). The extension wrapper that registers the definition is [index.ts](/docs/src/extensions/codemode/index.ts).
+
+<Scrollycoding>
+
+## !!steps The contract in the header
+
+The header comment is the best summary of the semantics. Nested calls go through `ctx.executeTool`, so validation, `tool_call` and `tool_result` hooks and permission checks apply as for direct calls, and only the script's output reaches the model.
+
+It also fixes how nested results appear to a script: structured content when the tool declares an output schema, otherwise one text string, and failures reject. The `store()` and `load()` values persist as `codemode-store` custom entries, so each session branch sees what was written on its own path.
+
+```ts ! tool.ts
+ * Scripts can call the agent loop's nested tools: active `direct` tools and every `codemode` or
+ * `deferred` tool. Nested calls run through the agent loop's tool pipeline (`ctx.executeTool`), so
+ * validation, `tool_call`/`tool_result` hooks, and permission checks apply exactly as for direct
+ * calls. Only the script's output reaches the model; nested results do not.
+ *
+ * Nested results are handed to the script as follows:
+ * - A tool that declares `outputSchema` resolves to its `structuredContent`, also for error
+ *   results that carry one (MCP tools resolve to their `CallToolResult`, including `isError`).
+ * - Any other tool resolves to its text content as one string.
+ * - A failed, blocked, or invalid call rejects with an Error carrying the tool's error text.
+```
+
+## !!steps Schema, identity and store entries
+
+The input is a single string, `code`, containing raw JavaScript. `isCodemodeTool` compares the registered tool's `parameters` object by reference with `codemodeSchema`, which distinguishes this package's tool from another extension's tool that merely uses the name `codemode`.
+
+Store writes are recorded as custom entries with the type `codemode-store`, holding keys to set and keys to delete.
+
+```ts ! tool.ts
+export const CODEMODE_TOOL_NAME = "codemode";
+
+/** Custom entry type holding one script's `store()` writes: {@link CodemodeStoreEntryData}. */
+export const CODEMODE_STORE_ENTRY_TYPE = "codemode-store";
+
+export interface CodemodeStoreEntryData {
+	set: Record<string, unknown>;
+	delete: string[];
+}
+// ...
+export const codemodeSchema = Type.Object({
+	code: Type.String({
+		description: "Raw JavaScript source.",
+	}),
+});
+
+export type CodemodeToolInput = Static<typeof codemodeSchema>;
+
+/**
+ * Whether a registered tool is this package's `codemode` tool rather than another extension's tool
+ * with the same name. Compares the parameter schema, which the definition passes through by reference.
+ */
+export function isCodemodeTool(tool: Pick<ToolInfo, "name" | "parameters">): boolean {
+	return tool.name === CODEMODE_TOOL_NAME && tool.parameters === codemodeSchema;
+}
+```
+
+## !!steps Options injected by the extension
+
+`CodemodeToolOptions` is how [index.ts](/docs/src/extensions/codemode/index.ts) connects the tool to the session without this file importing the extension API. Namespaces and guidelines are looked up by tool name, `appendEntry` persists the store, and mode and budget are callbacks so settings changes apply. Without `appendEntry`, store writes last only for the current script.
+
+```ts ! tool.ts
+export interface CodemodeToolOptions {
+	/** Namespace of a tool, for `searchTools()` ranking and its `namespace` filter. */
+	getToolNamespace?: (toolName: string) => ToolNamespace | undefined;
+	/** Prompt guidelines of every tool, by tool name, shown with declarations by `describeTool()` and `ALL_TOOLS`. */
+	getToolGuidelines?: () => ReadonlyMap<string, readonly string[]>;
+	/**
+	 * Expose the `models` namespace to scripts, backed by the session's model registry
+	 * (`ctx.modelRegistry`). Without it, `models` is not declared.
+	 */
+	models?: boolean;
+```
+
+## !!steps What a script sees of a tool
+
+`toCodemodeDeclaration` converts an agent tool into a declaration the sandbox package can render: description plus its prompt guidelines as bullets, the input schema, and an output schema that defaults to a plain string. The guidelines are added because the system prompt normally only carries them for tools that are declared directly.
+
+`getCodemodeCallableTools` is the rule that keeps scripts from starting scripts: everything except codemode itself.
+
+```ts ! tool.ts
+export function toCodemodeDeclaration(
+	tool: AgentTool<any>,
+	guidelines: readonly string[] = [],
+): Omit<CodemodeTool, "execute"> {
+	const bullets = guidelines.flatMap((guideline) => (guideline.trim() ? [`- ${guideline.trim()}`] : []));
+	return {
+		name: tool.name,
+		description: bullets.length > 0 ? `${tool.description.trim()}\n\n${bullets.join("\n")}` : tool.description,
+		inputSchema: tool.parameters as CodemodeJsonSchema,
+		outputSchema: (tool.outputSchema as CodemodeJsonSchema | undefined) ?? TEXT_OUTPUT_SCHEMA,
+	};
+}
+
+/** Tools a script may call: every given tool except the codemode tool itself. */
+export function getCodemodeCallableTools(tools: readonly AgentTool<any>[]): AgentTool<any>[] {
+	return tools.filter((tool) => tool.name !== CODEMODE_TOOL_NAME);
+}
+```
+
+## !!steps Fitting the catalog into a budget
+
+Listing every tool with full type declarations can be expensive, so the description has an inline budget (default 3000 estimated tokens, at four characters per token). `selectCatalog` spends it fairly: each round, every group (tools without a namespace first, then namespaces by name) places its cheapest remaining tool, and a group whose next tool does not fit drops out.
+
+The effect is that every namespace gets represented before any one is complete. Tools left out are still callable, and scripts find them with `searchTools()`.
+
+```ts ! tool.ts
+function selectCatalog(groups: readonly CatalogGroup[], budget: number | undefined): Set<string> {
+	if (budget === undefined) return new Set(groups.flatMap((group) => group.entries.map((entry) => entry.name)));
+	const queues = groups.map((group) => [...group.entries].sort((a, b) => a.cost - b.cost));
+	const shown = new Set<string>();
+	let remaining = budget;
+	let active = queues.filter((queue) => queue.length > 0);
+	while (active.length > 0) {
+		active = active.filter((queue) => {
+			const next = queue[0];
+			if (next.cost > remaining) return false;
+			remaining -= next.cost;
+			shown.add(next.name);
+			queue.shift();
+			return queue.length > 0;
+		});
+	}
+	return shown;
+}
+```
+
+## !!steps Building the description
+
+`createCodemodeDescription` assembles the text: intro, globals, optional shared MCP types (only if a listed tool needs them), then a `Nested tools:` part grouped by namespace. Deferred tools are never listed, which keeps the text identical while MCP servers connect or change their tools, so the prompt cache stays valid.
+
+Namespace headings say `(tools not listed)` or `(some tools not listed)` when the budget cut entries, so the model knows to search.
+
+```ts ! tool.ts
+	const toolSections = ["Nested tools:"];
+	for (const { namespace, entries } of ordered) {
+		const visible = entries.filter((entry) => shown.has(entry.name));
+		if (namespace) {
+			// Only tools that did not fit the budget are counted as not listed here.
+			const listing =
+				visible.length === entries.length
+					? ""
+					: visible.length === 0
+						? " (tools not listed)"
+						: " (some tools not listed)";
+			const description = namespace.description?.trim();
+			toolSections.push(`## ${namespace.name}${listing}${description ? `\n${description}` : ""}`);
+		}
+		for (const entry of visible) toolSections.push(entry.section);
+	}
+	sections.push(toolSections.join("\n\n"));
+	return sections.join("\n\n");
+```
+
+## !!steps Mode on versus only
+
+`prepareCodemodeLoadout` decides how codemode and the direct tools coexist. In `on` mode, each declared tool that scripts can also call gets a description appended saying how to call it from a script (`describeScriptCall`), and the codemode description lists only non-direct tools. In `only` mode, codemode lists every callable tool and the declarations of active direct tools are hidden from requests through `hiddenDeclarations`.
+
+The comment on the function explains why it lists by exposure rather than by the active set: loading a tool with [tool-search](/docs/src/extensions/tool-search/tool.ts) then does not change the codemode description.
+
+```ts ! tool.ts
+function prepareCodemodeLoadout(loadout: ToolLoadout, options: CodemodeToolOptions): ToolLoadoutChanges {
+	const mode = options.getMode?.() ?? "on";
+	const isDirect = (tool: AgentTool) => loadout.getExposure(tool.name) === "direct";
+	const callable = getCodemodeCallableTools(loadout.callable);
+	const callableNames = new Set(callable.map((tool) => tool.name));
+	const descriptions: Record<string, string> = {};
+	if (mode === "on") {
+		for (const tool of loadout.declared) {
+			if (callableNames.has(tool.name)) descriptions[tool.name] = describeScriptCall(tool);
+		}
+	}
+	const listed = mode === "only" ? callable : callable.filter((tool) => !isDirect(tool));
+```
+
+## !!steps The tool definition
+
+The definition ties it together. `exposure: "model-only"` keeps scripts from calling codemode. `prepareLoadout` rewrites descriptions when the tool is activated, so the placeholder description is replaced. `constrainedSampling` supplies a grammar so capable models can write the script as raw text rather than a JSON-escaped string.
+
+`execute` awaits `loadCodemodeExecutor()` first, so the sandbox and wasm load on the first call and not at startup. The renderers are spread in last.
+
+```ts ! tool.ts
+export function createCodemodeToolDefinition(
+	options: CodemodeToolOptions = {},
+): ToolDefinition<typeof codemodeSchema, CodemodeToolDetails | undefined> {
+	return {
+		name: CODEMODE_TOOL_NAME,
+		label: CODEMODE_TOOL_NAME,
+		// Replaced with the declarations of the callable tools when the tool is activated.
+		description: createCodemodeDescription([], { models: options.models === true }),
+		promptSnippet: codemodeToolSystemPromptContribution.snippet,
+		promptGuidelines: [...codemodeToolSystemPromptContribution.guidelines],
+		parameters: codemodeSchema,
+		// Scripts must not start other scripts.
+		exposure: "model-only",
+		prepareLoadout: (loadout) => prepareCodemodeLoadout(loadout, options),
+		// Capable models write the script as raw text instead of a JSON-escaped string.
+		constrainedSampling: { type: "grammar", variants: { openai_lark: CODEMODE_SOURCE_GRAMMAR } },
+		// The sandbox (worker, QuickJS wasm) loads on the first call, not at startup.
+		execute: async (toolCallId, params, signal, onUpdate, ctx) =>
+			(await loadCodemodeExecutor()).executeCodemode(toolCallId, params, signal, onUpdate, ctx, options),
+		...codemodeRenderers,
+	};
+}
+```
+
+</Scrollycoding>
+
+Besides the definition, the file exports `createCodemodeTool` for SDK users who want a plain `AgentTool`, wrapped by [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts) with the generated description patched in. The search ranker used for `searchTools()` comes from [tool-search/tool.ts](/docs/src/extensions/tool-search/tool.ts) and is used by [execute.ts](/docs/src/extensions/codemode/execute.ts). The `CodemodeMode` type comes from [settings-manager.ts](/docs/src/core/settings-manager.ts), and the extension types from [types.ts](/docs/src/core/extensions/types.ts).

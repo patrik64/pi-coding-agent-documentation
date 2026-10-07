@@ -1,0 +1,148 @@
+---
+title: "tui-renderer.ts"
+description: "Factory for the two terminal renderers (regular and fullscreen) plus a Proxy that lets components survive a renderer swap"
+source: "src/modes/interactive/tui-renderer.ts"
+full: true
+---
+
+The interactive mode can run in two screen modes: a regular main-screen renderer that writes into the terminal scrollback, and a fullscreen alt-screen renderer that owns the whole window. Both classes come from the `pi-tui` package; this small file is the one place that decides which to build and how to theme it.
+
+It also solves a lifecycle problem. [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) can replace the active renderer while the app is running, yet dozens of components were constructed holding a `TUI` reference. The second export hands them a stable handle that always forwards to whichever renderer is current.
+
+<Scrollycoding>
+
+## !!steps Options for a renderer
+
+`InteractiveTuiOptions` is the whole input. `tuiMode` picks the renderer, `showHardwareCursor` and `logDirectory` are passed to both, and the remaining fields only matter in fullscreen mode: right-click paste, copy on select, and wheel scroll speed.
+
+The `terminal` is optional so tests can inject a fake one.
+
+```ts ! tui-renderer.ts
+export interface InteractiveTuiOptions {
+	readonly tuiMode: "regular" | "fullscreen";
+	// !mark(1:2)
+	readonly showHardwareCursor: boolean;
+	readonly logDirectory: string;
+	readonly terminal?: Terminal;
+	readonly onRightClickPaste?: () => void;
+	readonly fullscreenCopyOnSelect?: boolean;
+	readonly fullscreenWheelScrollLines?: WheelScrollLines;
+}
+```
+
+## !!steps Overloads that narrow the return type
+
+Three overloads make the return type follow the `tuiMode` literal. A caller that passes `"fullscreen"` gets a `TuiAltScreen` and can use its alt-screen-only API without a cast. A caller with a plain union gets the union.
+
+At runtime there is a single implementation. A missing terminal defaults to a `ProcessTerminal`, which wraps the real stdin and stdout.
+
+```ts ! tui-renderer.ts
+/** Composition root shared by coding-agent presentations. */
+// !mark(1:3)
+export function createInteractiveTui(options: InteractiveTuiOptions & { readonly tuiMode: "fullscreen" }): TuiAltScreen;
+export function createInteractiveTui(options: InteractiveTuiOptions & { readonly tuiMode: "regular" }): TuiMainScreen;
+export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen;
+export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScreen | TuiAltScreen {
+	// !mark
+	const terminal = options.terminal ?? new ProcessTerminal();
+	if (options.tuiMode === "fullscreen") {
+```
+
+## !!steps Search highlighting from theme tokens
+
+The fullscreen renderer supports in-buffer search, and it asks the caller for styling callbacks rather than hard-coding colors. All of them route through the shared `theme` from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), so a theme switch changes search colors too.
+
+A match is drawn with the `searchMatchBg` and `searchMatchText` tokens and underlined. The current match is bold and inverted so it stands out from the others. The navigation buttons only underline when hovered.
+
+```ts ! tui-renderer.ts
+		const styleSearchMatch = (text: string) => theme.bg("searchMatchBg", theme.fg("searchMatchText", text));
+		return new TuiAltScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+			// !mark(1:3)
+			searchMatchStyle: (text) => theme.underline(styleSearchMatch(text)),
+			searchCurrentMatchStyle: (text) => theme.bold(theme.inverse(styleSearchMatch(text))),
+			searchNavigationButtonStyle: (text, hovered) => (hovered ? theme.underline(text) : text),
+			scrollToEndIndicator: () => {
+				const shortcut = keyDisplayText("tui.altScreen.bottom");
+				const label = ` ↓ Jump to latest message${shortcut ? ` · ${shortcut}` : ""} `;
+				return theme.bg("selectedBg", theme.fg("text", label));
+			},
+```
+
+## !!steps Clipboard and browser hooks
+
+The renderer never touches the clipboard or launches a browser itself. [clipboard.ts](/docs/src/utils/clipboard.ts) and [open-browser.ts](/docs/src/utils/open-browser.ts) are injected as `copySelection` and `openUrl`, which keeps `pi-tui` free of platform logic.
+
+The `copySelection` contract is worth noting: it resolves to `true` on success and to an error message string on failure, so the renderer can show the reason. Anything thrown that is not an `Error` is stringified. The wheel setting defaults to `"auto"`.
+
+```ts ! tui-renderer.ts
+			openUrl: openBrowser,
+			onRightClickPaste: options.onRightClickPaste,
+			copyOnSelect: options.fullscreenCopyOnSelect,
+			// !mark
+			wheelScrollLines: options.fullscreenWheelScrollLines ?? "auto",
+			copySelection: async (text) => {
+				try {
+					await copyToClipboard(text);
+					return true;
+				} catch (error) {
+					// !mark
+					return error instanceof Error ? error.message : String(error);
+				}
+			},
+		});
+	}
+	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+```
+
+## !!steps A Proxy standing in for the active renderer
+
+`createInteractiveTuiReference` takes a getter and returns a `Proxy` over an empty object cast to `TUI`. Every property read goes to `getTui()`, so a component that kept this reference never sees a stale renderer after the swap.
+
+Functions need care. A bare `tui.render` read would return a method bound to nothing, so the proxy returns a wrapper that applies the method with the renderer as `this`. The wrapper caches the method and renderer it resolved first and only looks the method up again when `getTui()` returns a different renderer. If the new renderer lacks that property as a function, it throws a `TypeError` instead of calling something undefined.
+
+```ts ! tui-renderer.ts
+export function createInteractiveTuiReference(getTui: () => TUI): TUI {
+	return new Proxy({} as TUI, {
+		get: (_target, property) => {
+			const tui = getTui();
+			const value = Reflect.get(tui, property, tui);
+			if (typeof value !== "function") return value;
+			// !mark(1:2)
+			let methodTui = tui;
+			let method = value;
+			return (...args: unknown[]) => {
+				const currentTui = getTui();
+				if (currentTui !== methodTui) {
+					const currentMethod = Reflect.get(currentTui, property, currentTui);
+					if (typeof currentMethod !== "function") {
+						throw new TypeError(`TUI property ${String(property)} is not callable`);
+					}
+					methodTui = currentTui;
+					method = currentMethod;
+				}
+				return Reflect.apply(method, methodTui, args);
+			};
+		},
+```
+
+## !!steps Writes, has, and prototype forwarding
+
+The remaining traps forward everything else. Writes go to the current renderer, `in` checks ask it, and `getPrototypeOf` returns its prototype so `instanceof` style checks on the reference behave plausibly.
+
+Only these four traps exist. Operations like `ownKeys` or `getOwnPropertyDescriptor` fall through to the empty target, so enumerating the reference yields nothing.
+
+```ts ! tui-renderer.ts
+		set: (_target, property, value) => {
+			const tui = getTui();
+			// !mark
+			return Reflect.set(tui, property, value, tui);
+		},
+		has: (_target, property) => Reflect.has(getTui(), property),
+		getPrototypeOf: () => Reflect.getPrototypeOf(getTui()),
+	});
+}
+```
+
+</Scrollycoding>
+
+The factory is the composition root used by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts), and its fullscreen branch depends on [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for the jump-to-latest label. Structurally, the file only wires things together: the rendering, search and mouse logic live in `pi-tui`, and everything coding-agent specific arrives through the callbacks above.

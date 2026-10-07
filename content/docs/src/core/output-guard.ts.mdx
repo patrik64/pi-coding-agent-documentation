@@ -1,0 +1,174 @@
+---
+title: "output-guard.ts"
+description: "Redirects process.stdout to stderr so stray writes cannot corrupt machine-readable output, while keeping a serialized raw stdout channel"
+source: "src/core/output-guard.ts"
+full: true
+---
+
+Some modes use stdout as a protocol channel: the JSON event stream and RPC mode both emit one structured message per line. A stray console.log from an extension or a dependency would corrupt that stream. This file lets a mode take over stdout, so ordinary writes are diverted to stderr, and keep a separate path that still reaches the real stdout.
+
+The module holds a single piece of global state, `stdoutTakeoverState`, and a promise chain that keeps raw writes ordered. It is used by [print-mode.ts](/docs/src/modes/print-mode.ts) and [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts), and wired up from [main.ts](/docs/src/main.ts).
+
+<Scrollycoding>
+
+## !!steps State for the takeover
+
+The state saves three functions: the bound original `stdout.write`, the bound `stderr.write`, and the unbound original so it can be restored. When no takeover is active, `getRawStdoutWrite` binds the current `process.stdout.write` on demand, so the raw channel works both before and during a takeover.
+
+```ts ! output-guard.ts
+interface StdoutTakeoverState {
+	rawStdoutWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
+	rawStderrWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
+	originalStdoutWrite: typeof process.stdout.write;
+}
+
+let stdoutTakeoverState: StdoutTakeoverState | undefined;
+
+const RAW_STDOUT_RETRY_DELAY_MS = 10;
+
+let rawStdoutWriteTail: Promise<void> = Promise.resolve();
+
+function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
+	if (stdoutTakeoverState) {
+		return stdoutTakeoverState.rawStdoutWrite;
+	}
+	return process.stdout.write.bind(process.stdout) as StdoutTakeoverState["rawStdoutWrite"];
+}
+```
+
+## !!steps Retrying a write that hits backpressure
+
+`writeRawStdoutChunk` wraps the callback-style write in a promise. Only three error codes are treated as transient: ENOBUFS, EAGAIN and EWOULDBLOCK, which a non-blocking pipe throws when the reader is slow. Those wait ten milliseconds and retry forever. Any other error propagates.
+
+Non-Error throwables are normalized to Error objects in both places they can arise.
+
+```ts ! output-guard.ts
+const RAW_STDOUT_RETRY_DELAY_MS = 10;
+// ...
+async function writeRawStdoutChunk(text: string): Promise<void> {
+	while (true) {
+		try {
+			await new Promise<void>((resolve, reject) => {
+				try {
+					getRawStdoutWrite()(text, (error) => {
+						if (error) reject(error);
+						else resolve();
+					});
+				} catch (error) {
+					reject(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
+			return;
+		} catch (error) {
+			const writeError = error instanceof Error ? error : new Error(String(error));
+			const code = (writeError as Error & { code?: unknown }).code;
+// !mark(1:3)
+			if (code !== "ENOBUFS" && code !== "EAGAIN" && code !== "EWOULDBLOCK") {
+				throw writeError;
+			}
+			await new Promise<void>((resolve) => setTimeout(resolve, RAW_STDOUT_RETRY_DELAY_MS));
+		}
+	}
+}
+```
+
+## !!steps Taking over stdout
+
+`takeOverStdout` is idempotent. It replaces `process.stdout.write` with a function that forwards everything to the saved stderr writer, handling the overloaded signature where the second argument may be an encoding or the callback. The chunk is coerced with `String`, so a binary Uint8Array would be stringified rather than passed through.
+
+Original functions are stored first, then the state object is assigned.
+
+```ts ! output-guard.ts
+export function takeOverStdout(): void {
+	if (stdoutTakeoverState) {
+		return;
+	}
+
+	const rawStdoutWrite = process.stdout.write.bind(process.stdout) as StdoutTakeoverState["rawStdoutWrite"];
+	const rawStderrWrite = process.stderr.write.bind(process.stderr) as StdoutTakeoverState["rawStderrWrite"];
+	const originalStdoutWrite = process.stdout.write;
+
+	process.stdout.write = ((
+		chunk: string | Uint8Array,
+		encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+		callback?: (error?: Error | null) => void,
+	): boolean => {
+// !mark(1:2)
+		if (typeof encodingOrCallback === "function") {
+			return rawStderrWrite(String(chunk), encodingOrCallback);
+		}
+		return rawStderrWrite(String(chunk), callback);
+	}) as typeof process.stdout.write;
+
+	stdoutTakeoverState = {
+		rawStdoutWrite,
+		rawStderrWrite,
+		originalStdoutWrite,
+	};
+}
+```
+
+## !!steps Restoring and querying
+
+`restoreStdout` puts back the original function and clears the state. It is a no-op if no takeover is active. `isStdoutTakenOver` lets callers such as the startup code check whether diverting is already in effect.
+
+```ts ! output-guard.ts
+export function restoreStdout(): void {
+	if (!stdoutTakeoverState) {
+		return;
+	}
+
+	process.stdout.write = stdoutTakeoverState.originalStdoutWrite;
+	stdoutTakeoverState = undefined;
+}
+
+export function isStdoutTakenOver(): boolean {
+	return stdoutTakeoverState !== undefined;
+}
+```
+
+## !!steps Ordered raw writes
+
+`writeRawStdout` is fire-and-forget but ordered: each chunk is chained onto `rawStdoutWriteTail`, so two calls can never interleave. Empty strings are ignored.
+
+Failure policy is blunt: if any raw write ultimately fails, the process exits with code 1. A broken stdout means the protocol consumer is gone, so continuing would be pointless.
+
+```ts ! output-guard.ts
+export function writeRawStdout(text: string): void {
+	if (text.length === 0) {
+		return;
+	}
+// !mark
+	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
+// !mark(1:2)
+	void rawStdoutWriteTail.catch(() => {
+		process.exit(1);
+	});
+}
+```
+
+## !!steps Draining before exit
+
+`waitForRawStdoutBackpressure` loops until the tail promise stops changing, since more writes may be queued while it waits. `flushRawStdout` then writes an empty chunk, whose callback fires only after earlier data has been handed to the OS. Callers use it before exiting so the last JSON line is not lost.
+
+```ts ! output-guard.ts
+export async function waitForRawStdoutBackpressure(): Promise<void> {
+	while (true) {
+		const tail = rawStdoutWriteTail;
+// !mark(1:5)
+		await tail;
+		if (tail === rawStdoutWriteTail) {
+			return;
+		}
+	}
+}
+
+export async function flushRawStdout(): Promise<void> {
+	await waitForRawStdoutBackpressure();
+	await writeRawStdoutChunk("");
+}
+```
+
+</Scrollycoding>
+
+Everything in the file is module-level state, so there is one takeover per process. The design splits cleanly: `takeOverStdout` and `restoreStdout` control where accidental output goes, while the `writeRawStdout` family is the deliberate channel for protocol output.

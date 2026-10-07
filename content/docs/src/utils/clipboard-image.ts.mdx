@@ -1,0 +1,296 @@
+---
+title: "clipboard-image.ts"
+description: "Reads an image from the system clipboard across Wayland, X11, WSL and native backends"
+source: "src/utils/clipboard-image.ts"
+full: true
+---
+
+`clipboard-image.ts` answers one question: is there an image on the clipboard, and if so what are its bytes and MIME type. It is used when the user pastes into the TUI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+
+Each backend returns one of three outcomes: an image, `null` for a clipboard that is reachable but holds no image, or `undefined` when the backend itself failed. That distinction decides whether the next backend is tried. Shared plumbing comes from [clipboard-command.ts](/docs/src/utils/clipboard-command.ts), [mime.ts](/docs/src/utils/mime.ts), [photon.ts](/docs/src/utils/photon.ts) and [wsl.ts](/docs/src/utils/wsl.ts).
+
+<Scrollycoding>
+
+## !!steps Supported types and MIME helpers
+
+Four formats are supported: PNG, JPEG, WebP and GIF. `baseMimeType` strips parameters and lowercases, and `extensionForImageMimeType` maps those formats to file extensions (JPEG becomes `jpg`).
+
+```ts ! clipboard-image.ts
+export type ClipboardImage = {
+	bytes: Uint8Array;
+	mimeType: string;
+};
+
+// !mark
+const SUPPORTED_IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
+
+const DEFAULT_LIST_TIMEOUT_MS = 1000;
+const DEFAULT_POWERSHELL_TIMEOUT_MS = 5000;
+
+export function isWaylandSession(env: NodeJS.ProcessEnv = process.env): boolean {
+	return Boolean(env.WAYLAND_DISPLAY) || env.XDG_SESSION_TYPE === "wayland";
+}
+
+function baseMimeType(mimeType: string): string {
+	return mimeType.split(";")[0]?.trim().toLowerCase() ?? mimeType.toLowerCase();
+}
+
+// !mark
+export function extensionForImageMimeType(mimeType: string): string | null {
+	switch (baseMimeType(mimeType)) {
+		case "image/png":
+			return "png";
+		case "image/jpeg":
+			return "jpg";
+		case "image/webp":
+			return "webp";
+		case "image/gif":
+			return "gif";
+		default:
+			return null;
+	}
+}
+```
+
+## !!steps Choosing the best type
+
+`selectPreferredImageMimeType` walks the supported list in priority order and returns the first match from the clipboard's advertised types, keeping the raw string. If none is supported it returns any other `image/` type, which later triggers conversion.
+
+```ts ! clipboard-image.ts
+function selectPreferredImageMimeType(mimeTypes: string[]): string | null {
+	const normalized = mimeTypes
+		.map((t) => t.trim())
+		.filter(Boolean)
+		.map((t) => ({ raw: t, base: baseMimeType(t) }));
+
+	// !mark
+	for (const preferred of SUPPORTED_IMAGE_MIME_TYPES) {
+		const match = normalized.find((t) => t.base === preferred);
+		if (match) {
+			return match.raw;
+		}
+	}
+
+	// !mark
+	const anyImage = normalized.find((t) => t.base.startsWith("image/"));
+	return anyImage?.raw ?? null;
+}
+
+function isSupportedImageMimeType(mimeType: string): boolean {
+	const base = baseMimeType(mimeType);
+	return SUPPORTED_IMAGE_MIME_TYPES.some((t) => t === base);
+}
+```
+
+## !!steps Converting with Photon
+
+Unsupported formats such as Windows DIB wrapped as BMP are re-encoded to PNG through the Photon WASM library. The loader may return null, and every failure yields null. `free` is called in a `finally` to release WASM memory.
+
+```ts ! clipboard-image.ts
+/**
+ * Convert unsupported image formats to PNG using Photon.
+ * Returns null if conversion is unavailable or fails.
+ */
+async function convertToPng(bytes: Uint8Array): Promise<Uint8Array | null> {
+	// !mark
+	const photon = await loadPhoton();
+	if (!photon) {
+		return null;
+	}
+
+	try {
+		// !mark(1:5)
+		const image = photon.PhotonImage.new_from_byteslice(bytes);
+		try {
+			return image.get_bytes();
+		} finally {
+			image.free();
+		}
+	} catch {
+		return null;
+	}
+}
+```
+
+## !!steps Wayland through wl-paste
+
+The comment states the rule: an empty Wayland clipboard returns `null`, not `undefined`, so a stale X11 selection is not read instead. The function lists the types, selects one, then fetches it without a trailing newline.
+
+```ts ! clipboard-image.ts
+// !mark(1:2)
+// Undefined means the backend failed; null means it has no image. An empty
+// Wayland clipboard must not fall through to stale X11 clipboard contents.
+async function readClipboardImageViaWlPaste(): Promise<ClipboardImage | null | undefined> {
+	// !mark
+	const list = await runClipboardCommand("wl-paste", ["--list-types"], { timeoutMs: DEFAULT_LIST_TIMEOUT_MS });
+	if (list === undefined) return undefined;
+
+	const types = list
+		.toString("utf-8")
+		.split(/\r?\n/)
+		.map((t) => t.trim())
+		.filter(Boolean);
+
+	const selectedType = selectPreferredImageMimeType(types);
+	if (!selectedType) {
+		return null;
+	}
+
+	// !mark
+	const data = await runClipboardCommand("wl-paste", ["--type", selectedType, "--no-newline"]);
+	if (data === undefined) return undefined;
+	if (data.length === 0) return null;
+
+	return { bytes: data, mimeType: baseMimeType(selectedType) };
+}
+```
+
+## !!steps WSL through PowerShell
+
+Windows screenshots do not reach the Linux clipboard, so PowerShell loads `System.Windows.Forms`, saves the clipboard image as PNG into a temp file addressed through `wslpath`, and prints `ok` or `empty`. Bytes are read back and the file is removed afterwards.
+
+```ts ! clipboard-image.ts
+async function readClipboardImageViaPowerShell(): Promise<ClipboardImage | null> {
+	const tmpFile = join(tmpdir(), `pi-wsl-clip-${randomUUID()}.png`);
+
+	try {
+		const winPathResult = await runClipboardCommand("wslpath", ["-w", tmpFile], {
+			timeoutMs: DEFAULT_LIST_TIMEOUT_MS,
+		});
+		if (winPathResult === undefined) {
+			return null;
+		}
+
+		const winPath = winPathResult.toString("utf-8").trim();
+		if (!winPath) {
+			return null;
+		}
+
+		// !mark
+		const psQuotedWinPath = winPath.replaceAll("'", "''");
+		// !mark(1:6)
+		const psScript = [
+			"Add-Type -AssemblyName System.Windows.Forms",
+			"Add-Type -AssemblyName System.Drawing",
+			`$path = '${psQuotedWinPath}'`,
+			"$img = [System.Windows.Forms.Clipboard]::GetImage()",
+			"if ($img) { $img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png); Write-Output 'ok' } else { Write-Output 'empty' }",
+		].join("; ");
+
+		const result = await runClipboardCommand("powershell.exe", ["-NoProfile", "-Command", psScript], {
+			timeoutMs: DEFAULT_POWERSHELL_TIMEOUT_MS,
+		});
+		if (result === undefined) {
+			return null;
+		}
+
+		// !mark(1:3)
+		const output = result.toString("utf-8").trim();
+		if (output !== "ok") {
+			return null;
+		}
+
+		const bytes = readFileSync(tmpFile);
+		if (bytes.length === 0) {
+			return null;
+		}
+
+		return { bytes: new Uint8Array(bytes), mimeType: "image/png" };
+```
+
+## !!steps X11 and native backends
+
+`xclip` is queried for TARGETS first and then asked for the preferred target. The native backend asks `pi-tui` for image bytes and detects the type from the bytes, falling back to `application/octet-stream`.
+
+```ts ! clipboard-image.ts
+async function readClipboardImageViaXclip(): Promise<ClipboardImage | null | undefined> {
+	const targets = await runClipboardCommand("xclip", ["-selection", "clipboard", "-t", "TARGETS", "-o"], {
+		timeoutMs: DEFAULT_LIST_TIMEOUT_MS,
+	});
+
+	// !mark
+	if (targets === undefined) return undefined;
+
+	const candidateTypes = targets
+		.toString("utf-8")
+		.split(/\r?\n/)
+		.map((t) => t.trim())
+		.filter(Boolean);
+	const preferred = selectPreferredImageMimeType(candidateTypes);
+	if (!preferred) return null;
+
+	const data = await runClipboardCommand("xclip", ["-selection", "clipboard", "-t", preferred, "-o"]);
+	if (data === undefined) return undefined;
+	if (data.length === 0) return null;
+	return { bytes: data, mimeType: baseMimeType(preferred) };
+}
+
+async function readClipboardImageViaNativeClipboard(): Promise<ClipboardImage | null | undefined> {
+	const bytes = await getNativeClipboard()?.getImage();
+	if (bytes === undefined) return undefined;
+	if (!bytes?.length) return null;
+	// !mark
+	return { bytes, mimeType: detectSupportedImageMimeType(bytes) ?? "application/octet-stream" };
+}
+```
+
+## !!steps The readClipboardImage orchestration
+
+Termux returns null. On Linux, Wayland or WSL tries `wl-paste`, then `xclip` if that failed, then PowerShell on WSL when nothing was found, and finally the native backend if every route failed. Other platforms use the native backend directly. `env` and `platform` are injectable for tests.
+
+```ts ! clipboard-image.ts
+export async function readClipboardImage(options?: {
+	env?: NodeJS.ProcessEnv;
+	platform?: NodeJS.Platform;
+}): Promise<ClipboardImage | null> {
+	const env = options?.env ?? process.env;
+	const platform = options?.platform ?? process.platform;
+
+	// !mark(1:3)
+	if (env.TERMUX_VERSION) {
+		return null;
+	}
+
+	let image: ClipboardImage | null | undefined;
+
+	// !mark(1:9)
+	if (platform === "linux") {
+		const wsl = isWSL(env);
+		if (isWaylandSession(env) || wsl) {
+			image = await readClipboardImageViaWlPaste();
+		}
+		if (image === undefined) image = await readClipboardImageViaXclip();
+		// Preserve Linux's empty/unavailable distinction if Windows has no image.
+		if (!image && wsl) image = (await readClipboardImageViaPowerShell()) ?? image;
+		if (image === undefined) image = await readClipboardImageViaNativeClipboard();
+	} else {
+		image = await readClipboardImageViaNativeClipboard();
+	}
+```
+
+## !!steps Final conversion
+
+If an image was found but its type is not supported, it is converted to PNG; failure to convert gives null.
+
+```ts ! clipboard-image.ts
+	if (!image) {
+		return null;
+	}
+
+	// Convert unsupported formats (e.g., Windows DIB data wrapped as BMP) to PNG
+	// !mark
+	if (!isSupportedImageMimeType(image.mimeType)) {
+		const pngBytes = await convertToPng(image.bytes);
+		if (!pngBytes) {
+			return null;
+		}
+		return { bytes: pngBytes, mimeType: "image/png" };
+	}
+
+	return image;
+}
+```
+
+</Scrollycoding>
+
+The `null` versus `undefined` protocol keeps the backend chain honest. Only `isWaylandSession`, `extensionForImageMimeType` and `readClipboardImage` are exported; the backends stay private to this file.

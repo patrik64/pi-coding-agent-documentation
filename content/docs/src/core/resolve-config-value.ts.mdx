@@ -1,0 +1,358 @@
+---
+title: "resolve-config-value.ts"
+description: "Turns config strings such as API keys and header values into real values: shell commands, environment variable templates, or literals"
+source: "src/core/resolve-config-value.ts"
+full: true
+---
+
+Configuration fields like an API key in models.json can be written three ways: a literal, a template that interpolates environment variables, or a leading bang followed by a shell command. This file defines the syntax and resolves it.
+
+It is used by [auth-storage.ts](/docs/src/core/auth-storage.ts), [provider-composer.ts](/docs/src/core/provider-composer.ts) and the MCP runtime in [runtime.ts](/docs/src/extensions/mcp/runtime.ts). Separate functions answer whether a value is configured without running anything, so the UI can show status cheaply.
+
+<Scrollycoding>
+
+## !!steps Two kinds of value
+
+Parsing yields either a command (any string starting with an exclamation mark) or a template made of literal and environment parts. Command results are cached for the life of the process in a module-level map, keyed by the whole config string.
+
+```ts ! resolve-config-value.ts
+// Cache for shell command results (persists for process lifetime)
+// !mark
+const commandResultCache = new Map<string, string | undefined>();
+const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENV_VAR_NAME_PREFIX_RE = /^[A-Za-z_][A-Za-z0-9_]*/;
+
+type TemplatePart = { type: "literal"; value: string } | { type: "env"; name: string };
+
+type ConfigValueReference = { type: "command"; config: string } | { type: "template"; parts: TemplatePart[] };
+// ...
+function parseConfigValueReference(config: string): ConfigValueReference {
+// !mark(1:3)
+	if (config.startsWith("!")) {
+		return { type: "command", config };
+	}
+
+	return { type: "template", parts: parseConfigValueTemplate(config) };
+}
+```
+
+## !!steps Parsing a template
+
+The parser scans for dollar signs. A doubled dollar or a dollar followed by a bang is an escape for the literal character, which is how a non-command value can begin with a bang. Braced references are accepted only if the name is a valid identifier; otherwise the original text is kept literally. An unclosed brace leaves the dollar as a literal.
+
+An unbraced dollar followed by identifier characters is an environment reference that takes the longest match. Adjacent literals are merged so parts stay compact.
+
+```ts ! resolve-config-value.ts
+function parseConfigValueTemplate(config: string): TemplatePart[] {
+	const parts: TemplatePart[] = [];
+	let index = 0;
+
+	while (index < config.length) {
+		const dollarIndex = config.indexOf("$", index);
+		if (dollarIndex < 0) {
+			appendLiteral(parts, config.slice(index));
+			break;
+		}
+
+		appendLiteral(parts, config.slice(index, dollarIndex));
+		const nextChar = config[dollarIndex + 1];
+
+// !mark(1:5)
+		if (nextChar === "$" || nextChar === "!") {
+			appendLiteral(parts, nextChar);
+			index = dollarIndex + 2;
+			continue;
+		}
+
+// !mark(1:2)
+		if (nextChar === "{") {
+			const endIndex = config.indexOf("}", dollarIndex + 2);
+			if (endIndex < 0) {
+				appendLiteral(parts, "$");
+				index = dollarIndex + 1;
+				continue;
+			}
+
+			const name = config.slice(dollarIndex + 2, endIndex);
+			if (ENV_VAR_NAME_RE.test(name)) {
+				parts.push({ type: "env", name });
+			} else {
+				appendLiteral(parts, config.slice(dollarIndex, endIndex + 1));
+			}
+			index = endIndex + 1;
+			continue;
+		}
+
+// !mark(1:3)
+		const match = config.slice(dollarIndex + 1).match(ENV_VAR_NAME_PREFIX_RE);
+		if (match) {
+			parts.push({ type: "env", name: match[0] });
+			index = dollarIndex + 1 + match[0].length;
+			continue;
+		}
+
+		appendLiteral(parts, "$");
+		index = dollarIndex + 1;
+	}
+
+	return parts;
+}
+```
+
+## !!steps Resolving environment parts
+
+A variable is looked up first in an explicit env map, then in the process environment. An empty string counts as missing, because of the `||` fallbacks. In `resolveTemplate`, one missing variable makes the whole value undefined rather than producing a partial string.
+
+```ts ! resolve-config-value.ts
+function resolveEnvConfigValue(name: string, env?: Record<string, string>): string | undefined {
+// !mark
+	return env?.[name] || process.env[name] || undefined;
+}
+
+function getTemplateEnvVarNames(parts: TemplatePart[]): string[] {
+	const names: string[] = [];
+	for (const part of parts) {
+		if (part.type !== "env" || names.includes(part.name)) continue;
+		names.push(part.name);
+	}
+	return names;
+}
+
+function resolveTemplate(parts: TemplatePart[], env?: Record<string, string>): string | undefined {
+	let resolved = "";
+	for (const part of parts) {
+		if (part.type === "literal") {
+			resolved += part.value;
+			continue;
+		}
+		const envValue = resolveEnvConfigValue(part.name, env);
+// !mark(1:2)
+		if (envValue === undefined) return undefined;
+		resolved += envValue;
+	}
+	return resolved;
+}
+```
+
+## !!steps Inspecting without resolving
+
+Helpers expose the variable names, the single-variable case, which names are missing, and whether the value is a command. `isConfigValueConfigured` is true for any command, since it cannot be checked without running it. These let [provider-composer.ts](/docs/src/core/provider-composer.ts) report auth status for free.
+
+```ts ! resolve-config-value.ts
+export function getConfigValueEnvVarName(config: string): string | undefined {
+	const reference = parseConfigValueReference(config);
+	if (reference.type !== "template") return undefined;
+// !mark
+	return reference.parts.length === 1 && reference.parts[0]?.type === "env" ? reference.parts[0].name : undefined;
+}
+
+export function getConfigValueEnvVarNames(config: string): string[] {
+	const reference = parseConfigValueReference(config);
+	return reference.type === "template" ? getTemplateEnvVarNames(reference.parts) : [];
+}
+
+export function getMissingConfigValueEnvVarNames(config: string, env?: Record<string, string>): string[] {
+	return getConfigValueEnvVarNames(config).filter((name) => resolveEnvConfigValue(name, env) === undefined);
+}
+
+export function isCommandConfigValue(config: string): boolean {
+	return parseConfigValueReference(config).type === "command";
+}
+
+// !mark(1:2)
+export function isConfigValueConfigured(config: string, env?: Record<string, string>): boolean {
+	return getMissingConfigValueEnvVarNames(config, env).length === 0;
+}
+```
+
+## !!steps The public resolver
+
+`resolveConfigValue` is the cached entry point. Its doc comment lists the syntax, including the escapes that apply only to non-command values.
+
+```ts ! resolve-config-value.ts
+/**
+ * Resolve a config value (API key, header value, etc.) to an actual value.
+ * - If starts with "!", executes the rest as a shell command and uses stdout (cached)
+ * - Interpolates "$ENV_VAR" or "${ENV_VAR}" references with the named environment variable
+ * - In non-command values, "$$" escapes a literal "$" and "$!" escapes a literal "!"
+ * - Otherwise treats the value as a literal
+ */
+// !mark(1:6)
+export function resolveConfigValue(config: string, env?: Record<string, string>): string | undefined {
+	const reference = parseConfigValueReference(config);
+	if (reference.type === "command") {
+		return executeCommand(reference.config);
+	}
+	return resolveTemplate(reference.parts, env);
+}
+```
+
+## !!steps Running commands
+
+Commands have a ten second timeout, ignore stderr, and trim stdout. Failure, nonzero exit, or empty output all become undefined.
+
+On Windows the configured shell from [shell.ts](/docs/src/utils/shell.ts) is tried first, with the command passed as an argument or through stdin depending on the shell. The fallback to `execSync` happens only when the shell is missing (ENOENT) or spawning throws. Elsewhere `execSync` is used directly, going through the default shell.
+
+The cache stores failures too, so a command that failed once is never retried until `clearConfigValueCache` runs.
+
+```ts ! resolve-config-value.ts
+function executeWithConfiguredShell(command: string): { executed: boolean; value: string | undefined } {
+	try {
+		const { shell, args, commandTransport } = getShellConfig();
+		const commandFromStdin = commandTransport === "stdin";
+		const result = spawnSync(shell, commandFromStdin ? args : [...args, command], {
+			encoding: "utf-8",
+			input: commandFromStdin ? command : undefined,
+// !mark(1:5)
+			timeout: 10000,
+			stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "ignore"],
+			shell: false,
+			windowsHide: true,
+		});
+
+		if (result.error) {
+			const error = result.error as NodeJS.ErrnoException;
+			if (error.code === "ENOENT") {
+				return { executed: false, value: undefined };
+			}
+			return { executed: true, value: undefined };
+		}
+
+		if (result.status !== 0) {
+			return { executed: true, value: undefined };
+		}
+
+		const value = (result.stdout ?? "").trim();
+		return { executed: true, value: value || undefined };
+	} catch {
+		return { executed: false, value: undefined };
+	}
+}
+
+function executeWithDefaultShell(command: string): string | undefined {
+	try {
+// !mark(1:3)
+		const output = execSync(command, {
+			encoding: "utf-8",
+			timeout: 10000,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return output.trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function executeCommandUncached(commandConfig: string): string | undefined {
+	const command = commandConfig.slice(1);
+	return process.platform === "win32"
+		? (() => {
+				const configuredResult = executeWithConfiguredShell(command);
+				return configuredResult.executed ? configuredResult.value : executeWithDefaultShell(command);
+			})()
+		: executeWithDefaultShell(command);
+}
+
+// !mark(1:9)
+function executeCommand(commandConfig: string): string | undefined {
+	if (commandResultCache.has(commandConfig)) {
+		return commandResultCache.get(commandConfig);
+	}
+
+	const result = executeCommandUncached(commandConfig);
+	commandResultCache.set(commandConfig, result);
+	return result;
+}
+```
+
+## !!steps Uncached and throwing variants
+
+`resolveConfigValueUncached` skips the cache, and `resolveConfigValueOrThrow` builds on it to produce descriptive errors: the failed command text, or the names of missing environment variables, singular or plural.
+
+```ts ! resolve-config-value.ts
+/**
+ * Resolve all header values using the same resolution logic as API keys.
+ */
+// !mark
+export function resolveConfigValueUncached(config: string, env?: Record<string, string>): string | undefined {
+	const reference = parseConfigValueReference(config);
+	if (reference.type === "command") {
+		return executeCommandUncached(reference.config);
+	}
+	return resolveTemplate(reference.parts, env);
+}
+
+// !mark(1:2)
+export function resolveConfigValueOrThrow(config: string, description: string, env?: Record<string, string>): string {
+	const resolvedValue = resolveConfigValueUncached(config, env);
+	if (resolvedValue !== undefined) {
+		return resolvedValue;
+	}
+
+	const reference = parseConfigValueReference(config);
+	if (reference.type === "command") {
+		throw new Error(`Failed to resolve ${description} from shell command: ${reference.config.slice(1)}`);
+	}
+
+	if (reference.type === "template") {
+// !mark(1:8)
+		const missingEnvVars = getMissingConfigValueEnvVarNames(config, env);
+		if (missingEnvVars.length === 1) {
+			throw new Error(`Failed to resolve ${description} from environment variable: ${missingEnvVars[0]}`);
+		}
+		if (missingEnvVars.length > 1) {
+			throw new Error(`Failed to resolve ${description} from environment variables: ${missingEnvVars.join(", ")}`);
+		}
+	}
+
+	throw new Error(`Failed to resolve ${description}`);
+}
+```
+
+## !!steps Headers
+
+`resolveHeaders` drops headers whose value resolves to nothing and returns undefined if none survive. `resolveHeadersOrThrow` instead throws on the first failure, naming the header. The cache clear function at the end is documented as exported for testing.
+
+```ts ! resolve-config-value.ts
+/**
+ * Resolve all header values using the same resolution logic as API keys.
+ */
+export function resolveHeaders(
+	headers: Record<string, string> | undefined,
+	env?: Record<string, string>,
+): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+// !mark(1:4)
+		const resolvedValue = resolveConfigValue(value, env);
+		if (resolvedValue) {
+			resolved[key] = resolvedValue;
+		}
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+export function resolveHeadersOrThrow(
+	headers: Record<string, string> | undefined,
+	description: string,
+	env?: Record<string, string>,
+): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+// !mark
+		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`, env);
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+/** Clear the config value command cache. Exported for testing. */
+export function clearConfigValueCache(): void {
+	commandResultCache.clear();
+}
+```
+
+</Scrollycoding>
+
+Everything funnels through `parseConfigValueReference`, so command detection and template parsing stay consistent across the inspect, resolve and throw variants. Two small defects: the doc comment on `resolveConfigValueUncached` is a copy of the one on `resolveHeaders` and does not describe the function, and the failure caching means a command that fails during startup stays failed.

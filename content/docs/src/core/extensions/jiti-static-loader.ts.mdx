@@ -1,0 +1,35 @@
+---
+title: "jiti-static-loader.ts"
+description: "Re-exports jiti's static entry so compiled Bun and SEA binaries embed the Babel transform"
+source: "src/core/extensions/jiti-static-loader.ts"
+full: true
+---
+
+Compiled pi binaries cannot discover jiti's transform at runtime the way a Node install can. This file re-exports `createJiti` from `jiti/static` so bundlers see the dependency and embed it.
+
+It is chosen by [loader.ts](/docs/src/core/extensions/loader.ts) when running from embedded modules, with [jiti-loader.ts](/docs/src/core/extensions/jiti-loader.ts) as the source-install counterpart.
+
+<Scrollycoding>
+
+## !!steps The static entry for bundlers
+
+The comment states the reason: Bun and SEA bundlers must see the Babel transform statically to embed it. The module stays lazy because it is only imported dynamically once an extension is loaded.
+
+```ts ! jiti-static-loader.ts
+// Compiled binaries need jiti's static entry so Bun and SEA bundlers embed the
+// Babel transform. The module itself remains lazy until an extension is loaded.
+// !mark
+export { createJiti } from "jiti/static";
+```
+
+## !!steps Why two near-identical files
+
+Both loader files export the same name, so the loader can treat them interchangeably and pick one by a flag. Splitting them into separate files, rather than branching inside one, keeps the unused variant out of the module graph at runtime. Extensions' own imports are served from [virtual-modules.ts](/docs/src/core/extensions/virtual-modules.ts).
+
+```ts ! jiti-static-loader.ts
+export { createJiti } from "jiti/static";
+```
+
+</Scrollycoding>
+
+Like its twin, this file has no logic of its own. Its value is purely in which import specifier a bundler sees.

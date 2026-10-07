@@ -1,0 +1,64 @@
+---
+title: "settings-diagnostics.ts"
+description: "Turns queued settings-file errors into startup warnings and removes duplicate diagnostics"
+source: "src/core/settings-diagnostics.ts"
+full: true
+---
+
+Settings files can be malformed, and the settings manager records the error
+instead of throwing so the app can still start. This file converts those
+recorded errors into the diagnostic objects the runtime shows to the user, and
+provides a helper to collapse duplicates.
+
+The error queue lives in [settings-manager.ts](/docs/src/core/settings-manager.ts),
+and the diagnostic type is defined by
+[agent-session-services.ts](/docs/src/core/agent-session-services.ts).
+
+<Scrollycoding>
+
+## !!steps Draining the manager into warnings
+
+`drainErrors()` returns and clears the queued errors, so each error is
+reported once per drain. Every one becomes a `warning`, never an error:
+a bad settings file should not stop the session.
+
+The message depends on what is known. With a file path it names the file;
+without one it names the scope, such as global or project settings.
+
+```ts ! settings-diagnostics.ts
+export function collectSettingsDiagnostics(settingsManager: SettingsManager): AgentSessionRuntimeDiagnostic[] {
+	return settingsManager.drainErrors().map(({ scope, path, error }) => ({
+		type: "warning",
+		message: path ? `Invalid settings file ${path}: ${error.message}` : `Invalid ${scope} settings: ${error.message}`,
+	}));
+}
+```
+
+## !!steps Deduplicating by type and message
+
+More than one settings manager can read the same files, for example one at
+startup and another created for the runtime, so the same parse error can be
+reported twice. The key joins type and message with a NUL character, which
+cannot appear in either, so distinct pairs never collide. The filter keeps the
+first occurrence and preserves order.
+
+```ts ! settings-diagnostics.ts
+export function deduplicateDiagnostics(
+	diagnostics: readonly AgentSessionRuntimeDiagnostic[],
+): AgentSessionRuntimeDiagnostic[] {
+	const seen = new Set<string>();
+	return diagnostics.filter((diagnostic) => {
+		const key = `${diagnostic.type}\0${diagnostic.message}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+```
+
+</Scrollycoding>
+
+The deduplication helper is generic over the diagnostic list, not just
+settings, so any code merging diagnostics from several sources can use it. The
+resource-oriented counterpart for skills and prompts is in
+[diagnostics.ts](/docs/src/core/diagnostics.ts).

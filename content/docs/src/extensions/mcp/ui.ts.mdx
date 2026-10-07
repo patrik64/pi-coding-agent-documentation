@@ -1,0 +1,260 @@
+---
+title: "ui.ts"
+description: "The /mcp manager view: a single TUI component that swaps between live-updating menus, status messages and a sign-in screen that accepts a pasted redirect URL"
+source: "src/extensions/mcp/ui.ts"
+full: true
+---
+
+When a user runs `/mcp`, they see a bordered panel that changes content as they navigate: a server list, a server's actions, a status message while something connects, and the sign-in screen. This file implements that panel as one component, `McpManagerView`, behind a small `McpUi` interface so the management logic in [index.ts](/docs/src/extensions/mcp/index.ts) can be written as plain async code (`await ui.menu(...)`) without knowing about the TUI.
+
+It is built from the components of the terminal UI library plus pi's own [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) and [auth-url.ts](/docs/src/modes/interactive/components/auth-url.ts), themed through [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and bound to keys through [keybindings.ts](/docs/src/core/keybindings.ts). The OAuth side of the sign-in is in [oauth.ts](/docs/src/extensions/mcp/oauth.ts).
+
+<Scrollycoding>
+
+## !!steps The interface the manager logic sees
+
+`McpMenu` is a description of a screen, not a screen: title, items, optional error and the labels for the confirm and cancel hints. `McpUi` has three operations. `menu` takes a builder function plus an optional `subscribe`, so the menu can be rebuilt whenever server state changes while it is open, keeping the selected item. `redirectUrl` resolves when the user pastes a URL, cancels, or the abort signal fires because the browser callback arrived first.
+
+```ts ! ui.ts
+export interface McpMenu {
+	title: string;
+	/** Shown below the title. */
+	details?: string;
+	/** Shown below the details in the error color. */
+	error?: string;
+	items: SelectItem[];
+	/** Shown when there are no items. */
+	empty?: string;
+	/** Value of the item selected when the menu opens. */
+	selected?: string;
+	/** What the confirm key does, for the key hint. */
+	confirmLabel: string;
+	/** What the cancel key does, for the key hint. */
+	cancelLabel: string;
+}
+
+export interface McpUi {
+	/**
+	 * Show a menu and resolve to the chosen item's value, or undefined when cancelled. `subscribe`
+	 * rebuilds the menu on every change, keeping the selected item.
+	 */
+	// !mark
+	menu(build: () => McpMenu, subscribe?: (listener: () => void) => () => void): Promise<string | undefined>;
+	/** Show a message while an operation runs. */
+	status(title: string, message: string): void;
+	/**
+	 * Show the authorization URL and wait for a pasted redirect URL. Resolves to undefined when
+	 * cancelled or when `signal` aborts (the browser reached the callback).
+	 */
+	// !mark
+	redirectUrl(title: string, authorizationUrl: string, signal: AbortSignal): Promise<string | undefined>;
+}
+```
+
+## !!steps Every screen shares one frame
+
+`frame` wraps any body in an accent-colored top and bottom border, a bold title and an optional dim footer. All screens go through it, which is what makes the panel look like a single window whose content changes.
+
+```ts ! ui.ts
+function frame(theme: Theme, title: string, body: Component[], footer?: string): Container {
+	const container = new Container();
+	// !mark
+	container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+	container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+	for (const child of body) container.addChild(child);
+	if (footer) {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg("dim", footer), 1, 0));
+	}
+	// !mark
+	container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+	return container;
+}
+```
+
+## !!steps Swapping content and moving focus
+
+The view holds one `content` container and one input handler. `setContent` replaces them together and requests a render. Focus is forwarded: the view is `Focusable`, and when the current screen has an input widget, it receives the focus state, with the previous target unfocused first. This keeps the text cursor correct when screens change.
+
+```ts ! ui.ts
+	get focused(): boolean {
+		return this._focused;
+	}
+
+	set focused(value: boolean) {
+		this._focused = value;
+		if (this.inputTarget) this.inputTarget.focused = value;
+	}
+
+	private setContent(content: Container, inputHandler?: (data: string) => void, inputTarget?: Focusable): void {
+		// !mark
+		if (this.inputTarget) this.inputTarget.focused = false;
+		this.content = content;
+		this.inputHandler = inputHandler;
+		this.inputTarget = inputTarget;
+		// !mark(1:2)
+		if (this.inputTarget) this.inputTarget.focused = this._focused;
+		this.tui.requestRender();
+	}
+```
+
+## !!steps A menu that rebuilds itself
+
+`menu` returns a promise that settles once, guarded by `settled`. Each `render` calls the builder again, restores the selected value (the user's last selection wins over the builder's default), and installs a `SelectList`. Selection changes are tracked so a later rebuild keeps the cursor on the same item. An empty menu shows the empty message and only listens for cancel.
+
+```ts ! ui.ts
+	menu(build: () => McpMenu, subscribe?: (listener: () => void) => () => void): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			let unsubscribe: (() => void) | undefined;
+			let settled = false;
+			// !mark(1:6)
+			const finish = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				unsubscribe?.();
+				resolve(value);
+			};
+			let selected: string | undefined;
+			const render = () => {
+				const menu = build();
+				// !mark
+				const wanted = selected ?? menu.selected;
+				const body: Component[] = [];
+				if (menu.details) body.push(new Text(this.theme.fg("muted", menu.details), 1, 0));
+				if (menu.error) body.push(new Text(this.theme.fg("error", menu.error), 1, 0));
+				body.push(new Spacer(1));
+				const footer = `${keyHint("tui.select.confirm", menu.confirmLabel)} • ${keyHint("tui.select.cancel", menu.cancelLabel)}`;
+				if (menu.items.length === 0) {
+					body.push(new Text(this.theme.fg("muted", menu.empty ?? "Nothing to show."), 1, 0));
+					this.setContent(
+						frame(this.theme, menu.title, body, keyHint("tui.select.cancel", menu.cancelLabel)),
+						(data) => {
+							if (this.keybindings.matches(data, "tui.select.cancel")) finish(undefined);
+						},
+					);
+					return;
+				}
+				const list = new SelectList(
+					menu.items,
+					Math.min(menu.items.length, MAX_VISIBLE_ITEMS),
+					getSelectListTheme(),
+				);
+				// !mark(1:3)
+				const index = menu.items.findIndex((item) => item.value === wanted);
+				if (index !== -1) list.setSelectedIndex(index);
+				selected = list.getSelectedItem()?.value;
+				list.onSelectionChange = (item) => {
+					selected = item.value;
+				};
+				list.onSelect = (item) => finish(item.value);
+				list.onCancel = () => finish(undefined);
+				body.push(list);
+				this.setContent(frame(this.theme, menu.title, body, footer), (data) => list.handleInput(data));
+			};
+			render();
+			// !mark(1:3)
+			unsubscribe = subscribe?.(() => {
+				if (!settled) render();
+			});
+		});
+	}
+```
+
+## !!steps Pasting a redirect URL
+
+When the browser cannot reach the loopback callback (over SSH, for example), the user can paste the URL the browser was sent to. `redirectUrl` shows the authorization link with a copy key and an `Input`, and resolves with the trimmed value on confirm. It also resolves undefined on cancel or when the signal aborts, and an already aborted signal resolves immediately. The listener is removed in `finish`.
+
+The result feeds `promptForRedirectUrl` in [oauth.ts](/docs/src/extensions/mcp/oauth.ts).
+
+```ts ! ui.ts
+	redirectUrl(title: string, authorizationUrl: string, signal: AbortSignal): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			let settled = false;
+			const finish = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				// !mark
+				signal.removeEventListener("abort", onAbort);
+				resolve(value);
+			};
+			const onAbort = () => finish(undefined);
+			// !mark
+			if (signal.aborted) {
+				finish(undefined);
+				return;
+			}
+			// !mark
+			signal.addEventListener("abort", onAbort, { once: true });
+			const input = new Input();
+			const link = new AuthUrlComponent(this.tui, authorizationUrl);
+```
+
+## !!steps Input handling and rendering
+
+Key handling is a closure per screen: confirm submits a non-empty value, cancel gives up, the copy key copies the link, and anything else goes to the input. At the component level, `handleInput` delegates to the current handler. `render` clips every line to the terminal width, since a long authorization URL would otherwise overflow.
+
+```ts ! ui.ts
+				(data) => {
+					// !mark(1:4)
+					if (this.keybindings.matches(data, "tui.select.confirm")) {
+						const value = input.getValue().trim();
+						if (value) finish(value);
+						return;
+					}
+					// !mark(1:3)
+					if (this.keybindings.matches(data, "tui.select.cancel")) {
+						finish(undefined);
+						return;
+					}
+					if (this.keybindings.matches(data, "app.message.copy")) {
+						void link.copy();
+						return;
+					}
+					input.handleInput(data);
+				},
+				input,
+			);
+		});
+	}
+
+	handleInput(data: string): void {
+		this.inputHandler?.(data);
+		this.tui.requestRender();
+	}
+
+	render(width: number): string[] {
+		// !mark(1:3)
+		return this.content
+			.render(width)
+			.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "") : line));
+	}
+```
+
+## !!steps Running the manager
+
+`showMcpManager` hosts the view in the custom UI slot of the command context and runs the supplied `manage` function against it. When `manage` finishes, the panel closes; when it throws, the error is shown as a notification first and the panel still closes.
+
+```ts ! ui.ts
+/** Run `manage` in the manager view until it returns. */
+export async function showMcpManager(
+	ctx: ExtensionCommandContext,
+	manage: (ui: McpUi) => Promise<void>,
+): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+		const view = new McpManagerView(tui, theme, keybindings);
+		// !mark(1:6)
+		void manage(view).then(
+			() => done(),
+			(error: unknown) => {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				done();
+			},
+		);
+		return view;
+	});
+}
+```
+
+</Scrollycoding>
+
+The view is deliberately dumb: no knowledge of servers or OAuth, only screens and input. All decisions stay in [index.ts](/docs/src/extensions/mcp/index.ts), which makes this file the only one that would change if the panel's look did.

@@ -1,0 +1,198 @@
+---
+title: "http-dispatcher.ts"
+description: "Configures the global undici dispatcher and fetch: idle timeouts, proxy env support, and crash-proofing for mid-stream errors"
+source: "src/core/http-dispatcher.ts"
+full: true
+---
+
+Every model request in pi goes through global `fetch`, which is backed by undici. This file replaces the global dispatcher with one tuned for long-lived streaming responses, and holds the helpers that parse and format the user-facing idle-timeout setting.
+
+The timeout matters because a model can go quiet for minutes while thinking; the default of five minutes applies to both headers and body. The proxy handling comes from undici's env-aware agent, plus a small helper to turn a configured proxy into environment variables. It is called from [main.ts](/docs/src/main.ts) and configured through [settings-manager.ts](/docs/src/core/settings-manager.ts).
+
+<Scrollycoding>
+
+## !!steps Timeout defaults and the choices list
+
+`DEFAULT_HTTP_IDLE_TIMEOUT_MS` is five minutes. The separate connection-attempt timeout of two seconds exists because Node's own 250 ms default can kill valid attempts on high-latency routes.
+
+`HTTP_IDLE_TIMEOUT_CHOICES` is the menu shown in settings. A value of 0 is spelled `disabled`, and undici treats 0 as no timeout.
+
+```ts ! http-dispatcher.ts
+// !mark
+export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
+// Node's 250ms default can terminate valid connection attempts on high-latency routes.
+const DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 2_000;
+
+export const HTTP_IDLE_TIMEOUT_CHOICES = [
+	{ label: "30 sec", timeoutMs: 30_000 },
+	{ label: "1 min", timeoutMs: 60_000 },
+	{ label: "2 min", timeoutMs: 120_000 },
+	{ label: "5 min", timeoutMs: 300_000 },
+	// !mark
+	{ label: "disabled", timeoutMs: 0 },
+] as const;
+```
+
+## !!steps Remembering the original fetch
+
+Two module-level variables support a later decision about whether to replace `fetch`. `originalGlobalFetch` captures whatever `fetch` was at module load, and `installedGlobalFetch` records what this module itself installed.
+
+```ts ! http-dispatcher.ts
+// !mark(1:2)
+const originalGlobalFetch = globalThis.fetch;
+let installedGlobalFetch: typeof globalThis.fetch | undefined;
+```
+
+## !!steps Parsing the timeout setting
+
+The parser accepts numbers or strings. The string `disabled` maps to 0, an empty string is `undefined`, and other strings are re-parsed as numbers. Negative, infinite and non-numeric values yield `undefined`, and fractions are floored.
+
+Returning `undefined` rather than throwing lets settings code decide whether to fall back or report.
+
+```ts ! http-dispatcher.ts
+export function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		// !mark(1:2)
+		if (trimmed.toLowerCase() === "disabled") {
+			return 0;
+		}
+		if (trimmed.length === 0) {
+			return undefined;
+		}
+		return parseHttpIdleTimeoutMs(Number(trimmed));
+	}
+
+	// !mark
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		return undefined;
+	}
+	return Math.floor(value);
+}
+```
+
+## !!steps Formatting and proxy settings
+
+Formatting is the inverse for display: a known choice gets its label, anything else becomes seconds. The proxy helper uses `??=`, so an existing `HTTP_PROXY` or `HTTPS_PROXY` in the environment always beats the configured value.
+
+```ts ! http-dispatcher.ts
+export function formatHttpIdleTimeoutMs(timeoutMs: number): string {
+	const choice = HTTP_IDLE_TIMEOUT_CHOICES.find((item) => item.timeoutMs === timeoutMs);
+	if (choice) {
+		return choice.label;
+	}
+	return `${timeoutMs / 1000} sec`;
+}
+
+export function applyHttpProxySettings(httpProxy: string | undefined): void {
+	const proxy = httpProxy?.trim();
+	if (!proxy) return;
+	// !mark(1:2)
+	process.env.HTTP_PROXY ??= proxy;
+	process.env.HTTPS_PROXY ??= proxy;
+}
+```
+
+## !!steps Keeping undici's internal errors from crashing pi
+
+Undici can emit an `error` event on a client while it tears down a mid-stream body. With no listener, Node's EventEmitter rethrows it as an uncaught exception. The body read still rejects normally, so a no-op listener loses nothing.
+
+`withUndiciErrorListener` attaches that listener to any dispatcher that is an EventEmitter.
+
+```ts ! http-dispatcher.ts
+// !mark
+const ignoreUndiciDispatcherError = (_error: unknown): void => {};
+
+// Undici can emit an internal Client "error" while terminating a mid-stream
+// fetch body. The body stream still rejects through reader.read(); this listener
+// only prevents EventEmitter's unhandled "error" special case from crashing pi.
+function withUndiciErrorListener<T extends undici.Dispatcher>(dispatcher: T): T {
+	if (dispatcher instanceof EventEmitter) {
+		// !mark
+		EventEmitter.prototype.on.call(dispatcher, "error", ignoreUndiciDispatcherError);
+	}
+	return dispatcher;
+}
+```
+
+## !!steps Client and pool factories
+
+Every client undici creates goes through `createUndiciClient`, so each one gets the listener. For origins, a pool is built whose own factory is that same function. If `connections` is 1, a single client is used instead of a pool of one.
+
+```ts ! http-dispatcher.ts
+function createUndiciClient(origin: string | URL, options: object): undici.Dispatcher {
+	return withUndiciErrorListener(new undici.Client(origin, options as undici.Client.Options));
+}
+
+function createUndiciOriginDispatcher(origin: string | URL, options: object): undici.Dispatcher {
+	const dispatcherOptions = options as undici.Pool.Options;
+	// !mark(1:2)
+	if (dispatcherOptions.connections === 1) {
+		return createUndiciClient(origin, dispatcherOptions);
+	}
+	return withUndiciErrorListener(
+		new undici.Pool(origin, {
+			...dispatcherOptions,
+			// !mark
+			factory: createUndiciClient,
+		}),
+	);
+}
+```
+
+## !!steps Installing the dispatcher
+
+`configureHttpDispatcher` validates the timeout first and throws on a bad value. It then builds an `EnvHttpProxyAgent`, which reads the proxy environment variables, with HTTP/2 off and CONNECT tunnels kept for plain HTTP origins. Both `headersTimeout` and `bodyTimeout` use the configured value.
+
+```ts ! http-dispatcher.ts
+export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TIMEOUT_MS): void {
+	// !mark(1:3)
+	const normalizedTimeoutMs = parseHttpIdleTimeoutMs(timeoutMs);
+	if (normalizedTimeoutMs === undefined) {
+		throw new Error(`Invalid HTTP idle timeout: ${String(timeoutMs)}`);
+	}
+	const dispatcher = withUndiciErrorListener(
+		new undici.EnvHttpProxyAgent({
+			// !mark
+			allowH2: false,
+			// Keep HTTP origins on CONNECT tunnels as they were before Undici 8.7.
+			proxyTunnel: true,
+			// !mark
+			bodyTimeout: normalizedTimeoutMs,
+			connect: {
+				autoSelectFamilyAttemptTimeout: DEFAULT_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,
+			},
+			headersTimeout: normalizedTimeoutMs,
+			clientFactory: createUndiciClient,
+			factory: createUndiciOriginDispatcher,
+		}),
+	);
+```
+
+## !!steps Replacing global fetch only when safe
+
+After `setGlobalDispatcher`, the function also calls `undici.install?.()` so global `fetch` comes from the same undici version as the dispatcher. The comment explains the bug this avoids, compressed responses that are not decompressed.
+
+The guard preserves overrides. On the first call, it installs only if `fetch` is still the original. On later calls, only if it is still what this module installed. Anyone who deliberately replaced `fetch` in between wins.
+
+```ts ! http-dispatcher.ts
+	undici.setGlobalDispatcher(dispatcher);
+	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
+	// bundled fetch can otherwise consume compressed responses through npm undici's
+	// dispatcher without decompressing them, causing response.json() failures.
+	// If a caller replaced fetch after module load, preserve that deliberate override.
+	// !mark(1:5)
+	const shouldInstallGlobals =
+		installedGlobalFetch === undefined
+			? globalThis.fetch === originalGlobalFetch
+			: globalThis.fetch === installedGlobalFetch;
+	if (shouldInstallGlobals) {
+		undici.install?.();
+		installedGlobalFetch = globalThis.fetch;
+	}
+}
+```
+
+</Scrollycoding>
+
+The guard logic around `installedGlobalFetch` is the part to read carefully if proxy or timeout behavior changes. Settings code that offers the timeout menu lives in [settings-manager.ts](/docs/src/core/settings-manager.ts), and the app entry in [main.ts](/docs/src/main.ts) calls the configure function at startup.

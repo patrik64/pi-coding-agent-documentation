@@ -1,0 +1,94 @@
+---
+title: "light.json"
+description: "The built-in light theme: the same token set as the dark theme with lightness inverted so foregrounds are dark and surfaces are pale"
+source: "src/modes/interactive/theme/light.json"
+full: true
+---
+
+This is the light counterpart of [dark.json](/docs/src/modes/interactive/theme/dark.json). The structure is identical: a `vars` palette, a `colors` table covering every token, and an `export` block. What changes is the numbers. Where the dark theme uses about 67% lightness for foregrounds and about 24% for surfaces, the light theme uses about 47% for foregrounds and about 91% for surfaces, with saturation raised to keep colors from washing out.
+
+The file is read by [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and has to satisfy [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts). When the user's setting is a light/dark pair or the `system` theme, [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) decides when this one is chosen.
+
+<Scrollycoding>
+
+## !!steps Palette and appearance
+
+Same variable names as the dark theme. Foreground families sit at roughly 46 to 47% lightness (text is darker at 27%), and `blueBg` is a very pale 91% tint. Because tokens refer to vars by name, the rest of the file is nearly identical in shape.
+
+```json ! light.json
+{
+	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"name": "light",
+	"appearance": "light",
+	"vars": {
+		"text": "okhsl(225 5% 27%)",
+		"muted": "okhsl(229 8% 47%)",
+		"violet": "okhsl(295 60% 46%)",
+		"blue": "okhsl(231 68% 47%)",
+		"green": "okhsl(159 75% 46%)",
+		"red": "okhsl(20 91% 47%)",
+		"yellow": "okhsl(83 99% 47%)",
+		"blueBg": "okhsl(235 19% 91%)"
+	},
+```
+
+## !!steps Surfaces become pale tints
+
+Panels (tool states, custom messages, search matches) are 91% lightness with low saturation, just enough hue to tell pending, success and error apart. The scrollbar thumb is darker than its track, the reverse of how the dark theme layers them.
+
+```json ! light.json
+		"scrollbarTrack": "okhsl(248 3% 90%)",
+		"scrollbarThumb": "okhsl(226 7% 65%)",
+		"searchMatchBg": "okhsl(56 22% 91%)",
+		"searchMatchText": "muted",
+		"userMessageBg": "blueBg",
+		"userMessageText": "text",
+		"customMessageBg": "okhsl(295 25% 91%)",
+		"customMessageText": "muted",
+		"customMessageLabel": "violet",
+		"toolPendingBg": "okhsl(248 3% 91%)",
+		"toolSuccessBg": "okhsl(156 21% 91%)",
+		"toolErrorBg": "okhsl(24 23% 91%)",
+```
+
+## !!steps Syntax colors
+
+The only syntax tokens with their own literals are again variable and string, now at 46% lightness and higher saturation than in dark mode (73% and 84% versus 58% and 67%), so they stay distinct on a bright background.
+
+```json ! light.json
+		"syntaxComment": "muted",
+		"syntaxKeyword": "blue",
+		"syntaxFunction": "yellow",
+		"syntaxVariable": "okhsl(203 73% 46%)",
+		"syntaxString": "okhsl(52 84% 46%)",
+		"syntaxNumber": "green",
+		"syntaxType": "violet",
+		"syntaxOperator": "muted",
+		"syntaxPunctuation": "muted",
+```
+
+## !!steps Thinking ramp and HTML export
+
+The thinking ramp is light here: pale greys and pastels (70 to 80% lightness) rather than mid-tones, to be visible as a border on a bright background without dominating it. The export block uses near-white page and card colors.
+
+```json ! light.json
+		"thinkingOff": "okhsl(223 5% 80%)",
+		"thinkingMinimal": "okhsl(229 14% 78%)",
+		"thinkingLow": "okhsl(232 33% 76%)",
+		"thinkingMedium": "okhsl(264 48% 74%)",
+		"thinkingHigh": "okhsl(295 62% 72%)",
+		"thinkingXhigh": "okhsl(337 74% 70%)",
+		"thinkingMax": "okhsl(20 98% 68%)",
+		"bashMode": "okhsl(159 74% 55%)"
+	},
+	"export": {
+		"pageBg": "okhsl(17 3% 94%)",
+		"cardBg": "okhsl(17 5% 97%)",
+		"infoBg": "okhsl(56 22% 91%)"
+	}
+}
+```
+
+</Scrollycoding>
+
+The two built-in files must stay in key-for-key sync because both are validated against the same schema. The generated `system` theme in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) derives its own colors from the terminal and aims for the same roles.

@@ -1,0 +1,38 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# fumadocs-mdx generated collections (rebuilt by `pnpm i` postinstall and `next dev`)
+/.source/
+
+# production
+/build
+
+# typescript
+*.tsbuildinfo
+
+# testing
+/coverage
+
+# env files (opt in to committing an example)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# misc
+.DS_Store
+*.pem

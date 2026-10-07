@@ -1,0 +1,184 @@
+---
+title: "paths.ts"
+description: "Path normalization, resolution and cwd-relative helpers shared by tools, config loading and the CLI"
+source: "src/utils/paths.ts"
+full: true
+---
+
+Every place that accepts a path from a user or a model has the same small problems: a leading `~`, an `@file` prefix from the CLI, exotic unicode spaces pasted from chat, `file://` URLs, and Git Bash style drive paths on Windows. This file collects those rules in one place so the rest of the code can call `resolvePath` and trust the result.
+
+It also holds a few unrelated filesystem helpers: symlink-aware canonicalization, a cheap file revision fingerprint, a check for whether a string is a local path versus a package source, and a macOS/Linux call that tells cloud sync clients to ignore a directory. Tool code such as [path-utils.ts](/docs/src/core/tools/path-utils.ts), [package-manager.ts](/docs/src/core/package-manager.ts) and [windows-self-update.ts](/docs/src/utils/windows-self-update.ts) builds on these.
+
+<Scrollycoding>
+
+## !!steps Options for normalization
+
+`PathInputOptions` makes each rewrite opt-in, except tilde expansion which is on by default. Different callers want different things: the CLI strips `@`, model-provided paths may need unicode spaces normalized, and settings values want trimming.
+
+```ts ! paths.ts
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+export interface PathInputOptions {
+	/** Trim leading/trailing whitespace before normalization. */
+	trim?: boolean;
+	/** Expand leading `~` to a home directory. Defaults to true. */
+	expandTilde?: boolean;
+	/** Home directory used for `~` expansion. Defaults to `os.homedir()`. */
+	homeDir?: string;
+	/** Strip a leading `@`, used for CLI @file paths. */
+	stripAtPrefix?: boolean;
+	/** Normalize unicode space variants to regular spaces. */
+	normalizeUnicodeSpaces?: boolean;
+}
+```
+
+## !!steps Canonical paths and file revisions
+
+`canonicalizePath` follows symlinks but never throws: if the target does not exist yet, the raw path is returned. `getFileRevision` builds a fingerprint from device, inode, size and nanosecond mtime/ctime, so callers can detect that a file changed on disk without hashing content. It returns `undefined` if the file cannot be stat'ed.
+
+```ts ! paths.ts
+export function canonicalizePath(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+}
+
+export function getFileRevision(path: string): string | undefined {
+	try {
+		const stats = statSync(path, { bigint: true });
+		return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+	} catch {
+		return undefined;
+	}
+}
+```
+
+## !!steps Local path versus package source
+
+Resource lists in settings mix filesystem paths with sources like `npm:` or `git:`. `isLocalPath` is a negative test: anything that does not start with a known remote prefix is local. Notably `file:` URLs count as local, because `normalizePath` later converts them.
+
+```ts ! paths.ts
+export function isLocalPath(value: string): boolean {
+	const trimmed = value.trim();
+	// Known non-local prefixes. file: URLs are local paths and are intentionally resolved by resolvePath().
+	if (
+		// !mark(1:7)
+		trimmed.startsWith("npm:") ||
+		trimmed.startsWith("git:") ||
+		trimmed.startsWith("github:") ||
+		trimmed.startsWith("http:") ||
+		trimmed.startsWith("https:") ||
+		trimmed.startsWith("ssh:") ||
+		trimmed.startsWith("builtin:")
+	) {
+		return false;
+	}
+	return true;
+}
+```
+
+## !!steps Windows shell drive paths
+
+Git Bash, MSYS, Cygwin and WSL write drive `C:` as `/c/...`, `/mnt/c/...` or `/cygdrive/c/...`. Native Windows APIs do not understand those, so the function rewrites them to `C:\...`. UNC paths (`//`) and anything already containing backslashes are left alone.
+
+```ts ! paths.ts
+export function normalizeWindowsShellPath(filePath: string): string {
+	if (!filePath.startsWith("/") || filePath.startsWith("//") || filePath.includes("\\")) return filePath;
+	const match = filePath.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+	if (!match) return filePath;
+	const suffix = match[2]?.replaceAll("/", "\\");
+	return `${match[1].toUpperCase()}:\\${suffix ?? ""}`;
+}
+```
+
+## !!steps normalizePath applies the rules in order
+
+Order matters: trim, unicode spaces, `@` prefix, Windows drive rewrite, then tilde, then `file://`. Tilde handling covers `~` alone and `~/` (plus `~\` on Windows). Note that tilde is expanded after the `@` is stripped, so `@~/x` works.
+
+```ts ! paths.ts
+export function normalizePath(input: string, options: PathInputOptions = {}): string {
+	let normalized = options.trim ? input.trim() : input;
+	if (options.normalizeUnicodeSpaces) {
+		normalized = normalized.replace(UNICODE_SPACES, " ");
+	}
+	// !mark(1:3)
+	if (options.stripAtPrefix && normalized.startsWith("@")) {
+		normalized = normalized.slice(1);
+	}
+	if (process.platform === "win32") {
+		normalized = normalizeWindowsShellPath(normalized);
+	}
+```
+
+## !!steps Tilde, file URLs and resolution
+
+After tilde expansion, `file://` URLs are converted with `fileURLToPath`. `resolvePath` then makes the result absolute against a base directory (itself normalized, so a base of `~/proj` works).
+
+```ts ! paths.ts
+	if (options.expandTilde ?? true) {
+		const home = options.homeDir ?? homedir();
+		if (normalized === "~") return home;
+		if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
+			return join(home, normalized.slice(2));
+		}
+	}
+
+	if (/^file:\/\//.test(normalized)) {
+		return fileURLToPath(normalized);
+	}
+
+	return normalized;
+}
+
+export function resolvePath(input: string, baseDir: string = process.cwd(), options: PathInputOptions = {}): string {
+	const normalized = normalizePath(input, options);
+	const normalizedBaseDir = normalizePath(baseDir);
+	return isAbsolute(normalized) ? nodeResolvePath(normalized) : nodeResolvePath(normalizedBaseDir, normalized);
+}
+```
+
+## !!steps Inside the cwd or not
+
+`getCwdRelativePath` returns a relative path only when the target is inside the directory, and `undefined` otherwise. The test rejects `..` exactly, anything starting with `..` plus a separator, and absolute results (a different Windows drive). `formatPathRelativeToCwdOrAbsolute` uses that to print short paths when possible, always with forward slashes.
+
+```ts ! paths.ts
+export function getCwdRelativePath(filePath: string, cwd: string): string | undefined {
+	const resolvedCwd = resolvePath(cwd);
+	const resolvedPath = resolvePath(filePath, resolvedCwd);
+	const relativePath = relative(resolvedCwd, resolvedPath);
+	const isInsideCwd =
+		relativePath === "" ||
+		(relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+
+	return isInsideCwd ? relativePath || "." : undefined;
+}
+```
+
+## !!steps Telling cloud sync to ignore a path
+
+`markPathIgnoredByCloudSync` sets extended attributes that Dropbox and iCloud/FileProvider honor: two on macOS via `xattr`, one on Linux via `setfattr`. On Windows the attribute list is empty, so it does nothing. Failures are ignored because [child-process.ts](/docs/src/utils/child-process.ts) spawns with stdio ignored and the result is never checked.
+
+```ts ! paths.ts
+export function markPathIgnoredByCloudSync(path: string): void {
+	const attrs =
+		process.platform === "darwin"
+			? ["com.dropbox.ignored", "com.apple.fileprovider.ignore#P"]
+			: process.platform === "linux"
+				? ["user.com.dropbox.ignored"]
+				: [];
+
+	for (const attr of attrs) {
+		if (process.platform === "darwin") {
+			spawnProcessSync("xattr", ["-w", attr, "1", path], { encoding: "utf-8", stdio: "ignore" });
+		} else {
+			spawnProcessSync("setfattr", ["-n", attr, "-v", "1", path], { encoding: "utf-8", stdio: "ignore" });
+		}
+	}
+}
+```
+
+</Scrollycoding>
+
+Most of the file is pure string handling with no filesystem access, which keeps it easy to test; only `canonicalizePath`, `getFileRevision` and the cloud-sync marker touch the disk or spawn processes. [windows-self-update.ts](/docs/src/utils/windows-self-update.ts) uses `getCwdRelativePath` as a containment test for loaded native libraries.

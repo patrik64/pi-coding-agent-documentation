@@ -1,0 +1,10 @@
+{
+  "title": "extensions",
+  "pages": [
+    "codemode",
+    "llama",
+    "mcp",
+    "tool-search",
+    "index.ts"
+  ]
+}

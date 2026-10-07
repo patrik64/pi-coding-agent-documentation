@@ -1,0 +1,343 @@
+---
+title: "runtime.ts"
+description: "Opens a durable session and exposes it to the TUI as an observable view plus a serialized command controller"
+source: "src/experimental/durable/runtime.ts"
+full: true
+---
+
+This is the engine of the durable experiment. `openDurable` selects and locks a session ([sessions.ts](/docs/src/experimental/durable/sessions.ts)), builds the Harness from pi's settings and tools ([harness-setup.ts](/docs/src/experimental/durable/harness-setup.ts)), and returns three things: a view source the UI subscribes to, a controller it calls, and a `close` function.
+
+The boundary is deliberately plain. The TUI in [tui.ts](/docs/src/experimental/durable/tui.ts) only receives `DurableView` values and only calls `DurableController` methods, so no Harness object leaks out. This is experimental code; a near-identical copy exists in the vacation folder.
+
+<Scrollycoding>
+
+## !!steps The view and controller contracts
+
+`DurableView` is everything the UI renders: session info, the shown conversation, a summary list of conversations, the models, notices, and optionally the live task graph. `DurableViewSource` is the usual `current` plus `subscribe` pair.
+
+`DurableController` lists the user's verbs. Submitting while busy either steers or queues a follow-up, and switching conversation changes which one is shown and talked to.
+
+```ts ! runtime.ts
+/** Everything the TUI renders. Plain values; no Harness objects cross this boundary. */
+// !mark
+export interface DurableView {
+	readonly session: { readonly id: string; readonly directory: string; readonly cwd: string };
+	/** The conversation shown and talked to. */
+	readonly conversation: ConversationView;
+	readonly conversations: readonly ConversationSummary[];
+	readonly models: readonly ModelSummary[];
+	readonly notices: readonly Notice[];
+	/** The live task graph while the task panel is open. */
+	readonly tasks?: TaskGraph;
+}
+
+export interface DurableViewSource {
+	current(): DurableView;
+	subscribe(listener: () => void): () => void;
+}
+
+/** What the TUI may ask for. */
+// !mark(1:2)
+export interface DurableController {
+	/** Prompt when idle; otherwise steer or queue a follow-up. */
+	submit(text: string, whenBusy: "steer" | "followUp"): Promise<void>;
+	compact(instructions: string | undefined): Promise<void>;
+	abort(): Promise<void>;
+	cycleThinking(): Promise<void>;
+	setModel(model: ModelRef): Promise<void>;
+	toggleTasks(): Promise<void>;
+	/** Show and talk to another conversation. */
+	switchConversation(id: ConversationId): Promise<void>;
+}
+```
+
+## !!steps Titles for subagent conversations
+
+`agentOf` reads the `pi.agent` document from a view. `firstInput` gives a subagent conversation a title, its task, by paging through its entries 256 at a time and keeping the matching user entry. The main conversation needs none.
+
+The doc comment says oldest user message, but the loop keeps overwriting `first` with the last user entry found with `findLast`, which is the newest if pages arrive in ascending order. Subagents normally receive only one input, so the difference rarely shows.
+
+```ts ! runtime.ts
+/** The agent document of a view; absent while the conversation has none. */
+export function agentOf(view: ConversationView): AgentState {
+	return (view.docs["pi.agent"] ?? {}) as AgentState;
+}
+
+/** A subagent's task: the oldest user message of its conversation. The main conversation needs no title. */
+async function firstInput(harness: Harness, id: ConversationId): Promise<{ title?: string }> {
+	if (id === ROOT_CONVERSATION_ID) return {};
+	const conversation = (await harness.conversation(id, context))!;
+	let first: EntryRecord | undefined;
+	let cursor: Cursor | undefined;
+	do {
+		const page = await conversation.entries({}, 256, cursor, context);
+		// !mark
+		first = page.items.findLast((entry) => entry.kind === "pi.user") ?? first;
+		cursor = page.next;
+	} while (cursor !== undefined);
+	return titleOf(first);
+}
+```
+
+## !!steps Opening the Harness
+
+Order matters here. The session is selected and locked first, then the model runtime, settings and registry are created, with `Subagent` installed last so it is part of every conversation's tool set.
+
+Errors reported by the Harness before the UI is ready are queued in `pendingReports`; `report` is swapped to a real notice function later. The initial model is only resolved for newly created sessions, since a continued one already has its saved agent.
+
+```ts ! runtime.ts
+export async function openDurable(options: OpenDurableOptions = {}): Promise<OpenDurableResult> {
+	// !mark
+	const location = await selectSession(options.cwd ?? process.cwd(), options.continueSession ?? false);
+	const envs = new ExecutionEnvs(location.cwd);
+	let harness: Harness | undefined;
+	try {
+		const modelRuntime = await ModelRuntime.create();
+		const settingsManager = SettingsManager.create(location.cwd);
+		configureHarnessHttp(settingsManager);
+		const settings = createHarnessSettings(settingsManager);
+		const registry = createCodingRegistry(settingsManager, location.cwd);
+		// !mark
+		registry.install(Subagent);
+
+		// !mark(1:2)
+		const pendingReports: unknown[] = [];
+		let report: (error: unknown) => void = (error) => pendingReports.push(error);
+		harness = await Harness.open(
+			await openNodeSqliteStorage(location.database),
+			{
+				models: modelRuntime,
+				registry,
+				settings,
+				env: envs.env,
+				onReport: (error) => report(error),
+			},
+			context,
+		);
+		// !mark
+		const initial = location.created ? await findInitialAgentModel(settingsManager, modelRuntime) : undefined;
+		const root = await harness.root(context, {
+			agent: {
+				cwd: location.cwd,
+				...(initial?.model === undefined ? {} : { model: initial.model }),
+				...(initial?.thinkingLevel === undefined ? {} : { thinkingLevel: initial.thinkingLevel }),
+			},
+		});
+```
+
+## !!steps Coalesced state updates
+
+Conversation summaries are loaded by scanning every conversation. `update` merges a patch into the state and schedules one `setImmediate` notification, with the `notifying` flag collapsing a burst of commits into a single render.
+
+`notice` keeps only the last 20 notices. Harness reports become warnings and command failures become errors.
+
+```ts ! runtime.ts
+		const listeners = new Set<() => void>();
+		let notifying = false;
+		// Commit listeners and Chord frames call this on the Session line; rendering runs afterwards, once per burst.
+		// !mark
+		const update = (patch: Partial<DurableView>): void => {
+			state = { ...state, ...patch };
+			if (notifying) return;
+			notifying = true;
+			// !mark
+			setImmediate(() => {
+				notifying = false;
+				for (const listener of listeners) listener();
+			});
+		};
+		let nextNotice = 1;
+		const notice = (level: Notice["level"], message: string): void => {
+			update({ notices: [...state.notices, { id: nextNotice++, level, message }].slice(-20) });
+		};
+		const fail = (error: unknown): void => notice("error", error instanceof Error ? error.message : String(error));
+		report = (error) => notice("warning", error instanceof Error ? error.message : String(error));
+		for (const error of pendingReports) report(error);
+```
+
+## !!steps Following commits
+
+The conversation view is a replicated state whose subscription feeds `update`. A separate commit subscription adds a summary when a conversation appears, which is how subagents show up live, and fills in a title from the first user entry.
+
+The comment is a rule: a commit listener only records. It must not call back into the Session API.
+
+```ts ! runtime.ts
+		let unsubscribe = conversation.subscribe((value) => update({ conversation: value }));
+		// !mark
+		// Subagents appear as their conversations are created. A commit listener only records; it calls no Session API.
+		const unsubscribeCommits = harness.subscribeCommits((publication) => {
+			let conversations = state.conversations;
+			for (const change of publication.changes) {
+				if (change.type === "conversation") {
+					conversations = [...conversations, { id: change.value.id, label: label(change.value.id) }];
+				} else if (change.type === "entry" && change.value.kind === "pi.user") {
+					const id = change.value.conversationId;
+					conversations = conversations.map((summary) =>
+						summary.id === id && summary.title === undefined ? { ...summary, ...titleOf(change.value) } : summary,
+					);
+				}
+			}
+			if (conversations !== state.conversations) update({ conversations });
+		});
+```
+
+## !!steps One command at a time
+
+Every command goes through a promise chain, so toggles, switches and key presses apply in order, and any failure becomes an error notice instead of breaking the chain. `abort` deliberately skips the queue, because it must act while another command may be waiting for an idle conversation.
+
+`watchAnswer` reports an unanswered submission, unless the reason was an abort.
+
+```ts ! runtime.ts
+		let queue = Promise.resolve();
+		// One at a time, so toggles, switches, and key presses apply in order.
+		// !mark(1:4)
+		const command = (operation: () => Promise<void>): Promise<void> => {
+			queue = queue.then(operation).catch(fail);
+			return queue;
+		};
+		const watchAnswer = (submission: Submission): void => {
+			void submission.wait(context).then((settled) => {
+				if (settled.status === "unanswered" && settled.reason !== "aborted") {
+					notice(
+						"error",
+						`No answer: ${settled.reason}${settled.detail === undefined ? "" : ` ${JSON.stringify(settled.detail)}`}`,
+					);
+				}
+			}, fail);
+		};
+```
+
+## !!steps Compaction with an honest result
+
+`compact` starts a task and returns right away. The outcome arrives later through `waitForTask`, and a summary written while the conversation was busy is a submission that can be placed, queued, or dropped as stale. The branches in the notice text distinguish each case, including the one where the context already fits the verbatim window.
+
+```ts ! runtime.ts
+			compact: (instructions) =>
+				command(async () => {
+					const id = await current.compact(instructions, context);
+					// Report the outcome once it is known; the status line shows the compaction meanwhile.
+					// !mark
+					void opened.waitForTask(id, context).then(async (receipt) => {
+						const outcome = receipt.state.outcome;
+						if (outcome.status === "completed") {
+							const { entryId, submissionId } = outcome.result;
+							// A summary written while busy is a submission: placed now, queued, or dropped as stale.
+							// !mark(1:5)
+							const status =
+								submissionId === undefined
+									? undefined
+									: (await (await opened.submission(submissionId, context))?.status(context))?.status;
+							notice(
+								"info",
+								entryId !== undefined || status === "done"
+									? "Compacted."
+									: status === "queued"
+										? "Compaction summary queued; it is placed at the next turn boundary."
+										: status === "unanswered"
+											? "Compaction summary dropped: the context changed under it."
+											: "Nothing to compact: the context fits in the recent window that is kept verbatim.",
+							);
+						} else if (outcome.status === "aborted") notice("info", "Compaction aborted.");
+						else
+							notice("error", `Compaction ${outcome.status}: ${outcome.error?.message ?? outcome.reason ?? ""}`);
+					}, fail);
+				}),
+```
+
+## !!steps Thinking and model changes
+
+Cycling steps through the levels the current model supports and wraps around, and refuses on models without reasoning. `setModel` clamps the existing thinking level to what the new model supports. Both end in `configure` on the current conversation.
+
+```ts ! runtime.ts
+			cycleThinking: () =>
+				command(async () => {
+					const model = agentModel();
+					// !mark
+					if (!model.reasoning) throw new Error("Current model does not support thinking");
+					const levels = getSupportedThinkingLevels(model);
+					const level = agentOf(state.conversation).thinkingLevel ?? "off";
+					const next = levels[(levels.indexOf(level) + 1) % levels.length] ?? "off";
+					await current.configure({ thinkingLevel: next }, context);
+				}),
+			setModel: (ref) =>
+				command(async () => {
+					const model = modelRuntime.getModel(ref.provider, ref.modelId);
+					if (model === undefined) throw new Error(`Unknown model: ${ref.provider}/${ref.modelId}`);
+					const thinking: ModelThinkingLevel = agentOf(state.conversation).thinkingLevel ?? "off";
+					// !mark
+					await current.configure({ model: ref, thinkingLevel: clampThinkingLevel(model, thinking) }, context);
+				}),
+```
+
+## !!steps Task panel and switching conversations
+
+`toggleTasks` attaches or disposes a replicated task graph. Switching conversations attaches the new view state before unsubscribing and disposing the old one, so there is no gap with no state.
+
+```ts ! runtime.ts
+			toggleTasks: () =>
+				command(async () => {
+					if (tasks !== undefined) {
+						closeTasks();
+						update({ tasks: undefined });
+						return;
+					}
+					// !mark(1:2)
+					const graph = await opened.taskGraph(context);
+					tasks = graph;
+					unsubscribeTasks = graph.subscribe((value) => update({ tasks: value }));
+				}),
+			switchConversation: (id) =>
+				command(async () => {
+					const next = await opened.conversation(id, context);
+					if (next === undefined) throw new Error(`Conversation ${id} does not exist`);
+					// !mark(1:6)
+					const nextState = await next.viewState(context);
+					unsubscribe();
+					conversation.dispose();
+					current = next;
+					conversation = nextState;
+					unsubscribe = nextState.subscribe((value) => update({ conversation: value }));
+				}),
+```
+
+## !!steps Startup and shutdown
+
+After warnings about a missing or unavailable saved model, the task panel is opened (so it starts visible) and `harness.resume()` continues work that an interrupted turn left behind.
+
+`close` is memoized with `??=`. It writes no outcome, so a running turn resumes with `--continue`; the session lock is released in `finally`. The outer `catch` closes the Harness and releases the lock if opening itself failed.
+
+```ts ! runtime.ts
+		const saved = agentOf(state.conversation).model;
+		if (saved === undefined) notice("warning", "No model configured; select one with /model.");
+		else if (modelRuntime.getModel(saved.provider, saved.modelId) === undefined) {
+			notice("warning", `Saved model is unavailable: ${saved.provider}/${saved.modelId}`);
+		}
+		if (initial?.fallbackMessage !== undefined) notice("info", initial.fallbackMessage);
+		// The task panel starts open; /tasks hides it.
+		// !mark
+		await controller.toggleTasks();
+		// Recovered work from an interrupted turn continues now.
+		// !mark
+		harness.resume();
+
+			// ...
+			close() {
+				closing ??= (async () => {
+					unsubscribe();
+					unsubscribeCommits();
+					conversation.dispose();
+					closeTasks();
+					try {
+						// !mark(1:2)
+						// Close writes no outcome: a running turn resumes with --continue.
+						await opened.close(context);
+						await envs.cleanup(context);
+					} finally {
+						await location.release();
+					}
+				})();
+```
+
+</Scrollycoding>
+
+[main.ts](/docs/src/experimental/durable/main.ts) is the only caller of `openDurable`, and [tui.ts](/docs/src/experimental/durable/tui.ts) imports `agentOf` and the view types. Model data comes from [model-runtime.ts](/docs/src/core/model-runtime.ts) and settings from [settings-manager.ts](/docs/src/core/settings-manager.ts). The whole function is one long closure, so state such as `current` and `tasks` is shared by the controller methods instead of living on a class.

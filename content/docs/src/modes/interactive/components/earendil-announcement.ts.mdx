@@ -1,0 +1,88 @@
+---
+title: "earendil-announcement.ts"
+description: "Banner component announcing that pi has joined Earendil, with a blog link and an optional bundled image"
+source: "src/modes/interactive/components/earendil-announcement.ts"
+full: true
+---
+
+`EarendilAnnouncementComponent` is a one-off announcement block shown in the interactive transcript. It is a fixed stack of children: a border, a title, a blog link, an optional image, and a closing border. There is no state or input handling.
+
+The interesting part is the image: it is read from the bundled assets once, lazily, and a missing file simply removes the image instead of failing the announcement. It reuses [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts) for framing and [theme.ts](/docs/src/modes/interactive/theme/theme.ts) for colors, and finds the asset through [config.ts](/docs/src/config.ts).
+
+<Scrollycoding>
+
+## !!steps Constants and the cache flags
+
+The blog URL and image filename are module constants. Two module-level variables cache the base64 payload and remember whether a load was already attempted.
+
+```ts ! earendil-announcement.ts
+const BLOG_URL = "https://mariozechner.at/posts/2026-04-08-ive-sold-out/";
+const IMAGE_FILENAME = "clankolas.png";
+
+let cachedImageBase64: string | undefined;
+let attemptedImageLoad = false;
+```
+
+## !!steps Load the image once
+
+The first call sets `attemptedImageLoad` before reading, so a failure is also cached: later calls return `undefined` without touching the disk again. The path comes from `getBundledInteractiveAssetPath`, and any read error is swallowed.
+
+```ts ! earendil-announcement.ts
+function loadImageBase64(): string | undefined {
+	if (attemptedImageLoad) {
+		return cachedImageBase64;
+	}
+
+	attemptedImageLoad = true;
+	try {
+		// !mark
+		cachedImageBase64 = fs.readFileSync(getBundledInteractiveAssetPath(IMAGE_FILENAME)).toString("base64");
+	} catch {
+		cachedImageBase64 = undefined;
+	}
+	return cachedImageBase64;
+}
+```
+
+## !!steps Text block
+
+The constructor builds the banner top-down: accent-colored border, bold title, a muted label, and the URL in the markdown-link color so it reads as clickable. Spacers separate the groups.
+
+```ts ! earendil-announcement.ts
+export class EarendilAnnouncementComponent extends Container {
+	constructor() {
+		super();
+
+		this.addChild(new DynamicBorder((text) => theme.fg("accent", text)));
+		this.addChild(new Text(theme.bold(theme.fg("accent", "pi has joined Earendil")), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("muted", "Read the blog post:"), 1, 0));
+		this.addChild(new Text(theme.fg("mdLink", BLOG_URL), 1, 0));
+		this.addChild(new Spacer(1));
+```
+
+## !!steps Optional image and closing border
+
+The image is added only if the load succeeded. It is declared as PNG, capped at 56 cells wide, and given a muted fallback color for terminals without image support. The component ends with the second border.
+
+```ts ! earendil-announcement.ts
+		const imageBase64 = loadImageBase64();
+		if (imageBase64) {
+			this.addChild(
+				new Image(
+					imageBase64,
+					"image/png",
+					{ fallbackColor: (text) => theme.fg("muted", text) },
+					// !mark
+					{ maxWidthCells: 56, filename: IMAGE_FILENAME },
+				),
+			);
+			this.addChild(new Spacer(1));
+		}
+
+		this.addChild(new DynamicBorder((text) => theme.fg("accent", text)));
+```
+
+</Scrollycoding>
+
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) adds the component to the chat container directly. The URL is hard-coded and the dated blog path means the banner is tied to that specific announcement.

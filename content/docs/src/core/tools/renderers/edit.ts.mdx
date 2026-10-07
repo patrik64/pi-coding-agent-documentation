@@ -1,0 +1,247 @@
+---
+title: "edit.ts"
+description: "Terminal presentation for the edit tool: a header that previews the diff while the call is still pending, then settles on the real result"
+source: "src/core/tools/renderers/edit.ts"
+full: true
+---
+
+The edit tool is the one built-in renderer with real behavior, because it shows the user a diff before the edit has run. As soon as the model has finished streaming its arguments, the renderer computes the diff that the edit would produce, using `computeEditsDiff` from [edit-diff.ts](/docs/src/core/tools/edit-diff.ts), and paints it inside the call component with a green or red background.
+
+When the tool result arrives, the same component is updated with the actual diff from the result, so the preview and the outcome occupy one box. The tool itself lives in [tools/edit.ts](/docs/src/core/tools/edit.ts), which spreads these renderers into its definition. Diff drawing is delegated to [diff.ts](/docs/src/modes/interactive/components/diff.ts), and shared path formatting to [render-utils.ts](/docs/src/core/tools/render-utils.ts).
+
+<Scrollycoding>
+
+## !!steps Types and the cached call component
+
+`EditPreview` is either a successful diff or an error from the dry run. The call component is a `Box` extended with four fields: the current preview, a key identifying which arguments it was computed for, a pending flag so only one computation runs at a time, and `settledError` for when the tool failed without a usable preview.
+
+`EditRenderState` is how the call component is shared with `renderResult`, which gets the same per-call `state` object.
+
+```ts ! edit.ts
+type EditPreview = EditDiffResult | EditDiffError;
+export type EditRenderState = {
+	callComponent?: EditCallRenderComponent;
+};
+// ...
+type EditCallRenderComponent = Box & {
+	preview?: EditPreview;
+	previewArgsKey?: string;
+	previewPending?: boolean;
+	settledError?: boolean;
+};
+function createEditCallRenderComponent(): EditCallRenderComponent {
+	return Object.assign(new Box(1, 1, (text: string) => text), {
+		preview: undefined as EditPreview | undefined,
+		previewArgsKey: undefined as string | undefined,
+		previewPending: false,
+		settledError: false,
+	});
+}
+```
+
+## !!steps Finding the component to reuse
+
+Renderers are called many times per tool call and may be handed a previous component. This helper prefers `lastComponent` when it is a `Box`, then the one remembered in state, and only then creates a new one. Either way it records the component in state so the result renderer can find it.
+
+```ts ! edit.ts
+function getEditCallRenderComponent(state: EditRenderState, lastComponent: unknown): EditCallRenderComponent {
+	if (lastComponent instanceof Box) {
+		const component = lastComponent as EditCallRenderComponent;
+		// !mark
+		state.callComponent = component;
+		return component;
+	}
+	if (state.callComponent) {
+		return state.callComponent;
+	}
+	const component = createEditCallRenderComponent();
+	state.callComponent = component;
+	return component;
+}
+```
+
+## !!steps Accepting both argument shapes
+
+The edit tool takes either an `edits` array or a single legacy `oldText`/`newText` pair, and the path may arrive as `path` or `file_path`. `getRenderablePreviewInput` normalizes both into one `{ path, edits }` object, or returns `null` if anything is missing or mistyped.
+
+While arguments stream in, they are often incomplete. Returning `null` here is what keeps a half-formed call from triggering a diff computation.
+
+```ts ! edit.ts
+function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path: string; edits: Edit[] } | null {
+	if (!args) {
+		return null;
+	}
+
+	const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : null;
+	if (!path) {
+		return null;
+	}
+
+	if (
+		Array.isArray(args.edits) &&
+		args.edits.length > 0 &&
+		args.edits.every((edit) => typeof edit?.oldText === "string" && typeof edit?.newText === "string")
+	) {
+		return { path, edits: args.edits };
+	}
+
+	// !mark(1:3)
+	if (typeof args.oldText === "string" && typeof args.newText === "string") {
+		return { path, edits: [{ oldText: args.oldText, newText: args.newText }] };
+	}
+
+	return null;
+}
+```
+
+## !!steps Header color tells the story
+
+The background of the box is derived from state. A preview with an error is red, a preview with a diff is green, and with no preview yet the box is the pending color. If the tool already failed without any preview (`settledError`), it turns red too.
+
+`buildEditCallComponent` then redraws: set the background, clear children, add the header line, and if a preview exists add a spacer and either the error text or the rendered diff.
+
+```ts ! edit.ts
+function getEditHeaderBg(
+	preview: EditPreview | undefined,
+	settledError: boolean | undefined,
+	theme: Theme,
+): (text: string) => string {
+	if (preview) {
+		// !mark(1:3)
+		if ("error" in preview) {
+			return (text: string) => theme.bg("toolErrorBg", text);
+		}
+		return (text: string) => theme.bg("toolSuccessBg", text);
+	}
+	if (settledError) {
+		return (text: string) => theme.bg("toolErrorBg", text);
+	}
+	return (text: string) => theme.bg("toolPendingBg", text);
+}
+```
+
+## !!steps Detecting whether a preview really changed
+
+`setEditPreview` stores a preview and returns whether it differs from the previous one. The comparison is spelled out: a first preview always counts, a switch between error and diff counts, two errors differ if their text differs, and two diffs differ if the diff text or first changed line differs.
+
+The return value lets `renderResult` skip a rebuild of the call component when the real result matches what was already previewed.
+
+```ts ! edit.ts
+function setEditPreview(
+	component: EditCallRenderComponent,
+	preview: EditPreview,
+	argsKey: string | undefined,
+): boolean {
+	const current = component.preview;
+	const changed =
+		// !mark(1:7)
+		current === undefined ||
+		("error" in current && "error" in preview
+			? current.error !== preview.error
+			: "error" in current !== "error" in preview) ||
+		(!("error" in current) &&
+			!("error" in preview) &&
+			(current.diff !== preview.diff || current.firstChangedLine !== preview.firstChangedLine));
+	component.preview = preview;
+	component.previewArgsKey = argsKey;
+	component.previewPending = false;
+	return changed;
+}
+```
+
+## !!steps renderCall launches the dry-run diff
+
+The args key is the JSON of path and edits. If it differs from the key the existing preview was computed for, the preview and error flags are reset, so editing arguments invalidate stale previews.
+
+The diff is only requested once `argsComplete` is true and nothing is pending. It runs asynchronously, and when it resolves the result is applied only if the key still matches, which discards answers for arguments that have since changed. Then `context.invalidate()` asks for a re-render.
+
+```ts ! edit.ts
+export const editRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
+	renderCall(args, theme, context) {
+		const component = getEditCallRenderComponent(context.state, context.lastComponent);
+		const previewInput = getRenderablePreviewInput(args as RenderableEditArgs | undefined);
+		const argsKey = previewInput ? JSON.stringify({ path: previewInput.path, edits: previewInput.edits }) : undefined;
+
+		if (component.previewArgsKey !== argsKey) {
+			component.preview = undefined;
+			component.previewArgsKey = argsKey;
+			component.previewPending = false;
+			component.settledError = false;
+		}
+
+		// !mark(1:8)
+		if (context.argsComplete && previewInput && !component.preview && !component.previewPending) {
+			component.previewPending = true;
+			const requestKey = argsKey;
+			void computeEditsDiff(previewInput.path, previewInput.edits, context.cwd).then((preview) => {
+				if (component.previewArgsKey === requestKey) {
+					setEditPreview(component, preview, requestKey);
+					context.invalidate();
+				}
+			});
+		}
+
+		return buildEditCallComponent(component, args as RenderableEditArgs | undefined, theme, context.cwd);
+	},
+```
+
+## !!steps renderResult folds the outcome into the call box
+
+When the result arrives, a successful result's diff replaces the preview in the call component (so the header shows what actually happened), and a change in error status is recorded. The call component is rebuilt only if something changed.
+
+The separate result component then shows only what the header does not already show: an error message that differs from the preview error, or a result diff that differs from the preview diff. In the common case, where preview and result agree, the result renders as an empty container.
+
+```ts ! edit.ts
+	renderResult(result, _options, theme, context) {
+		const callComponent = context.state.callComponent;
+		const previewInput = getRenderablePreviewInput(context.args as RenderableEditArgs | undefined);
+		const argsKey = previewInput ? JSON.stringify({ path: previewInput.path, edits: previewInput.edits }) : undefined;
+		const typedResult = result as EditToolResultLike;
+		const resultDiff = !context.isError ? typedResult.details?.diff : undefined;
+		let changed = false;
+		if (callComponent) {
+			// !mark(1:6)
+			if (typeof resultDiff === "string") {
+				changed =
+					setEditPreview(
+						callComponent,
+						{ diff: resultDiff, firstChangedLine: typedResult.details?.firstChangedLine },
+						argsKey,
+					) || changed;
+			}
+```
+
+## !!steps What the result component prints
+
+`formatEditResult` implements the "only show what is new" rule. On error it prints the tool's error text unless it equals the preview error, or is empty. On success it prints the real diff only if it differs from the preview diff, for example because the file changed between the preview and the write.
+
+```ts ! edit.ts
+function formatEditResult(
+	args: RenderableEditArgs | undefined,
+	preview: EditPreview | undefined,
+	result: EditToolResultLike,
+	theme: Theme,
+	isError: boolean,
+): string | undefined {
+	const rawPath = str(args?.file_path ?? args?.path);
+	const previewDiff = preview && !("error" in preview) ? preview.diff : undefined;
+	const previewError = preview && "error" in preview ? preview.error : undefined;
+	if (isError) {
+// ...
+		// !mark
+		if (!errorText || errorText === previewError) {
+			return undefined;
+		}
+		return theme.fg("error", errorText);
+	}
+
+	const resultDiff = result.details?.diff;
+	// !mark(1:3)
+	if (resultDiff && resultDiff !== previewDiff) {
+		return renderDiff(resultDiff, { filePath: rawPath ?? undefined });
+	}
+```
+
+</Scrollycoding>
+
+The consumers are the interactive tool-execution component and, via [renderers/index.ts](/docs/src/core/tools/renderers/index.ts), anything that renders built-in tools. The `ToolDefinition` renderer contract it implements is in [extensions/types.ts](/docs/src/core/extensions/types.ts). Structurally the design hinges on one shared mutable component between the call and result hooks, with the args key acting as a cache validity token.

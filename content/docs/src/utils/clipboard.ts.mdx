@@ -1,0 +1,212 @@
+---
+title: "clipboard.ts"
+description: "Cross-platform text clipboard: native module, platform tools, WSL PowerShell and OSC 52 fallbacks"
+source: "src/utils/clipboard.ts"
+full: true
+---
+
+`clipboard.ts` provides `copyToClipboard`, `readClipboardText` and `readClipboardFilePaths`. Clipboards differ wildly between macOS, Windows, Linux with Wayland or X11, Termux, WSL, containers and SSH sessions, so the file is mostly an ordered list of strategies.
+
+Process execution goes through [clipboard-command.ts](/docs/src/utils/clipboard-command.ts) and WSL detection through [wsl.ts](/docs/src/utils/wsl.ts). Images are handled separately by [clipboard-image.ts](/docs/src/utils/clipboard-image.ts). The TUI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) consumes all three functions.
+
+<Scrollycoding>
+
+## !!steps Remote sessions and OSC 52
+
+OSC 52 is a terminal escape that asks the terminal emulator to set its own clipboard, which works across SSH. `emitOsc52` base64-encodes the text and refuses anything over 100,000 encoded characters. `isRemoteSession` looks for SSH or mosh environment variables.
+
+```ts ! clipboard.ts
+const MAX_OSC52_ENCODED_LENGTH = 100_000;
+
+// !mark(1:3)
+function isRemoteSession(env: NodeJS.ProcessEnv): boolean {
+	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);
+}
+
+function emitOsc52(text: string): boolean {
+	const encoded = Buffer.from(text).toString("base64");
+	// !mark
+	if (encoded.length > MAX_OSC52_ENCODED_LENGTH) {
+		return false;
+	}
+	process.stdout.write(`\x1b]52;c;${encoded}\x07`);
+	return true;
+}
+```
+
+## !!steps WSL without a display
+
+On WSL without WSLg there is no Linux display, so text goes to Windows through PowerShell. It is written to a temporary file with mode 0600 and read back as UTF-8, because piping text mangles non-ASCII under the console code page. `wslpath` converts the path and single quotes are doubled for PowerShell.
+
+```ts ! clipboard.ts
+async function copyViaWindowsClipboard(text: string): Promise<boolean> {
+	const tmpFile = join(tmpdir(), `pi-wsl-clip-${randomUUID()}.txt`);
+	try {
+		// !mark
+		writeFileSync(tmpFile, text, { encoding: "utf8", mode: 0o600 });
+		const winPath = (await runClipboardCommand("wslpath", ["-w", tmpFile], { timeoutMs: 1000 }))
+			?.toString("utf8")
+			.trim();
+		if (!winPath) return false;
+		// !mark
+		const script = `Set-Clipboard -Value ([System.IO.File]::ReadAllText('${winPath.replaceAll("'", "''")}', [System.Text.Encoding]::UTF8))`;
+		const result = await runClipboardCommand("powershell.exe", ["-NoProfile", "-Command", script], {
+			timeoutMs: 5000,
+		});
+		return result !== undefined;
+```
+
+## !!steps Cleaning up the temp file
+
+Any failure returns false. The `finally` block always tries to delete the file, ignoring the case where it was never created.
+
+```ts ! clipboard.ts
+	} catch {
+		return false;
+	} finally {
+		try {
+			unlinkSync(tmpFile);
+		} catch {
+			// The file may not have been created.
+		}
+	}
+}
+```
+
+## !!steps Reading text
+
+On Linux the function tries tools in order: Termux, `wl-paste` under Wayland, then `xclip` and `xsel` under X11. A tool that runs returns its result (or null if empty); only a failed tool moves on. Everything else falls back to the native clipboard from `pi-tui`.
+
+```ts ! clipboard.ts
+export async function readClipboardText(): Promise<string | null> {
+	if (platform() === "linux") {
+		const commands: [string, string[]][] = [];
+		// !mark(1:3)
+		if (process.env.TERMUX_VERSION) commands.push(["termux-clipboard-get", []]);
+		if (process.env.WAYLAND_DISPLAY) commands.push(["wl-paste", ["--no-newline", "--type", "text"]]);
+		if (process.env.DISPLAY) {
+			commands.push(["xclip", ["-selection", "clipboard", "-out"]], ["xsel", ["--clipboard", "--output"]]);
+		}
+		for (const [command, args] of commands) {
+			const bytes = await runClipboardCommand(command, args, { timeoutMs: 5000 });
+			// !mark
+			if (bytes !== undefined) return bytes.toString("utf8") || null;
+		}
+	}
+	try {
+		return (await getNativeClipboard()?.getText()) || null;
+	} catch {
+		return null;
+	}
+}
+```
+
+## !!steps File paths from the clipboard
+
+`readClipboardFilePaths` asks the native module for copied file paths, for example files copied in Finder, and returns null when there are none.
+
+```ts ! clipboard.ts
+/** Read file paths, such as Finder file copies, from the native clipboard. */
+export async function readClipboardFilePaths(): Promise<string[] | null> {
+	const paths = await getNativeClipboard()?.getFilePaths?.();
+	return paths?.length ? paths : null;
+}
+```
+
+## !!steps Direct writes first
+
+`copyToClipboard` starts with the native writer on every platform except Linux, where tools keep ownership of the selection after returning. If that is unavailable it runs a platform command such as `pbcopy`, `clip`, `wl-copy`, `xclip` or `xsel`, feeding the text on stdin.
+
+```ts ! clipboard.ts
+export async function copyToClipboard(text: string): Promise<void> {
+	const p = platform();
+	const env = process.env;
+	let copied = false;
+	// Direct writes precede OSC 52 so the terminal cannot race the native writer.
+	// Linux tools retain clipboard selection ownership after this call returns.
+	// !mark
+	if (p !== "linux") {
+		try {
+			const clipboard = getNativeClipboard();
+			if (clipboard?.setText) {
+				await clipboard.setText(text);
+				copied = true;
+			}
+		} catch {
+			// Try platform commands next.
+		}
+	}
+	// !mark
+	if (!copied) {
+		const commands: [string, string[]][] = [];
+		if (p === "darwin") commands.push(["pbcopy", []]);
+		else if (p === "win32") commands.push(["clip", []]);
+		else {
+			if (env.TERMUX_VERSION) commands.push(["termux-clipboard-set", []]);
+			if (env.WAYLAND_DISPLAY) commands.push(["wl-copy", []]);
+			if (env.DISPLAY) {
+				commands.push(["xclip", ["-selection", "clipboard"]], ["xsel", ["--clipboard", "--input"]]);
+			}
+		}
+		// !mark
+		for (const [command, args] of commands) {
+			if ((await runClipboardCommand(command, args, { input: text, timeoutMs: 5000 })) !== undefined) {
+				copied = true;
+				break;
+			}
+		}
+	}
+```
+
+## !!steps WSL and OSC 52 decisions
+
+Under WSL, Windows Terminal sessions prefer OSC 52, otherwise PowerShell is used. Since OSC 52 cannot be verified, a desktop session with a display reports an error rather than pretending; headless sessions and remote sessions use it as the route to the clipboard.
+
+```ts ! clipboard.ts
+	let osc52Emitted = false;
+	// !mark
+	if (!copied && p === "linux" && isWSL(env)) {
+		// Windows Terminal supports OSC 52; prefer it over the slower PowerShell round trip.
+		if (env.WT_SESSION) osc52Emitted = emitOsc52(text);
+		copied = osc52Emitted || (await copyViaWindowsClipboard(text));
+	}
+	// OSC 52 cannot be verified, so a desktop session with a display reports the failure
+	// instead (#9618). Without a display the terminal is the only clipboard route (containers,
+	// WSL without WSLg), and remote sessions always emit it to reach the client clipboard.
+	// !mark
+	const headless = p === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY && !env.TERMUX_VERSION;
+	let oversized = false;
+	// !mark
+	if (!osc52Emitted && (isRemoteSession(env) || (!copied && headless))) {
+		if (emitOsc52(text)) copied = true;
+		else oversized = true;
+	}
+```
+
+## !!steps Error messages
+
+If nothing worked, an oversized message gets a specific error. On Linux the message names the package to install based on the session type; otherwise a generic error is thrown.
+
+```ts ! clipboard.ts
+	if (copied) return;
+	// !mark
+	if (oversized) throw new Error("Clipboard unavailable: text exceeds the OSC 52 size limit");
+	if (p === "linux") {
+		// !mark(1:3)
+		if (env.TERMUX_VERSION) {
+			throw new Error("Clipboard unavailable: install the Termux:API app and `termux-api` package");
+		}
+		if (env.WAYLAND_DISPLAY) {
+			throw new Error("Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access");
+		}
+		if (env.DISPLAY) {
+			throw new Error("Clipboard unavailable: install `xclip` or `xsel`, or check X11 access");
+		}
+	}
+	throw new Error("Clipboard unavailable");
+}
+```
+
+</Scrollycoding>
+
+Strategy order is the important design: native, then tools, then terminal escapes. Note that on Linux a successful tool is trusted, whereas OSC 52 is only emitted when it is the sole route or the session is remote.

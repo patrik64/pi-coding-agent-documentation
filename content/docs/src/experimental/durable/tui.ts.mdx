@@ -1,0 +1,482 @@
+---
+title: "tui.ts"
+description: "Terminal UI for the durable experiment: renders a DurableView with pi's interactive components and routes keys to the controller"
+source: "src/experimental/durable/tui.ts"
+full: true
+---
+
+This file turns `DurableView` snapshots from [runtime.ts](/docs/src/experimental/durable/runtime.ts) into a terminal screen. It reuses pi's interactive components, such as [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts), [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts), [custom-editor.ts](/docs/src/modes/interactive/components/custom-editor.ts) and the theme code, so the durable mode looks like the classic one.
+
+The main difference is the data flow. Instead of reacting to agent events, the `DurableTui` class is handed a full view on each change and syncs its components to it, appending only what is new. This is experimental code.
+
+<Scrollycoding>
+
+## !!steps A filterable list in place of the editor
+
+`ListSelector` is used for the model and conversation pickers. It replaces the editor, forwards the select keys (up, down, confirm, cancel) to the list and sends everything else to a text input. After each keystroke the list is rebuilt from the fuzzy-filtered items.
+
+```ts ! tui.ts
+/** A filterable list in place of the editor. */
+class ListSelector extends Container implements Focusable {
+	readonly #input = new Input();
+	readonly #listContainer = new Container();
+	readonly #items: SelectItem[];
+	readonly #onSelect: (value: string) => void;
+	// ...
+	handleInput(data: string): void {
+		const keybindings = getKeybindings();
+		// !mark
+		const forwarded = ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const;
+		if (forwarded.some((action) => keybindings.matches(data, action))) {
+			this.#list.handleInput(data);
+			return;
+		}
+		this.#input.handleInput(data);
+		const query = this.#input.getValue();
+		// !mark(1:3)
+		const filtered =
+			query.length === 0 ? this.#items : fuzzyFilter(this.#items, query, (item) => `${item.label} ${item.value}`);
+		this.#list = this.#build(filtered);
+	}
+
+	#build(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, 10, SELECT_THEME);
+		list.onSelect = (item) => this.#onSelect(item.value);
+		list.onCancel = this.#onCancel;
+		this.#listContainer.clear();
+		this.#listContainer.addChild(list);
+		return list;
+	}
+```
+
+## !!steps Layout of the screen
+
+The constructor creates containers for chat, tasks, queue, notices, editor and footer. The transcript is a `ScrollView` that follows the end. The dock under it is a vertical stack where the editor needs at least three lines and the rest may shrink to zero.
+
+Under the transcript the dock has `basis: "auto"` and no growth, so the transcript takes all spare height.
+
+```ts ! tui.ts
+		// One empty line between the transcript and everything below it.
+		const content = new Container();
+		content.addChild(this.#chat);
+		content.addChild(new Spacer(1));
+		// !mark
+		const transcript = new ScrollView(content, { follow: "end", primary: true, overscroll: "chain" });
+		this.#transcript = transcript;
+		const dock = new VStack([
+			{ component: this.#tasks, shrink: 1, minSize: 0 },
+			{ component: this.#queue, shrink: 1, minSize: 0 },
+			{ component: this.#notices, shrink: 1, minSize: 0 },
+			// !mark
+			{ component: this.#editorContainer, shrink: 1, minSize: 3 },
+			{ component: this.#footer, shrink: 1, minSize: 0 },
+		]);
+		for (const component of [
+			this.#chat,
+			this.#tasks,
+			this.#queue,
+			this.#notices,
+			this.#editorContainer,
+			this.#footer,
+		]) {
+			this.#ui.addChild(component);
+		}
+		// !mark
+		this.#ui.setLayoutRoot(
+			new VStack([
+				{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+				{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+			]),
+		);
+		this.#ui.setFocus(this.#editor);
+	}
+```
+
+## !!steps Keys routed to handlers
+
+The editor's actions are wired to the handlers passed in: submit, escape to abort, Ctrl+D and clear to exit, model selection and thinking cycle. The expand action toggles one flag and applies it to every tool card and compaction summary.
+
+The follow-up action takes the editor text, clears it, and only then calls the handler.
+
+```ts ! tui.ts
+	constructor(cwd: string, handlers: Handlers) {
+		this.#cwd = cwd;
+		this.#ui = new TuiAltScreen(new ProcessTerminal(), false, getAgentDir());
+		const keybindings = KeybindingsManager.create();
+		setKeybindings(keybindings);
+		this.#editor = new CustomEditor(this.#ui, getEditorTheme(), keybindings, {
+			paddingX: 1,
+			embedWorkingStatus: true,
+		});
+		// !mark
+		this.#editor.onSubmit = handlers.submit;
+		this.#editor.onEscape = handlers.abort;
+		this.#editor.onCtrlD = handlers.exit;
+		// !mark(1:3)
+		this.#editor.onAction("app.clear", handlers.exit);
+		this.#editor.onAction("app.model.select", handlers.selectModel);
+		this.#editor.onAction("app.thinking.cycle", handlers.cycleThinking);
+		// !mark
+		this.#editor.onAction("app.tools.expand", () => {
+			this.#expanded = !this.#expanded;
+			for (const component of [...this.#cards, ...this.#summaries]) component.setExpanded(this.#expanded);
+			this.#ui.requestRender();
+		});
+		this.#editor.onAction("app.message.followUp", () => {
+			const text = this.#editor.getText().trim();
+			if (!text) return;
+			this.#editor.setText("");
+			handlers.followUp(text);
+		});
+```
+
+## !!steps Applying a view
+
+`apply` is the center of the file. It syncs the transcript, then the streaming message from the `pi.live` document, then the tool slots, tasks, queue, notices, border color, status and footer, and finally renders.
+
+If a streaming partial disappears without an entry replacing it, for example after a retry, the transcript is rebuilt. After a rebuild the next render repaints the whole screen and scrolls to the end.
+
+```ts ! tui.ts
+	apply(view: DurableView): void {
+		const live = (view.conversation.docs["pi.live"] ?? {}) as LiveState;
+		this.#syncTranscript(view.conversation.entries);
+		const message = live.generation?.message as AssistantMessage | undefined;
+		// A partial without its entry was dropped, for example by a retry: render the transcript again.
+		// !mark
+		if (message === undefined && this.#streaming !== undefined) this.#rebuild(view.conversation.entries);
+		if (message !== undefined) this.#syncStreaming(message);
+		for (const slot of live.tools ?? []) {
+			if (slot.status === "pending") continue;
+			const component = this.#tool(slot.name, slot.callId);
+			component.setArgsComplete();
+			if (slot.status !== "running") continue;
+			component.markExecutionStarted();
+			// !mark
+			const child = (slot.details as { conversationId?: number } | undefined)?.conversationId;
+			if (slot.output === undefined && child !== undefined) {
+				const text = `Subagent ${child} is working. /agents switches to it.`;
+				component.updateResult({ content: [{ type: "text", text }], details: slot.details, isError: false }, true);
+			} else if (slot.output !== undefined) {
+				component.updateResult(
+					{ content: [{ type: "text", text: slot.output }], details: slot.details, isError: false },
+					true,
+				);
+			}
+		}
+		this.#syncTasks(view.tasks);
+		this.#syncQueue((view.conversation.docs["pi.inbox"] ?? { items: [] }) as InboxState);
+		this.#syncNotices(view);
+		this.#editor.borderColor = theme.getThinkingBorderColor(agentOf(view.conversation).thinkingLevel ?? "off");
+		this.#syncStatus(live);
+		this.#syncFooter(view);
+		// !mark(1:3)
+		if (this.#rebuilt) this.#transcript.scrollToEnd();
+		this.#ui.requestRender(this.#rebuilt);
+		this.#rebuilt = false;
+	}
+```
+
+## !!steps Tasks and the queue
+
+The task panel prints a tree. A task owned by another task is a child of it, and a task with no owner whose conversation is owned by a live task is placed under that task. Only roots start at depth zero.
+
+The queue shows pending inbox items with their mode. Write-mode items have no user text, so they show their entry kind.
+
+```ts ! tui.ts
+	#syncTasks(graph: TaskGraph | undefined): void {
+		this.#tasks.clear();
+		if (graph === undefined) return;
+		const nodes = Object.values(graph.tasks);
+		const lines: string[] = [theme.fg("accent", `Tasks (${nodes.length} live, /tasks to hide)`)];
+		// A conversation-owned task sits under the task that owns its conversation, when that task is live.
+		// !mark
+		const owned = new Set(nodes.flatMap((node) => node.conversations));
+		const children = (node: TaskGraphNode) =>
+			nodes.filter(
+				(candidate) =>
+					candidate.owner === node.id ||
+					(candidate.owner === undefined && node.conversations.includes(candidate.conversationId)),
+			);
+		// !mark(1:4)
+		const visit = (node: TaskGraphNode, depth: number): void => {
+			lines.push(`${"  ".repeat(depth + 1)}${describeTask(node)}`);
+			for (const child of children(node)) visit(child, depth + 1);
+		};
+		for (const node of nodes) {
+			// !mark
+			if (node.owner === undefined && !owned.has(node.conversationId)) visit(node, 0);
+		}
+		for (const line of lines) this.#tasks.addChild(new TruncatedText(theme.fg("muted", line), 1, 0));
+	}
+
+	#syncQueue(inbox: InboxState): void {
+		this.#queue.clear();
+		for (const item of inbox.items) {
+			const text =
+				item.mode === "write" ? `<${String(item.entry.kind)}>` : userText(item.content as UserMessage["content"]);
+			this.#queue.addChild(new TruncatedText(theme.fg("muted", `[${item.mode}] ${text}`), 1, 0));
+		}
+	}
+```
+
+## !!steps Status line and footer
+
+The status text follows a priority order: retry, deferred response, compaction, running tool, then generic working. The indicator is only replaced when the text changes.
+
+The footer sums usage across models and tools, adds the context percentage and turns it red above 90 percent.
+
+```ts ! tui.ts
+	#syncStatus(live: LiveState): void {
+		const generation = live.generation;
+		const compaction = live.compactions?.[0];
+		const runningTool = live.tools?.find((slot) => slot.status === "running");
+		let text = "";
+		// !mark
+		if (generation?.retry !== undefined) {
+			text = `Retrying (attempt ${generation.attempt + 1}): ${generation.retry.error}`;
+		} else if (generation?.deferred !== undefined) text = "Waiting for deferred response...";
+		// !mark
+		else if (compaction !== undefined) {
+			text = compaction.retry
+				? `Retrying ${compaction.reason} compaction (attempt ${compaction.attempt + 1})...`
+				: `Compacting (${compaction.reason})...`;
+		// !mark
+		} else if (runningTool !== undefined) text = `Running ${runningTool.name}... (esc to abort)`;
+		else if (live.run !== undefined) text = "Working... (esc to abort)";
+		if (text === this.#statusText) return;
+		this.#statusText = text;
+		this.#indicator?.dispose();
+		this.#indicator = text
+			? new WorkingStatusIndicator(this.#ui, text, undefined, (part) => this.#editor.borderColor(part))
+			: undefined;
+		this.#editor.setWorkingStatusIndicator(this.#indicator);
+	}
+		// ...
+		stats.push(`$${usage.cost.total.toFixed(3)}`);
+		const contextWindow =
+			view.models.find((model) => model.provider === agent.model?.provider && model.modelId === agent.model.modelId)
+				?.contextWindow ?? 0;
+		if (contextWindow > 0) {
+			const tokens = contextTokens(view.conversation.entries);
+			const percent = tokens === undefined ? undefined : (tokens / contextWindow) * 100;
+			const text = `${percent === undefined ? "?" : percent.toFixed(1)}%/${formatTokens(contextWindow)}`;
+			// !mark
+			stats.push(percent !== undefined && percent > 90 ? theme.fg("error", text) : text);
+		}
+		this.#footerStats.setText(theme.fg("dim", `${stats.join(" ")}  ${view.session.cwd}`));
+```
+
+## !!steps Syncing the transcript incrementally
+
+The component remembers the ids it has rendered. If any of them no longer lines up with the new entries, compaction or a reset replaced the head and the whole chat is rebuilt. Otherwise only entries beyond the rendered count are added.
+
+```ts ! tui.ts
+	#syncTranscript(entries: readonly EntryRecord[]): void {
+		// Compaction and resets replace the head of the active transcript.
+		// !mark
+		if (this.#renderedEntryIds.some((id, index) => entries[index]?.id !== id)) this.#rebuild(entries);
+		// !mark(1:3)
+		for (const entry of entries.slice(this.#renderedEntryIds.length)) {
+			this.#addEntry(entry);
+			this.#renderedEntryIds.push(entry.id);
+		}
+	}
+
+	#rebuild(entries: readonly EntryRecord[]): void {
+		this.#chat.clear();
+		this.#discardTools();
+		this.#summaries.length = 0;
+		this.#rebuilt = true;
+		this.#renderedEntryIds = [];
+		this.#streaming = undefined;
+		for (const entry of entries) {
+			this.#addEntry(entry);
+			this.#renderedEntryIds.push(entry.id);
+		}
+	}
+```
+
+## !!steps Turning entries into components
+
+Each entry kind has its own component: user messages, assistant messages with their tool calls, tool results, compaction summaries and the reset marker. An assistant message whose stop reason is not tool use never ran its calls, so cards that were shown during streaming are marked as not run and calls never shown are skipped.
+
+```ts ! tui.ts
+	#addEntry(entry: EntryRecord): void {
+		const message = entry.model?.[0];
+		if (entry.kind === "pi.user" && message?.role === "user") {
+			this.#chat.addChild(new Spacer(1));
+			this.#chat.addChild(new UserMessageComponent(userText(message.content)));
+		} else if (entry.kind === "pi.assistant" && message?.role === "assistant") {
+			const component = this.#streaming ?? new AssistantMessageComponent();
+			if (this.#streaming === undefined) this.#chat.addChild(component);
+			this.#streaming = undefined;
+			component.updateContent(message, false);
+			// Only a tool-calling answer runs its calls; an aborted, failed, or truncated one never does.
+			// !mark
+			const ran = message.stopReason === "toolUse";
+			for (const content of message.content) {
+				if (content.type !== "toolCall") continue;
+				const streamed = this.#streamingCalls.has(content.id);
+				// Only cards the stream already showed are kept for calls that never run.
+				// !mark
+				if (!ran && !streamed) continue;
+				const card = this.#tool(content.name, content.id, content.arguments, !streamed);
+				card.setArgsComplete();
+				if (!ran) {
+					// !mark(1:2)
+					const text = "Not run: the answer was interrupted.";
+					card.updateResult({ content: [{ type: "text", text }], isError: true }, false);
+				}
+			}
+			this.#streamingCalls.clear();
+		} else if (entry.kind === "pi.tool-result" && message?.role === "toolResult") {
+			const result = message as ToolResultMessage;
+			this.#tool(result.toolName, result.toolCallId).updateResult(result);
+		} else if (entry.kind === "pi.compaction") {
+			const summary = new CompactionComponent(
+				message?.role === "user" ? userText(message.content) : "",
+				this.#expanded,
+			);
+			this.#summaries.push(summary);
+			this.#chat.addChild(new Spacer(1));
+			this.#chat.addChild(summary);
+		} else if (entry.kind === "pi.reset") this.#addText("[new context]");
+	}
+```
+
+## !!steps Tool cards keyed by call id
+
+Provider call ids can repeat across turns, so the file keeps both a map of the newest card per id and a list of every card. `fresh` creates a new card for an id an earlier turn used. Streaming calls are tracked so the final entry takes over the card the stream made.
+
+```ts ! tui.ts
+	/** The card of a call; `fresh` starts a new one for a call ID an earlier turn used. */
+	#tool(name: string, callId: string, args?: unknown, fresh = false): ToolExecutionComponent {
+		// !mark
+		const existing = fresh ? undefined : this.#tools.get(callId);
+		if (existing !== undefined) {
+			if (args !== undefined) existing.updateArgs(args);
+			return existing;
+		}
+		const component = new ToolExecutionComponent(
+			name,
+			callId,
+			args ?? {},
+			{},
+			DurableTui.#renderers[name],
+			this.#ui,
+			this.#cwd,
+		);
+		component.setExpanded(this.#expanded);
+		this.#chat.addChild(component);
+		// !mark(1:2)
+		this.#cards.push(component);
+		this.#tools.set(callId, component);
+		return component;
+	}
+```
+
+## !!steps Context size and usage helpers
+
+`contextTokens` measures the current context by the usage of the newest successful answer after the newest compaction. Entries kept after the summary are older than it, so they are excluded by id. It returns undefined before any such answer. `totalUsage` adds up model and tool usage, though it does not sum `totalTokens`.
+
+```ts ! tui.ts
+function totalUsage(state: UsageState): Usage {
+	const total: Usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	for (const usage of [...Object.values(state.models), ...Object.values(state.tools)]) {
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.cost.total += usage.cost.total;
+	}
+	return total;
+}
+
+/** Context size from the newest successful answer after the newest compaction; unknown before one. */
+function contextTokens(entries: readonly EntryRecord[]): number | undefined {
+	// Kept entries follow the summary in the view but are older than it; only later answers measure the new context.
+	// !mark
+	const compacted = Math.max(0, ...entries.filter((entry) => entry.kind === "pi.compaction").map((entry) => entry.id));
+	for (const entry of [...entries].reverse()) {
+		const message = entry.model?.[0];
+		if (entry.id < compacted || entry.kind !== "pi.assistant" || message?.role !== "assistant") continue;
+		// !mark
+		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+		const usage = message.usage;
+		return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	}
+	return undefined;
+}
+```
+
+## !!steps Running the UI
+
+`runDurableTui` sets terminal capabilities and the theme, then builds the handlers. The submit handler intercepts four slash commands: model, tasks, agents and compact. Everything else is submitted with steer mode while busy.
+
+The theme controller resolves the configured theme against the terminal colors. The loop waits for the exit promise, then unsubscribes, disposes the theme controller and stops the UI.
+
+```ts ! tui.ts
+export async function runDurableTui(
+	source: DurableViewSource,
+	controller: DurableController,
+	settings: SettingsManager,
+): Promise<void> {
+	setCapabilityOverrides(settings.getTerminalCapabilityOverrides());
+	// The system theme until the controller resolves the user's theme against the terminal's colors.
+	initTheme();
+	let exit = (): void => {};
+	const exited = new Promise<void>((resolve) => {
+		exit = resolve;
+	});
+	let view!: DurableTui;
+	// ...
+	view = new DurableTui(source.current().session.cwd, {
+		submit: (text) => {
+			const trimmed = text.trim();
+			if (!trimmed) return;
+			// !mark(1:4)
+			if (trimmed === "/model") return selectModel();
+			if (trimmed === "/tasks") return void controller.toggleTasks();
+			if (trimmed === "/agents") return selectConversation();
+			if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
+				const instructions = trimmed.slice("/compact".length).trim();
+				return void controller.compact(instructions || undefined);
+			}
+			// !mark
+			void controller.submit(trimmed, "steer");
+		},
+		followUp: (text) => void controller.submit(text, "followUp"),
+		abort: () => void controller.abort(),
+		exit,
+		selectModel,
+		cycleThinking: () => void controller.cycleThinking(),
+	});
+
+	// pi's theme handling: the theme setting (also light/dark pairs) resolved against the terminal's reported colors.
+	const themes = new InteractiveThemeController(view.ui, {
+		getSettingsManager: () => settings,
+		showError: (message) => console.error(message),
+		onChanged: () => view.ui.requestRender(),
+	});
+	// !mark
+	const unsubscribe = source.subscribe(() => view.apply(source.current()));
+	view.start();
+	themes.applyFromSettings();
+	view.apply(source.current());
+	await exited;
+	unsubscribe();
+	themes.dispose();
+	view.stop();
+}
+```
+
+</Scrollycoding>
+
+The file is one large class plus helpers and one entry function. [runtime.ts](/docs/src/experimental/durable/runtime.ts) provides the types, the other interactive files provide the widgets, and [main.ts](/docs/src/experimental/durable/main.ts) calls `runDurableTui`. Tool rendering comes from [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) and theming from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).

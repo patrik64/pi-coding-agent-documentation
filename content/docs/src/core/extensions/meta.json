@@ -1,0 +1,13 @@
+{
+  "title": "extensions",
+  "pages": [
+    "index.ts",
+    "jiti-loader.ts",
+    "jiti-static-loader.ts",
+    "loader.ts",
+    "runner.ts",
+    "types.ts",
+    "virtual-modules.ts",
+    "wrapper.ts"
+  ]
+}

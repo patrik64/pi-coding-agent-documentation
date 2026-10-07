@@ -1,0 +1,281 @@
+---
+title: "model-resolver.ts"
+description: "Turns user-typed model strings (CLI flags, scope patterns, saved settings) into concrete Model objects and picks the model a session starts with"
+source: "src/core/model-resolver.ts"
+full: true
+---
+
+Users refer to models loosely: `sonnet`, `anthropic/claude-sonnet-4-5:high`, `*codex*`, or an OpenRouter id that itself contains slashes and colons. This file is the pure-logic layer that maps those strings onto the catalog held by [model-runtime.ts](/docs/src/core/model-runtime.ts), and decides which model to start with when several sources disagree.
+
+It has three jobs: fuzzy matching with an optional `:thinking` suffix, resolving a list of scope patterns (for model cycling), and the startup decision tree. Most of it takes plain arrays of models, which makes it easy to test; only the CLI and startup functions touch a `ModelRuntime`.
+
+<Scrollycoding>
+
+## !!steps Default model per provider
+
+A table of known provider ids to the model pi prefers when it has to pick for the user. The type is `Partial<Record<KnownProvider, string>>`, so providers without an entry simply fall through to "first model".
+
+Insertion order matters: startup walks `Object.keys` of this object and takes the first provider that has an available model, so the order is a priority list.
+
+```ts ! model-resolver.ts
+/** Default chat model IDs for providers with built-in chat models. */
+export const defaultModelPerProvider: Partial<Record<KnownProvider, string>> = {
+	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
+	"ant-ling": "Ring-2.6-1T",
+	anthropic: "claude-opus-4-8",
+	openai: "gpt-5.5",
+	azure: "gpt-5.4",
+	"openai-codex": "gpt-6.1-sol",
+	radius: "balanced",
+	nvidia: "nvidia/nemotron-3-ultra-550b-a55b",
+	deepseek: "deepseek-v4-pro",
+	google: "gemini-3.1-pro-preview",
+```
+
+## !!steps Exact references and ambiguity
+
+`findExactModelReferenceMatch` accepts either `provider/id` or a bare id, compared case-insensitively. The rule is that ambiguity yields no result: if two providers expose the same bare id, it returns `undefined` rather than guessing by catalog order.
+
+Order of attempts is canonical `provider/id`, then a split at the first slash, then bare id. The split handles ids that contain slashes themselves.
+
+```ts ! model-resolver.ts
+	const canonicalMatches = availableModels.filter(
+		(model) => `${model.provider}/${model.id}`.toLowerCase() === normalizedReference,
+	);
+	if (canonicalMatches.length === 1) {
+		return canonicalMatches[0];
+	}
+	if (canonicalMatches.length > 1) {
+		return undefined;
+	}
+
+	const slashIndex = trimmedReference.indexOf("/");
+	if (slashIndex !== -1) {
+```
+
+## !!steps Fuzzy matching prefers aliases
+
+When there is no exact match, `tryMatchModel` falls back to substring matching on id or display name. Among the matches it prefers an alias (an id ending in `-latest`, or with no `-YYYYMMDD` date suffix) over a dated snapshot, and within each group takes the id that sorts highest with `localeCompare`.
+
+So typing `sonnet` picks `claude-sonnet-4-5` over `claude-sonnet-4-5-20250929`. Note that "sorts highest" is lexical, not semantic versioning.
+
+```ts ! model-resolver.ts
+	// Separate into aliases and dated versions
+	const aliases = matches.filter((m) => isAlias(m.id));
+	const datedVersions = matches.filter((m) => !isAlias(m.id));
+
+	if (aliases.length > 0) {
+		// Prefer alias - if multiple aliases, pick the one that sorts highest
+		aliases.sort((a, b) => b.id.localeCompare(a.id));
+		return aliases[0];
+	} else {
+		// No alias found, pick latest dated version
+		datedVersions.sort((a, b) => b.id.localeCompare(a.id));
+		return datedVersions[0];
+	}
+```
+
+## !!steps Peeling a thinking level off the end
+
+`parseModelPattern` handles `model:level`. It first tries the whole string as a model, because ids like OpenRouter's `:exacto` legitimately contain colons. Only if that fails does it split on the last colon and recurse on the prefix.
+
+A valid suffix (checked by `isValidThinkingLevel` from [args.ts](/docs/src/cli/args.ts)) becomes the thinking level, unless the inner recursion produced a warning. An invalid suffix depends on `allowInvalidThinkingLevelFallback`: scope mode warns and drops it, strict CLI mode fails so that a typo cannot silently resolve to a different model.
+
+```ts ! model-resolver.ts
+	if (isValidThinkingLevel(suffix)) {
+		// Valid thinking level - recurse on prefix and use this level
+		const result = parseModelPattern(prefix, availableModels, options);
+		if (result.model) {
+			// Only use this thinking level if no warning from inner recursion
+			return {
+				model: result.model,
+				thinkingLevel: result.warning ? undefined : suffix,
+				warning: result.warning,
+			};
+		}
+		return result;
+	} else {
+		// Invalid suffix
+		const allowFallback = options?.allowInvalidThinkingLevelFallback ?? true;
+		if (!allowFallback) {
+```
+
+## !!steps Resolving scope patterns with globs
+
+The scope is the list of models the user can cycle through, typically from settings or `--models`. `resolveModelScopeFromModels` handles glob patterns (any of `*`, `?`, `[`) separately from plain ones.
+
+A glob is tested against both `provider/id` and the bare id with `minimatch`, so `*sonnet*` works without a provider prefix. A trailing valid thinking level applies to every model the glob matches. Results are de-duplicated with `modelsAreEqual`, and unmatched patterns produce a diagnostic instead of an error.
+
+```ts ! model-resolver.ts
+			// Match against "provider/modelId" format OR just model ID
+			// This allows "*sonnet*" to match without requiring "anthropic/*sonnet*"
+			const matchingModels = availableModels.filter((m) => {
+				const fullId = `${m.provider}/${m.id}`;
+				return minimatch(fullId, globPattern, { nocase: true }) || minimatch(m.id, globPattern, { nocase: true });
+			});
+
+			if (matchingModels.length === 0) {
+				diagnostics.push({
+					type: "warning",
+					code: "no-match",
+					message: `No models match pattern "${pattern}"`,
+					pattern,
+				});
+				continue;
+			}
+```
+
+## !!steps Separating diagnostics from printing
+
+The core function returns `{ scopedModels, diagnostics }` with no side effects. `resolveModelScopeWithDiagnostics` feeds it only models that have configured auth (`getAvailable`), and `resolveModelScope` is the printing wrapper that writes each diagnostic as a yellow warning.
+
+This split lets callers such as [settings-diagnostics.ts](/docs/src/core/settings-diagnostics.ts) style or collect the messages themselves.
+
+```ts ! model-resolver.ts
+export async function resolveModelScopeWithDiagnostics(
+	patterns: string[],
+	modelRuntime: ModelRuntime,
+	options?: AuthOperationOptions,
+): Promise<ResolveModelScopeResult> {
+	return resolveModelScopeFromModels(patterns, await modelRuntime.getAvailable(undefined, options));
+}
+
+export async function resolveModelScope(
+	patterns: string[],
+	modelRuntime: ModelRuntime,
+	options?: AuthOperationOptions,
+): Promise<ScopedModel[]> {
+	const { scopedModels, diagnostics } = await resolveModelScopeWithDiagnostics(patterns, modelRuntime, options);
+	for (const diagnostic of diagnostics) {
+		console.warn(chalk.yellow(`Warning: ${diagnostic.message}`));
+	}
+	return scopedModels;
+}
+```
+
+## !!steps CLI resolution: provider inference
+
+`resolveCliModel` handles `--provider` and `--model`. It searches all models, not only authenticated ones, with the comment explaining why: `--api-key` must work for first-time setup before any auth exists.
+
+Provider names are canonicalized case-insensitively. Without `--provider`, a prefix before the first slash that names a known provider wins over models whose ids literally start with that text. The example in the comment is `zai/glm-5` meaning provider zai, not a gateway model with that id.
+
+```ts ! model-resolver.ts
+	// Important: use *all* models here, not just models with pre-configured auth.
+	// This allows "--api-key" to be used for first-time setup.
+	const availableModels = [...modelRuntime.getModels()];
+	// ...
+	let pattern = cliModel;
+	let inferredProvider = false;
+
+	if (!provider) {
+		const slashIndex = cliModel.indexOf("/");
+		if (slashIndex !== -1) {
+			const maybeProvider = cliModel.substring(0, slashIndex);
+			const canonical = providerMap.get(maybeProvider.toLowerCase());
+			if (canonical) {
+				provider = canonical;
+				pattern = cliModel.substring(slashIndex + 1);
+				inferredProvider = true;
+			}
+		}
+	}
+```
+
+## !!steps CLI resolution: ambiguous bare ids
+
+Without a provider, a bare id can exist under several providers. If exactly one matches it is used. If several match, the sole authenticated one wins. Otherwise the function returns an error that lists every candidate and says whether none or more than one is authenticated.
+
+That is a deliberate refusal to pick silently, because an unusable provider would only fail later at request time.
+
+```ts ! model-resolver.ts
+		if (exactMatches.length > 1) {
+			const authenticatedExactMatches = exactMatches.filter((m) => modelRuntime.hasConfiguredAuth(m.provider));
+			if (authenticatedExactMatches.length === 1) {
+				return {
+					model: authenticatedExactMatches[0],
+					warning: undefined,
+					thinkingLevel: undefined,
+					error: undefined,
+				};
+			}
+
+			const matches = exactMatches
+				.map((m) => `${m.provider}/${m.id}`)
+				.sort((a, b) => a.localeCompare(b))
+				.join(", ");
+```
+
+## !!steps Custom model ids for a known provider
+
+If a provider is known but the model id is not in its catalog, the resolver builds a fallback model: it clones the provider's default model (or its first one) and overwrites `id` and `name`. This lets users target a model that was released after the bundled catalog.
+
+A thinking suffix is parsed off first, unless `--thinking` was given, and any requested level other than `off` flips `reasoning` to true on the clone. The result carries a warning so the user knows the id was not verified.
+
+```ts ! model-resolver.ts
+		const fallbackModel = buildFallbackModel(provider, fallbackPattern, availableModels);
+		if (fallbackModel) {
+			const requestedThinking = cliThinking ?? fallbackThinking;
+			const model =
+				requestedThinking && requestedThinking !== "off" ? { ...fallbackModel, reasoning: true } : fallbackModel;
+			const fallbackWarning = warning
+				? `${warning} Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`
+				: `Model "${fallbackPattern}" not found for provider "${provider}". Using custom model id.`;
+			return { model, thinkingLevel: fallbackThinking, warning: fallbackWarning, error: undefined };
+		}
+```
+
+## !!steps The startup priority list
+
+`findInitialModel` decides what a fresh session uses. Its doc comment lists five sources in order. In code: CLI args are used only when both provider and model are given, and a resolution error exits the process. Next is the first scoped model, unless the session is being continued.
+
+Thinking level comes from the scope pattern, then a per-model entry in `modelThinkingLevels` keyed as `provider/id`, then the default, then `DEFAULT_THINKING_LEVEL` from [defaults.ts](/docs/src/core/defaults.ts).
+
+```ts ! model-resolver.ts
+	// 2. Use first model from scoped models (skip if continuing/resuming)
+	if (scopedModels.length > 0 && !isContinuing) {
+		const scopedModel = scopedModels[0];
+		const perModel = modelThinkingLevels?.[`${scopedModel.model.provider}/${scopedModel.model.id}`];
+		return {
+			model: scopedModel.model,
+			thinkingLevel: scopedModel.thinkingLevel ?? perModel ?? defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL,
+			fallbackMessage: undefined,
+		};
+	}
+
+	// 3. Try saved default from settings if auth is configured.
+	if (defaultProvider && defaultModelId) {
+		const found = modelRuntime.getModel(defaultProvider, defaultModelId);
+		if (found && modelRuntime.hasConfiguredAuth(found.provider)) {
+```
+
+## !!steps Restoring a saved session model
+
+`restoreModelFromSession` is used when resuming. It succeeds only if the saved model still exists and its provider still has auth. Otherwise it computes a reason (`model no longer exists` or `no auth configured`) and falls back to the current model, then to the first provider default that is available, then to any available model.
+
+Printing is gated by `shouldPrintMessages`, but the same text is always returned as `fallbackMessage` so a TUI can show it itself. This is called from session setup in [agent-session.ts](/docs/src/core/agent-session.ts).
+
+```ts ! model-resolver.ts
+	// Model not found or no API key - fall back
+	const reason = !restoredModel ? "model no longer exists" : "no auth configured";
+
+	if (shouldPrintMessages) {
+		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));
+	}
+
+	// If we already have a model, use it as fallback
+	if (currentModel) {
+		if (shouldPrintMessages) {
+			console.log(chalk.dim(`Falling back to: ${currentModel.provider}/${currentModel.id}`));
+		}
+		return {
+			model: currentModel,
+			fallbackMessage: `Could not restore model ${savedProvider}/${savedModelId} (${reason}). Using ${currentModel.provider}/${currentModel.id}.`,
+		};
+	}
+```
+
+</Scrollycoding>
+
+The runtime in [model-runtime.ts](/docs/src/core/model-runtime.ts) supplies the model lists and auth checks, while [list-models.ts](/docs/src/cli/list-models.ts) and [args.ts](/docs/src/cli/args.ts) are the CLI counterparts that feed `--model` strings in. The same provider defaults are consulted in two places (startup and session restore) with duplicated loops.
+
+Structurally the file is ordered from small helpers up to the orchestrators: matching, parsing, scope resolution, CLI resolution, then initial selection and restore.

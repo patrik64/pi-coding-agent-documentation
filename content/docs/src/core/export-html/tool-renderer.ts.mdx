@@ -1,0 +1,188 @@
+---
+title: "tool-renderer.ts"
+description: "Renders extension tool calls and results to HTML by running their TUI renderers and converting the ANSI output"
+source: "src/core/export-html/tool-renderer.ts"
+full: true
+---
+
+Built-in tools such as read, edit and bash have dedicated HTML renderers in [template.js](/docs/src/core/export-html/template.js). Tools registered by extensions do not, but they do have terminal renderers that return TUI components. This file reuses those: it runs each renderer against a fake render context, takes the ANSI lines the component prints, and turns them into HTML with [ansi-to-html.ts](/docs/src/core/export-html/ansi-to-html.ts).
+
+The result is a small factory. [index.ts](/docs/src/core/export-html/index.ts) calls it once per export, pre-renders every custom tool call and result into a map, and the page script falls back to a JSON dump for any tool missing from that map.
+
+<Scrollycoding>
+
+## !!steps The dependency and renderer contracts
+
+The factory takes a lookup for tool renderers (so it works for both extension tools and registered ones), a theme, the working directory and a width that defaults to 100 columns. Both render methods return `undefined` when there is nothing to show, which is the signal for the caller to use its fallback. The renderer type `ToolRenderers` comes from [types.ts](/docs/src/core/extensions/types.ts).
+
+```ts ! tool-renderer.ts
+export interface ToolHtmlRendererDeps {
+	/** Renderers of calls to a tool, as resolved by extensions and the registered tool */
+	getToolRenderers: (name: string) => ToolRenderers | undefined;
+	/** Theme for styling */
+	theme: Theme;
+	/** Working directory for render context */
+	cwd: string;
+	/** Terminal width for rendering (default: 100) */
+	width?: number;
+}
+
+export interface ToolHtmlRenderer {
+	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
+	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
+	/** Render a tool result to collapsed/expanded HTML. Returns undefined if tool has no custom renderer. */
+	renderResult(
+		toolCallId: string,
+		toolName: string,
+		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+		details: unknown,
+		isError: boolean,
+	): { collapsed?: string; expanded?: string } | undefined;
+}
+```
+
+## !!steps Trimming blank lines
+
+TUI components often pad their output with blank lines. Results are trimmed top and bottom, and a line counts as blank after its SGR color escapes are removed, so a line of only color codes is not kept. Call output is not trimmed.
+
+The doc comment above `ANSI_ESCAPE_REGEX` describes `createToolHtmlRenderer`; it was left behind when the helpers were inserted.
+
+```ts ! tool-renderer.ts
+/**
+ * Create a tool HTML renderer.
+ *
+ * The renderer looks up tool definitions and invokes their renderCall/renderResult
+ * methods, converting the resulting TUI Component output (ANSI) to HTML.
+ */
+const ANSI_ESCAPE_REGEX = /\x1b\[[\d;]*m/g;
+
+function isBlankRenderedLine(line: string): boolean {
+	return line.replace(ANSI_ESCAPE_REGEX, "").trim().length === 0;
+}
+
+function trimRenderedResultLines(lines: string[]): string[] {
+	let start = 0;
+	let end = lines.length;
+	while (start < end && isBlankRenderedLine(lines[start])) start++;
+	while (end > start && isBlankRenderedLine(lines[end - 1])) end--;
+	return lines.slice(start, end);
+}
+```
+
+## !!steps Per-call state and the render context
+
+The renderer keeps maps keyed by tool call id: last components, a state object and the args. The context mimics a live TUI call but pins everything to finished: execution started, arguments complete, images off, `invalidate` a no-op. Passing the previous component as `lastComponent` lets a renderer reuse its own instance, as it would in the terminal. The maps are never cleared, which is fine for one export.
+
+```ts ! tool-renderer.ts
+export function createToolHtmlRenderer(deps: ToolHtmlRendererDeps): ToolHtmlRenderer {
+	const { getToolRenderers, theme, cwd, width = 100 } = deps;
+
+	const renderedCallComponents = new Map<string, Component>();
+	const renderedResultComponents = new Map<string, Component>();
+	const renderedStates = new Map<string, any>();
+	const renderedArgs = new Map<string, unknown>();
+
+	const getState = (toolCallId: string): any => {
+		let state = renderedStates.get(toolCallId);
+		if (!state) {
+			state = {};
+			renderedStates.set(toolCallId, state);
+		}
+		return state;
+	};
+
+	const createRenderContext = (
+		toolCallId: string,
+		lastComponent: Component | undefined,
+		expanded: boolean,
+		isPartial: boolean,
+		isError: boolean,
+	): ToolRenderContext => {
+		return {
+			args: renderedArgs.get(toolCallId),
+			toolCallId,
+			invalidate: () => {},
+			lastComponent,
+			state: getState(toolCallId),
+			cwd,
+			executionStarted: true,
+			argsComplete: true,
+			isPartial,
+			expanded,
+			showImages: false,
+			isError,
+		};
+	};
+```
+
+## !!steps Rendering a call
+
+The call is always rendered with `isPartial` true, matching how the terminal shows a call before its result arrives. Any exception, including a renderer bug, is swallowed and turned into `undefined`, so one broken extension cannot fail the whole export.
+
+```ts ! tool-renderer.ts
+	return {
+		renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined {
+			try {
+				renderedArgs.set(toolCallId, args);
+				const toolDef = getToolRenderers(toolName);
+				if (!toolDef?.renderCall) {
+					return undefined;
+				}
+
+				const component = toolDef.renderCall(
+					args,
+					theme,
+					createRenderContext(toolCallId, renderedCallComponents.get(toolCallId), false, true, false),
+				);
+				renderedCallComponents.set(toolCallId, component);
+				const lines = component.render(width);
+				return ansiLinesToHtml(lines);
+			} catch {
+				// On error, return undefined so HTML export can fall back to structured result rendering
+				return undefined;
+			}
+		},
+```
+
+## !!steps Rendering a result twice
+
+Each result is rendered collapsed and then expanded, because the page offers a click-to-expand toggle. If both strings are identical, only `expanded` is returned. That is why the page script checks for a differing pair before building the expandable block.
+
+```ts ! tool-renderer.ts
+				// Build AgentToolResult from content array
+				// Cast content since session storage uses generic object types
+				const agentToolResult = {
+					content: result as (TextContent | ImageContent)[],
+					details,
+					isError,
+				};
+
+				// Render collapsed
+				const collapsedComponent = toolDef.renderResult(
+					agentToolResult,
+					{ expanded: false, isPartial: false },
+					theme,
+					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), false, false, isError),
+				);
+				renderedResultComponents.set(toolCallId, collapsedComponent);
+				const collapsed = ansiLinesToHtml(trimRenderedResultLines(collapsedComponent.render(width)));
+
+				// Render expanded
+				const expandedComponent = toolDef.renderResult(
+					agentToolResult,
+					{ expanded: true, isPartial: false },
+					theme,
+					createRenderContext(toolCallId, renderedResultComponents.get(toolCallId), true, false, isError),
+				);
+				renderedResultComponents.set(toolCallId, expandedComponent);
+				const expanded = ansiLinesToHtml(trimRenderedResultLines(expandedComponent.render(width)));
+
+				return {
+					...(collapsed && collapsed !== expanded ? { collapsed } : {}),
+					expanded,
+				};
+```
+
+</Scrollycoding>
+
+The consumer is [index.ts](/docs/src/core/export-html/index.ts), which passes the output into the exported session data as `renderedTools`. The ANSI conversion lives in [ansi-to-html.ts](/docs/src/core/export-html/ansi-to-html.ts); this file only decides what to render and handles failures. Styling for the converted output comes from the `.ansi-line` rules in [template.css](/docs/src/core/export-html/template.css).

@@ -1,0 +1,12 @@
+{
+  "title": "vacation",
+  "pages": [
+    "harness-setup.ts",
+    "main.ts",
+    "README.md",
+    "runtime.ts",
+    "sessions.ts",
+    "tui.ts",
+    "vacation.ts"
+  ]
+}

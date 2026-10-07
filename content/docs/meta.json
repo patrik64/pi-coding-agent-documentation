@@ -1,0 +1,10 @@
+{
+  "pages": [
+    "index",
+    "architecture",
+    "code-graph",
+    "findings",
+    "src",
+    "scripts"
+  ]
+}

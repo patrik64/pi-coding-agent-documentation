@@ -1,0 +1,494 @@
+---
+title: "tui.ts"
+description: "The terminal UI for the vacation demo: renders a DurableView with pi's interactive components, plus slash commands, model and conversation pickers"
+source: "src/experimental/vacation/tui.ts"
+full: true
+---
+
+This is the rendering half of the demo. It consumes the plain `DurableView` values and `DurableController` commands from [runtime.ts](/docs/src/experimental/vacation/runtime.ts) and turns them into an alternate-screen terminal UI, reusing pi's interactive components rather than writing new ones: the assistant message, tool execution cards, the custom editor, the working indicator and the theme controller.
+
+The core is the `DurableTui` class. Its `apply` method is called with a fresh view each time anything changes and incrementally syncs transcript, streaming message, tool cards, task panel, queue, notices, status and footer. The exported `runDurableTui` at the bottom wires the editor's actions to slash commands and the controller. It is experimental, shared in shape with [durable/tui.ts](/docs/src/experimental/durable/tui.ts), and used only by [main.ts](/docs/src/experimental/vacation/main.ts).
+
+<Scrollycoding>
+
+## !!steps A filterable list selector
+
+`ListSelector` replaces the editor temporarily for the model and conversation pickers. It forwards navigation, confirm and cancel keys to the select list, and sends every other key to a text input; after each key it filters the items with `fuzzyFilter` and rebuilds the list. The selection keybindings come from the global keybinding registry that [keybindings.ts](/docs/src/core/keybindings.ts) populates.
+
+```ts ! tui.ts
+	handleInput(data: string): void {
+		const keybindings = getKeybindings();
+		const forwarded = ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const;
+		// !mark(1:3)
+		if (forwarded.some((action) => keybindings.matches(data, action))) {
+			this.#list.handleInput(data);
+			return;
+		}
+		this.#input.handleInput(data);
+		const query = this.#input.getValue();
+		const filtered =
+			// !mark
+			query.length === 0 ? this.#items : fuzzyFilter(this.#items, query, (item) => `${item.label} ${item.value}`);
+		this.#list = this.#build(filtered);
+	}
+
+	#build(items: SelectItem[]): SelectList {
+		const list = new SelectList(items, 10, SELECT_THEME);
+		list.onSelect = (item) => this.#onSelect(item.value);
+		list.onCancel = this.#onCancel;
+		this.#listContainer.clear();
+		this.#listContainer.addChild(list);
+		return list;
+	}
+```
+
+## !!steps Compaction summaries
+
+After compaction the earlier context is replaced by a summary entry. `CompactionComponent` shows it collapsed to one line, with the expand key hint from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), or fully rendered as Markdown when expanded. Rebuilding the children on every toggle keeps the component stateless apart from the summary text.
+
+```ts ! tui.ts
+/** The summary that replaced earlier context: collapsed to one line until expanded. */
+class CompactionComponent extends Box {
+	readonly #summary: string;
+
+	constructor(summary: string, expanded: boolean) {
+		super(1, 1, (text) => theme.bg("customMessageBg", text));
+		this.#summary = summary;
+		this.setExpanded(expanded);
+	}
+
+	// !mark
+	setExpanded(expanded: boolean): void {
+		this.clear();
+		this.addChild(new Text(theme.fg("customMessageLabel", theme.bold("[compaction]")), 0, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(
+			// !mark(1:3)
+			expanded
+				? new Markdown(this.#summary, 0, 0, getMarkdownTheme(), {
+						color: (text: string) => theme.fg("customMessageText", text),
+					})
+				: new Text(
+						theme.fg("customMessageText", "Earlier context summarized (") +
+							theme.fg("dim", keyText("app.tools.expand")) +
+							theme.fg("customMessageText", " to expand)"),
+						0,
+						0,
+					),
+		);
+	}
+```
+
+## !!steps What the TUI keeps
+
+The class holds one container per region (chat, tasks, queue, notices, footer, editor) plus bookkeeping to make updates incremental. Two maps deal with a quirk: provider call IDs can repeat across turns, so the newest card per ID is looked up in one map while all cards are kept in a list. `#renderedEntryIds` records which entries are already shown, and `#rebuilt` forces a full repaint after the transcript is rebuilt.
+
+```ts ! tui.ts
+class DurableTui {
+	static readonly #renderers: Record<string, ToolRenderers> = createAllToolRenderers();
+	readonly #ui: TuiAltScreen;
+	readonly #chat = new Container();
+	readonly #tasks = new Container();
+	readonly #queue = new Container();
+	readonly #notices = new Container();
+	readonly #footer = new Container();
+	readonly #footerStats = new Text("", 1, 0);
+	readonly #footerHints = new Text("", 1, 0);
+	readonly #editorContainer = new Container();
+	readonly #editor: CustomEditor;
+	readonly #cwd: string;
+	// !mark(1:6)
+	/** The newest card per call ID; provider call IDs may repeat across turns. */
+	readonly #tools = new Map<string, ToolExecutionComponent>();
+	/** Every card shown, also older ones whose call ID a later turn reused. */
+	readonly #cards: ToolExecutionComponent[] = [];
+	/** Call IDs whose cards the streaming answer created; its entry takes them over. */
+	readonly #streamingCalls = new Set<string>();
+	readonly #summaries: CompactionComponent[] = [];
+	/** Tool output and summaries shown in full; toggled like pi. */
+	// !mark
+	#expanded = false;
+	#renderedEntryIds: number[] = [];
+	#streaming: AssistantMessageComponent | undefined;
+	#indicator: StatusIndicator | undefined;
+	#statusText = "";
+	/** Set when the transcript was rebuilt: the next render repaints the screen and shows the end. */
+	#rebuilt = false;
+	#transcript: ScrollView;
+```
+
+## !!steps Layout and key bindings
+
+The constructor creates the alternate-screen UI and the editor from [custom-editor.ts](/docs/src/modes/interactive/components/custom-editor.ts), and binds app actions to handlers: submit, escape for abort, Ctrl+D and clear for exit, model select, thinking cycle, tool expansion, and follow-up.
+
+The layout is a vertical stack: a scrolling transcript that follows the end, and a dock beneath it for tasks, queue, notices, editor and footer. The editor has a minimum size of three rows so it survives a small terminal.
+
+```ts ! tui.ts
+	constructor(cwd: string, handlers: Handlers) {
+		this.#cwd = cwd;
+		this.#ui = new TuiAltScreen(new ProcessTerminal(), false, getAgentDir());
+		const keybindings = KeybindingsManager.create();
+		setKeybindings(keybindings);
+		this.#editor = new CustomEditor(this.#ui, getEditorTheme(), keybindings, {
+			paddingX: 1,
+			embedWorkingStatus: true,
+		});
+		this.#editor.onSubmit = handlers.submit;
+		this.#editor.onEscape = handlers.abort;
+		this.#editor.onCtrlD = handlers.exit;
+		this.#editor.onAction("app.clear", handlers.exit);
+		// !mark
+		this.#editor.onAction("app.model.select", handlers.selectModel);
+		this.#editor.onAction("app.thinking.cycle", handlers.cycleThinking);
+		// ...
+		// !mark
+		const transcript = new ScrollView(content, { follow: "end", primary: true, overscroll: "chain" });
+		this.#transcript = transcript;
+		const dock = new VStack([
+			{ component: this.#tasks, shrink: 1, minSize: 0 },
+			{ component: this.#queue, shrink: 1, minSize: 0 },
+			{ component: this.#notices, shrink: 1, minSize: 0 },
+			{ component: this.#editorContainer, shrink: 1, minSize: 3 },
+			{ component: this.#footer, shrink: 1, minSize: 0 },
+		]);
+		// ...
+		this.#ui.setLayoutRoot(
+			new VStack([
+				// !mark(1:2)
+				{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+				{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+			]),
+		);
+		this.#ui.setFocus(this.#editor);
+```
+
+## !!steps Applying a view
+
+`apply` is the one entry point for updates. It syncs the transcript, then the in-progress assistant message, then the live tool slots. If the streamed partial vanished without an entry (for example a retry dropped it), the transcript is rebuilt. For running tools that have spawned a subagent, the card says so and points at `/agents`.
+
+The editor border color follows the thinking level, and the final lines scroll to the end only after a rebuild.
+
+```ts ! tui.ts
+	apply(view: DurableView): void {
+		const live = (view.conversation.docs["pi.live"] ?? {}) as LiveState;
+		this.#syncTranscript(view.conversation.entries);
+		const message = live.generation?.message as AssistantMessage | undefined;
+		// A partial without its entry was dropped, for example by a retry: render the transcript again.
+		// !mark
+		if (message === undefined && this.#streaming !== undefined) this.#rebuild(view.conversation.entries);
+		if (message !== undefined) this.#syncStreaming(message);
+		for (const slot of live.tools ?? []) {
+			if (slot.status === "pending") continue;
+			const component = this.#tool(slot.name, slot.callId);
+			component.setArgsComplete();
+			if (slot.status !== "running") continue;
+			component.markExecutionStarted();
+			// !mark(1:4)
+			const child = (slot.details as { conversationId?: number } | undefined)?.conversationId;
+			if (slot.output === undefined && child !== undefined) {
+				const text = `Subagent ${child} is working. /agents switches to it.`;
+				component.updateResult({ content: [{ type: "text", text }], details: slot.details, isError: false }, true);
+			} else if (slot.output !== undefined) {
+				component.updateResult(
+					{ content: [{ type: "text", text: slot.output }], details: slot.details, isError: false },
+					true,
+				);
+			}
+		}
+		this.#syncTasks(view.tasks);
+		this.#syncQueue((view.conversation.docs["pi.inbox"] ?? { items: [] }) as InboxState);
+		this.#syncNotices(view);
+		this.#editor.borderColor = theme.getThinkingBorderColor(agentOf(view.conversation).thinkingLevel ?? "off");
+		this.#syncStatus(live);
+		this.#syncFooter(view);
+		// !mark(1:2)
+		if (this.#rebuilt) this.#transcript.scrollToEnd();
+		this.#ui.requestRender(this.#rebuilt);
+		this.#rebuilt = false;
+	}
+```
+
+## !!steps The task panel as a tree
+
+Tasks come from the Harness task graph. A task owned by another task, or one that owns a conversation, is drawn as a child of its owner; only roots are visited from the top. `describeTask` formats status, flags like background or aborting, and owned conversations. This is where the parallel `search` calls of the demo appear as separate lines.
+
+```ts ! tui.ts
+	#syncTasks(graph: TaskGraph | undefined): void {
+		this.#tasks.clear();
+		if (graph === undefined) return;
+		const nodes = Object.values(graph.tasks);
+		const lines: string[] = [theme.fg("accent", `Tasks (${nodes.length} live, /tasks to hide)`)];
+		// A conversation-owned task sits under the task that owns its conversation, when that task is live.
+		// !mark
+		const owned = new Set(nodes.flatMap((node) => node.conversations));
+		const children = (node: TaskGraphNode) =>
+			nodes.filter(
+				(candidate) =>
+					candidate.owner === node.id ||
+					(candidate.owner === undefined && node.conversations.includes(candidate.conversationId)),
+			);
+		// !mark(1:4)
+		const visit = (node: TaskGraphNode, depth: number): void => {
+			lines.push(`${"  ".repeat(depth + 1)}${describeTask(node)}`);
+			for (const child of children(node)) visit(child, depth + 1);
+		};
+		for (const node of nodes) {
+			if (node.owner === undefined && !owned.has(node.conversationId)) visit(node, 0);
+		}
+		for (const line of lines) this.#tasks.addChild(new TruncatedText(theme.fg("muted", line), 1, 0));
+	}
+```
+
+## !!steps Status line and indicator
+
+The status text is picked by priority: a retry, a deferred response, a compaction, a running tool, then a generic working state. The indicator is only replaced when the text changes, so the spinner does not restart on each render. The indicator is [status-indicator.ts](/docs/src/modes/interactive/components/status-indicator.ts) and it is embedded in the editor border.
+
+```ts ! tui.ts
+	#syncStatus(live: LiveState): void {
+		const generation = live.generation;
+		const compaction = live.compactions?.[0];
+		const runningTool = live.tools?.find((slot) => slot.status === "running");
+		let text = "";
+		// !mark
+		if (generation?.retry !== undefined) {
+			text = `Retrying (attempt ${generation.attempt + 1}): ${generation.retry.error}`;
+		} else if (generation?.deferred !== undefined) text = "Waiting for deferred response...";
+		else if (compaction !== undefined) {
+			text = compaction.retry
+				? `Retrying ${compaction.reason} compaction (attempt ${compaction.attempt + 1})...`
+				: `Compacting (${compaction.reason})...`;
+		} else if (runningTool !== undefined) text = `Running ${runningTool.name}... (esc to abort)`;
+		else if (live.run !== undefined) text = "Working... (esc to abort)";
+		// !mark
+		if (text === this.#statusText) return;
+		this.#statusText = text;
+		// !mark(1:5)
+		this.#indicator?.dispose();
+		this.#indicator = text
+			? new WorkingStatusIndicator(this.#ui, text, undefined, (part) => this.#editor.borderColor(part))
+			: undefined;
+		this.#editor.setWorkingStatusIndicator(this.#indicator);
+	}
+```
+
+## !!steps Footer statistics
+
+The footer sums token usage and cost over all models and tools in the usage document, formats counts with `formatTokens` from [footer.ts](/docs/src/modes/interactive/components/footer.ts), and shows the context size as a percentage of the model's window. The percentage turns red above 90.
+
+```ts ! tui.ts
+	#syncFooter(view: DurableView): void {
+		const agent = agentOf(view.conversation);
+		// !mark
+		const usage = totalUsage((view.conversation.docs["pi.usage"] ?? { models: {}, tools: {} }) as UsageState);
+		const stats: string[] = [];
+		if (usage.input) stats.push(`↑${formatTokens(usage.input)}`);
+		if (usage.output) stats.push(`↓${formatTokens(usage.output)}`);
+		if (usage.cacheRead) stats.push(`R${formatTokens(usage.cacheRead)}`);
+		if (usage.cacheWrite) stats.push(`W${formatTokens(usage.cacheWrite)}`);
+		stats.push(`$${usage.cost.total.toFixed(3)}`);
+		const contextWindow =
+			view.models.find((model) => model.provider === agent.model?.provider && model.modelId === agent.model.modelId)
+				?.contextWindow ?? 0;
+		if (contextWindow > 0) {
+			const tokens = contextTokens(view.conversation.entries);
+			// !mark(1:3)
+			const percent = tokens === undefined ? undefined : (tokens / contextWindow) * 100;
+			const text = `${percent === undefined ? "?" : percent.toFixed(1)}%/${formatTokens(contextWindow)}`;
+			stats.push(percent !== undefined && percent > 90 ? theme.fg("error", text) : text);
+		}
+		this.#footerStats.setText(theme.fg("dim", `${stats.join(" ")}  ${view.session.cwd}`));
+```
+
+## !!steps Incremental transcript sync
+
+Entries are append-only, so `#syncTranscript` compares the ids it has shown against the new list and appends only the new ones. If any id differs at an earlier position, compaction or reset replaced the head and the whole transcript is rebuilt.
+
+`#addEntry` maps entry kinds to components. A tool-calling assistant message is rendered through [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts). Calls of an answer that was interrupted are shown only if the stream already displayed them, and are marked as not run.
+
+```ts ! tui.ts
+	#syncTranscript(entries: readonly EntryRecord[]): void {
+		// Compaction and resets replace the head of the active transcript.
+		// !mark
+		if (this.#renderedEntryIds.some((id, index) => entries[index]?.id !== id)) this.#rebuild(entries);
+		for (const entry of entries.slice(this.#renderedEntryIds.length)) {
+			this.#addEntry(entry);
+			this.#renderedEntryIds.push(entry.id);
+		}
+	}
+	// ...
+	#addEntry(entry: EntryRecord): void {
+		const message = entry.model?.[0];
+		if (entry.kind === "pi.user" && message?.role === "user") {
+			this.#chat.addChild(new Spacer(1));
+			this.#chat.addChild(new UserMessageComponent(userText(message.content)));
+		} else if (entry.kind === "pi.assistant" && message?.role === "assistant") {
+			const component = this.#streaming ?? new AssistantMessageComponent();
+			if (this.#streaming === undefined) this.#chat.addChild(component);
+			this.#streaming = undefined;
+			component.updateContent(message, false);
+			// Only a tool-calling answer runs its calls; an aborted, failed, or truncated one never does.
+			// !mark
+			const ran = message.stopReason === "toolUse";
+			for (const content of message.content) {
+				if (content.type !== "toolCall") continue;
+				const streamed = this.#streamingCalls.has(content.id);
+				// Only cards the stream already showed are kept for calls that never run.
+				// !mark
+				if (!ran && !streamed) continue;
+				const card = this.#tool(content.name, content.id, content.arguments, !streamed);
+				card.setArgsComplete();
+				if (!ran) {
+					// !mark(1:2)
+					const text = "Not run: the answer was interrupted.";
+					card.updateResult({ content: [{ type: "text", text }], isError: true }, false);
+				}
+			}
+			this.#streamingCalls.clear();
+```
+
+## !!steps Tool cards
+
+`#tool` returns the existing card for a call id or creates a new [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts) component using the renderer registered for that tool name from [index.ts](/docs/src/core/tools/renderers/index.ts). The `fresh` flag forces a new card for a repeated call ID.
+
+```ts ! tui.ts
+	/** The card of a call; `fresh` starts a new one for a call ID an earlier turn used. */
+	#tool(name: string, callId: string, args?: unknown, fresh = false): ToolExecutionComponent {
+		// !mark
+		const existing = fresh ? undefined : this.#tools.get(callId);
+		if (existing !== undefined) {
+			if (args !== undefined) existing.updateArgs(args);
+			return existing;
+		}
+		const component = new ToolExecutionComponent(
+			name,
+			callId,
+			args ?? {},
+			{},
+			// !mark
+			DurableTui.#renderers[name],
+			this.#ui,
+			this.#cwd,
+		);
+		component.setExpanded(this.#expanded);
+		this.#chat.addChild(component);
+		this.#cards.push(component);
+		this.#tools.set(callId, component);
+		return component;
+	}
+```
+
+## !!steps Context size and cleanup of finished tools
+
+`contextTokens` measures the current context from the newest successful answer after the newest compaction. The comment explains why: kept entries follow the summary in the view but are older than it. Aborted and failed answers are skipped, and the result is undefined before any answer exists, which the footer shows as a question mark.
+
+`#discardTools` finishes every card, because a running bash card keeps a timer until it receives a final result.
+
+```ts ! tui.ts
+	/** Finish every card: a running bash card keeps a timer until it gets a final result. */
+	#discardTools(): void {
+		// !mark
+		for (const component of this.#cards) component.updateResult({ content: [], isError: false }, false);
+		this.#cards.length = 0;
+		this.#tools.clear();
+		this.#streamingCalls.clear();
+	}
+// ...
+/** Context size from the newest successful answer after the newest compaction; unknown before one. */
+function contextTokens(entries: readonly EntryRecord[]): number | undefined {
+	// Kept entries follow the summary in the view but are older than it; only later answers measure the new context.
+	// !mark
+	const compacted = Math.max(0, ...entries.filter((entry) => entry.kind === "pi.compaction").map((entry) => entry.id));
+	for (const entry of [...entries].reverse()) {
+		const message = entry.model?.[0];
+		if (entry.id < compacted || entry.kind !== "pi.assistant" || message?.role !== "assistant") continue;
+		// !mark
+		if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+		const usage = message.usage;
+		return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+	}
+	return undefined;
+}
+```
+
+## !!steps Slash commands and the controller
+
+`runDurableTui` builds the view with handlers. Slash commands are recognized by exact text: `/model`, `/tasks`, `/agents` and `/compact` with optional instructions. Everything else is submitted with the steer mode, while the follow-up action submits with the follow-up mode.
+
+The theme is handled by pi's [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts), which resolves the configured theme against the terminal. The function waits on an `exited` promise and then tears everything down.
+
+```ts ! tui.ts
+	view = new DurableTui(source.current().session.cwd, {
+		submit: (text) => {
+			const trimmed = text.trim();
+			if (!trimmed) return;
+			// !mark(1:4)
+			if (trimmed === "/model") return selectModel();
+			if (trimmed === "/tasks") return void controller.toggleTasks();
+			if (trimmed === "/agents") return selectConversation();
+			if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
+				const instructions = trimmed.slice("/compact".length).trim();
+				return void controller.compact(instructions || undefined);
+			}
+			// !mark
+			void controller.submit(trimmed, "steer");
+		},
+		followUp: (text) => void controller.submit(text, "followUp"),
+		abort: () => void controller.abort(),
+		exit,
+		selectModel,
+		cycleThinking: () => void controller.cycleThinking(),
+	});
+	// ...
+	// pi's theme handling: the theme setting (also light/dark pairs) resolved against the terminal's reported colors.
+	// !mark
+	const themes = new InteractiveThemeController(view.ui, {
+		getSettingsManager: () => settings,
+		showError: (message) => console.error(message),
+		onChanged: () => view.ui.requestRender(),
+	});
+	const unsubscribe = source.subscribe(() => view.apply(source.current()));
+	view.start();
+	themes.applyFromSettings();
+	view.apply(source.current());
+	await exited;
+	unsubscribe();
+	themes.dispose();
+	view.stop();
+```
+
+## !!steps The model and conversation pickers
+
+The model picker lists all available models with the current one first and, on selection, restores the editor and calls `setModel`. The conversation picker lists conversations newest first, marks the shown one, and calls `switchConversation`. Both are mounted in place of the editor and restore it on cancel.
+
+```ts ! tui.ts
+	const selectModel = (): void => {
+		const snapshot = source.current();
+		const current = agentOf(snapshot.conversation).model;
+		const isCurrent = (model: { provider: string; modelId: string }) =>
+			model.provider === current?.provider && model.modelId === current.modelId;
+		// !mark(1:2)
+		const items: SelectItem[] = [...snapshot.models]
+			.sort((left, right) => Number(isCurrent(right)) - Number(isCurrent(left)))
+			.map((model) => ({
+				value: `${model.provider}/${model.modelId}`,
+				label: model.modelId,
+				description: model.provider,
+			}));
+		const selector = new ListSelector(
+			"Select model:",
+			items,
+			(value) => {
+				// !mark(1:5)
+				view.restoreEditor();
+				const separator = value.indexOf("/");
+				void controller.setModel({ provider: value.slice(0, separator), modelId: value.slice(separator + 1) });
+			},
+			() => view.restoreEditor(),
+		);
+		view.mount(selector);
+	};
+```
+
+</Scrollycoding>
+
+The TUI never reads Harness state directly: it works from `DurableView` and returns commands through the controller, so the same boundary could serve a different front end. The theme object and `initTheme` come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and user messages render with [user-message.ts](/docs/src/modes/interactive/components/user-message.ts). Structurally, all state is private to the class and the module-level functions are pure formatting helpers.

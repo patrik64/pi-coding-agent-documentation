@@ -1,0 +1,9 @@
+{
+  "title": "compaction",
+  "pages": [
+    "branch-summarization.ts",
+    "compaction.ts",
+    "index.ts",
+    "utils.ts"
+  ]
+}

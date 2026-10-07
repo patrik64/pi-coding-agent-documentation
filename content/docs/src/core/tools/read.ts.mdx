@@ -1,0 +1,234 @@
+---
+title: "read.ts"
+description: "The read tool: text files with offset/limit paging and head truncation, plus image files that are resized and attached"
+source: "src/core/tools/read.ts"
+full: true
+---
+
+The read tool is how the model looks at files. For text it returns numbered paging hints rather than whole giant files: output is cut to 2000 lines or 50KB, and the notice at the end tells the model exactly which `offset` to use to continue. For images it detects the type, optionally resizes, and returns an image block alongside a short text note.
+
+Like [write.ts](/docs/src/core/tools/write.ts) it goes through a replaceable operations object, so remote backends can supply their own file access. Truncation is delegated to `truncateHead` in [truncate.ts](/docs/src/core/tools/truncate.ts), and image handling to [image-process.ts](/docs/src/utils/image-process.ts) and [mime.ts](/docs/src/utils/mime.ts).
+
+<Scrollycoding>
+
+## !!steps Input schema and prompt text
+
+`offset` is 1-indexed and `limit` is a line count, both optional. The guideline pushes the model to use this tool instead of `cat` or `sed` through bash, which keeps truncation and image support in play.
+
+```ts ! read.ts
+const readSchema = Type.Object({
+	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+export const readToolSystemPromptContribution = {
+	snippet: "Read file contents",
+	guidelines: ["Use read to examine files instead of cat or sed."],
+} as const;
+
+export type ReadToolInput = Static<typeof readSchema>;
+```
+
+## !!steps A second, programmatic output type
+
+Besides the text the model sees, the tool returns `structuredContent` for programmatic callers such as codemode scripts. It is either a string or an image object with a note. The comment explains why property descriptions are omitted: the type is printed inline in tool descriptions and should stay on one line.
+
+`toReadOutput` derives it from the normal content blocks, picking the first text block and the first image block.
+
+```ts ! read.ts
+const readOutputSchema = Type.Union([
+	Type.String(),
+	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String(), note: Type.String() }),
+]);
+
+export type ReadToolOutput = Static<typeof readOutputSchema>;
+
+export interface ReadToolDetails {
+	truncation?: TruncationResult;
+}
+// ...
+/** The image block and its note, or the text for text files and images that could not be processed. */
+function toReadOutput(content: (TextContent | ImageContent)[]): ReadToolOutput {
+	const text = content.find((block) => block.type === "text")?.text ?? "";
+	const image = content.find((block) => block.type === "image");
+	return image ? { type: "image", data: image.data, mimeType: image.mimeType, note: text } : text;
+}
+```
+
+## !!steps Operations and defaults
+
+Three operations: read bytes, check access, and detect an image MIME type. The last is optional, and when a backend does not supply it, no file is ever treated as an image. The local default checks `R_OK` and uses `detectSupportedImageMimeTypeFromFile`, which inspects file contents, not just the extension.
+
+```ts ! read.ts
+export interface ReadOperations {
+	/** Read file contents as a Buffer */
+	readFile: (absolutePath: string) => Promise<Buffer>;
+	/** Check if file is readable (throw if not) */
+	access: (absolutePath: string) => Promise<void>;
+	/** Detect image MIME type, return null or undefined for non-images */
+	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
+}
+
+const defaultReadOperations: ReadOperations = {
+	readFile: (path) => fsReadFile(path),
+	access: (path) => fsAccess(path, constants.R_OK),
+	detectImageMimeType: detectSupportedImageMimeTypeFromFile,
+};
+```
+
+## !!steps Abort handling without a mutation queue
+
+Reads do not need the queue that writes use, so abort is handled directly. The tool wraps its work in a promise, rejects immediately if the signal is already aborted, and otherwise registers a one-shot listener that flips a local `aborted` flag and rejects.
+
+The async body checks that flag after each await and simply returns when it is set, so an aborted read stops doing work even though the promise has already rejected. Path resolution goes through `resolveReadPathAsync` in [path-utils.ts](/docs/src/core/tools/path-utils.ts), which is read-specific.
+
+```ts ! read.ts
+			return new Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }>(
+				(resolve, reject) => {
+					if (signal?.aborted) {
+						reject(new Error("Operation aborted"));
+						return;
+					}
+					let aborted = false;
+					const onAbort = () => {
+						aborted = true;
+						reject(new Error("Operation aborted"));
+					};
+					signal?.addEventListener("abort", onAbort, { once: true });
+
+					(async () => {
+						try {
+							const absolutePath = await resolveReadPathAsync(path, ctx?.cwd || cwd);
+							if (aborted) return;
+							// Check if file exists and is readable.
+							await ops.access(absolutePath);
+							if (aborted) return;
+							const mimeType = ops.detectImageMimeType ? await ops.detectImageMimeType(absolutePath) : undefined;
+```
+
+## !!steps The image branch
+
+If a MIME type was detected, the file is read as bytes and handed to `processImage`, with `autoResizeImages` on by default. The resize options come from the active model's `inputLimits` when the context has a model, else from the tool option.
+
+Failure to process is not an error: the model gets a text note instead. In both outcomes a second note is appended when the current model has no image input, so the model is told the image will be dropped from the request.
+
+```ts ! read.ts
+							let content: (TextContent | ImageContent)[];
+							let details: ReadToolDetails | undefined;
+							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
+							if (mimeType) {
+								// Read image as binary.
+								const buffer = await ops.readFile(absolutePath);
+								const processed = await processImage(buffer, mimeType, {
+									autoResizeImages,
+									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
+								});
+								if (!processed.ok) {
+									let textNote = `Read image file [${mimeType}]\n${processed.message}`;
+									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
+									content = [{ type: "text", text: textNote }];
+								} else {
+									let textNote = `Read image file [${processed.mimeType}]`;
+									if (processed.hints.length > 0) textNote += `\n${processed.hints.join("\n")}`;
+									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
+									content = [
+										{ type: "text", text: textNote },
+										{ type: "image", data: processed.data, mimeType: processed.mimeType },
+									];
+								}
+```
+
+## !!steps The text branch: offset and limit
+
+The whole file is read and split on newlines. `offset` converts to a zero-based start, and an offset past the end is an error with the real line count so the model can correct itself.
+
+A user-supplied `limit` is applied first and recorded in `userLimitedLines`. Without a limit, everything from the offset onward goes to truncation, which then decides how much fits.
+
+```ts ! read.ts
+								// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
+								const startLine = offset ? Math.max(0, offset - 1) : 0;
+								const startLineDisplay = startLine + 1;
+								// Check if offset is out of bounds.
+								if (startLine >= allLines.length) {
+									throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
+								}
+								let selectedContent: string;
+								let userLimitedLines: number | undefined;
+								// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
+								if (limit !== undefined) {
+									const endLine = Math.min(startLine + limit, allLines.length);
+									selectedContent = allLines.slice(startLine, endLine).join("\n");
+									userLimitedLines = endLine - startLine;
+								} else {
+									selectedContent = allLines.slice(startLine).join("\n");
+								}
+```
+
+## !!steps Truncation notices that tell the model what to do next
+
+After `truncateHead`, there are four outcomes, each with a different message. An oversized first line gives a `sed ... | head -c` fallback. A line-limit or byte-limit truncation gives a `Showing lines X-Y of N` notice with the next `offset`, and the byte version names the limit. If only the caller's `limit` stopped output early, a simpler `N more lines` notice is used. Otherwise the text is returned as is.
+
+The truncation details are stored in `details` for the first two cases so renderers can show them.
+
+```ts ! read.ts
+								const truncation = truncateHead(selectedContent);
+								let outputText: string;
+								if (truncation.firstLineExceedsLimit) {
+									// First line alone exceeds the byte limit. Point the model at a bash fallback.
+									const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
+									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
+									details = { truncation };
+								} else if (truncation.truncated) {
+									// Truncation occurred. Build an actionable continuation notice.
+									const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
+									const nextOffset = endLineDisplay + 1;
+									outputText = truncation.content;
+									if (truncation.truncatedBy === "lines") {
+										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
+									} else {
+										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
+									}
+									details = { truncation };
+								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
+									// User-specified limit stopped early, but the file still has more content.
+									const remaining = allLines.length - (startLine + userLimitedLines);
+									const nextOffset = startLine + userLimitedLines + 1;
+									outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+								} else {
+									// No truncation and no remaining user-limited content.
+									outputText = truncation.content;
+								}
+```
+
+## !!steps Completion and cleanup
+
+On success the listener is removed before resolving; on error it is removed in the catch block and the rejection is skipped if the abort already rejected. The outer `then` attaches `structuredContent` to every successful result.
+
+The final wrapper function turns the definition into an `AgentTool` via [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts).
+
+```ts ! read.ts
+								content = [{ type: "text", text: outputText }];
+							}
+
+							if (aborted) return;
+							signal?.removeEventListener("abort", onAbort);
+							resolve({ content, details });
+						} catch (error: any) {
+							signal?.removeEventListener("abort", onAbort);
+							if (!aborted) reject(error);
+						}
+					})();
+				},
+			).then((result) => ({ ...result, structuredContent: toReadOutput(result.content) }));
+// ...
+export function createReadTool(cwd: string, options?: ReadToolOptions): AgentTool<typeof readSchema> {
+	return wrapToolDefinition(createReadToolDefinition(cwd, options));
+}
+```
+
+</Scrollycoding>
+
+The tool is exported from [index.ts](/docs/src/core/tools/index.ts) and drawn by [read.ts](/docs/src/core/tools/renderers/read.ts) in the renderers directory. Its counterparts for changing files are [edit.ts](/docs/src/core/tools/edit.ts) and [write.ts](/docs/src/core/tools/write.ts).
+
+Two small inconsistencies are worth knowing. A file that ends in a newline splits into a trailing empty element, so the "lines total" figure and the `Offset is beyond end of file` check count one more line than `truncateHead` does. And the bash fallback hint inserts `path` into the shell command without quoting it.

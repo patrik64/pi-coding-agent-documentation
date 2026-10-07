@@ -1,0 +1,65 @@
+---
+title: "fs-watch.ts"
+description: "Small helpers for creating file watchers that never throw and for closing them safely"
+source: "src/utils/fs-watch.ts"
+full: true
+---
+
+`fs.watch` can throw synchronously, for example when a path does not exist, and can emit asynchronous errors later when a directory is deleted. This file wraps both cases so callers only deal with one callback.
+
+It is consumed by watchers such as the git branch tracking in [footer-data-provider.ts](/docs/src/core/footer-data-provider.ts) and the theme file watching in [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
+
+<Scrollycoding>
+
+## !!steps Retry delay constant
+
+The only exported value is the delay callers should wait before trying to re-establish a failed watcher: five seconds. The module itself never retries; it just publishes the number so every watcher in the app uses the same one.
+
+```ts ! fs-watch.ts
+import { type FSWatcher, type WatchListener, watch } from "node:fs";
+
+export const FS_WATCH_RETRY_DELAY_MS = 5000;
+```
+
+## !!steps Closing quietly
+
+`closeWatcher` accepts null or undefined and swallows errors from `close()`, so teardown code can call it unconditionally.
+
+```ts ! fs-watch.ts
+export function closeWatcher(watcher: FSWatcher | null | undefined): void {
+	if (!watcher) {
+		return;
+	}
+
+	try {
+		watcher.close();
+	} catch {
+		// Ignore watcher close errors
+	}
+}
+```
+
+## !!steps Watching with a single error path
+
+Both a synchronous failure from `watch` and a later `error` event call the same `onError`. In the synchronous case the function returns null, so callers can tell there is no watcher to close. The listener type is the standard Node `WatchListener` with a string filename.
+
+```ts ! fs-watch.ts
+export function watchWithErrorHandler(
+	path: string,
+	listener: WatchListener<string>,
+	onError: () => void,
+): FSWatcher | null {
+	try {
+		const watcher = watch(path, listener);
+		watcher.on("error", onError);
+		return watcher;
+	} catch {
+		onError();
+		return null;
+	}
+}
+```
+
+</Scrollycoding>
+
+This is a thin policy layer: it decides that watch errors are non-fatal and routes them to the caller, leaving the retry scheduling to the caller.

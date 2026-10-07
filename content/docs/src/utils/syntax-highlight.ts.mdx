@@ -1,0 +1,202 @@
+---
+title: "syntax-highlight.ts"
+description: "highlight.js wrapper that converts its HTML output into themed terminal strings through a scope-to-formatter map"
+source: "src/utils/syntax-highlight.ts"
+full: true
+---
+
+highlight.js produces HTML with `span class="hljs-keyword"` style markup. pi renders to a terminal, not a browser, so this file runs highlight.js and then walks the HTML, replacing each span with a caller-supplied formatter, typically one that wraps text in ANSI color codes.
+
+It also controls bundle cost: a core set of 21 languages is registered up front, and the full highlight.js language set is imported later in the background. The theme maps come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts), and HTML entity decoding is borrowed from [html.ts](/docs/src/utils/html.ts). The type shims for highlight.js are in [highlight-js.d.ts](/docs/src/utils/highlight-js.d.ts).
+
+<Scrollycoding>
+
+## !!steps Eager languages
+
+Importing from `highlight.js/lib/core.js` and registering only common languages keeps startup fast. Each is registered under the key of the `eagerLanguages` object.
+
+```ts ! syntax-highlight.ts
+const eagerLanguages = {
+	python,
+	java,
+	go,
+	javascript,
+	json,
+	cpp,
+	typescript,
+	php,
+	ruby,
+	c,
+	csharp,
+	nix,
+	bash,
+	rust,
+	scala,
+	kotlin,
+	swift,
+	dart,
+	groovy,
+	perl,
+	lua,
+};
+
+for (const [name, language] of Object.entries(eagerLanguages)) {
+	hljs.registerLanguage(name, language);
+}
+```
+
+## !!steps Loading the rest in the background
+
+`loadAllHighlightLanguages` defers a dynamic import of the full highlight.js index to `setImmediate`, so it does not delay the first render. The promise is memoized. The import registers all other languages on the shared instance as a side effect. If it fails, it still resolves, leaving the eager languages and plaintext available.
+
+```ts ! syntax-highlight.ts
+let allLanguagesPromise: Promise<void> | undefined;
+
+export function loadAllHighlightLanguages(): Promise<void> {
+	if (!allLanguagesPromise) {
+		allLanguagesPromise = new Promise((resolve) => {
+			setImmediate(() => {
+				void import("highlight.js/lib/index.js").then(
+					() => resolve(),
+					() => {
+						// Eager languages and plaintext fallback remain available.
+						resolve();
+					},
+				);
+			});
+		});
+	}
+	return allLanguagesPromise;
+}
+```
+
+## !!steps Theme types
+
+A theme is a partial map from highlight.js scope names to functions that take text and return styled text. The special `default` key styles unscoped text.
+
+```ts ! syntax-highlight.ts
+export type HighlightFormatter = (text: string) => string;
+export type HighlightTheme = Partial<Record<string, HighlightFormatter>>;
+
+export interface HighlightOptions {
+	language?: string;
+	ignoreIllegals?: boolean;
+	languageSubset?: string[];
+	theme?: HighlightTheme;
+}
+```
+
+## !!steps Reading the scope from a span
+
+highlight.js emits classes like `hljs-keyword` or `hljs-title function_`. The parser takes the first class with the `hljs-` prefix and strips it, accepting either quote style.
+
+```ts ! syntax-highlight.ts
+function getScopeFromSpanTag(tag: string): string | undefined {
+	const match = /\sclass\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(tag);
+	const classValue = match?.[1] ?? match?.[2];
+	if (!classValue) {
+		return undefined;
+	}
+
+	for (const className of classValue.split(/\s+/)) {
+		if (className.startsWith(HIGHLIGHT_CLASS_PREFIX)) {
+			return className.slice(HIGHLIGHT_CLASS_PREFIX.length);
+		}
+	}
+
+	return undefined;
+}
+```
+
+## !!steps Scope fallback and nesting
+
+A formatter lookup tries the exact scope, then the part before a dot (`title.function` to `title`), then the part before a dash. For nested spans, `getActiveFormatter` scans from the innermost scope outward and takes the first scope that has a formatter, finally falling back to `theme.default`.
+
+```ts ! syntax-highlight.ts
+function getScopeFormatter(scope: string, theme: HighlightTheme): HighlightFormatter | undefined {
+	const exact = theme[scope];
+	if (exact) {
+		return exact;
+	}
+
+	const dotIndex = scope.indexOf(".");
+	if (dotIndex !== -1) {
+		const prefixFormatter = theme[scope.slice(0, dotIndex)];
+		if (prefixFormatter) {
+			return prefixFormatter;
+		}
+	}
+```
+
+## !!steps A small HTML scanner
+
+`renderHighlightedHtml` is a hand-written scanner rather than an HTML parser, which is enough because highlight.js output contains only `span` tags and entities. It keeps a stack of scopes and a text buffer. Opening spans flush text and push a scope, closing spans flush and pop, and `&` sequences are decoded into plain text.
+
+```ts ! syntax-highlight.ts
+	let index = 0;
+	while (index < html.length) {
+		if (isSpanOpenTagStart(html, index)) {
+			const tagEndIndex = html.indexOf(">", index + 5);
+			if (tagEndIndex !== -1) {
+				flushText();
+				const tag = html.slice(index, tagEndIndex + 1);
+				const scope = getScopeFromSpanTag(tag);
+				scopes.push(scope);
+				index = tagEndIndex + 1;
+				continue;
+			}
+		}
+
+		if (html.startsWith(SPAN_CLOSE, index)) {
+			flushText();
+			if (scopes.length > 0) {
+				scopes.pop();
+			}
+			index += SPAN_CLOSE.length;
+			continue;
+		}
+```
+
+## !!steps Formatting line by line
+
+When text is flushed, the active formatter is applied per line and empty lines are left alone. Splitting on newlines matters for terminals: an ANSI style opened on one line and closed on the next would bleed through any prefix such as a gutter or a box border drawn around each line.
+
+```ts ! syntax-highlight.ts
+	const flushText = () => {
+		if (!textBuffer) {
+			return;
+		}
+		const formatter = getActiveFormatter(scopes, theme);
+		output += formatter
+			? textBuffer
+					.split("\n")
+					.map((line) => (line ? formatter(line) : line))
+					.join("\n")
+			: textBuffer;
+		textBuffer = "";
+	};
+```
+
+## !!steps Public entry points
+
+`highlight` uses a named language when given, otherwise `highlightAuto` with an optional subset. Auto-detection can guess wrong on short snippets. `supportsLanguage` reports whether a name is registered at the moment, so its answer can change after the background load completes.
+
+```ts ! syntax-highlight.ts
+export function highlight(code: string, options: HighlightOptions = {}): string {
+	const html = options.language
+		? hljs.highlight(code, {
+				language: options.language,
+				ignoreIllegals: options.ignoreIllegals,
+			}).value
+		: hljs.highlightAuto(code, options.languageSubset).value;
+	return renderHighlightedHtml(html, options.theme);
+}
+
+export function supportsLanguage(name: string): boolean {
+	return hljs.getLanguage(name) !== undefined;
+}
+```
+
+</Scrollycoding>
+
+`highlight` throws for an unknown explicit language, so callers should check `supportsLanguage` first. The consumers are the interactive UI (see [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and [theme.ts](/docs/src/modes/interactive/theme/theme.ts)), which pass in an ANSI theme.

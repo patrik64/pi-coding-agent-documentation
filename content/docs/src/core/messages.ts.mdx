@@ -1,0 +1,216 @@
+---
+title: "messages.ts"
+description: "Coding-agent message types (bash runs, extension messages, summaries) and the convertToLlm function that flattens them to plain user messages"
+source: "src/core/messages.ts"
+full: true
+---
+
+The agent loop in `pi-agent-core` only knows the standard roles: system, user, assistant and tool result. The coding agent needs more kinds of transcript entries than that, such as a shell command the user ran with `!`, a message injected by an extension, and the summaries produced by compaction and branching. This file defines those extra message types and the one function that turns all of them back into something an LLM provider accepts.
+
+The design is that the rich types live in memory and in the session file, while the model only ever sees user-role text. Everything funnels through `convertToLlm`, which is used for normal prompts, queued messages and the summarization calls in [compaction.ts](/docs/src/core/compaction/compaction.ts).
+
+<Scrollycoding>
+
+## !!steps Summary framing text
+
+When history is compacted or an abandoned branch is summarized, the summary is shown to the model as a user message wrapped in a `summary` tag with an explanatory lead-in. These four constants hold that framing.
+
+Note the asymmetry: the compaction prefix and suffix both carry their own newline (the prefix ends with a newline after the opening tag, the suffix starts with one), while the branch prefix ends with a newline but the branch suffix is bare. The resulting strings are still well formed because the summary text is concatenated between them.
+
+```ts ! messages.ts
+export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
+
+<summary>
+`;
+
+export const COMPACTION_SUMMARY_SUFFIX = `
+</summary>`;
+
+export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch that this conversation came back from:
+
+<summary>
+`;
+
+export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
+```
+
+## !!steps A shell command as a transcript entry
+
+`BashExecutionMessage` records a command run from the `!` shortcut in the TUI, along with its output, exit code, whether it was cancelled or truncated, and where the full output went. `excludeFromContext` is the `!!` variant: the entry is kept in the session so the user sees it, but it is dropped from what the model receives.
+
+The execution itself is done by [bash-executor.ts](/docs/src/core/bash-executor.ts); this file only describes the record.
+
+```ts ! messages.ts
+// !mark
+export interface BashExecutionMessage {
+	role: "bashExecution";
+	command: string;
+	output: string;
+	exitCode: number | undefined;
+	cancelled: boolean;
+	truncated: boolean;
+	fullOutputPath?: string;
+	timestamp: number;
+	/** If true, this message is excluded from LLM context (!! prefix) */
+	excludeFromContext?: boolean;
+}
+```
+
+## !!steps Extension messages and declaration merging
+
+`CustomMessage` is what extensions inject with `sendMessage()`. `customType` identifies the extension, `display` controls whether the TUI renders it, and `details` carries metadata that never reaches the model.
+
+The `declare module` block is the trick that makes the new roles first-class. `pi-agent-core` exposes an empty `CustomAgentMessages` interface that is folded into its `AgentMessage` union; merging four entries into it means every `switch` over `message.role` in the codebase now sees `bashExecution`, `custom`, `branchSummary` and `compactionSummary`, with exhaustiveness checking.
+
+```ts ! messages.ts
+export interface CustomMessage<T = unknown> {
+	role: "custom";
+	customType: string;
+	content: string | (TextContent | ImageContent)[];
+	display: boolean;
+	details?: T;
+	timestamp: number;
+}
+// ...
+// !mark(1:4)
+declare module "@earendil-works/pi-agent-core" {
+	interface CustomAgentMessages {
+		bashExecution: BashExecutionMessage;
+		custom: CustomMessage;
+		branchSummary: BranchSummaryMessage;
+		compactionSummary: CompactionSummaryMessage;
+	}
+}
+```
+
+## !!steps Rendering a bash run as text
+
+`bashExecutionToText` produces the user-message text for a command: the command in backticks, then the output in a fenced block, or `(no output)` when empty. Cancellation takes priority over the exit code; a non-zero code is reported only when the run was not cancelled.
+
+When the output was truncated and a full copy was saved to disk, the path is appended so the model can read the rest with a tool. The explicit `null` check on `exitCode` is redundant with the declared type (`number | undefined`) but harmless.
+
+```ts ! messages.ts
+export function bashExecutionToText(msg: BashExecutionMessage): string {
+	let text = `Ran \`${msg.command}\`\n`;
+	if (msg.output) {
+		text += `\`\`\`\n${msg.output}\n\`\`\``;
+	} else {
+		text += "(no output)";
+	}
+	if (msg.cancelled) {
+		text += "\n\n(command cancelled)";
+	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
+		text += `\n\nCommand exited with code ${msg.exitCode}`;
+	}
+	if (msg.truncated && msg.fullOutputPath) {
+		text += `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;
+	}
+	return text;
+}
+```
+
+## !!steps Factories that turn session timestamps into numbers
+
+Session entries store ISO timestamp strings, while `AgentMessage` carries numeric milliseconds. These three constructors do that conversion in one place. They are called from `sessionEntryToContextMessages` in [session-manager.ts](/docs/src/core/session-manager.ts) when a stored entry is projected into the model's context.
+
+`createCustomMessage` takes `details` as `unknown | undefined`, which collapses to plain `unknown`; the redundancy has no effect.
+
+```ts ! messages.ts
+export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
+	return {
+		role: "branchSummary",
+		summary,
+		fromId,
+		timestamp: new Date(timestamp).getTime(),
+	};
+}
+// ...
+export function createCustomMessage(
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+	display: boolean,
+	details: unknown | undefined,
+	timestamp: string,
+): CustomMessage {
+	return {
+		role: "custom",
+		customType,
+		content,
+		display,
+		details,
+		timestamp: new Date(timestamp).getTime(),
+	};
+}
+```
+
+## !!steps convertToLlm, first half
+
+`convertToLlm` maps each message to zero or one provider message. A bash message becomes a user message holding the text above, unless `excludeFromContext` is set, in which case it maps to `undefined` and disappears. A custom message becomes a user message, with a bare string promoted to a single text block.
+
+Timestamps are preserved on every converted message, so downstream ordering and cache logic still work.
+
+```ts ! messages.ts
+export function convertToLlm(messages: AgentMessage[]): Message[] {
+	return messages
+		.map((m): Message | undefined => {
+			switch (m.role) {
+				case "bashExecution":
+					// Skip messages excluded from context (!! prefix)
+					if (m.excludeFromContext) {
+						return undefined;
+					}
+					return {
+						role: "user",
+						content: [{ type: "text", text: bashExecutionToText(m) }],
+						timestamp: m.timestamp,
+					};
+				case "custom": {
+					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
+					return {
+						role: "user",
+						content,
+						timestamp: m.timestamp,
+					};
+				}
+```
+
+## !!steps convertToLlm, second half
+
+Summaries become user messages built from the prefix and suffix constants. The standard four roles pass through untouched. The `default` branch assigns the message to a variable of type `never`: if a new role is ever added to `CustomAgentMessages` without a case here, the file stops compiling.
+
+A final `filter` removes the `undefined` results from excluded bash messages.
+
+```ts ! messages.ts
+				case "branchSummary":
+					return {
+						role: "user",
+						content: [{ type: "text" as const, text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX }],
+						timestamp: m.timestamp,
+					};
+				case "compactionSummary":
+					return {
+						role: "user",
+						content: [
+							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+						],
+						timestamp: m.timestamp,
+					};
+				case "system":
+				case "user":
+				case "assistant":
+				case "toolResult":
+					return m;
+				default:
+					// biome-ignore lint/correctness/noSwitchDeclarations: fine
+					const _exhaustiveCheck: never = m;
+					return undefined;
+			}
+		})
+		.filter((m) => m !== undefined);
+}
+```
+
+</Scrollycoding>
+
+This file sits between two worlds. On one side, [session-manager.ts](/docs/src/core/session-manager.ts) stores and rebuilds these types, and [agent-session.ts](/docs/src/core/agent-session.ts) creates them. On the other, [compaction.ts](/docs/src/core/compaction/compaction.ts) and [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts) produce the summaries that `convertToLlm` wraps. Structurally it is types first, constructors next, and a single large switch last.
+

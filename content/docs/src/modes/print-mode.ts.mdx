@@ -1,0 +1,198 @@
+---
+title: "print-mode.ts"
+description: "Single-shot runner behind pi -p and pi --mode json: send prompts, print the result, exit"
+source: "src/modes/print-mode.ts"
+full: true
+---
+
+Print mode is the non-interactive way to run the agent: `pi -p "prompt"` prints the final assistant text, and `pi --mode json` streams every session event as one JSON line. There is no TUI and no long-lived input loop. `runPrintMode` returns a process exit code that [main.ts](/docs/src/main.ts) hands back to the shell.
+
+It works against an [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) host rather than a bare session, because extensions can replace the session mid-run (new session, fork, switch). Output goes through [output-guard.ts](/docs/src/core/output-guard.ts) so that stdout stays clean for machine consumers, and JSON events are shaped by [json-event.ts](/docs/src/modes/json-event.ts).
+
+<Scrollycoding>
+
+## !!steps Options and setup state
+
+`mode` selects text or JSON output. `initialMessage` may already contain expanded `@file` content, images attach only to that first message, and `messages` are follow-up prompts sent in order.
+
+The function keeps `session` in a mutable variable plus unsubscribe handles and a `disposed` flag, since all of these change when the session is rebound.
+
+```ts ! print-mode.ts
+export interface PrintModeOptions {
+	/** Output mode: "text" for final response only, "json" for all events */
+	mode: "text" | "json";
+	/** Array of additional prompts to send after initialMessage */
+	messages?: string[];
+	/** First message to send (may contain @file content) */
+	initialMessage?: string;
+	/** Images to attach to the initial message */
+	initialImages?: ImageContent[];
+}
+
+/**
+ * Run in print (single-shot) mode.
+ * Sends prompts to the agent and outputs the result.
+ */
+export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
+	const { mode, messages = [], initialMessage, initialImages } = options;
+	let exitCode = 0;
+	let session = runtimeHost.session;
+```
+
+## !!steps Idempotent disposal and signals
+
+`disposeRuntime` can be reached from the normal exit path and from a signal handler, so a `disposed` flag makes it run once. On SIGTERM (and SIGHUP outside Windows) the handler first kills detached child processes tracked by [shell.ts](/docs/src/utils/shell.ts), disposes the runtime, then exits with the conventional 128 plus signal number: 143 or 129.
+
+Each handler registers its own removal function so the `finally` block can detach them.
+
+```ts ! print-mode.ts
+	const disposeRuntime = async (): Promise<void> => {
+		if (disposed) return;
+		// !mark
+		disposed = true;
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		await runtimeHost.dispose();
+	};
+
+	const registerSignalHandlers = (): void => {
+		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (process.platform !== "win32") {
+			signals.push("SIGHUP");
+		}
+
+		for (const signal of signals) {
+			const handler = () => {
+				// !mark
+				killTrackedDetachedChildren();
+				void disposeRuntime().finally(() => {
+					// !mark
+					process.exit(signal === "SIGHUP" ? 129 : 143);
+				});
+			};
+			process.on(signal, handler);
+			signalCleanupHandlers.push(() => process.off(signal, handler));
+		}
+	};
+```
+
+## !!steps Rebinding extensions to a session
+
+`rebindSession` re-reads `runtimeHost.session` and calls `bindExtensions` with the mode (`json` or `print`) and a set of command-context actions. These let extension commands call `newSession`, `fork`, `navigateTree`, `switchSession` and `reload`. Fork and navigate results are reduced to just `cancelled`.
+
+The runtime is told to call this same function whenever it swaps sessions, via `setRebindSession`. See [agent-session.ts](/docs/src/core/agent-session.ts) for the session API being forwarded to.
+
+```ts ! print-mode.ts
+	registerSignalHandlers();
+
+	runtimeHost.setRebindSession(async () => {
+		await rebindSession();
+	});
+
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			mode: mode === "json" ? "json" : "print",
+			commandContextActions: {
+				waitForIdle: () => session.waitForIdle(),
+				newSession: async (newSessionOptions) => runtimeHost.newSession(newSessionOptions),
+				fork: async (entryId, forkOptions) => {
+					const result = await runtimeHost.fork(entryId, forkOptions);
+					return { cancelled: result.cancelled };
+				},
+```
+
+## !!steps Event output and backpressure
+
+After binding, any previous subscriptions are dropped and new ones attached to the new session. In JSON mode every event is converted with `toJsonEvent` and written as a line. A second subscriber on the underlying agent awaits `waitForRawStdoutBackpressure`, so a slow stdout pipe pauses the agent rather than buffering unboundedly. In text mode neither subscription does anything.
+
+```ts ! print-mode.ts
+			onError: (err) => {
+				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
+			},
+		});
+
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			if (mode === "json") {
+				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
+			}
+		});
+		unsubscribeBackpressure =
+			mode === "json"
+				? session.agent.subscribe(async () => {
+						await waitForRawStdoutBackpressure();
+					})
+				: undefined;
+	};
+```
+
+## !!steps Running the prompts
+
+JSON mode first prints the session header (taken from [session-manager.ts](/docs/src/core/session-manager.ts)) so a consumer knows which session the events belong to. Then it binds, sends the initial message with its images, and sends each extra message sequentially, each awaited until the run finishes.
+
+```ts ! print-mode.ts
+	try {
+		if (mode === "json") {
+			const header = session.sessionManager.getHeader();
+			if (header) {
+				writeRawStdout(`${JSON.stringify(header)}\n`);
+			}
+		}
+
+		await rebindSession();
+
+		if (initialMessage) {
+			await session.prompt(initialMessage, { images: initialImages });
+		}
+
+		for (const message of messages) {
+			await session.prompt(message);
+		}
+```
+
+## !!steps Text output and exit codes
+
+In text mode only the last message matters. If it is an assistant message that ended with `error` or `aborted`, its error text goes to stderr and the exit code becomes 1. Otherwise every text block is written to stdout, one per line; thinking and tool-call blocks are skipped.
+
+Exceptions are printed and return 1. The `finally` block always removes signal handlers, disposes the runtime and flushes stdout before the process can exit.
+
+```ts ! print-mode.ts
+		if (mode === "text") {
+			const state = session.state;
+			const lastMessage = state.messages[state.messages.length - 1];
+
+			if (lastMessage?.role === "assistant") {
+				const assistantMsg = lastMessage as AssistantMessage;
+				// !mark(1:4)
+				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+					console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
+					exitCode = 1;
+				} else {
+					for (const content of assistantMsg.content) {
+						if (content.type === "text") {
+							writeRawStdout(`${content.text}\n`);
+						}
+					}
+				}
+			}
+		}
+
+		return exitCode;
+	} catch (error: unknown) {
+		console.error(error instanceof Error ? error.message : String(error));
+		return 1;
+	} finally {
+		for (const cleanup of signalCleanupHandlers) {
+			cleanup();
+		}
+		await disposeRuntime();
+		await flushRawStdout();
+	}
+}
+```
+
+</Scrollycoding>
+
+[main.ts](/docs/src/main.ts) calls this and re-exports it through [index.ts](/docs/src/modes/index.ts). Its RPC sibling is [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts), which shares the same JSON event shaping but keeps reading commands instead of exiting. Note that in JSON mode the exit code stays 0 even if the run ended in an error, because the error is only visible in the event stream.

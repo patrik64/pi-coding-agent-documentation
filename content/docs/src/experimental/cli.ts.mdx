@@ -1,0 +1,55 @@
+---
+title: "cli.ts"
+description: "Experimental executable entry point that tries the development-only server and client commands before falling back to the normal pi CLI"
+source: "src/experimental/cli.ts"
+full: true
+---
+
+This is a twelve-line launcher for developers working on the experimental client/server architecture. It is experimental code and is not part of the published entry points; it exists so one binary can run either the ordinary agent or the new `server` and `client` subcommands.
+
+All it does is give the experimental dispatcher first refusal on the arguments. If [commands.ts](/docs/src/experimental/commands.ts) does not claim them, control passes to the regular [main.ts](/docs/src/main.ts).
+
+<Scrollycoding>
+
+## !!steps Shared startup, then the raw arguments
+
+The shebang makes the file directly executable. `setupCli` from [setup.ts](/docs/src/cli/setup.ts) runs first so the experimental path gets the same process-level setup as the normal CLI. Arguments are taken from `process.argv.slice(2)`, with no parsing here.
+
+```ts ! cli.ts
+#!/usr/bin/env node
+import { setupCli } from "../cli/setup.ts";
+import { main } from "../main.ts";
+import { runExperimentalCommand } from "./commands.ts";
+
+// !mark(1:2)
+setupCli();
+const args = process.argv.slice(2);
+```
+
+## !!steps Experimental commands win, otherwise the normal CLI
+
+`runExperimentalCommand` resolves to `true` when it handled the arguments and `false` when it did not (feature flag off, or the first argument is not `server` or `client`). In the `false` case the file simply awaits `main(args)`.
+
+```ts ! cli.ts
+// ...
+if (await runExperimentalCommand(args)) {
+	if (args[0] === "client") process.exit(process.exitCode ?? 0);
+} else {
+	await main(args);
+}
+```
+
+## !!steps Why the client forces an exit
+
+Only the `client` case exits explicitly. The code does not say why, but it is consistent with a client leaving sockets or timers open. The exit preserves any `process.exitCode` the command set to signal failure.
+
+```ts ! cli.ts
+// ...
+// !mark
+	if (args[0] === "client") process.exit(process.exitCode ?? 0);
+// ...
+```
+
+</Scrollycoding>
+
+The sibling [coordinator-entry.ts](/docs/src/experimental/coordinator-entry.ts) is the other tiny launcher in this folder, used for an internal child process rather than for users. Everything real happens in [commands.ts](/docs/src/experimental/commands.ts), which in turn calls [server.ts](/docs/src/experimental/server.ts) and [client.ts](/docs/src/experimental/client.ts).

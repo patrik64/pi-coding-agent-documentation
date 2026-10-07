@@ -1,0 +1,535 @@
+---
+title: "server.ts"
+description: "Experimental server lifecycle: profile locking, automatic activation, idle retirement, plugin selection per Session, and wiring of the coordinator, workers and Radius relay."
+source: "src/experimental/server.ts"
+full: true
+---
+
+This is the control tower of the experimental client/server stack. It decides where the server directory lives, which logical server id is in use, how a client starts a server that is not running yet, how a server shuts itself down when nobody needs it, and how every moving part (coordinator, Session workers, Unix socket server, Radius relay, plugin builds) is assembled and torn down in order.
+
+There are two entry points. `activateServer` is used by clients: it connects to the server, or spawns an internal child process that runs `runServerProcess`. `startForegroundServer` is what the `server` command runs when an operator holds the server open. Both end in `startServer`, which is the large composition function. Collaborators include [coordinator.ts](/docs/src/experimental/coordinator.ts), [session-worker-manager.ts](/docs/src/experimental/session-worker-manager.ts), [session-catalog.ts](/docs/src/experimental/session-catalog.ts), [process.ts](/docs/src/experimental/process.ts), [radius-relay.ts](/docs/src/experimental/radius-relay.ts) and the plugin helpers in [package.ts](/docs/src/experimental/plugins/package.ts).
+
+<Scrollycoding>
+
+## !!steps Server and Session directories
+
+The server directory defaults to `~/.pi/server`, overridden by `PI_SERVER_DIR`. Because Unix sockets live there, `ensurePrivateServerDirectory` creates it with mode 0700, rejects a non-directory or a directory owned by another user, and re-applies the mode. Sessions default to an `experimental/sessions` folder under the agent directory.
+
+```ts ! server.ts
+// !mark(1:2)
+export const ENV_SERVER_DIR = "PI_SERVER_DIR";
+export const ENV_SERVER_ID = "PI_SERVER_ID";
+
+export function resolveServerDirectory(directory?: string): string {
+	return resolvePath(directory ?? process.env[ENV_SERVER_DIR] ?? join(homedir(), ".pi", "server"));
+}
+
+export async function ensurePrivateServerDirectory(directory: string): Promise<void> {
+	if (typeof process.getuid !== "function") throw new Error("Unix socket directory requires a POSIX user ID");
+	await mkdir(directory, { recursive: true, mode: 0o700 });
+	const stats = await lstat(directory);
+	if (!stats.isDirectory()) throw new Error(`Unix socket directory is not a directory: ${directory}`);
+// !mark(1:3)
+	if (stats.uid !== process.getuid()) {
+		throw new Error(`Unix socket directory is not owned by the current user: ${directory}`);
+	}
+// !mark
+	await chmod(directory, 0o700);
+}
+
+export function resolveSessionDirectory(sessionDir?: string): string {
+	return resolvePath(sessionDir ?? join(getAgentDir(), "experimental", "sessions"));
+}
+```
+
+## !!steps Locking a server identity
+
+`acquireServerProfile` resolves a server id: an explicit valid one, or the id stored in `default-server-id`. Creation uses the `wx` flag so two racing processes cannot both write; the loser reads the winner's value. Then a lock file per id is taken with retries for up to 30 seconds, which serializes launchers.
+
+```ts ! server.ts
+export async function acquireServerProfile(directory: string, requestedServerId?: string): Promise<ServerProfile> {
+	await mkdir(directory, { recursive: true, mode: 0o700 });
+	let serverId: ServerId;
+	if (requestedServerId !== undefined) {
+// !mark
+		if (!isServerId(requestedServerId)) throw new Error(`Invalid experimental server ID: ${requestedServerId}`);
+		serverId = requestedServerId;
+	} else {
+		const path = join(directory, DEFAULT_SERVER_ID_FILE);
+		try {
+			const value = (await readFile(path, "utf8")).trim();
+			if (!isServerId(value)) throw new Error(`Invalid default experimental server identity in ${path}`);
+			serverId = value;
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? error.code : undefined;
+			if (code !== "ENOENT") throw error;
+// ...
+// !mark
+	const release = await lockfile.lock(join(directory, `launcher-${serverId}`), {
+		realpath: false,
+		stale: LOCK_STALE_MS,
+		update: LOCK_STALE_MS / 3,
+		retries: {
+			retries: Math.ceil(LOCK_WAIT_MS / LOCK_RETRY_MS),
+			factor: 1,
+			minTimeout: LOCK_RETRY_MS,
+			maxTimeout: LOCK_RETRY_MS,
+			maxRetryTime: LOCK_WAIT_MS,
+		},
+	});
+	return { serverId, release };
+}
+```
+
+## !!steps Activating a server
+
+`activateServer` takes and immediately releases the profile lock to learn the id, then takes a separate per-id activation lock. If a server already answers, it is reused, but a model selection is then an error because startup-only options cannot be applied to a running server. Otherwise it spawns an internal `server` child process with the directory, id, session directory and optional JSON model options.
+
+```ts ! server.ts
+export async function activateServer(options: ActivateServerOptions): Promise<ActivatedServer> {
+	if (options.provider !== undefined && options.model === undefined) {
+		throw new Error("Server model provider requires a model");
+	}
+	await ensurePrivateServerDirectory(options.directory);
+	const profile = await acquireServerProfile(options.directory, options.requestedServerId);
+	const serverId = profile.serverId;
+	await profile.release();
+	const route = { serverId, path: getUnixSocketPath(serverId, options.directory) };
+// !mark
+	const release = await acquireServerActivation(options.directory, serverId);
+	try {
+		const existing = await connect(route);
+		if (existing) {
+			// Another activator won the race, so startup-only selections can no longer be applied.
+// !mark(1:4)
+			if (options.model !== undefined) {
+				await existing.dispose();
+				throw new Error("Model selection is only valid when automatically activating a new server");
+			}
+			return { client: existing, route };
+// ...
+		const modelArgs =
+			options.model === undefined
+				? []
+				: [
+						JSON.stringify({
+							...(options.provider === undefined ? {} : { provider: options.provider }),
+							model: options.model,
+						}),
+					];
+// !mark
+		const child = spawnInternalProcess("server", [options.directory, serverId, options.sessionDir, ...modelArgs]);
+```
+
+## !!steps Waiting for the child
+
+The loop polls every 10 ms for up to 10 seconds. It stops early if the spawn failed or the child exited, and terminates the child on any failure so no half-started server is left behind. The activation lock is released in the outer `finally` either way.
+
+```ts ! server.ts
+		try {
+			const deadline = Date.now() + ACTIVATION_TIMEOUT_MS;
+			while (true) {
+				const client = await connect(route);
+// !mark
+				if (client) return { client, route };
+// !mark
+				if (spawnError) throw new Error("Failed to automatically activate server", { cause: spawnError });
+// !mark(1:3)
+				if (child.exitCode !== null || child.signalCode !== null) {
+					throw new Error("Automatically activated server exited during startup");
+				}
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for automatically activated server");
+				await new Promise<void>((resolve) => setTimeout(resolve, ACTIVATION_RETRY_MS));
+			}
+		} catch (error) {
+// !mark
+			await terminateInternalProcess(child);
+			throw error;
+		}
+	} finally {
+		await release();
+	}
+}
+```
+
+## !!steps Telling absent from broken
+
+`connect` returns `undefined` only when the failure means no server is listening: a disconnect, a protocol version mismatch, or a nested cause with code `ENOENT`, `ECONNREFUSED`, `ECONNRESET`, `EPIPE` or `ETIMEDOUT`. The `seen` set guards against cause cycles. Any other error is rethrown.
+
+```ts ! server.ts
+async function connect(route: UnixServerRoute): Promise<Client | undefined> {
+	const client = new Client({
+		serverId: route.serverId,
+		transportFactory: createUnixTransportFactory({ path: route.path }),
+	});
+	try {
+		await client.connect();
+		return client;
+	} catch (error) {
+		await client.dispose();
+// !mark
+		if (error instanceof DisconnectedError || (error instanceof ClientServerError && error.code === "version")) {
+			return undefined;
+		}
+		let current = error;
+		const seen = new Set<unknown>();
+		while (current instanceof Error && !seen.has(current)) {
+			seen.add(current);
+// !mark(1:4)
+			if (
+				"code" in current &&
+				["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT"].includes(String(current.code))
+			) {
+				return undefined;
+			}
+			current = current.cause;
+		}
+// !mark
+		throw error;
+	}
+}
+```
+
+## !!steps ServerLifetime holds
+
+An automatically started server must not live forever. `ServerLifetime` combines four holds: operator keep-alive, a 10 second startup grace, connected clients, and live workers. Startup grace ends when the first client connects or the timer fires. Timers are unref'd.
+
+```ts ! server.ts
+export class ServerLifetime {
+	readonly #keepAlive: boolean;
+	#connectionCount = 0;
+	#workerCount = 0;
+	#startupHeld: boolean;
+	#startupTimer: NodeJS.Timeout | undefined;
+	#retirementTimer: NodeJS.Timeout | undefined;
+	#retire: (() => void) | undefined;
+	#stopped = false;
+
+	constructor(keepAlive: boolean) {
+// !mark
+		this.#keepAlive = keepAlive;
+		this.#startupHeld = !keepAlive;
+	}
+
+	start(retire: () => void): void {
+		this.#retire = retire;
+		if (this.#startupHeld) {
+// !mark(1:5)
+			this.#startupTimer = setTimeout(() => {
+				this.#startupTimer = undefined;
+				this.#startupHeld = false;
+				this.#reconcile();
+			}, AUTO_SERVER_STARTUP_GRACE_MS);
+			this.#startupTimer.unref();
+		}
+		this.#reconcile();
+	}
+```
+
+## !!steps Retirement after idle
+
+`#reconcile` clears any pending retirement while a hold exists. When all holds are gone it arms a one second timer, and rechecks the conditions when it fires before calling `retire`. That short delay absorbs the gap between one client leaving and another arriving.
+
+```ts ! server.ts
+	#reconcile(): void {
+// !mark(1:6)
+		if (
+			this.#stopped ||
+			this.#keepAlive ||
+			this.#startupHeld ||
+			this.#connectionCount !== 0 ||
+			this.#workerCount !== 0
+		) {
+			if (this.#retirementTimer) clearTimeout(this.#retirementTimer);
+			this.#retirementTimer = undefined;
+			return;
+		}
+		const retire = this.#retire;
+		if (this.#retirementTimer || !retire) return;
+// !mark
+		this.#retirementTimer = setTimeout(() => {
+			this.#retirementTimer = undefined;
+// !mark(1:3)
+			if (!this.#stopped && !this.#startupHeld && this.#connectionCount === 0 && this.#workerCount === 0) {
+				retire();
+			}
+		}, AUTO_SERVER_IDLE_GRACE_MS);
+		this.#retirementTimer.unref();
+	}
+```
+
+## !!steps Backend session lookups
+
+Inside `startServerBackend`, the session list merges the catalogue on disk with sessions tracked by running workers, with workers winning on the same path. `resolveSession` checks tracked workers first, then the disk, and throws `SessionNotFoundError` for an unknown id. Creation always records `process.cwd()` of the server as the working directory.
+
+```ts ! server.ts
+	const listSessions = async (): Promise<SessionCatalogMetadata[]> => {
+		const sessions = new Map((await listCatalogSessions(sessionDir)).map((metadata) => [metadata.path, metadata]));
+// !mark
+		for (const metadata of workers.trackedSessions) sessions.set(metadata.path, metadata);
+		return [...sessions.values()];
+	};
+	const resolveSession = async (sessionId: string, _context: Context): Promise<SessionCatalogMetadata> => {
+		const metadata =
+// !mark(1:3)
+			workers.trackedSessions.find((candidate) => candidate.id === sessionId) ??
+			(await readSession(sessionDir, sessionId));
+		if (metadata === undefined) throw new SessionNotFoundError(`Unknown session: ${sessionId}`);
+		return metadata;
+	};
+// ...
+	const serverServices = await createExperimentalServerServices({
+		list: async () =>
+			(await listSessions())
+				.map(summarize)
+				.sort((left, right) => left.sessionId.localeCompare(right.sessionId) || left.createdAt - right.createdAt),
+		create: async (createOptions) => summarize(await createSession(createOptions)),
+// !mark(1:5)
+		remove: async (sessionId, context) => {
+			const metadata = await resolveSession(sessionId, context);
+			await workers.closeSession(metadata, context);
+			await deleteSession(metadata);
+			await options.removeSessionPlugins(metadata);
+		},
+		async prepareSessionPlugins(sessionId, packagePaths, context) {
+```
+
+## !!steps Building the Server host
+
+`ServerHost` has three jobs: the server-scoped services, resolving a Session id to catalogue metadata, and opening a Session by asking the plugin resolver for manifest paths and handing them to the worker manager. The Unix server is created with mode 0600. If `start` fails, both the server and the catalogue are closed and errors are aggregated.
+
+```ts ! server.ts
+	const host: ServerHost<SessionCatalogMetadata> = {
+		serverServices: serverServices.host,
+		resolveSession,
+		openSession: async (metadata, context) => {
+// !mark(1:2)
+			const selected = await options.resolveSessionPlugins(metadata, undefined, context);
+			return workers.openSession(metadata, context, selected.manifestPaths);
+		},
+	};
+	const socketPath = options.path;
+	const closeCatalog = (): Promise<void> => serverServices.dispose();
+	const server = createUnixServer(host, {
+		serverId,
+		path: socketPath,
+// !mark
+		mode: 0o600,
+		onConnectionCountChanged,
+	});
+	try {
+		await server.start();
+	} catch (error) {
+// !mark
+		const cleanup = await Promise.allSettled([server.close(), closeCatalog()]);
+		const cleanupErrors = cleanup.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+		if (cleanupErrors.length > 0) {
+			throw new AggregateError([error, ...cleanupErrors], "Experimental server startup and cleanup failed");
+		}
+		throw error;
+	}
+```
+
+## !!steps startServer setup
+
+`startServer` validates model options, resolves the directory and id with the profile lock, creates the lifetime tracker and starts a try block that tracks every resource it opens so the catch can clean them up. Plugin packages are restored from the server profile unless explicit ones are given.
+
+```ts ! server.ts
+export async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
+// !mark
+	if (options.provider !== undefined && options.model === undefined) {
+		throw new Error("Server model provider requires a model");
+	}
+	const workerModel =
+		options.model === undefined
+			? undefined
+			: { ...(options.provider === undefined ? {} : { provider: options.provider }), model: options.model };
+	const directory = resolveServerDirectory(options.directory);
+// !mark
+	const { serverId, release } = await acquireServerProfile(directory, options.serverId ?? process.env[ENV_SERVER_ID]);
+// !mark
+	const lifetime = new ServerLifetime(options.keepAlive ?? true);
+	let backend: RunningServerBackend | undefined;
+	let coordinator: CoordinatorConnection | undefined;
+	let startupLease: CoordinatorStartupLease | undefined;
+	let workers: SessionWorkerManager | undefined;
+	let relay: RadiusRelayHost | undefined;
+	let released = false;
+	try {
+		await ensurePrivateServerDirectory(directory);
+```
+
+## !!steps Per Session plugin selection
+
+A requested package list is normalized and reused if identical to the current one. Otherwise it is checked against the running worker's manifests, built, checked again, persisted to the Session profile and cached. With no request, a cached or stored selection wins, falling back to the server default, which is written back so the Session keeps it.
+
+```ts ! server.ts
+		const resolveSessionPlugins = async (
+			metadata: SessionCatalogMetadata,
+			requestedPackagePaths: readonly string[] | undefined,
+			_context: Context,
+		): Promise<ResolvedSessionPlugins> => {
+			if (requestedPackagePaths !== undefined) {
+				const normalizedPackagePaths = normalizePluginPackagePaths(requestedPackagePaths);
+// !mark(1:2)
+				const current = sessionPluginSelections.get(metadata.path);
+				if (current !== undefined && sameStrings(current.packagePaths, normalizedPackagePaths)) return current;
+				const requestedManifestPaths = normalizedPackagePaths.map(
+					(packagePath) => getPluginPackage(packagePath).manifestPath,
+				);
+// !mark
+				workers?.assertSessionPluginManifestPaths(metadata, requestedManifestPaths);
+				const candidate = await buildPluginSelection(normalizedPackagePaths);
+				workers?.assertSessionPluginManifestPaths(metadata, candidate.manifestPaths);
+// !mark
+				await writeSessionPluginPackageProfile(directory, serverId, metadata.path, candidate.packagePaths);
+				sessionPluginSelections.set(metadata.path, candidate);
+				return candidate;
+			}
+			const cached = sessionPluginSelections.get(metadata.path);
+			if (cached !== undefined) return cached;
+			const storedPackagePaths = await readSessionPluginPackageProfile(directory, serverId, metadata.path);
+			const selected =
+				storedPackagePaths === undefined ? defaultPluginSelection : await buildPluginSelection(storedPackagePaths);
+// !mark(1:3)
+			if (storedPackagePaths === undefined) {
+				await writeSessionPluginPackageProfile(directory, serverId, metadata.path, selected.packagePaths);
+			}
+			sessionPluginSelections.set(metadata.path, selected);
+			return selected;
+		};
+```
+
+## !!steps Sockets and coordinator
+
+Three paths are derived: the stable public socket, a control socket, and a per-run server socket with a random nonce. `ensureCoordinator` holds the public endpoint, and the real server registers behind it, which is what makes the server replaceable. Workers are discovered after connecting, sessions are refreshed, then the Radius relay starts.
+
+```ts ! server.ts
+		const socketPath = getUnixSocketPath(serverId, directory);
+// !mark(1:3)
+		const controlPath = join(directory, `control-${serverId}.sock`);
+		const serverNonce = randomUUID().replaceAll("-", "").slice(0, 12);
+		const serverPath = join(directory, `server-${serverId}-${serverNonce}.sock`);
+// !mark(1:2)
+		startupLease = await ensureCoordinator(socketPath, controlPath);
+		coordinator = new CoordinatorConnection({ controlPath, endpoint: serverPath });
+		const sessionDir = resolveSessionDirectory(options.sessionDir);
+		workers = new SessionWorkerManager(coordinator, sessionDir, workerModel, (count) =>
+			lifetime.setWorkerCount(count),
+		);
+		backend = await startServerBackend(
+			{
+				path: serverPath,
+				serverId,
+				sessionDir: options.sessionDir,
+				resolveSessionPlugins,
+				removeSessionPlugins,
+				reloadPresentationFacetBundles,
+			},
+			workers,
+			(count) => lifetime.setConnectionCount(count),
+		);
+// !mark(1:5)
+		await coordinator.connect();
+		startupLease.close();
+		startupLease = undefined;
+		await workers.discover(coordinator.peerIds);
+		await backend.refreshSessions();
+// !mark
+		relay = new RadiusRelayHost({
+			serverId,
+			server: backend.server,
+			auth: new RadiusRelayAuthResolver(options.relayAuth),
+			onStatus: options.onRelayStatus,
+		});
+		relay.start();
+
+```
+
+## !!steps Replacement and shutdown
+
+If the coordinator reports this server was replaced, it stops the lifetime, detaches workers instead of killing them, and closes relay and backend. A normal close closes relay and backend first, then either detaches (replaced) or shuts down the workers, and always closes the coordinator. The lifetime's retire callback calls the same `close`.
+
+```ts ! server.ts
+		const activeBackend = backend;
+		const activeCoordinator = coordinator;
+		const activeWorkers = workers;
+		const activeRelay = relay;
+		void activeCoordinator.replaced
+			.then(async () => {
+// !mark(1:3)
+				lifetime.stop();
+				activeWorkers.detach();
+				await activeRelay.close();
+				await activeBackend.close();
+			})
+			.finally(() => activeCoordinator.close())
+			.catch(() => {});
+// ...
+			close() {
+				lifetime.stop();
+				closePromise ??= (async () => {
+					try {
+						await activeRelay.close();
+						await activeBackend.close();
+					} finally {
+						try {
+// !mark(1:2)
+							if (activeCoordinator.wasReplaced) activeWorkers.detach();
+							else await activeWorkers.shutdown();
+						} finally {
+							activeCoordinator.close();
+						}
+					}
+				})();
+				return closePromise;
+			},
+		};
+// !mark(1:3)
+		lifetime.start(() => {
+			void runtime.close().catch(() => {});
+		});
+		released = true;
+		await release();
+```
+
+## !!steps Foreground and internal process entry
+
+`startForegroundServer` takes the activation lock so it cannot race an automatic cold start, then starts with `keepAlive: true`. `runServerProcess` is the child's entry: it validates absolute paths and the id, starts with `keepAlive: false`, closes on SIGINT and SIGTERM, and waits for `closed`. The file ends with a guard that runs it only when invoked as the internal `server` role.
+
+```ts ! server.ts
+	const profile = await acquireServerProfile(directory, options.serverId ?? process.env[ENV_SERVER_ID]);
+	const serverId = profile.serverId;
+	await profile.release();
+	const release = await acquireServerActivation(directory, serverId);
+	try {
+// !mark(1:5)
+		return await startServer({
+			...options,
+			directory,
+			serverId,
+			keepAlive: true,
+		});
+	} finally {
+		await release();
+	}
+}
+// ...
+	const close = (): void => {
+		void runtime.close().catch(() => {});
+	};
+	process.once("SIGINT", close);
+	process.once("SIGTERM", close);
+	try {
+		await runtime.closed;
+	} finally {
+		process.off("SIGINT", close);
+		process.off("SIGTERM", close);
+		await runtime.close();
+	}
+}
+```
+
+</Scrollycoding>
+
+The pattern throughout is lock, build, publish, and unwind on failure. Locks (profile, activation) protect the cold-start races, ServerLifetime protects idle servers from lingering, and the coordinator protects clients from restarts. The services the server publishes are assembled in [server.ts](/docs/src/experimental/services/server.ts), and the file is also an executable: the last lines run `runServerProcess` when it is the process entry.

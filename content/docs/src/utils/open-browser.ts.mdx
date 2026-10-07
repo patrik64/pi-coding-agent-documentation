@@ -1,0 +1,62 @@
+---
+title: "open-browser.ts"
+description: "Best-effort, shell-free launcher that opens a URL or file in the platform's default handler"
+source: "src/utils/open-browser.ts"
+full: true
+---
+
+A single function, `openBrowser`, used when pi needs to send the user to a URL (for example an OAuth login page or a docs link) or open a file. It picks the right launcher per operating system and spawns it detached.
+
+The file is small but security-sensitive. URLs can come from remote sources, so the design rule is to never route them through a shell. It is called from the login dialog and the MCP CLI. Related process-spawning helpers live in [child-process.ts](/docs/src/utils/child-process.ts), and the other Windows-aware path handling is in [paths.ts](/docs/src/utils/paths.ts).
+
+<Scrollycoding>
+
+## !!steps Pick a launcher per platform
+
+macOS uses `open`, Windows uses `rundll32` with `url.dll,FileProtocolHandler`, and everything else falls back to `xdg-open`. The result is a command plus an argument array, so the target is always a single argv entry and never part of a command string.
+
+```ts ! open-browser.ts
+export function openBrowser(target: string): void {
+	const [cmd, args]: [string, string[]] =
+		// !mark(1:5)
+		process.platform === "darwin"
+			? ["open", [target]]
+			: process.platform === "win32"
+				? ["rundll32", ["url.dll,FileProtocolHandler", target]]
+				: ["xdg-open", [target]];
+```
+
+## !!steps Why Windows avoids cmd start
+
+The doc comment explains the choice of `rundll32`. `cmd /c start` would make cmd.exe re-parse metacharacters such as `&`, `|` and `^` before `start` runs, so an attacker-controlled URL could inject commands.
+
+```ts ! open-browser.ts
+/**
+ * Open a URL or file in the platform browser/default handler.
+ *
+ * This intentionally never invokes a shell. On Windows, do not use
+ * `cmd /c start`: cmd.exe re-parses metacharacters (&, |, ^, ...) before
+ * `start` runs, which would make attacker-controlled URLs injectable.
+ */
+```
+
+## !!steps Detached, silent, and failure tolerant
+
+The child is spawned with ignored stdio and `detached: true`, then `unref()` so it cannot keep pi's event loop alive. A missing launcher (no `xdg-open` on a headless box) surfaces as an asynchronous `error` event; an empty handler swallows it so it cannot crash the process.
+
+Callers are expected to also print the target, which is why failing silently is acceptable.
+
+```ts ! open-browser.ts
+	// spawn reports launcher failures (for example, missing xdg-open) via an
+	// error event. Browser launch is best-effort: callers still present the target
+	// to the user, so keep the launcher failure from becoming a process crash.
+	// !mark(1:3)
+	spawn(cmd, args, { stdio: "ignore", detached: true })
+		.on("error", () => {})
+		.unref();
+}
+```
+
+</Scrollycoding>
+
+There is no return value and no way to tell whether a browser actually opened. Consumers treat it as a convenience on top of printing the URL. Compare the similar fire-and-forget handling in [clipboard-command.ts](/docs/src/utils/clipboard-command.ts).

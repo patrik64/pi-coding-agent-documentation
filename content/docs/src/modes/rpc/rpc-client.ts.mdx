@@ -1,0 +1,289 @@
+---
+title: "rpc-client.ts"
+description: "Typed Node client that spawns pi in RPC mode and wraps each JSONL command as an async method"
+source: "src/modes/rpc/rpc-client.ts"
+full: true
+---
+
+`RpcClient` is the programmatic counterpart of [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts). It spawns `node dist/cli.js --mode rpc` as a child process, writes one JSON command per line to its stdin, and reads responses and events from its stdout. Responses are matched to requests by id; everything else is treated as an agent event and fanned out to listeners.
+
+The wire types come from [rpc-types.ts](/docs/src/modes/rpc/rpc-types.ts), framing from [jsonl.ts](/docs/src/modes/rpc/jsonl.ts), and event shapes from [json-event.ts](/docs/src/modes/json-event.ts). Most of the file is thin command wrappers, so the walkthrough focuses on process lifecycle, request correlation and the helpers.
+
+<Scrollycoding>
+
+## !!steps Options and client state
+
+`DistributiveOmit` is needed because `Omit` on a union collapses it; this version distributes over each command so `RpcCommandBody` stays a proper union without the `id` field. Requests wait in a map keyed by id, and stderr is accumulated so errors can include it.
+
+`cliPath` defaults to `dist/cli.js`, resolved by node relative to the spawned process working directory, so callers outside the package usually pass it explicitly.
+
+```ts ! rpc-client.ts
+/** Distributive Omit that works with union types */
+type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+
+/** RpcCommand without the id field (for internal send) */
+type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+
+export interface RpcClientOptions {
+	/** Path to the CLI entry point (default: searches for dist/cli.js) */
+	cliPath?: string;
+	/** Working directory for the agent */
+	cwd?: string;
+	/** Environment variables */
+	env?: Record<string, string>;
+	/** Provider to use */
+	provider?: string;
+	/** Model ID to use */
+	model?: string;
+	/** Additional CLI arguments */
+	args?: string[];
+}
+```
+
+## !!steps Spawning the agent
+
+`start` refuses to run twice, builds the argument list (`--mode rpc` plus optional provider, model and extra args) and spawns node with piped stdio. The environment is the parent's merged with `options.env`.
+
+Stderr is both captured for later error messages and forwarded to the parent's stderr.
+
+```ts ! rpc-client.ts
+	async start(): Promise<void> {
+		if (this.process) {
+			throw new Error("Client already started");
+		}
+
+		this.exitError = null;
+
+		const cliPath = this.options.cliPath ?? "dist/cli.js";
+		const args = ["--mode", "rpc"];
+
+		if (this.options.provider) {
+			args.push("--provider", this.options.provider);
+		}
+		if (this.options.model) {
+			args.push("--model", this.options.model);
+		}
+		if (this.options.args) {
+			args.push(...this.options.args);
+		}
+
+		const childProcess = spawn("node", [cliPath, ...args], {
+			cwd: this.options.cwd,
+			env: { ...process.env, ...this.options.env },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		this.process = childProcess;
+```
+
+## !!steps Failure handling and startup check
+
+Exit, spawn error and stdin error handlers each guard with `this.process !== childProcess` so a stale process from an earlier start cannot poison a new one. Each records `exitError` and rejects all pending requests, so callers fail fast with stderr attached instead of waiting for the 30 second timeout.
+
+Stdout is read with the strict JSONL reader. After a fixed 100 ms pause, `start` checks whether the child already exited and throws if so. This is a heuristic: a slow-starting process is not verified as ready.
+
+```ts ! rpc-client.ts
+		childProcess.once("exit", (code, signal) => {
+			if (this.process !== childProcess) return;
+			const error = this.createProcessExitError(code, signal);
+			this.exitError = error;
+			this.rejectPendingRequests(error);
+		});
+		// ...
+		// Set up strict JSONL reader for stdout.
+		this.stopReadingStdout = attachJsonlLineReader(childProcess.stdout!, (line) => {
+			this.handleLine(line);
+		});
+
+		// Wait a moment for process to initialize
+		await new Promise((resolve) => setTimeout(resolve, 100));
+
+		if (this.process.exitCode !== null) {
+			const error = this.exitError ?? this.createProcessExitError(this.process.exitCode, this.process.signalCode);
+			this.exitError = error;
+			throw error;
+		}
+	}
+```
+
+## !!steps Stopping and subscribing
+
+`stop` detaches the stdout reader, sends SIGTERM, and escalates to SIGKILL if the child has not exited within one second. It then clears the process handle and pending map.
+
+`onEvent` returns an unsubscribe function; removal uses `indexOf` and `splice` on the listener array.
+
+```ts ! rpc-client.ts
+	async stop(): Promise<void> {
+		if (!this.process) return;
+
+		this.stopReadingStdout?.();
+		this.stopReadingStdout = null;
+		this.process.kill("SIGTERM");
+
+		// Wait for process to exit
+		await new Promise<void>((resolve) => {
+			const timeout = setTimeout(() => {
+				this.process?.kill("SIGKILL");
+				resolve();
+			}, 1000);
+
+			this.process?.on("exit", () => {
+				clearTimeout(timeout);
+				resolve();
+			});
+		});
+
+		this.process = null;
+		this.pendingRequests.clear();
+	}
+```
+
+## !!steps Prompt, steer and follow-up
+
+These methods send a command and unwrap the typed `data` payload. `prompt` returns a disposition: if it is `handled`, no run started (for example an extension command consumed the text), so waiting for `agent_settled` would hang. `streamingBehavior` chooses how a prompt sent mid-run is queued. The disposition types live in [agent-session.ts](/docs/src/core/agent-session.ts).
+
+```ts ! rpc-client.ts
+	/**
+	 * Send a prompt to the agent.
+	 * Returns the prompt's disposition after acceptance; use onEvent() to receive streaming events.
+	 * If the disposition is "handled", no run started for this prompt, so don't wait for agent_settled.
+	 */
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<PromptDisposition> {
+		const response = await this.send({ type: "prompt", message, images, streamingBehavior });
+		return this.getData<{ disposition: PromptDisposition }>(response).disposition;
+	}
+
+	/**
+	 * Queue a steering message to interrupt the agent mid-run.
+	 */
+	async steer(message: string, images?: ImageContent[]): Promise<QueuedInputDisposition> {
+		const response = await this.send({ type: "steer", message, images });
+		return this.getData<{ disposition: QueuedInputDisposition }>(response).disposition;
+	}
+```
+
+## !!steps Session and tree commands
+
+Session operations mirror the runtime: `newSession`, `switchSession`, `fork` and `clone` each report `cancelled` when an extension vetoed them. `getEntries` supports incremental reads via `since`, and `getTree` returns the branch structure defined in [session-manager.ts](/docs/src/core/session-manager.ts).
+
+```ts ! rpc-client.ts
+	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "switch_session", sessionPath });
+		return this.getData(response);
+	}
+
+	/**
+	 * Fork from a specific message.
+	 * @returns Object with `text` (the message text) and `cancelled` (if extension cancelled)
+	 */
+	async fork(entryId: string): Promise<{ text: string; cancelled: boolean }> {
+		const response = await this.send({ type: "fork", entryId });
+		return this.getData(response);
+	}
+
+	/**
+	 * Get session entries in append order, optionally only those after the `since` entry id.
+	 */
+	async getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
+		const response = await this.send({ type: "get_entries", since });
+		return this.getData<{ entries: SessionEntry[]; leafId: string | null }>(response);
+	}
+```
+
+## !!steps Waiting helpers
+
+`waitForIdle` and `collectEvents` both listen for `agent_settled` and enforce a 60 second default timeout, always unsubscribing on either outcome. `promptAndWait` starts collecting before sending the prompt, which avoids missing early events.
+
+One caveat: if `prompt` returns `handled`, `promptAndWait` still waits for a settle event that never comes and times out.
+
+```ts ! rpc-client.ts
+	waitForIdle(timeout = 60000): Promise<void> {
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				unsubscribe();
+				reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.stderr}`));
+			}, timeout);
+
+			const unsubscribe = this.onEvent((event) => {
+				if (event.type === "agent_settled") {
+					clearTimeout(timer);
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+	}
+```
+
+## !!steps Dispatching lines
+
+A parsed line with `type: "response"` and a known id resolves the matching pending request. Anything else is an event, delivered to a copy of the listener array so listeners can unsubscribe during dispatch safely. Lines that fail to parse are dropped silently. Note the `catch` also swallows exceptions thrown by listeners, since the dispatch sits inside the same `try`.
+
+```ts ! rpc-client.ts
+	private handleLine(line: string): void {
+		try {
+			const data = JSON.parse(line);
+
+			// Check if it's a response to a pending request
+			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
+				const pending = this.pendingRequests.get(data.id)!;
+				this.pendingRequests.delete(data.id);
+				pending.resolve(data as RpcResponse);
+				return;
+			}
+
+			// Otherwise it's an event. Iterate a snapshot so listeners that unsubscribe during dispatch
+			// do not cause later listeners to miss this event.
+			for (const listener of [...this.eventListeners]) {
+				listener(data as JsonAgentSessionEvent);
+			}
+		} catch {
+			// Ignore non-JSON lines
+		}
+	}
+```
+
+## !!steps Sending a request
+
+`send` first checks the process is alive and stdin writable, recording an error if not. It assigns an id like `req_1`, registers resolve and reject wrappers that clear a 30 second timer, and writes the command with `serializeJsonLine`. A synchronous write failure removes the pending entry and rejects.
+
+`getData` then converts a failed `RpcResponse` into a thrown `Error` and otherwise casts `data` to the type each method promises.
+
+```ts ! rpc-client.ts
+		const id = `req_${++this.requestId}`;
+		const fullCommand = { ...command, id } as RpcCommand;
+
+		return new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				this.pendingRequests.delete(id);
+				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
+			}, 30000);
+
+			this.pendingRequests.set(id, {
+				resolve: (response) => {
+					clearTimeout(timeout);
+					resolve(response);
+				},
+				reject: (error) => {
+					clearTimeout(timeout);
+					reject(error);
+				},
+			});
+
+			try {
+				stdin.write(serializeJsonLine(fullCommand));
+			} catch (error: unknown) {
+				const writeError = error instanceof Error ? error : new Error(String(error));
+				const pending = this.pendingRequests.get(id);
+				this.pendingRequests.delete(id);
+				pending?.reject(writeError);
+			}
+		});
+```
+
+</Scrollycoding>
+
+The client is a pure consumer of the protocol that [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) implements, so every public method corresponds to one `RpcCommand` variant. Because requests time out after 30 seconds, slow commands such as `compact` or `bash` can fail client-side while still running in the agent.

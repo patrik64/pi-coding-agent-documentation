@@ -1,0 +1,34 @@
+---
+title: "sandbox-env-setup.ts"
+description: "Tiny side-effect module that calls restoreSandboxEnv before any other module reads the environment"
+source: "src/bun/sandbox-env-setup.ts"
+full: true
+---
+
+This file exists purely for import ordering. Calling `restoreSandboxEnv()` inside [cli.ts](/docs/src/bun/cli.ts) itself would not work, because ES imports are hoisted and evaluated before the body of the importing module. Putting the call in its own module and importing it first guarantees it runs first.
+
+The recovery logic lives in [restore-sandbox-env.ts](/docs/src/bun/restore-sandbox-env.ts); this file only triggers it.
+
+<Scrollycoding>
+
+## !!steps Import the fix
+
+The only dependency is the function from the sibling module.
+
+```ts ! sandbox-env-setup.ts
+import { restoreSandboxEnv } from "./restore-sandbox-env.ts";
+```
+
+## !!steps Run it at module load
+
+The comment states the reason: later modules, such as [runtime-setup.ts](/docs/src/bun/runtime-setup.ts) and the CLI graph, may read the environment at startup.
+
+```ts ! sandbox-env-setup.ts
+// Restore the environment before evaluating modules that read it at startup.
+// !mark
+restoreSandboxEnv();
+```
+
+</Scrollycoding>
+
+The function is a no-op on Node and on a healthy Bun environment, so the cost is negligible when it is not needed.

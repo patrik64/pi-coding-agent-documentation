@@ -1,0 +1,175 @@
+---
+title: "session-share.ts"
+description: "The /share flow: export the current branch, upload it to Radius, or fall back to a private GitHub gist, with a cancellable loader in the editor slot"
+source: "src/modes/interactive/session-share.ts"
+full: true
+---
+
+Sharing a session means producing a link someone else can open. This file implements the interactive path: it exports the active branch to a temporary file, tries to upload it as a Radius artifact, and if Radius is not configured falls back to a secret GitHub gist rendered through the share viewer.
+
+Both upload paths temporarily replace the editor with a [bordered-loader.ts](/docs/src/modes/interactive/components/bordered-loader.ts) so the user can cancel with the abort key. The export itself is done by [session-export.ts](/docs/src/core/session-export.ts), and the entry point is called from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+
+<Scrollycoding>
+
+## !!steps What the flow needs from the UI
+
+`SessionShareContext` bundles the session, the TUI, the editor container and the editor itself (to swap in and out), and two reporting callbacks. Passing a context instead of the whole interactive mode keeps this file independent of it.
+
+```ts ! session-share.ts
+interface SessionShareContext {
+	session: AgentSession;
+	ui: TUI;
+	editorContainer: Container;
+	editor: EditorComponent;
+	showStatus: (message: string) => void;
+	showError: (message: string) => void;
+}
+```
+
+## !!steps A trailing entry for the viewer
+
+The exported JSONL gets one extra custom entry, `pi.share`, appended at the end. It holds the session's system prompt and each tool's name, description and parameter schema. A session file does not otherwise record those, and the viewer needs them to show what the model was given. The entry id is a random 8-character slice of a UUID and it is parented to the last real entry.
+
+`exportSessionForShare` passes this as a callback to [session-export.ts](/docs/src/core/session-export.ts). The same function is reused by [bug-report.ts](/docs/src/modes/interactive/bug-report.ts).
+
+```ts ! session-share.ts
+export function createShareTrailingEntries(
+	session: AgentSession,
+	parentId: string | null,
+	timestamp: string,
+): object[] {
+	return [
+		{
+			type: "custom",
+			customType: "pi.share",
+			id: crypto.randomUUID().slice(0, 8),
+			parentId,
+			timestamp,
+			data: {
+				// !mark(1:6)
+				systemPrompt: session.state.systemPrompt,
+				tools: session.state.tools.map((tool) => ({
+					name: tool.name,
+					description: tool.description,
+					parameters: tool.parameters,
+				})),
+			},
+		},
+	];
+}
+```
+
+## !!steps The orchestration and its fallbacks
+
+`shareSession` works in a private temp dir that is always removed in `finally`. Order matters: JSONL export first, then Radius. Radius returning true means "handled" (success, failure or cancel), and nothing else runs.
+
+Only when Radius is unavailable does it check `gh auth status`. The error message distinguishes not logged in from not installed, though a missing `gh` with `spawnSync` normally returns an error object rather than throwing, so the `catch` branch may not be reached in that case (and then the status check reports "not logged in"). Then the HTML export is created with the current theme name.
+
+```ts ! session-share.ts
+		if (await tryShareViaRadius(jsonlFile, context)) return;
+
+		try {
+			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			// !mark(1:3)
+			if (authResult.status !== 0) {
+				context.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
+				return;
+			}
+		} catch {
+			context.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
+			return;
+		}
+
+		try {
+			await context.session.exportToHtml(htmlFile, { themeName: theme.name });
+```
+
+## !!steps Radius: credentials, loader, upload
+
+`tryShareViaRadius` bails out with `false` (so the gist path runs) when the provider is not registered or no credential is obtainable. The token is requested with `minOAuthValidityMs` of five minutes, so it will not expire mid-upload. Credential extraction uses `getAuthCredential` from [auth-command.ts](/docs/src/cli/auth-command.ts) and the runtime is [model-runtime.ts](/docs/src/core/model-runtime.ts).
+
+Once it has a token it takes over the editor slot with a loader and wires `onAbort` to restore the editor and report cancellation.
+
+```ts ! session-share.ts
+async function tryShareViaRadius(tmpFile: string, context: SessionShareContext): Promise<boolean> {
+	const provider = context.session.modelRuntime.getProvider("radius");
+	if (!provider) return false;
+
+	const token = getAuthCredential(
+		await context.session.modelRuntime.getAuth("radius", { minOAuthValidityMs: 5 * 60_000 }),
+	);
+	if (!token) return false;
+
+	const loader = new BorderedLoader(context.ui, theme, "Uploading to Radius...");
+	// !mark(1:4)
+	context.editorContainer.clear();
+	context.editorContainer.addChild(loader);
+	context.ui.setFocus(loader);
+	context.ui.requestRender();
+	loader.onAbort = () => {
+		restoreEditor(loader, context);
+		context.showStatus("Share cancelled");
+	};
+```
+
+## !!steps The Radius request and its abort checks
+
+The file is posted as `application/x-ndjson` to `/v1/artifacts` with organization visibility, using the loader's abort signal. After each await it re-checks `loader.signal.aborted`: if the user cancelled, `onAbort` already restored the editor, so the function returns without touching the UI again.
+
+Every outcome returns `true`, including errors. Once a Radius token existed, failing never falls through to the gist.
+
+```ts ! session-share.ts
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"Content-Type": "application/x-ndjson",
+				"Content-Length": String(body.byteLength),
+			},
+			body,
+			signal: loader.signal,
+		});
+		// !mark
+		if (loader.signal.aborted) return true;
+		const json = (await response.json().catch(() => null)) as {
+			artifact?: { canonical_url: string };
+			error?: string;
+		} | null;
+		if (loader.signal.aborted) return true;
+		restoreEditor(loader, context);
+```
+
+## !!steps The gist fallback
+
+The gist path spawns `gh gist create --public=false` and collects stdout and stderr. Abort kills the child process. The gist id is the last segment of the printed URL, and the shown link points to the viewer built by `getShareViewerUrl` in [config.ts](/docs/src/config.ts), with the raw gist URL below it.
+
+```ts ! session-share.ts
+	let proc: ReturnType<typeof spawn> | null = null;
+	loader.onAbort = () => {
+		proc?.kill();
+		restoreEditor(loader, context);
+		context.showStatus("Share cancelled");
+	};
+
+	try {
+		const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
+			// !mark
+			proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
+```
+
+## !!steps Putting the editor back
+
+Both paths end in `restoreEditor`: dispose the loader, clear the container, re-add the real editor and give it focus. It is also what the abort handlers call, which is why the post-await checks above exist.
+
+```ts ! session-share.ts
+function restoreEditor(loader: BorderedLoader, context: SessionShareContext): void {
+	loader.dispose();
+	context.editorContainer.clear();
+	context.editorContainer.addChild(context.editor);
+	context.ui.setFocus(context.editor);
+}
+```
+
+</Scrollycoding>
+
+The two upload helpers duplicate the loader setup and the abort pattern; `tryShareViaRadius` checks `response.ok` itself because `fetch` does not reject on non-2xx. The Radius result URL is the artifact's canonical URL, while a gist share needs the separate viewer to render the HTML.

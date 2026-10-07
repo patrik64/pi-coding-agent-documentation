@@ -1,0 +1,163 @@
+---
+title: "image-process.ts"
+description: "Turns raw image bytes into a provider-ready base64 image, converting unsupported formats and resizing, with human-readable hints"
+source: "src/utils/image-process.ts"
+full: true
+---
+
+This is the front door for images going to a model. It normalizes the format, optionally shrinks the image to provider limits, and returns either a ready payload or a short bracketed message explaining why the image was dropped.
+
+It composes [image-convert.ts](/docs/src/utils/image-convert.ts) and [image-resize.ts](/docs/src/utils/image-resize.ts). Callers such as [read.ts](/docs/src/core/tools/read.ts) and [file-processor.ts](/docs/src/cli/file-processor.ts) insert the hints next to the image so the model knows what happened to it.
+
+<Scrollycoding>
+
+## !!steps Options and result
+
+The result is a discriminated union: success carries base64 data, a MIME type and an array of hint strings; failure carries just a message. Resizing defaults to on.
+
+```ts ! image-process.ts
+export interface ProcessImageOptions {
+	/** Whether to resize images to inline provider limits. Default: true */
+	autoResizeImages?: boolean;
+	/** Optional resize overrides. Uses resizeImage defaults when omitted. */
+	resizeOptions?: ImageResizeOptions;
+}
+
+export type ProcessImageResult =
+	| {
+			ok: true;
+			data: string;
+			mimeType: string;
+			hints: string[];
+	  }
+	| {
+			ok: false;
+			message: string;
+	  };
+
+interface NormalizedImage {
+	bytes: Uint8Array;
+	mimeType: string;
+	convertedFrom?: string;
+}
+```
+
+## !!steps Recognizing supported formats
+
+`baseMimeType` drops parameters like `; charset` and lower-cases. Only PNG, JPEG (including the nonstandard `image/jpg`), GIF and WebP pass through; everything else is a candidate for conversion.
+
+```ts ! image-process.ts
+function baseMimeType(mimeType: string): string {
+	return mimeType.split(";")[0]?.trim().toLowerCase() ?? mimeType.toLowerCase();
+}
+
+function normalizeSupportedImageMimeType(mimeType: string): string | null {
+	switch (baseMimeType(mimeType)) {
+		case "image/png":
+			return "image/png";
+		case "image/jpeg":
+		case "image/jpg":
+			return "image/jpeg";
+		case "image/gif":
+			return "image/gif";
+		case "image/webp":
+			return "image/webp";
+		default:
+			return null;
+	}
+}
+```
+
+## !!steps Converting the rest
+
+`normalizeImage` converts unsupported formats to PNG and remembers the original type in `convertedFrom`, so a hint can mention it later. If conversion fails the image is dropped.
+
+```ts ! image-process.ts
+async function normalizeImage(bytes: Uint8Array, mimeType: string): Promise<NormalizedImage | null> {
+	const normalizedMimeType = normalizeSupportedImageMimeType(mimeType);
+	if (normalizedMimeType) {
+		return { bytes, mimeType: normalizedMimeType };
+	}
+
+	const pngBytes = await convertImageBytesToPng(bytes);
+	if (!pngBytes) {
+		return null;
+	}
+
+	return {
+		bytes: pngBytes,
+		mimeType: "image/png",
+		convertedFrom: baseMimeType(mimeType),
+	};
+}
+
+function conversionHint(from: string | undefined, to: string): string | undefined {
+	if (!from || from === to) return undefined;
+	return `[Image converted from ${from} to ${to}.]`;
+}
+```
+
+## !!steps Resizing branch
+
+With auto resize on, the normalized bytes go through `resizeImage`. A null result means it could not get under the size limit. Hints are collected for a format change and for a dimension change, the latter so the model can map coordinates back to the original.
+
+```ts ! image-process.ts
+export async function processImage(
+	bytes: Uint8Array,
+	mimeType: string,
+	options?: ProcessImageOptions,
+): Promise<ProcessImageResult> {
+	const autoResizeImages = options?.autoResizeImages ?? true;
+	const normalized = await normalizeImage(bytes, mimeType);
+	if (!normalized) {
+		return {
+			ok: false,
+			message: "[Image omitted: could not be converted to a supported inline image format.]",
+		};
+	}
+
+	if (autoResizeImages) {
+		const resized = await resizeImage(normalized.bytes, normalized.mimeType, options?.resizeOptions);
+		if (!resized) {
+			return {
+				ok: false,
+				message: "[Image omitted: could not be resized below the inline image size limit.]",
+			};
+		}
+
+		const hints: string[] = [];
+		const convertedHint = conversionHint(normalized.convertedFrom, resized.mimeType);
+		if (convertedHint) hints.push(convertedHint);
+		const dimensionNote = formatDimensionNote(resized);
+		if (dimensionNote) hints.push(dimensionNote);
+
+		return {
+			ok: true,
+			data: resized.data,
+			mimeType: resized.mimeType,
+			hints,
+		};
+	}
+```
+
+## !!steps No-resize branch
+
+With resizing off, the bytes are base64 encoded as they are, with only the conversion hint. Note this path performs no size check, so an oversized image is sent as is.
+
+```ts ! image-process.ts
+	const hints: string[] = [];
+	const convertedHint = conversionHint(normalized.convertedFrom, normalized.mimeType);
+	if (convertedHint) hints.push(convertedHint);
+
+	return {
+		ok: true,
+		data: Buffer.from(normalized.bytes).toString("base64"),
+		mimeType: normalized.mimeType,
+		hints,
+	};
+}
+```
+
+</Scrollycoding>
+
+The two failure messages are written for the model, not for logs, so they can be placed straight into a tool result.

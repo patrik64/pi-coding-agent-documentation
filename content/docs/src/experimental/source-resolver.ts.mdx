@@ -1,0 +1,131 @@
+---
+title: "source-resolver.ts"
+description: "A Node module-resolution hook that maps the workspace's tsconfig path aliases to TypeScript source, so experimental processes never load stale dist builds"
+source: "src/experimental/source-resolver.ts"
+full: true
+---
+
+Node can run TypeScript directly by stripping types, but it ignores the `paths` aliases in `tsconfig.json`. In this monorepo the `@earendil-works/*` packages are imported by those aliases, so without help Node would resolve them through `node_modules` to built `dist` files, which may be out of date relative to the source being edited.
+
+This file is a preload module: it has no exports, and importing it with `node --import` installs a resolve hook as a side effect. It is experimental tooling. [process.ts](/docs/src/experimental/process.ts) adds `--import` for it whenever it spawns an internal process (such as [session-worker.ts](/docs/src/experimental/session-worker.ts)) from `.ts` source, several tests preload it, and the [vacation demo](/docs/src/experimental/vacation/README.md) documents the flag for running without a build.
+
+<Scrollycoding>
+
+## !!steps Why a resolver exists and how tsconfig is read
+
+The header comment states the intent: Node strips types but does not apply source aliases, so internal source processes preload this resolver and cannot silently fall through to stale package dist files.
+
+At import time the module finds the repository root four directories above itself, reads `tsconfig.json` and requires `compilerOptions.paths`. A missing `paths` block is a hard error rather than a silent no-op, which fits the goal of failing loudly.
+
+```ts ! source-resolver.ts
+// Node strips TypeScript natively, but it does not apply the workspace source
+// aliases from tsconfig.json. Internal source processes preload this resolver so
+// they cannot silently fall through to stale package dist files.
+// ...
+const repositoryRoot = fileURLToPath(new URL("../../../..", import.meta.url));
+const tsconfigPath = resolve(repositoryRoot, "tsconfig.json");
+const tsconfig = JSON.parse(readFileSync(tsconfigPath, "utf8")) as TsConfig;
+// !mark(1:2)
+const paths = tsconfig.compilerOptions?.paths;
+if (!paths) throw new Error(`Source runtime requires compilerOptions.paths in ${tsconfigPath}`);
+```
+
+## !!steps Turning path patterns into aliases
+
+Only patterns starting with `@earendil-works/` are kept. Each pattern is split at its single `*` into a prefix and a suffix; a pattern with no wildcard is an exact-match alias. More than one wildcard is rejected, because the matching below only supports one.
+
+The list is sorted by pattern length, longest first, so a specific alias such as a subpath export wins over a broader wildcard that would also match.
+
+```ts ! source-resolver.ts
+const aliases: SourceAlias[] = Object.entries(paths)
+	// !mark
+	.filter(([pattern]) => pattern.startsWith("@earendil-works/"))
+	.map(([pattern, replacements]) => {
+		const wildcard = pattern.indexOf("*");
+		if (wildcard !== -1 && pattern.indexOf("*", wildcard + 1) !== -1) {
+			throw new Error(`Source runtime does not support multiple wildcards in ${pattern}`);
+		}
+		return {
+			pattern,
+			prefix: wildcard === -1 ? pattern : pattern.slice(0, wildcard),
+			suffix: wildcard === -1 ? "" : pattern.slice(wildcard + 1),
+			replacements,
+		};
+	})
+	// !mark
+	.sort((left, right) => right.pattern.length - left.pattern.length);
+```
+
+## !!steps The resolve hook
+
+`registerHooks` from `node:module` installs a synchronous in-thread hook. For each specifier it tries every alias, remembering the first pattern that matched. A match yields the text captured by the wildcard, which is substituted into each replacement path in turn; the first replacement that points at a real file is returned with `shortCircuit`.
+
+If an alias matched but no replacement resolved, it throws with the pattern name instead of falling back to `nextResolve`. That is the part that prevents the stale-dist fallthrough. Specifiers that match no alias are passed on untouched.
+
+```ts ! source-resolver.ts
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		let matchedPattern: string | undefined;
+		for (const alias of aliases) {
+			const wildcard = matchAlias(alias, specifier);
+			if (wildcard === undefined) continue;
+			matchedPattern ??= alias.pattern;
+			for (const replacement of alias.replacements) {
+				const resolved = resolveSourcePath(replacement.replace("*", wildcard));
+				if (resolved) return { url: pathToFileURL(resolved).href, shortCircuit: true };
+			}
+		}
+		// !mark(1:4)
+		if (matchedPattern) {
+			throw new Error(`Source runtime could not resolve ${specifier} through tsconfig path ${matchedPattern}`);
+		}
+		return nextResolve(specifier, context);
+	},
+});
+```
+
+## !!steps Matching one alias
+
+`matchAlias` returns the wildcard text, an empty string for an exact alias, or `undefined` for no match. A wildcard match requires both the prefix and the suffix and slices out what lies between them.
+
+```ts ! source-resolver.ts
+function matchAlias(alias: SourceAlias, specifier: string): string | undefined {
+	// !mark(1:3)
+	if (!alias.pattern.includes("*")) return specifier === alias.pattern ? "" : undefined;
+	if (!specifier.startsWith(alias.prefix) || !specifier.endsWith(alias.suffix)) return undefined;
+	return specifier.slice(alias.prefix.length, specifier.length - alias.suffix.length);
+}
+```
+
+## !!steps Finding the source file on disk
+
+The replacement is resolved against the repository root, and anything that escapes the root is refused. A `.js`, `.mjs` or `.cjs` target is tried as written and then with the matching TypeScript extension, which supports tsconfig paths that point at emitted names. An explicit `.ts`, `.mts`, `.cts` or `.json` is used as is. Extensionless targets try the bare path, then `.ts`, then `index.ts` in a directory.
+
+Only candidates that exist and are regular files are returned.
+
+```ts ! source-resolver.ts
+function resolveSourcePath(replacement: string): string | undefined {
+	const basePath = resolve(repositoryRoot, replacement);
+	const rootPrefix = repositoryRoot.endsWith(sep) ? repositoryRoot : `${repositoryRoot}${sep}`;
+	// !mark
+	if (!basePath.startsWith(rootPrefix)) return undefined;
+	const extension = extname(basePath);
+	// !mark(1:2)
+	const sourceExtension =
+		extension === ".js" ? ".ts" : extension === ".mjs" ? ".mts" : extension === ".cjs" ? ".cts" : undefined;
+	const candidates = sourceExtension
+		? [basePath, `${basePath.slice(0, -extension.length)}${sourceExtension}`]
+		// !mark(1:3)
+		: extension === ".ts" || extension === ".mts" || extension === ".cts" || extension === ".json"
+			? [basePath]
+			: [basePath, `${basePath}.ts`, resolve(basePath, "index.ts")];
+	for (const candidate of candidates) {
+		if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+	}
+	return undefined;
+}
+```
+
+</Scrollycoding>
+
+The whole file is a side effect: nothing imports a function from it. Its consumers are [process.ts](/docs/src/experimental/process.ts), the tests, and people running the demos by hand. One structural note: the `.replace("*", wildcard)` call substitutes only the first `*` in a replacement, which matches the single-wildcard restriction enforced earlier.

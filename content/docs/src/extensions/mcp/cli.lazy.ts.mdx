@@ -1,0 +1,35 @@
+---
+title: "cli.lazy.ts"
+description: "Two-line lazy loader that imports the pi mcp command module only when the command actually runs."
+source: "src/extensions/mcp/cli.lazy.ts"
+full: true
+---
+
+This file is a deliberate indirection. The `pi mcp` command in [cli.ts](/docs/src/extensions/mcp/cli.ts) pulls in the whole MCP runtime ([runtime.ts](/docs/src/extensions/mcp/runtime.ts)), the OAuth code, chalk, and readline. Most invocations of `pi` never run `pi mcp`, so the main entry point should not pay to load all of that at startup.
+
+The same pattern appears for the runtime in [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts). The file is tiny, so the walkthrough is short.
+
+<Scrollycoding>
+
+## !!steps The doc comment
+
+The comment states the purpose: load the command and the MCP runtime only when the command runs. It points back to `cli.ts`, which is the real module.
+
+```ts ! cli.lazy.ts
+/** Loads `pi mcp` and the MCP runtime only when the command runs (see cli.ts). */
+```
+
+## !!steps The dynamic import
+
+`loadMcpCommand` is a function, not a promise, so nothing is imported until a caller invokes it. The result is a promise of the module, which exports `runMcpCommand` and `McpCommandOptions`. The `.ts` extension in the specifier matches how the rest of the package imports files.
+
+```ts ! cli.lazy.ts
+// !mark
+export const loadMcpCommand = () => import("./cli.ts");
+```
+
+</Scrollycoding>
+
+The consumer is [main.ts](/docs/src/main.ts), which calls `loadMcpCommand()` when it sees `mcp` as the first argument and then runs `runMcpCommand` with the working directory and agent directory. The extension itself ([index.ts](/docs/src/extensions/mcp/index.ts)) keeps the in-session `/mcp` UI separate from this offline command.
+
+Structurally this is one of several `*.lazy.ts` files in the repository whose only job is to keep a heavy module out of the startup path.

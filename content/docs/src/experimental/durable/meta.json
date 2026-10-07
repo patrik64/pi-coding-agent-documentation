@@ -1,0 +1,13 @@
+{
+  "title": "durable",
+  "pages": [
+    "harness-setup.ts",
+    "main.ts",
+    "prompt.ts",
+    "README.md",
+    "runtime.ts",
+    "sessions.ts",
+    "subagent.ts",
+    "tui.ts"
+  ]
+}

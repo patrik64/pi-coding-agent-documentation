@@ -1,0 +1,199 @@
+---
+title: "theme-controller.ts"
+description: "Keeps the active theme in sync with the user's theme setting and the terminal's reported colors, including the system theme and light/dark pairs"
+source: "src/modes/interactive/theme/theme-controller.ts"
+full: true
+---
+
+Choosing a theme used to be a one-time lookup. With the `system` theme and light/dark pairs it became a live relationship: the theme depends on the setting, on the terminal's colors, and on whether the terminal switches between light and dark while pi is running. `InteractiveThemeController` owns that relationship for one TUI.
+
+It is a thin coordinator over the global theme state in [theme.ts](/docs/src/modes/interactive/theme/theme.ts). The system theme itself is generated in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) from whatever colors this controller feeds in. Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts), and the controller is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and also by experimental TUIs such as [client-tui.ts](/docs/src/experimental/client-tui.ts).
+
+<Scrollycoding>
+
+## !!steps Querying the terminal without hanging
+
+`requestTerminalColors` asks the TUI for foreground, background and palette. A 100 ms timeout bounds the wait for terminals that answer nothing; `onLateReply` still applies a reply that arrives afterward. A synchronous throw and a rejected promise are both treated as "no colors", so `apply` is always called at least once and the returned promise always settles.
+
+The comment explains why the timeout rarely bites: terminals answer a trailing DA1 request right after the color replies, so the query usually completes well within 100 ms.
+
+```ts ! theme-controller.ts
+const TERMINAL_QUERY_TIMEOUT_MS = 100;
+
+/**
+ * Query the terminal's colors and pass them to `apply` when the query completes or times out, and again
+ * if the terminal answers after the timeout. A failed query applies no colors. Settles after the first apply.
+ */
+export function requestTerminalColors(ui: TUI, apply: (colors: TerminalColors) => void): Promise<void> {
+	let query: Promise<TerminalColors>;
+	try {
+		query = ui.queryTerminalColors({ timeoutMs: TERMINAL_QUERY_TIMEOUT_MS, onLateReply: apply });
+	} catch {
+		// Treat a failed query like a terminal that does not report colors.
+		query = Promise.resolve({});
+	}
+	return query.then(apply, () => apply({}));
+}
+```
+
+## !!steps Comparing colors to avoid re-renders
+
+Applying colors rebuilds every component, which is expensive, so the controller first checks whether anything really changed. The comparison is structural: foreground, background and each palette entry. A timeout that reports nothing therefore costs nothing.
+
+```ts ! theme-controller.ts
+function sameRgb(a: RgbColor | undefined, b: RgbColor | undefined): boolean {
+	return a === b || (a !== undefined && b !== undefined && a.r === b.r && a.g === b.g && a.b === b.b);
+}
+
+function sameTerminalColors(a: TerminalColors, b: TerminalColors): boolean {
+	if (!sameRgb(a.foreground, b.foreground) || !sameRgb(a.background, b.background)) return false;
+	if (a.palette === b.palette) return true;
+	if (!a.palette || !b.palette || a.palette.length !== b.palette.length) return false;
+	return a.palette.every((color, index) => sameRgb(color, b.palette?.[index]));
+}
+```
+
+## !!steps Construction: grayscale first, color later
+
+The constructor resolves a theme name from the setting and calls `markTerminalColorsPending()` before `initTheme`, so if the system theme is chosen it starts in grayscale rather than guessing colors. It also subscribes to the terminal's light/dark notifications.
+
+`resolveThemeName` falls back to the system theme when there is no setting at all, which is the default for new users.
+
+```ts ! theme-controller.ts
+	constructor(
+		ui: TUI,
+		options: {
+			getSettingsManager: () => SettingsManager;
+			showError: (message: string) => void;
+			onChanged: () => void;
+			initialThemeSetting?: string;
+		},
+	) {
+		this.ui = ui;
+		this.getSettingsManager = options.getSettingsManager;
+		this.showError = options.showError;
+		this.onChanged = options.onChanged;
+		this.currentThemeSetting = options.initialThemeSetting;
+		this.activeThemeName = this.resolveThemeName();
+		// The system theme starts in grayscale; color follows once the terminal reports its colors.
+		// !mark(1:3)
+		markTerminalColorsPending();
+		initTheme(this.activeThemeName, true);
+		this.bindTerminalColorSchemeListener();
+	}
+```
+
+## !!steps Applying the setting
+
+`applyFromSettings` is the main entry. It enables auto-sync when the setting is a light/dark pair or resolves to the system theme (both depend on terminal appearance), applies the theme right away, and starts a color query. The theme is therefore visible immediately and refined once the terminal answers.
+
+`waitForTerminalColors` exposes the query promise for callers that bake colors into strings, such as the startup header.
+
+```ts ! theme-controller.ts
+	applyFromSettings(): void {
+		const themeSetting = this.getThemeSetting();
+		const themeName = this.resolveThemeName();
+		// !mark
+		this.setAutoSync(parseAutoThemeSetting(themeSetting) !== undefined || themeName === SYSTEM_THEME_NAME);
+		this.applyThemeName(themeName, themeSetting !== undefined);
+		this.queryTerminalColors();
+	}
+```
+
+## !!steps Previews, explicit names and in-memory themes
+
+Explicit changes behave differently. `setThemeName` records the choice and enables auto-sync only for the system theme. `setThemeInstance` (used by extensions) disables auto-sync and marks the active name `"<in-memory>"`, which later opt-outs rely on. `preview` switches the theme visually without recording anything or changing sync state, so a selector like [theme-selector.ts](/docs/src/modes/interactive/components/theme-selector.ts) can show live previews and cancel cleanly.
+
+```ts ! theme-controller.ts
+	setThemeName(themeName: string, showError = false): ThemeResult {
+		this.setAutoSync(themeName === SYSTEM_THEME_NAME);
+		const result = this.applyThemeName(themeName, showError);
+		if (result.success) {
+			this.currentThemeSetting = themeName;
+		}
+		return result;
+	}
+	// ...
+	setThemeInstance(themeInstance: Theme): ThemeResult {
+		this.setAutoSync(false);
+		setThemeInstance(themeInstance);
+		this.activeThemeName = "<in-memory>";
+		this.notifyChanged();
+		return { success: true };
+	}
+
+	preview(themeSettingOrName: string): void {
+		const themeName = resolveThemeSetting(themeSettingOrName, getTerminalTheme()) ?? this.activeThemeName;
+		if (!themeName) return;
+		if (setTheme(themeName, true).success) {
+			this.ui.invalidate();
+			this.ui.requestRender();
+		}
+	}
+```
+
+## !!steps Failure falls back to the system theme
+
+`applyThemeName` always records the result: if loading fails, the active name becomes the system theme (which `setTheme` is expected to have fallen back to) and, when asked, an error message tells the user which theme failed and that a fallback was used.
+
+```ts ! theme-controller.ts
+	private applyThemeName(themeName: string, showError = false): ThemeResult {
+		const result = setTheme(themeName, true);
+		// !mark
+		this.activeThemeName = result.success ? themeName : SYSTEM_THEME_NAME;
+		this.notifyChanged();
+		if (!result.success && showError) {
+			this.showError(`Failed to load theme "${themeName}": ${result.error}\nFell back to the system theme.`);
+		}
+		return result;
+	}
+```
+
+## !!steps Merging reported colors
+
+Terminals do not always report everything, and a later partial report must not erase an earlier full one. The merge keeps the previous value for any field the new report lacks. Only when the merged result differs does it store the colors, re-resolve the theme and re-render.
+
+```ts ! theme-controller.ts
+	private applyTerminalColors(reported: TerminalColors): void {
+		const previous = this.terminalColors;
+		const next: TerminalColors = {
+			foreground: reported.foreground ?? previous?.foreground,
+			background: reported.background ?? previous?.background,
+			palette: reported.palette ?? previous?.palette,
+		};
+		// Re-rendering rebuilds every component, so skip it when nothing changed (including timeouts).
+		// !mark
+		if (previous && sameTerminalColors(previous, next)) return;
+		this.terminalColors = next;
+		setTerminalColors(next);
+		this.reapplyForTerminal();
+		this.ui.invalidate();
+		this.ui.requestRender();
+	}
+```
+
+## !!steps Reacting to a light/dark switch
+
+`reapplyForTerminal` leaves in-memory themes alone, and otherwise re-applies when the name changed (pair switching) or when the system theme must be regenerated. When the terminal announces a scheme change, the controller records the hint and re-queries: the actual background color decides appearance, and the notification only matters for terminals that do not report their background.
+
+The notification is ignored unless auto-sync is on, and `setAutoSync` asks the TUI to start or stop the notifications at all.
+
+```ts ! theme-controller.ts
+	private reapplyForTerminal(): void {
+		if (this.activeThemeName === "<in-memory>") return;
+		const themeName = this.resolveThemeName();
+		if (themeName === SYSTEM_THEME_NAME || themeName !== this.activeThemeName) {
+			this.applyThemeName(themeName);
+		}
+	}
+
+	private setAutoSync(enabled: boolean): void {
+		if (this.autoSyncEnabled === enabled) return;
+		this.autoSyncEnabled = enabled;
+		this.ui.setTerminalColorSchemeNotifications(enabled);
+	}
+```
+
+</Scrollycoding>
+
+Two quirks. `rebindTui` re-subscribes and re-sets the notifications when the TUI instance is replaced, but does not re-query colors. And `applyTerminalColorSchemeChange` calls `queryTerminalColors` unconditionally, which overwrites the `terminalColorQuery` promise that `waitForTerminalColors` hands out, so a caller holding an older promise waits on the old query only.

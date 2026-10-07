@@ -1,0 +1,48 @@
+---
+title: "sleep.ts"
+description: "Promise-based delay that rejects immediately when an AbortSignal fires"
+source: "src/utils/sleep.ts"
+full: true
+---
+
+A tiny timer helper used wherever pi waits, such as retry backoff, and must stay cancellable. A plain `setTimeout` promise cannot be interrupted, so aborting a run would otherwise hang until the delay expired.
+
+It pairs with the signal utilities in [abort.ts](/docs/src/utils/abort.ts) and is typically driven by the abort signal owned by [agent-session.ts](/docs/src/core/agent-session.ts).
+
+<Scrollycoding>
+
+## !!steps Fail fast if already aborted
+
+If the signal is already aborted, the promise rejects before a timer is created. This avoids a leaked timer and gives callers a deterministic result.
+
+```ts ! sleep.ts
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		// !mark(1:4)
+		if (signal?.aborted) {
+			reject(new Error("Aborted"));
+			return;
+		}
+```
+
+## !!steps Race the timer against abort
+
+The timer resolves normally. If abort fires first, the listener clears the timer and rejects with `Error("Aborted")`.
+
+The listener is not registered with `once: true` and is never removed after the timer fires normally, so a long-lived signal accumulates one listener per completed sleep.
+
+```ts ! sleep.ts
+		const timeout = setTimeout(resolve, ms);
+
+		// !mark(1:4)
+		signal?.addEventListener("abort", () => {
+			clearTimeout(timeout);
+			reject(new Error("Aborted"));
+		});
+	});
+}
+```
+
+</Scrollycoding>
+
+The rejection is a generic `Error` with the message "Aborted", not an `AbortError`, so callers that want to distinguish cancellation must match on the message or check the signal themselves.

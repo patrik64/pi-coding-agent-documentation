@@ -1,0 +1,475 @@
+---
+title: "interactive-mode.ts"
+description: "The terminal UI controller: owns the TUI layout, routes editor input and slash commands to the session, renders agent events, and handles shutdown and crashes"
+source: "src/modes/interactive/interactive-mode.ts"
+full: true
+---
+
+At about seven thousand lines, `InteractiveMode` is the largest file in the
+project, and it is one class. It is the glue between three things: the
+[AgentSession](/docs/src/core/agent-session.ts) that does the work, the terminal
+UI built from components, and the user typing into an editor. It is created by
+[main.ts](/docs/src/main.ts) only when both stdin and stdout are terminals.
+
+The size comes from breadth rather than depth. Most of the file is small
+private methods: one per slash command (`handleModelCommand`, `handleCloneCommand`
+and so on), one per selector overlay, plus path formatting for the startup
+resource listing, login flows, and extension UI plumbing. The control flow that
+matters is short: construct, `init`, `run`, then react to editor submissions and
+session events until shutdown. This walkthrough follows that spine and skips the
+long tail.
+
+The visual pieces live in [components](/docs/src/modes/interactive/components/index.ts)
+such as [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts)
+and [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts),
+while [chat-viewport.ts](/docs/src/modes/interactive/chat-viewport.ts) lays them out.
+
+<Scrollycoding>
+
+## !!steps What main hands in
+
+`InteractiveModeOptions` is the startup context that `main` collected
+and that the TUI has to surface once it exists. Diagnostics and warnings are
+passed in as data rather than printed, because the terminal is not ready to
+show them yet. The initial prompt and images come from `@file` arguments, the
+extra messages from additional positional arguments, and `terminal` exists so
+tests can substitute a fake.
+
+```ts ! interactive-mode.ts
+export interface InteractiveModeOptions {
+	/** Providers that were migrated to auth.json (shows warning) */
+	migratedProviders?: string[];
+	/** Diagnostics collected before the interactive TUI was initialized. */
+	startupDiagnostics?: AgentSessionRuntimeDiagnostic[];
+	/** Warning message if session model couldn't be restored */
+	modelFallbackMessage?: string;
+	/** Cwd to trust after reload if it gained a .pi directory during this implicitly trusted session. */
+	autoTrustOnReloadCwd?: string;
+	/** Initial message to send on startup (can include @file content) */
+	initialMessage?: string;
+	/** Images to attach to the initial message */
+	initialImages?: ImageContent[];
+	/** Additional messages to send after the initial message */
+	initialMessages?: string[];
+```
+
+## !!steps State held by one class
+
+Fields fall into groups: the component tree (containers for header, chat,
+pending messages, status, widgets, editor and footer), editor and selector
+state, tracking maps for streaming output, and extension UI state. The
+`pendingTools` map ties a tool call id to the component rendering it, which is
+how a result arriving later finds its row.
+
+Because the session can be replaced by `/new` or a switch, `session` is not a
+field. It is a getter that reads `runtimeHost.session` each time.
+
+```ts ! interactive-mode.ts
+	// Streaming message tracking
+	private streamingComponent: AssistantMessageComponent | undefined = undefined;
+	private readonly entriesRenderedByBoundaryCompaction = new Set<string>();
+	private streamingMessage: AssistantMessage | undefined = undefined;
+
+	// Tool execution tracking: toolCallId -> component
+	private pendingTools = new Map<string, ToolExecutionComponent>();
+// ...
+	// Convenience accessors
+	// !mark(1:3)
+	private get session(): AgentSession {
+		return this.runtimeHost.session;
+	}
+	private get agent() {
+		return this.session.agent;
+	}
+```
+
+## !!steps The constructor wires the runtime hooks
+
+Two callbacks are registered on the runtime. Before a session is invalidated,
+extension UI (widgets, custom editors, headers) is reset. When a new session is
+bound, the mode re-renders and re-applies the theme. This is the interactive
+counterpart of `rebindSession` in [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts).
+
+The renderer is created from the TUI mode setting, and `ui` is a reference that
+looks the renderer up lazily so the mode can be swapped later.
+
+```ts ! interactive-mode.ts
+	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
+		this.runtimeHost = runtimeHost;
+		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
+		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
+		this.options = { ...options, tuiMode };
+		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
+		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.resetExtensionUI();
+		});
+		this.runtimeHost.setRebindSession(async () => {
+			await this.rebindCurrentSession({ renderBeforeBind: true });
+			this.themeController.applyFromSettings();
+		});
+```
+
+## !!steps The component tree
+
+Everything scrolling is under `documentContainer`: header, loaded-resources
+listing, and chat, in that order. Pending messages, status, widgets, the
+editor and the footer sit outside it, so in fullscreen mode only the document
+scrolls while the editor stays fixed. The same container objects are remounted
+when the renderer changes rather than rebuilt.
+
+```ts ! interactive-mode.ts
+		this.headerContainer = new Container();
+		this.loadedResourcesContainer = new Container();
+		this.chatContainer = new Container();
+		this.documentContainer = new Container();
+		this.documentContainer.addChild(this.headerContainer);
+		this.documentContainer.addChild(this.loadedResourcesContainer);
+		this.documentContainer.addChild(this.chatContainer);
+		this.pendingMessagesContainer = new Container();
+		this.statusContainer = new Container();
+		this.widgetContainerAbove = new Container();
+		this.widgetContainerBelow = new Container();
+```
+
+## !!steps init: a UI that accepts text before it is ready
+
+`init` runs once. It mounts the containers, then installs a minimal set of
+handlers: Ctrl+C, Ctrl+D, and a submit handler that only says startup is still
+in progress and puts the text back. Typing is accepted but nothing is sent.
+
+The UI is started before extensions are initialized, with a comment explaining
+why: `session_start` handlers may open interactive dialogs.
+
+```ts ! interactive-mode.ts
+		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
+		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
+		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
+		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
+		this.ui.setFocus(this.editor);
+
+		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		this.ui.start();
+		this.isInitialized = true;
+		this.ensurePngTranscoder();
+
+		this.themeController.applyFromSettings();
+```
+
+## !!steps init: tools, then real handlers, then extensions
+
+Next `init` makes sure the `fd` and `rg` binaries exist, downloading them if
+needed. They are awaited in parallel after the TUI is mounted, so a slow
+download shows status instead of a frozen screen. Only after that are the real
+key and submit handlers installed, which is the moment input starts working.
+
+Then `rebindCurrentSession` initializes extensions and shows loaded resources,
+and only after that are initial messages rendered, so resource listings appear
+before the conversation.
+
+```ts ! interactive-mode.ts
+		const [fdPath] = await Promise.all([
+			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
+			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
+		]);
+		this.fdPath = fdPath;
+
+		// Enable the remaining input handlers only after managed-tool setup completes.
+		this.setupKeyHandlers();
+		this.setupEditorSubmitHandler();
+		this.ui.requestRender();
+
+		// Initialize extensions first so resources are shown before messages
+		await this.rebindCurrentSession();
+
+		// Render initial messages AFTER showing loaded resources
+		this.renderInitialMessages();
+```
+
+## !!steps run: background checks, warnings, initial prompts
+
+`run` calls `init`, then fires off work it does not wait for: a model catalog
+refresh (skipped when offline, with a 15 second abort), a version check, a
+package update check and a tmux keyboard check. Each reports through
+a notification only if it finds something.
+
+Startup diagnostics are then replayed with severity: errors, warnings, or plain
+status. The `initialMessage` and each of `initialMessages` are sent with
+`session.prompt`, one after another, and failures are shown rather than thrown.
+
+```ts ! interactive-mode.ts
+		// Process initial messages
+		if (initialMessage) {
+			try {
+				await this.session.prompt(initialMessage, { images: initialImages });
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+
+		if (initialMessages) {
+			for (const message of initialMessages) {
+				try {
+					await this.session.prompt(message);
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					this.showError(errorMessage);
+				}
+			}
+		}
+```
+
+## !!steps The main loop is just prompt, forever
+
+After startup, `run` is an infinite loop: wait for the next input, hand it to
+`session.prompt`, show any error. Input arrives through `getUserInput`, which
+bridges the editor's callback style to promises. If a submission arrived while
+nobody was waiting (the previous prompt was still running), it was pushed onto
+`pendingUserInputs` and is returned first; otherwise a one-shot callback is
+stored for the submit handler to call.
+
+```ts ! interactive-mode.ts
+		// Main interactive loop
+		while (true) {
+			const userInput = await this.getUserInput();
+			try {
+				await this.session.prompt(userInput);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+	}
+// ...
+	async getUserInput(): Promise<string> {
+		const queuedInput = this.pendingUserInputs.shift();
+		if (queuedInput !== undefined) {
+			return queuedInput;
+		}
+
+		return new Promise((resolve) => {
+			this.onInputCallback = (text: string) => {
+				this.onInputCallback = undefined;
+				resolve(text);
+			};
+		});
+	}
+```
+
+## !!steps The submit handler: commands, bash, queues
+
+`setupEditorSubmitHandler` is a long chain of exact-match checks. Each slash
+command is recognized by comparing the trimmed text (with `startsWith` for
+commands that take arguments), clears the editor, and calls a handler. Unknown
+slash text falls through and is sent as a prompt, so extension commands and
+prompt templates are resolved by the session, not here.
+
+Lines beginning with `!` run a shell command; `!!` runs it but leaves the output
+out of the model's context. A second bash command is refused while one is
+running.
+
+```ts ! interactive-mode.ts
+			// Handle bash command (! for normal, !! for excluded from context)
+			if (text.startsWith("!")) {
+				const isExcluded = text.startsWith("!!");
+				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+				if (command) {
+					if (this.session.isBashRunning) {
+						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+						this.editor.setText(text);
+						return;
+					}
+					this.editor.addToHistory?.(text);
+					await this.handleBashCommand(command, isExcluded);
+					this.isBashMode = false;
+					this.updateEditorBorderColor();
+					return;
+				}
+			}
+```
+
+## !!steps Typing while the agent is busy
+
+If compaction is running, ordinary text is queued locally in
+`compactionQueuedMessages`, while extension commands run immediately. While the
+agent is streaming, the text goes to `session.prompt` with
+`streamingBehavior: "steer"`, which makes it a steering message delivered
+mid-run. Alt+Enter (`handleFollowUp`) is the same with `"followUp"`, which
+waits until the agent is finished. Only an idle agent reaches the last branch,
+where the text is passed to the pending `getUserInput` call.
+
+```ts ! interactive-mode.ts
+			// Queue input during compaction (extension commands execute immediately)
+			if (this.session.isCompacting) {
+				if (this.isExtensionCommand(text)) {
+					this.editor.addToHistory?.(text);
+					this.editor.setText("");
+					await this.session.prompt(text);
+				} else {
+					this.queueCompactionMessage(text, "steer");
+				}
+				return;
+			}
+
+			// If streaming, use prompt() with steer behavior
+			// This handles extension commands (execute immediately), prompt template expansion, and queueing
+			if (this.session.isStreaming) {
+				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				await this.session.prompt(text, { streamingBehavior: "steer" });
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
+				return;
+			}
+```
+
+## !!steps Draining the compaction queue
+
+When compaction ends, `flushCompactionQueue` replays what the user typed. If an
+automatic retry is pending, every message is queued as steer or follow-up for
+that retry turn. Otherwise the first non-extension message becomes a real
+prompt, extension commands before it run first, and the rest are queued behind
+it. If sending fails, the queue is restored so nothing the user typed is lost,
+and an error is shown.
+
+```ts ! interactive-mode.ts
+			// Find first non-extension-command message to use as prompt
+			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+			if (firstPromptIndex === -1) {
+				// All extension commands - execute them all
+				for (const message of queuedMessages) {
+					await this.session.prompt(message.text);
+				}
+				return;
+			}
+
+			// Execute any extension commands before the first prompt
+			const preCommands = queuedMessages.slice(0, firstPromptIndex);
+			const firstPrompt = queuedMessages[firstPromptIndex];
+			const rest = queuedMessages.slice(firstPromptIndex + 1);
+```
+
+## !!steps Rendering the agent event stream
+
+`subscribeToAgent` forwards every session event to `handleEvent`, one big
+switch. On `message_start` for an assistant message it creates an
+`AssistantMessageComponent` and appends it; each `message_update` re-renders the
+partial message and, for every tool call block in it, creates a
+`ToolExecutionComponent` the first time that call id appears or updates its
+arguments later. That lets tool rows show up while the model is still writing
+the call.
+
+```ts ! interactive-mode.ts
+			case "message_update":
+				if (this.streamingComponent && event.message.role === "assistant") {
+					this.streamingMessage = event.message;
+					this.streamingComponent.updateContent(this.streamingMessage, true);
+
+					for (const content of this.streamingMessage.content) {
+						if (content.type === "toolCall") {
+							if (!this.pendingTools.has(content.id)) {
+								const component = new ToolExecutionComponent(
+									content.name,
+									content.id,
+									content.arguments,
+```
+
+## !!steps Finishing or failing a message
+
+On `message_end`, the component is switched out of streaming state. An aborted
+message gets a readable error, mentioning retry attempts if any. For aborted or
+errored messages, every still-pending tool row is completed with an error result
+so nothing is left spinning. On success, tool arguments are marked complete,
+which triggers diff computation for edit tools.
+
+```ts ! interactive-mode.ts
+					if (this.streamingMessage.stopReason === "aborted" || this.streamingMessage.stopReason === "error") {
+						if (!errorMessage) {
+							errorMessage = this.streamingMessage.errorMessage || "Error";
+						}
+						for (const [, component] of this.pendingTools.entries()) {
+							component.updateResult({
+								content: [{ type: "text", text: errorMessage }],
+								isError: true,
+							});
+						}
+						this.pendingTools.clear();
+						this.maybeSuggestBugReport(this.streamingMessage);
+					} else {
+						// Args are now complete - trigger diff computation for edit tools
+						for (const [, component] of this.pendingTools.entries()) {
+							component.setArgsComplete();
+						}
+```
+
+## !!steps Ctrl+C, Ctrl+D and graceful shutdown
+
+Ctrl+C clears the editor, and a second press within 500 ms quits. Ctrl+D quits
+only when the editor is empty, which `CustomEditor` enforces.
+
+For an interactive quit, the order is deliberate: stop theme syncing, drain
+pending keyboard input so key-release escape sequences do not leak into the
+parent shell, stop the TUI, then dispose the runtime so extension shutdown
+cleanup cannot repaint the final frame. Finally the resume command is printed.
+A signal-triggered shutdown instead disposes first, so extension cleanup runs
+even if the terminal is dead.
+
+```ts ! interactive-mode.ts
+		// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
+		// TUI before emitting shutdown events so extension UI cleanup cannot repaint
+		// the final frame while the process is exiting.
+		// Drain any in-flight Kitty key release events before stopping.
+		// This prevents escape sequences from leaking to the parent shell over slow SSH.
+		this.themeController.disableAutoSync();
+		await this.ui.terminal.drainInput(1000);
+
+		this.stop();
+		await this.runtimeHost.dispose();
+
+		const resumeCommand = formatResumeCommand(this.sessionManager);
+		if (resumeCommand) {
+			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+		}
+
+		process.exit(0);
+```
+
+## !!steps Dead terminals and uncaught exceptions
+
+A raw-mode TUI that crashes leaves the user's shell unusable, so
+`registerSignalHandlers` installs three layers. SIGTERM (and SIGHUP outside
+Windows) start a graceful shutdown. Errors on stdin, stdout or stderr that mean
+the terminal is gone (`EIO`, `EPIPE` and similar) go to `emergencyTerminalExit`
+with status 129, skipping cleanup that would write to a dead tty. Any other
+uncaught exception goes to `uncaughtCrash`, which stops the UI to restore the
+terminal, prints the error, records the crash for the `/bug` report, and exits 1.
+
+```ts ! interactive-mode.ts
+		const terminalErrorHandler = (error: Error) => {
+			if (isDeadTerminalError(error)) {
+				this.emergencyTerminalExit();
+			}
+			throw error;
+		};
+		// stdin needs the handler too: once the terminal is gone, reads and setRawMode
+		// fail with EIO (orphaned background process group) or ENOTTY (revoked tty).
+		// Node emits these as stream errors, which are uncaught without a listener.
+		for (const stream of [process.stdin, process.stdout, process.stderr]) {
+			stream.on("error", terminalErrorHandler);
+			this.signalCleanupHandlers.push(() => stream.off("error", terminalErrorHandler));
+		}
+```
+
+</Scrollycoding>
+
+The class is a single-threaded state machine around two queues: the editor
+produces input, and the session produces events. Neither is awaited on the
+other, which is why so much state (`streamingComponent`, `pendingTools`,
+`compactionQueuedMessages`) is held in fields rather than locals. Related
+modules own the pieces it composes: [footer.ts](/docs/src/modes/interactive/components/footer.ts)
+and [custom-editor.ts](/docs/src/modes/interactive/components/custom-editor.ts)
+for the chrome, [external-editor.ts](/docs/src/modes/interactive/external-editor.ts)
+for the external editor shortcut, and [bug-report.ts](/docs/src/modes/interactive/bug-report.ts)
+for the crash path. The same session is driven headlessly by
+[rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) and
+[print-mode.ts](/docs/src/modes/print-mode.ts).

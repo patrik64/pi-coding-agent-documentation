@@ -1,0 +1,88 @@
+---
+title: "custom-entry.ts"
+description: "Renders an extension-defined custom session entry through the extension's own renderer, with a visible error box if it throws"
+source: "src/modes/interactive/components/custom-entry.ts"
+full: true
+---
+
+Extensions can append custom entries to the session (the `CustomEntry` type from [session-manager.ts](/docs/src/core/session-manager.ts)) and register an `EntryRenderer` for them (typed in [types.ts](/docs/src/core/extensions/types.ts)). `CustomEntryComponent` is the transcript widget that bridges the two: it calls the renderer and shows whatever component comes back.
+
+It differs from [custom-message.ts](/docs/src/modes/interactive/components/custom-message.ts) in two ways. There is no default rendering, so an entry with no renderer output shows nothing, and spacing is owned by the host.
+
+<Scrollycoding>
+
+## !!steps State and expansion
+
+The component keeps the entry, the renderer, the last component produced, and an expanded flag. `hasContent` lets the transcript decide whether the entry produced anything visible. `setExpanded` rebuilds only when the flag actually changes.
+
+```ts ! custom-entry.ts
+export class CustomEntryComponent extends Container {
+	private entry: CustomEntry<unknown>;
+	private renderer: EntryRenderer;
+	private customComponent?: Component;
+	private _expanded = false;
+
+	constructor(entry: CustomEntry<unknown>, renderer: EntryRenderer) {
+		super();
+		this.entry = entry;
+		this.renderer = renderer;
+		this.rebuild();
+	}
+
+	hasContent(): boolean {
+		return this.customComponent !== undefined;
+	}
+```
+
+## !!steps Rebuilding on theme change
+
+Overriding `invalidate` to call `rebuild` means a theme switch re-invokes the extension renderer, which receives the live `theme` and can therefore recolor its output.
+
+```ts ! custom-entry.ts
+	setExpanded(expanded: boolean): void {
+		if (this._expanded !== expanded) {
+			this._expanded = expanded;
+			this.rebuild();
+		}
+	}
+
+	override invalidate(): void {
+		super.invalidate();
+		this.rebuild();
+	}
+```
+
+## !!steps Error isolation
+
+The renderer is extension code, so it runs inside try/catch. A throw becomes a boxed error line naming the entry's `customType` and the message, so a buggy extension cannot break the transcript.
+
+```ts ! custom-entry.ts
+		let component: Component | undefined;
+		try {
+			component = this.renderer(this.entry, { expanded: this._expanded }, theme);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			// !mark
+			const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+			box.addChild(new Text(theme.fg("error", `[${this.entry.customType}] renderer failed: ${message}`), 0, 0));
+			component = box;
+		}
+```
+
+## !!steps Adding to the container
+
+If the renderer returned nothing, the container stays empty. Otherwise a one-line spacer precedes the component. The class doc says the host owns transcript spacing, yet the spacer is added here too.
+
+```ts ! custom-entry.ts
+		if (!component) {
+			return;
+		}
+
+		this.customComponent = component;
+		this.addChild(new Spacer(1));
+		this.addChild(component);
+```
+
+</Scrollycoding>
+
+The interactive mode in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) creates one of these per custom entry with a registered renderer. A structural note: the rebuild-from-scratch approach is simple but re-runs extension code on every invalidate.

@@ -1,0 +1,105 @@
+---
+title: "chat-viewport.ts"
+description: "Factory for the fullscreen layout: a scrolling transcript above a fixed dock of status, editor and footer"
+source: "src/modes/interactive/chat-viewport.ts"
+full: true
+---
+
+A tiny layout helper. It takes the already-built components of the interactive
+UI and arranges them with `ScrollView` and `VStack` from pi-tui: the transcript
+fills the screen and follows new output, while pending messages, status, editor
+and footer stay pinned at the bottom.
+
+It is shared so that different callers, such as
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and
+[tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts), get identical
+layout behavior.
+
+<Scrollycoding>
+
+## !!steps The inputs and the result
+
+Options name each slot of the screen. Only `widgetsAbove`, `widgetsBelow` and the scrollbar settings are optional. The result exposes the `root` to mount and the `transcript` scroll view, so callers can scroll it programmatically.
+
+```ts ! chat-viewport.ts
+export interface ChatViewportOptions {
+	readonly document: Component;
+	readonly pendingMessages: Component;
+	readonly status: Component;
+	readonly editor: Component;
+	readonly footer: Component;
+	readonly widgetsAbove?: Component;
+	readonly widgetsBelow?: Component;
+	readonly scrollbar?: ScrollViewScrollbar;
+	readonly scrollbarTrackStyle?: (text: string) => string;
+	readonly scrollbarThumbStyle?: (text: string) => string;
+}
+
+export interface ChatViewport {
+	readonly root: Component;
+	readonly transcript: ScrollView;
+}
+```
+
+## !!steps The transcript scroll view
+
+`follow: "end"` keeps the view pinned to the newest output, `primary: true`
+marks it as the main scroller, and `overscroll: "chain"` lets extra scrolling
+pass to the parent. The scrollbar defaults to `"auto"`. The style callbacks are
+spread in only when defined, which avoids passing explicit `undefined` values.
+
+```ts ! chat-viewport.ts
+// !mark(3:5)
+export function createChatViewport(options: ChatViewportOptions): ChatViewport {
+	const transcript = new ScrollView(options.document, {
+		follow: "end",
+		primary: true,
+		overscroll: "chain",
+		scrollbar: options.scrollbar ?? "auto",
+		...(options.scrollbarTrackStyle === undefined ? {} : { scrollbarTrackStyle: options.scrollbarTrackStyle }),
+		...(options.scrollbarThumbStyle === undefined ? {} : { scrollbarThumbStyle: options.scrollbarThumbStyle }),
+	});
+```
+
+## !!steps The dock
+
+The dock is a `VStack` of the input area. Every child can shrink, with a minimum
+of 0 for everything except the editor, which never gets smaller than 3 rows.
+Optional widget slots are inserted by conditional spread so absent widgets take
+no space.
+
+```ts ! chat-viewport.ts
+// !mark(5:5)
+	const dock = new VStack([
+		{ component: options.pendingMessages, shrink: 1, minSize: 0 },
+		{ component: options.status, shrink: 1, minSize: 0 },
+		...(options.widgetsAbove === undefined ? [] : [{ component: options.widgetsAbove, shrink: 1, minSize: 0 }]),
+		{ component: options.editor, shrink: 1, minSize: 3 },
+		...(options.widgetsBelow === undefined ? [] : [{ component: options.widgetsBelow, shrink: 1, minSize: 0 }]),
+		{ component: options.footer, shrink: 1, minSize: 0 },
+	]);
+```
+
+## !!steps The root stack
+
+The root puts the transcript first with `basis: 0` and `grow: 1`, so it takes
+all leftover height, and the dock with `basis: "auto"` and `grow: 0`, so it takes
+exactly its content height. When the terminal is too short both can shrink, down
+to one row each.
+
+```ts ! chat-viewport.ts
+	return {
+		transcript,
+		root: new VStack([
+			{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+			{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
+		]),
+	};
+}
+```
+
+</Scrollycoding>
+
+Nothing here has state or input handling; the function just wires components
+together. Editor behavior lives in [custom-editor.ts](/docs/src/modes/interactive/components/custom-editor.ts)
+and the bottom bar in [footer.ts](/docs/src/modes/interactive/components/footer.ts).

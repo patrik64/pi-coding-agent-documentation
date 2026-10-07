@@ -1,0 +1,318 @@
+---
+title: "armin.ts"
+description: "Easter egg: an XBM bitmap of Armin rendered with half-block characters and revealed by one of seven random animations"
+source: "src/modes/interactive/components/armin.ts"
+full: true
+---
+
+A purely decorative component. It stores a 31 by 36 monochrome image as an XBM
+byte array, converts it to Unicode half-block characters (two pixel rows per
+terminal row), and plays a randomly chosen reveal animation when constructed,
+ending with the caption "ARMIN SAYS HI".
+
+It implements the pi-tui `Component` interface directly rather than extending a
+container. A sibling easter egg is [easter-egg-3d.ts](/docs/src/modes/interactive/components/easter-egg-3d.ts),
+and the logo lives in [pi-logo.ts](/docs/src/modes/interactive/components/pi-logo.ts).
+Colors come from the shared theme used across [index.ts](/docs/src/modes/interactive/components/index.ts).
+
+<Scrollycoding>
+
+## !!steps The bitmap and the effect list
+
+The image is an XBM: LSB first, one bit per pixel, where 0 means foreground and
+1 means background. `ARMIN_WIDTH` and `ARMIN_HEIGHT` are exported so other code
+can reuse the pixel data.
+
+```ts ! armin.ts
+// XBM image: 31x36 pixels, LSB first, 1=background, 0=foreground
+export const ARMIN_WIDTH = 31;
+export const ARMIN_HEIGHT = 36;
+const WIDTH = ARMIN_WIDTH;
+const HEIGHT = ARMIN_HEIGHT;
+const BITS = [
+// ...
+];
+
+const BYTES_PER_ROW = Math.ceil(WIDTH / 8);
+const DISPLAY_HEIGHT = Math.ceil(HEIGHT / 2); // Half-block rendering
+
+type Effect = "typewriter" | "scanline" | "rain" | "fade" | "crt" | "glitch" | "dissolve";
+
+const EFFECTS: Effect[] = ["typewriter", "scanline", "rain", "fade", "crt", "glitch", "dissolve"];
+```
+
+## !!steps From pixels to half blocks
+
+`isArminPixel` decodes one bit, treating anything below the image height as
+background. `getChar` packs two vertical pixels into one cell, choosing a full
+block, upper half, lower half or space. `buildFinalGrid` produces the finished
+image once, which every effect animates toward.
+
+```ts ! armin.ts
+// Get pixel at (x, y): true = foreground, false = background
+export function isArminPixel(x: number, y: number): boolean {
+	if (y >= HEIGHT) return false;
+	const byteIndex = y * BYTES_PER_ROW + Math.floor(x / 8);
+	const bitIndex = x % 8;
+	return ((BITS[byteIndex] >> bitIndex) & 1) === 0;
+}
+
+// Get the character for a cell (2 vertical pixels packed)
+function getChar(x: number, row: number): string {
+	const upper = isArminPixel(x, row * 2);
+	const lower = isArminPixel(x, row * 2 + 1);
+	if (upper && lower) return "█";
+	if (upper) return "▀";
+	if (lower) return "▄";
+	return " ";
+}
+
+// Build the final image grid
+function buildFinalGrid(): string[][] {
+	const grid: string[][] = [];
+	for (let row = 0; row < DISPLAY_HEIGHT; row++) {
+		const line: string[] = [];
+		for (let x = 0; x < WIDTH; x++) {
+			line.push(getChar(x, row));
+		}
+		grid.push(line);
+	}
+	return grid;
+}
+```
+
+## !!steps Component state
+
+An effect is picked at random from `EFFECTS`. The component keeps the target
+`finalGrid`, the visible `currentGrid`, an untyped `effectState` bag shaped by
+each effect, and a render cache keyed by width and a `gridVersion` counter.
+The constructor starts the timer immediately.
+
+```ts ! armin.ts
+export class ArminComponent implements Component {
+	private ui: TUI;
+	private interval: ReturnType<typeof setInterval> | null = null;
+	private effect: Effect;
+	private finalGrid: string[][];
+	private currentGrid: string[][];
+	private effectState: Record<string, unknown> = {};
+	private cachedLines: string[] = [];
+	private cachedWidth = 0;
+	private gridVersion = 0;
+	private cachedVersion = -1;
+
+	constructor(ui: TUI) {
+		this.ui = ui;
+		this.effect = EFFECTS[Math.floor(Math.random() * EFFECTS.length)];
+		this.finalGrid = buildFinalGrid();
+		this.currentGrid = this.createEmptyGrid();
+
+		this.initEffect();
+		this.startAnimation();
+	}
+
+	invalidate(): void {
+		this.cachedWidth = 0;
+	}
+```
+
+## !!steps Cached rendering
+
+Rendering is cheap when nothing changed: the cache hits if width and version
+match. Otherwise each row is clipped to the available width, colored with the
+accent color and right-padded, then the caption is appended. `invalidate` zeroes
+the cached width to force a rebuild after a theme change.
+
+```ts ! armin.ts
+	render(width: number): string[] {
+		if (width === this.cachedWidth && this.cachedVersion === this.gridVersion) {
+			return this.cachedLines;
+		}
+
+		const padding = 1;
+		const availableWidth = width - padding;
+
+		this.cachedLines = this.currentGrid.map((row) => {
+			// Clip row to available width before applying color
+			const clipped = row.slice(0, availableWidth).join("");
+			const padRight = Math.max(0, width - padding - clipped.length);
+			return ` ${theme.fg("accent", clipped)}${" ".repeat(padRight)}`;
+		});
+
+		// Add "ARMIN SAYS HI" at the end
+		const message = "ARMIN SAYS HI";
+		const msgPadRight = Math.max(0, width - padding - message.length);
+		this.cachedLines.push(` ${theme.fg("accent", message)}${" ".repeat(msgPadRight)}`);
+
+		this.cachedWidth = width;
+		this.cachedVersion = this.gridVersion;
+
+		return this.cachedLines;
+	}
+```
+
+## !!steps Setting up an effect
+
+`initEffect` seeds the state for the chosen effect. Rain tracks a falling drop
+per column starting at random negative offsets; fade and dissolve shuffle every
+cell position with a Fisher-Yates shuffle; dissolve also starts from random
+noise characters.
+
+```ts ! armin.ts
+	private initEffect(): void {
+		switch (this.effect) {
+			case "typewriter":
+				this.effectState = { pos: 0 };
+				break;
+			case "scanline":
+				this.effectState = { row: 0 };
+				break;
+			case "rain":
+				// Track falling position for each column
+				this.effectState = {
+					drops: Array.from({ length: WIDTH }, () => ({
+						y: -Math.floor(Math.random() * DISPLAY_HEIGHT * 2),
+						settled: 0,
+					})),
+				};
+				break;
+```
+
+## !!steps The animation loop
+
+Glitch runs at 60 frames per second, everything else at 30. Each tick advances
+the effect, bumps `gridVersion`, requests a render and stops the interval when
+the effect reports completion. `dispose` also stops it, so removing the
+component does not leave a timer running.
+
+```ts ! armin.ts
+	private startAnimation(): void {
+		const fps = this.effect === "glitch" ? 60 : 30;
+		this.interval = setInterval(() => {
+			const done = this.tickEffect();
+			this.updateDisplay();
+			this.ui.requestRender();
+			if (done) {
+				this.stopAnimation();
+			}
+		}, 1000 / fps);
+	}
+
+	private stopAnimation(): void {
+		if (this.interval) {
+			clearInterval(this.interval);
+			this.interval = null;
+		}
+	}
+
+	private tickEffect(): boolean {
+		switch (this.effect) {
+			case "typewriter":
+				return this.tickTypewriter();
+			case "scanline":
+				return this.tickScanline();
+			case "rain":
+				return this.tickRain();
+			case "fade":
+				return this.tickFade();
+			case "crt":
+				return this.tickCrt();
+			case "glitch":
+				return this.tickGlitch();
+			case "dissolve":
+				return this.tickDissolve();
+			default:
+				return true;
+		}
+	}
+```
+
+## !!steps Two of the simplest effects
+
+Typewriter copies three cells per frame in reading order; fade copies 15 cells
+per frame from the shuffled position list. Both finish when they run out of
+cells. The other effects follow the same contract: mutate `currentGrid`, return
+true when done.
+
+```ts ! armin.ts
+	private tickTypewriter(): boolean {
+		const state = this.effectState as { pos: number };
+		const pixelsPerFrame = 3;
+
+		for (let i = 0; i < pixelsPerFrame; i++) {
+			const row = Math.floor(state.pos / WIDTH);
+			const x = state.pos % WIDTH;
+			if (row >= DISPLAY_HEIGHT) return true;
+			this.currentGrid[row][x] = this.finalGrid[row][x];
+			state.pos++;
+		}
+		return false;
+	}
+// ...
+	private tickFade(): boolean {
+		const state = this.effectState as { positions: [number, number][]; idx: number };
+		const pixelsPerFrame = 15;
+
+		for (let i = 0; i < pixelsPerFrame; i++) {
+			if (state.idx >= state.positions.length) return true;
+			const [row, x] = state.positions[state.idx];
+			this.currentGrid[row][x] = this.finalGrid[row][x];
+			state.idx++;
+		}
+		return false;
+	}
+```
+
+## !!steps Glitch and the end state
+
+Glitch shows eight frames of randomly shifted or swapped rows, then one clean
+frame. The `render` cache is bumped by `updateDisplay`, and `dispose` stops the timer.
+
+```ts ! armin.ts
+	private tickGlitch(): boolean {
+		const state = this.effectState as { phase: number; glitchFrames: number };
+
+		if (state.phase < state.glitchFrames) {
+			// Glitch phase: show corrupted version
+			this.currentGrid = this.finalGrid.map((row) => {
+				const offset = Math.floor(Math.random() * 7) - 3;
+				const glitchRow = [...row];
+
+				// Random horizontal offset
+				if (Math.random() < 0.3) {
+					const shifted = glitchRow.slice(offset).concat(glitchRow.slice(0, offset));
+					return shifted.slice(0, WIDTH);
+				}
+
+				// Random vertical swap
+				if (Math.random() < 0.2) {
+					const swapRow = Math.floor(Math.random() * DISPLAY_HEIGHT);
+					return [...this.finalGrid[swapRow]];
+				}
+
+				return glitchRow;
+			});
+			state.phase++;
+			return false;
+		}
+
+		// Final frame: show clean image
+		this.currentGrid = this.finalGrid.map((row) => [...row]);
+		return true;
+	}
+// ...
+	private updateDisplay(): void {
+		this.gridVersion++;
+	}
+
+	dispose(): void {
+		this.stopAnimation();
+	}
+}
+```
+
+</Scrollycoding>
+
+Everything is self-contained; the only external dependencies are the TUI for
+`requestRender` and the theme for color. Nothing stops the timer if the
+component is never disposed, apart from the animation finishing on its own.

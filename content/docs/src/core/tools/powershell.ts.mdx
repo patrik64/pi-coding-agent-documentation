@@ -1,0 +1,130 @@
+---
+title: "powershell.ts"
+description: "The PowerShell tool, built as a thin configuration of the shared shell tool from bash.ts"
+source: "src/core/tools/powershell.ts"
+full: true
+---
+
+PowerShell support is not a second implementation. It reuses the shell tool factory exported from [bash.ts](/docs/src/core/tools/bash.ts) and supplies only what differs: the shell name, the prompt shown in the UI, the system prompt snippet and an operations object that spawns PowerShell instead of bash.
+
+The file also re-exports the bash types under PowerShell names, so callers can talk about `PowerShellToolOptions` without importing from the bash module. Output rendering lives in [renderers/bash.ts](/docs/src/core/tools/renderers/bash.ts), where the same renderer is parameterised with the `PS>` prompt.
+
+<Scrollycoding>
+
+## !!steps Reusing the bash building blocks
+
+Everything the tool needs is imported from `bash.ts`, including type-only imports of the options and details shapes. Only `getPowerShellConfig` comes from [shell.ts](/docs/src/utils/shell.ts), which knows how to locate a PowerShell executable on the host.
+
+The `UTF8_OUTPUT_PREFIX` is a small script that forces the console output encoding to UTF-8 and swallows any error. Without it, Windows PowerShell would emit output in the legacy code page and the agent would see garbled text.
+
+```ts ! powershell.ts
+import { getPowerShellConfig } from "../../utils/shell.ts";
+import {
+	type BashOperations,
+	type BashSpawnContext,
+	type BashSpawnHook,
+	type BashToolDetails,
+	type BashToolInput,
+	type BashToolOptions,
+	type createBashTool,
+	createLocalShellOperations,
+	createShellToolDefinition,
+	type ShellToolConfig,
+} from "./bash.ts";
+import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
+
+// !mark
+const UTF8_OUTPUT_PREFIX = "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+```
+
+## !!steps Prompt contribution and type aliases
+
+`powershellToolSystemPromptContribution` is the text the system prompt builder adds when this tool is active: a one-line snippet and one guideline pointing at the `PI_*` environment variables.
+
+The aliases are pure renames. `PowerShellOperations` is literally `BashOperations`, so any code that implements the operations interface for bash (for example a remote or sandboxed executor) can be reused unchanged. `PowerShellToolOptions` narrows the bash options to three fields with `Pick`, leaving out bash-only knobs.
+
+```ts ! powershell.ts
+export const powershellToolSystemPromptContribution = {
+	snippet: "Execute PowerShell commands",
+	guidelines: ["You can inspect PI_* environment variables for current model and session details."],
+} as const;
+
+// !mark(1:5)
+export type PowerShellOperations = BashOperations;
+export type PowerShellSpawnContext = BashSpawnContext;
+export type PowerShellSpawnHook = BashSpawnHook;
+export type PowerShellToolDetails = BashToolDetails;
+export type PowerShellToolInput = BashToolInput;
+
+export interface PowerShellToolOptions
+	extends Pick<BashToolOptions, "operations" | "exposeSessionEnvironment" | "spawnHook"> {}
+```
+
+## !!steps Local operations with the UTF-8 prefix
+
+`createLocalShellOperations` builds an operations object for a named shell given a function that resolves its executable. Here the result is wrapped so every command is prefixed with the encoding script before it reaches `exec`.
+
+Only `exec` is exposed, which is the whole `BashOperations` surface this tool relies on.
+
+```ts ! powershell.ts
+export function createLocalPowerShellOperations(): PowerShellOperations {
+	// !mark
+	const operations = createLocalShellOperations("PowerShell", getPowerShellConfig);
+	return {
+		// !mark
+		exec: (command, cwd, options) => operations.exec(`${UTF8_OUTPUT_PREFIX}${command}`, cwd, options),
+	};
+}
+```
+
+## !!steps The tool configuration
+
+`ShellToolConfig` is the full set of per-shell differences: tool name and label, the human shell name, the prompt string used by renderers, prompt snippet and guidelines, and a prefix for temp files that hold full output when it is truncated.
+
+```ts ! powershell.ts
+const powershellToolConfig: ShellToolConfig = {
+	name: "powershell",
+	label: "powershell",
+	shellName: "PowerShell",
+	// !mark
+	prompt: "PS>",
+	promptSnippet: powershellToolSystemPromptContribution.snippet,
+	promptGuidelines: powershellToolSystemPromptContribution.guidelines,
+	// !mark
+	tempFilePrefix: "pi-powershell",
+};
+```
+
+## !!steps Definition and wrapped tool factories
+
+`createPowerShellToolDefinition` delegates to `createShellToolDefinition`, defaulting `operations` to the local PowerShell ones when the caller supplied none.
+
+`createPowerShellTool` wraps the definition into an `AgentTool` with [wrapToolDefinition](/docs/src/core/tools/tool-definition-wrapper.ts). The wrapper drops prompt metadata, so the two prompt fields are copied back onto the tool with `Object.assign`. The return type borrows `createBashTool`'s, which works because the shapes are identical.
+
+```ts ! powershell.ts
+export function createPowerShellToolDefinition(
+	cwd: string,
+	options?: PowerShellToolOptions,
+): ReturnType<typeof createShellToolDefinition> {
+	return createShellToolDefinition(cwd, powershellToolConfig, {
+		...options,
+		// !mark
+		operations: options?.operations ?? createLocalPowerShellOperations(),
+	});
+}
+
+export function createPowerShellTool(cwd: string, options?: PowerShellToolOptions): ReturnType<typeof createBashTool> {
+	const definition = createPowerShellToolDefinition(cwd, options);
+	const tool = wrapToolDefinition(definition);
+	// !mark(1:4)
+	Object.assign(tool, {
+		promptSnippet: definition.promptSnippet,
+		promptGuidelines: definition.promptGuidelines,
+	});
+	return tool;
+}
+```
+
+</Scrollycoding>
+
+The barrel in [index.ts](/docs/src/core/tools/index.ts) re-exports these factories and types, and the tool is a normal tool to everything downstream. Structurally the file is configuration over reuse: about 60 lines because [bash.ts](/docs/src/core/tools/bash.ts) does the work.

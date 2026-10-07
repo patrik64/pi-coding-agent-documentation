@@ -1,0 +1,380 @@
+---
+title: "rpc-mode.ts"
+description: "The headless JSON-over-stdio server: dispatches RpcCommand lines to an AgentSession and bridges extension UI to the host"
+source: "src/modes/rpc/rpc-mode.ts"
+full: true
+---
+
+RPC mode is how another program embeds pi. The host spawns the process, writes
+one JSON command per line to stdin, and reads one JSON object per line from
+stdout: command responses, the agent's event stream, and extension UI requests.
+The commands and replies are declared in
+[rpc-types.ts](/docs/src/modes/rpc/rpc-types.ts), the line framing lives in
+[jsonl.ts](/docs/src/modes/rpc/jsonl.ts), and the ready-made client is
+[rpc-client.ts](/docs/src/modes/rpc/rpc-client.ts).
+
+`runRpcMode` is one long closure. It takes the
+[AgentSessionRuntime](/docs/src/core/agent-session-runtime.ts) built by
+[main.ts](/docs/src/main.ts), subscribes to the current session, and then waits
+forever. Because a command like `new_session` replaces the underlying
+[AgentSession](/docs/src/core/agent-session.ts), the closure keeps a mutable
+`session` variable and a `rebindSession` function that re-attaches everything.
+
+<Scrollycoding>
+
+## !!steps Owning stdout and building responses
+
+`takeOverStdout` is called first. From then on, ordinary `console.log` output
+is diverted (see [output-guard.ts](/docs/src/core/output-guard.ts)) and only
+`writeRawStdout` reaches the host, so stray logging cannot corrupt the
+protocol stream. `output` serializes any object as one JSON line.
+
+`success` omits `data` entirely when none is given, which matches the response
+variants in the types file that have no payload.
+
+```ts ! rpc-mode.ts
+export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+	takeOverStdout();
+	let session = runtimeHost.session;
+	let unsubscribe: (() => void) | undefined;
+	let unsubscribeBackpressure: (() => void) | undefined;
+
+	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		writeRawStdout(serializeJsonLine(obj));
+	};
+
+	const success = <T extends RpcCommand["type"]>(
+		id: string | undefined,
+		command: T,
+		data?: object | null,
+	): RpcResponse => {
+		if (data === undefined) {
+			return { id, type: "response", command, success: true } as RpcResponse;
+		}
+		return { id, type: "response", command, success: true, data } as RpcResponse;
+	};
+```
+
+## !!steps Dialogs that survive timeouts and aborts
+
+Extension dialogs are asked of the host, so each one registers a pending entry
+keyed by a random UUID and emits an `extension_ui_request`. Whichever happens
+first settles the promise: the host's reply, the caller's `AbortSignal`, or a
+timeout. The latter two resolve to a default value (`undefined` or `false`)
+rather than rejecting, and `cleanup` always removes the pending entry and the
+listeners.
+
+```ts ! rpc-mode.ts
+	function createDialogPromise<T>(
+		opts: ExtensionUIDialogOptions | undefined,
+		defaultValue: T,
+		request: Record<string, unknown>,
+		parseResponse: (response: RpcExtensionUIResponse) => T,
+	): Promise<T> {
+		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+
+		const id = crypto.randomUUID();
+		return new Promise((resolve, reject) => {
+			let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+			const cleanup = () => {
+				if (timeoutId) clearTimeout(timeoutId);
+				opts?.signal?.removeEventListener("abort", onAbort);
+				pendingExtensionRequests.delete(id);
+			};
+```
+
+## !!steps An ExtensionUIContext with most of the terminal missing
+
+`createExtensionUIContext` implements the same interface the interactive TUI
+does (see [types.ts](/docs/src/core/extensions/types.ts)), so extensions run
+unchanged. What it can do is map onto protocol messages: `select`, `confirm`
+and `input` become dialogs, while `notify` and `setStatus` are
+fire-and-forget requests.
+
+Everything that needs a real terminal is a no-op: working indicators, custom
+headers and footers, theme switching. `getEditorText` returns an empty string
+because a synchronous method cannot wait for a host reply, so hosts must track
+editor state themselves.
+
+```ts ! rpc-mode.ts
+		select: (title, options, opts) =>
+			createDialogPromise(opts, undefined, { method: "select", title, options, timeout: opts?.timeout }, (r) =>
+				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
+			),
+
+		confirm: (title, message, opts) =>
+			createDialogPromise(opts, false, { method: "confirm", title, message, timeout: opts?.timeout }, (r) =>
+				"cancelled" in r && r.cancelled ? false : "confirmed" in r ? r.confirmed : false,
+			),
+// ...
+		getEditorText(): string {
+			// Synchronous method can't wait for RPC response
+			// Host should track editor state locally if needed
+			return "";
+		},
+```
+
+## !!steps Rebinding after the session changes
+
+`rebindSession` is called once at startup and again whenever a command
+swapped the session. It binds extensions in `"rpc"` mode with the UI context
+above and a set of command actions (new session, fork, tree navigation,
+reload) that delegate to the runtime.
+
+Note the `shutdownHandler`: an extension asking to quit does not exit
+immediately, it only sets `shutdownRequested`. The actual exit waits for a safe
+point.
+
+```ts ! rpc-mode.ts
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			uiContext: createExtensionUIContext(),
+			mode: "rpc",
+			commandContextActions: {
+				waitForIdle: () => session.waitForIdle(),
+				newSession: async (options) => runtimeHost.newSession(options),
+// ...
+			shutdownHandler: () => {
+				shutdownRequested = true;
+			},
+			onError: (err) => {
+				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			},
+		});
+```
+
+## !!steps Streaming events with backpressure
+
+After binding, the old subscriptions are dropped and new ones attached. Every
+session event goes through `toJsonEvent` from
+[json-event.ts](/docs/src/modes/json-event.ts) and is written to stdout, and an
+`agent_settled` event triggers the deferred shutdown check.
+
+The second subscription is the backpressure valve. It is registered on the
+agent itself and does nothing except await `waitForRawStdoutBackpressure`,
+which is meant to hold the agent back while the host is slow to read, instead
+of buffering events without limit.
+
+```ts ! rpc-mode.ts
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			output(toJsonEvent(event));
+			if (event.type === "agent_settled") {
+				void checkShutdownRequested();
+			}
+		});
+		unsubscribeBackpressure = session.agent.subscribe(async () => {
+			await waitForRawStdoutBackpressure();
+		});
+	};
+```
+
+## !!steps Prompt answers twice, and answers early
+
+`prompt` is the one command that does not return a response from
+`handleCommand`. It starts the run without awaiting it and emits the response
+from the `preflightResult` callback, once validation has passed and the prompt
+is accepted, queued, or handled immediately. If `prompt` rejects before that
+point, the error becomes the response; after it, errors are not reported
+again here, since the event stream carries the run's outcome.
+
+`steer` and `follow_up`, by contrast, await the session and return a
+disposition.
+
+```ts ! rpc-mode.ts
+			case "prompt": {
+				// Start prompt handling immediately, but emit the authoritative response only after
+				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+				let preflightSucceeded = false;
+				void session
+					.prompt(command.message, {
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+						source: "rpc",
+						preflightResult: (disposition) => {
+							preflightSucceeded = true;
+							output(success(id, "prompt", { disposition }));
+						},
+					})
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "prompt", e.message));
+						}
+					});
+				return undefined;
+			}
+```
+
+## !!steps Session-replacing commands rebind
+
+`new_session`, `switch_session`, `fork` and `clone` all follow one pattern: call
+the runtime, and only if the result is not cancelled, `rebindSession()` so
+events and extensions follow the new session. `clone` is implemented as a fork
+at the current leaf with `position: "at"`, and fails with an error when there
+is no current entry.
+
+```ts ! rpc-mode.ts
+			case "fork": {
+				const result = await runtimeHost.fork(command.entryId);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
+			}
+
+			case "clone": {
+				const leafId = session.sessionManager.getLeafId();
+				if (!leafId) {
+					return error(id, "clone", "Cannot clone session: no current entry selected");
+				}
+				const result = await runtimeHost.fork(leafId, { position: "at" });
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "clone", { cancelled: result.cancelled });
+			}
+```
+
+## !!steps Bash gives extensions the first move
+
+The `bash` command emits a `user_bash` event to extensions first. An extension
+can fully handle it by returning a result, which is then recorded in the
+session (honoring `excludeFromContext`) without running anything. Otherwise the
+command runs through `executeBash`, optionally with custom operations supplied
+by the extension, for example to run remotely. See
+[bash-executor.ts](/docs/src/core/bash-executor.ts) for the execution side.
+
+```ts ! rpc-mode.ts
+			case "bash": {
+				const eventResult = await session.extensionRunner.emitUserBash({
+					type: "user_bash",
+					command: command.command,
+					excludeFromContext: command.excludeFromContext ?? false,
+					cwd: session.sessionManager.getCwd(),
+				});
+
+				if (eventResult?.result) {
+					session.recordBashResult(command.command, eventResult.result, {
+						excludeFromContext: command.excludeFromContext,
+					});
+					return success(id, "bash", eventResult.result);
+				}
+```
+
+## !!steps get_commands flattens three sources
+
+The `get_commands` handler merges registered extension commands, prompt
+templates and skills into one list. Skills are exposed with a `skill:` name
+prefix, matching how they are invoked from a prompt. Each entry keeps its
+`sourceInfo`, so the host can show where a command came from.
+
+```ts ! rpc-mode.ts
+			case "get_commands": {
+				const commands: RpcSlashCommand[] = [];
+
+				for (const command of session.extensionRunner.getRegisteredCommands()) {
+					commands.push({
+						name: command.invocationName,
+						description: command.description,
+						source: "extension",
+						sourceInfo: command.sourceInfo,
+					});
+				}
+```
+
+## !!steps Shutdown order
+
+`shutdown` is idempotent in a blunt way: a second call exits immediately. The
+first call removes signal handlers, unsubscribes, disposes the runtime (so
+extensions get their shutdown event), detaches stdin, and flushes stdout before
+exiting. On `SIGTERM` the flush is skipped, so a terminating parent is not kept
+waiting on a pipe it no longer reads.
+
+```ts ! rpc-mode.ts
+	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+		if (shuttingDown) {
+			process.exit(exitCode);
+		}
+		shuttingDown = true;
+		for (const cleanup of signalCleanupHandlers) {
+			cleanup();
+		}
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		await runtimeHost.dispose();
+		detachInput();
+		process.stdin.pause();
+		if (signal !== "SIGTERM") {
+			await flushRawStdout();
+		}
+		process.exit(exitCode);
+	}
+```
+
+## !!steps Parsing input lines
+
+Each stdin line is parsed independently. A bad line produces an error response
+with command `parse` and no id, and the server keeps running. Lines whose
+`type` is `extension_ui_response` are routed to the matching pending dialog and
+never reach `handleCommand`. A reply for an unknown id is silently ignored.
+
+Responses are followed by `waitForRawStdoutBackpressure`, and a shutdown
+requested by an extension is honored after each command.
+
+```ts ! rpc-mode.ts
+		// Handle extension UI responses
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"type" in parsed &&
+			parsed.type === "extension_ui_response"
+		) {
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
+			}
+			return;
+		}
+```
+
+## !!steps Staying alive until stdin closes
+
+The input reader is attached last, and `stdin` ending triggers `shutdown`. The
+function then returns a promise that never resolves, which is why its type is
+`Promise<never>`: the only exits are `process.exit` calls inside `shutdown`.
+
+```ts ! rpc-mode.ts
+	const onInputEnd = () => {
+		void shutdown();
+	};
+	process.stdin.on("end", onInputEnd);
+
+	detachInput = (() => {
+		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
+			void handleInputLine(line);
+		});
+		return () => {
+			detachJsonl();
+			process.stdin.off("end", onInputEnd);
+		};
+	})();
+
+	// Keep process alive forever
+	return new Promise(() => {});
+```
+
+</Scrollycoding>
+
+The server is deliberately thin: nearly every `case` is a one-line delegation
+to [AgentSession](/docs/src/core/agent-session.ts) or the runtime, so behavior
+matches the interactive mode in
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts), which
+drives the same session through a TUI instead. One structural quirk: input
+lines are handled with `void handleInputLine(line)`, so commands are not
+serialized. Two lines arriving back to back are processed concurrently, and
+only hosts that wait for each response get strict ordering.

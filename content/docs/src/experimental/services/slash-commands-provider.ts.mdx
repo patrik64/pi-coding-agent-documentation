@@ -1,0 +1,273 @@
+---
+title: "slash-commands-provider.ts"
+description: "The slash command registry class and the built-in model, thinking, compact and reload commands, wired as facets (experimental)"
+source: "src/experimental/services/slash-commands-provider.ts"
+full: true
+---
+
+This file does two jobs. It implements the registry behind the local slash-commands service from [slash-commands.ts](/docs/src/experimental/services/slash-commands.ts), and it defines the four built-in commands that ship with the experimental server: `/model`, `/thinking`, `/compact` and `/reload`.
+
+Commands do not call the agent directly. They go through services: [models.ts](/docs/src/experimental/services/models.ts) for model state, [agent-controller.ts](/docs/src/experimental/services/agent-controller.ts) for compaction, [presentation-ui.ts](/docs/src/experimental/services/presentation-ui.ts) for dialogs, and [plugins.ts](/docs/src/experimental/services/plugins.ts) for reload.
+
+<Scrollycoding>
+
+## !!steps Storage: a stack of entries per command name
+
+The registry keeps a map from name to an array of entries, plus a set of listeners. Each entry has a frozen copy of the command and a `closed` flag.
+
+Only the first entry in a name's array is visible through `list`. That is the mechanism behind `replace`: a new generation is appended and the old one stays first until it closes. Validation uses a lowercase pattern that allows digits, colons and dashes after the first character.
+
+```ts ! slash-commands-provider.ts
+interface RegisteredSlashCommand {
+	readonly command: SlashCommandContribution;
+	closed: boolean;
+}
+
+export class SlashCommandRegistry implements SlashCommands {
+	readonly #commands = new Map<string, RegisteredSlashCommand[]>();
+	readonly #listeners = new Set<(commands: readonly SlashCommandContribution[]) => void>();
+
+	register(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		if (this.#commands.has(command.name)) throw new Error(`Slash command /${command.name} is already registered`);
+		return this.#add(command);
+	}
+
+	replace(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		return this.#add(command);
+	}
+
+	list(): readonly SlashCommandContribution[] {
+		// !mark
+		return Object.freeze([...this.#commands.values()].map((entries) => entries[0]!.command));
+	}
+
+	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void {
+		this.#listeners.add(listener);
+		listener(this.list());
+		return () => this.#listeners.delete(listener);
+	}
+	// ...
+	#validate(command: SlashCommandContribution): void {
+		// !mark
+		if (!/^[a-z0-9][a-z0-9:-]*$/u.test(command.name)) {
+			throw new TypeError(`Invalid slash command name: ${command.name}`);
+		}
+	}
+```
+
+## !!steps Adding and retiring entries
+
+`register` refuses a name that already exists, while `replace` skips that check. `#add` publishes to listeners only when the new entry is the first one for its name, because a replacement that is queued behind an older entry changes nothing visible yet.
+
+The returned disposer marks its entry closed. If it was not first, it just waits. If it was first, closed entries are shifted off the front, so the queued replacement becomes visible, and listeners are told.
+
+```ts ! slash-commands-provider.ts
+	register(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		// !mark
+		if (this.#commands.has(command.name)) throw new Error(`Slash command /${command.name} is already registered`);
+		return this.#add(command);
+	}
+
+	replace(command: SlashCommandContribution): () => void {
+		this.#validate(command);
+		return this.#add(command);
+	}
+	// ...
+	#add(command: SlashCommandContribution): () => void {
+		const entry: RegisteredSlashCommand = { command: Object.freeze({ ...command }), closed: false };
+		const entries = this.#commands.get(command.name) ?? [];
+		entries.push(entry);
+		this.#commands.set(command.name, entries);
+		// !mark
+		if (entries.length === 1) this.#publish();
+		return () => {
+			if (entry.closed) return;
+			entry.closed = true;
+			// !mark(1:3)
+			if (entries[0] !== entry) return;
+			while (entries[0]?.closed) entries.shift();
+			if (entries.length === 0) this.#commands.delete(command.name);
+			this.#publish();
+		};
+	}
+```
+
+## !!steps Two runtime facets
+
+`createSlashCommandsRuntimeFacet` just provides a registry instance under the `SlashCommands` token, creating a fresh one by default. Plugins and the built-ins register into it.
+
+`subscribe` calls the listener immediately with the current list (see the implementation above), so a late subscriber never misses commands that were already registered.
+
+```ts ! slash-commands-provider.ts
+	subscribe(listener: (commands: readonly SlashCommandContribution[]) => void): () => void {
+		this.#listeners.add(listener);
+		// !mark
+		listener(this.list());
+		return () => this.#listeners.delete(listener);
+	}
+// ...
+export function createSlashCommandsRuntimeFacet(registry = new SlashCommandRegistry()): Facet {
+	return defineFacet({
+		id: "@pi/slash-commands-runtime",
+		setup(env) {
+			// !mark
+			env.provide(SlashCommands, registry);
+		},
+	});
+}
+```
+
+## !!steps Built-ins replace rather than register
+
+The built-in facet pulls five services with `env.use` and installs commands inside `onActivate`. It uses `replace`, not `register`, for all four, which is what lets the facet be reloaded without a duplicate-name error.
+
+Each registration goes through `env.own`, so the unregister function runs when the facet is disposed.
+
+```ts ! slash-commands-provider.ts
+export function createBuiltInSlashCommandsFacet(options: {
+	reloadPresentationPlugins(data: JsonValue): Promise<void>;
+}): Facet {
+	return defineFacet({
+		id: "@pi/slash-commands-builtin",
+		setup(env) {
+			const commands = env.use(SlashCommands);
+			const models = env.use(Models);
+			const controller = env.use(AgentController);
+			const ui = env.use(PresentationUI);
+			const presentationPlugins = env.use(PresentationPlugins);
+			const sessionPlugins = env.use(SessionPlugins);
+			env.onActivate(() => {
+				// !mark(1:3)
+				env.own(commands.replace(modelCommand(models, ui)));
+				env.own(commands.replace(thinkingCommand(models, ui)));
+				env.own(commands.replace(compactCommand(controller, ui)));
+```
+
+## !!steps The reload command sequences three steps
+
+`/reload` shows a status message, asks the server for a new presentation build, reloads the worker's facets, and finally calls the `reloadPresentationPlugins` callback passed in by the host, handing it the data. Order matters: the data comes from the server first, and the client applies it last.
+
+An error thrown in any step propagates out of `run`, so the success message is only shown if all three finished.
+
+```ts ! slash-commands-provider.ts
+				env.own(
+					commands.replace({
+						name: "reload",
+						description: "Reload server-selected plugins",
+						async run(_args, context) {
+							ui.showStatus("Reloading plugins…", context);
+							// !mark(1:3)
+							const data = await presentationPlugins.reload(context);
+							await sessionPlugins.reload(context);
+							await options.reloadPresentationPlugins(data);
+							ui.showStatus("Reloaded plugins.", context);
+							return undefined;
+						},
+					}),
+				);
+			});
+		},
+	});
+}
+```
+
+## !!steps The model command: exact match, or ask
+
+With an argument, `/model` must match exactly one model, otherwise it throws. Without one, it opens the select dialog, marking the current model with a suffix and pre-selecting it. A cancelled dialog returns `undefined` and nothing changes.
+
+Argument completion filters by substring over provider, model id and name, case-insensitively.
+
+```ts ! slash-commands-provider.ts
+function modelCommand(models: ModelsService, ui: PresentationUI): SlashCommandContribution {
+	return {
+		name: "model",
+		description: "Select model",
+		argumentHint: "<provider/model>",
+		// ...
+		async run(args, context) {
+			const state = models.state.value;
+			if (state === undefined) throw new Error("Models service is not ready");
+			// !mark
+			let selected = exactModel(state.catalog.availableModels, args);
+			if (args.length > 0 && selected === undefined) {
+				throw new Error(`Unknown model: ${args}`);
+			}
+			if (selected === undefined) {
+				const value = await ui.select(
+					"Select model:",
+					state.catalog.availableModels.map((model) => ({
+						value: `${model.provider}/${model.modelId}`,
+				// ...
+				// !mark
+				if (value === undefined) return undefined;
+				selected = exactModel(state.catalog.availableModels, value);
+				if (selected === undefined) throw new Error(`Unknown model: ${value}`);
+			}
+			// !mark
+			await models.select({ provider: selected.provider, modelId: selected.modelId }, context);
+			ui.showStatus(`Selected ${selected.provider}/${selected.modelId}.`, context);
+			return undefined;
+```
+
+## !!steps Thinking levels and compaction
+
+`/thinking` follows the same shape: take the typed argument, or ask through the UI. The valid levels come from `getThinkingLevels`, so they depend on the selected model. The description text comes from the `THINKING_DESCRIPTIONS` table at the top of the file.
+
+`/compact` is different: it returns the controller's promise directly, with the argument as custom instructions or `null` when empty.
+
+```ts ! slash-commands-provider.ts
+		async run(args, context) {
+			// !mark(1:2)
+			const levels = await models.getThinkingLevels(context);
+			let selected = levels.find((level) => level === args.toLowerCase());
+			if (args.length > 0 && selected === undefined) {
+				throw new Error(`Unknown thinking level "${args}". Available levels: ${levels.join(", ")}.`);
+			}
+				// ...
+				if (value === undefined) return undefined;
+				selected = levels.find((level) => level === value);
+				if (selected === undefined) throw new Error(`Unknown thinking level: ${value}`);
+			}
+			await models.selectThinking(selected, context);
+			ui.showStatus(`Thinking level: ${selected}.`, context);
+			return undefined;
+// ...
+function compactCommand(controller: AgentController, ui: PresentationUI): SlashCommandContribution {
+	return {
+		name: "compact",
+		description: "Manually compact the session context",
+		argumentHint: "<instructions>",
+		// !mark(1:3)
+		run(args, context) {
+			ui.showStatus("Compacting…", context);
+			return controller.compact({ customInstructions: args.length === 0 ? null : args }, context);
+		},
+	};
+```
+
+## !!steps Exact model lookup
+
+`exactModel` accepts either a full `provider/model` string or a bare model id, case-insensitively, and returns a model only if exactly one matches. A bare id that exists under two providers is therefore treated as unknown, and the user has to qualify it.
+
+```ts ! slash-commands-provider.ts
+function exactModel(models: readonly ModelSummary[], query: string): ModelSummary | undefined {
+	if (query.length === 0) return undefined;
+	const normalized = query.toLowerCase();
+	const matches = models.filter(
+		(model) =>
+			`${model.provider}/${model.modelId}`.toLowerCase() === normalized ||
+			model.modelId.toLowerCase() === normalized,
+	);
+	// !mark
+	return matches.length === 1 ? matches[0] : undefined;
+}
+```
+
+</Scrollycoding>
+
+The registry and the built-ins are separate facets on purpose: the runtime facet is created once per session worker, while the built-in facet can be rebuilt on reload. The same `replace` mechanism supports plugin-provided commands, loaded through the facet loader in [worker.ts](/docs/src/experimental/services/worker.ts).
+
+One quirk: the `thinkingCommand` exact match lowercases the argument but compares against level names as stored, which works only because all levels are lowercase.

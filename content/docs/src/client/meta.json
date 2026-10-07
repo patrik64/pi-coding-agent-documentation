@@ -1,0 +1,6 @@
+{
+  "title": "client",
+  "pages": [
+    "index.ts"
+  ]
+}

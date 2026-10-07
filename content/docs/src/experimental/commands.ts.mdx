@@ -1,0 +1,130 @@
+---
+title: "commands.ts"
+description: "Development-only dispatcher that runs the experimental server and client commands, and picks the TUI or headless client"
+source: "src/experimental/commands.ts"
+full: true
+---
+
+This file turns the parsed `server` and `client` subcommands into running code. The parsing itself lives under `src/cli/experimental`, for example [client.ts](/docs/src/cli/experimental/commands/client.ts) and [server.ts](/docs/src/cli/experimental/commands/server.ts); here the handlers are plugged into that parser.
+
+Its doc comment is explicit that published entry points must not import it, so it is experimental, development-only code. Its caller is [cli.ts](/docs/src/experimental/cli.ts).
+
+<Scrollycoding>
+
+## !!steps The server command and Radius status reporting
+
+`runServerCommand` starts a foreground server through [server.ts](/docs/src/experimental/server.ts). Relay status callbacks may arrive before the `Server:` and `Socket:` lines are printed, so early ones are held in `pendingRelayStatus` and only the latest is replayed afterwards. `reportRelayStatus` also suppresses repeats and the transient `connecting` state, so the console shows only changes.
+
+```ts ! commands.ts
+async function runServerCommand(command: ServerCommand): Promise<void> {
+	let previousRelayStatus = "";
+	let relayOutputReady = false;
+	let pendingRelayStatus: RadiusRelayHostStatus | undefined;
+	const reportRelayStatus = (status: RadiusRelayHostStatus): void => {
+		const description =
+			status.status === "connected"
+				? "connected"
+				: status.status === "not_authenticated"
+					? "not connected; local only"
+					: status.status === "retrying"
+						? `reconnecting: ${status.error}`
+						: "connecting";
+		// !mark
+		if (description === previousRelayStatus || status.status === "connecting") return;
+```
+
+## !!steps Starting and announcing the server
+
+The options map one-to-one from the command: id, session directory, provider and model, plugin packages, and relay auth. The `Radius` relay itself is implemented in [radius-relay.ts](/docs/src/experimental/radius-relay.ts). Only after printing the server id and socket path is output unlocked and any buffered status flushed.
+
+```ts ! commands.ts
+	const runtime = await startForegroundServer({
+		serverId: command.serverId,
+		sessionDir: command.sessionDir,
+		provider: command.provider,
+		model: command.model,
+		pluginPackages: command.pluginPackages ?? [],
+		relayAuth: command.auth,
+		onRelayStatus(status) {
+			if (relayOutputReady) reportRelayStatus(status);
+			else pendingRelayStatus = status;
+		},
+	});
+	console.log(`Server: ${runtime.serverId}`);
+	console.log(`Socket: ${runtime.socketPath}`);
+	relayOutputReady = true;
+	if (pendingRelayStatus !== undefined) reportRelayStatus(pendingRelayStatus);
+```
+
+## !!steps Run until a signal or the server closes
+
+The server stays alive on a promise that resolves on SIGINT or SIGTERM, or when `runtime.closed` settles. A normal close resolves it, a failed close rejects it. Handlers are removed in `cleanup` either way, and `runtime.close()` runs in `finally`.
+
+```ts ! commands.ts
+	try {
+		await new Promise<void>((resolve, reject) => {
+			const cleanup = (): void => {
+				process.off("SIGINT", finish);
+				process.off("SIGTERM", finish);
+			};
+			// ...
+			process.once("SIGINT", finish);
+			process.once("SIGTERM", finish);
+			void runtime.closed.then(finish, fail);
+		});
+	} finally {
+		await runtime.close();
+	}
+}
+```
+
+## !!steps TUI for terminals, plain output otherwise
+
+The client command picks its presentation from the environment. The full-screen UI in [client-tui.ts](/docs/src/experimental/client-tui.ts) is used only when no prompt was given and both stdin and stdout are TTYs. In every other case the headless [client.ts](/docs/src/experimental/client.ts) runs and its three result kinds are printed: `attached` and listings as tab-separated lines, `prompted` as the raw answer text.
+
+```ts ! commands.ts
+async function runClientCommand(command: ClientCommand): Promise<void> {
+	// !mark
+	if (command.prompt === undefined && process.stdin.isTTY === true && process.stdout.isTTY === true) {
+		await runClientTui(command);
+		return;
+	}
+	const result = await runClient(command);
+	if (result.kind === "attached") {
+		console.log(`${result.serverId}\t${result.sessionId}\tattached`);
+		return;
+	}
+	if (result.kind === "prompted") {
+		console.log(result.text);
+		return;
+	}
+	for (const session of result.sessions) console.log(`${session.serverId}\t${session.sessionId}`);
+}
+```
+
+## !!steps The gated entry point
+
+`runExperimentalCommand` returns `false` unless experimental features are enabled (see [experimental.ts](/docs/src/core/experimental.ts)) and the first argument is `server` or `client`. That boolean is what lets [cli.ts](/docs/src/experimental/cli.ts) fall back to the normal CLI. Otherwise it runs the parser with the two handlers. Validation errors are printed in red and set exit code 1, and so are thrown errors.
+
+```ts ! commands.ts
+/** Development-only command dispatch. Published entrypoints must not import this module. */
+export async function runExperimentalCommand(args: string[]): Promise<boolean> {
+	// !mark
+	if (!areExperimentalFeaturesEnabled() || (args[0] !== "server" && args[0] !== "client")) return false;
+	try {
+		const result = await cli.execute(args, { runServer: runServerCommand, runClient: runClientCommand });
+		if (!result.ok) {
+			for (const error of result.errors) console.error(chalk.red(`Error: ${error}`));
+			process.exitCode = 1;
+		}
+	} catch (error) {
+		console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+		process.exitCode = 1;
+	}
+	return true;
+}
+```
+
+</Scrollycoding>
+
+Both handlers ultimately lean on two big collaborators: [server.ts](/docs/src/experimental/server.ts) for hosting, and [client-runtime.ts](/docs/src/experimental/client-runtime.ts) for connecting. The option shapes come from the parser in [cli.ts](/docs/src/cli/experimental/cli.ts).

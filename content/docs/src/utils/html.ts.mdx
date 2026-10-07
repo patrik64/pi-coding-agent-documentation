@@ -1,0 +1,86 @@
+---
+title: "html.ts"
+description: "Decodes the handful of HTML entities the project needs, by name or numeric code point"
+source: "src/utils/html.ts"
+full: true
+---
+
+A small decoder used when text comes from HTML and must be turned back into plain characters. It does not try to be a full HTML parser: it knows five named entities plus decimal and hex numeric forms.
+
+It lives alongside other text helpers such as [text.ts](/docs/src/utils/text.ts).
+
+<Scrollycoding>
+
+## !!steps Safe code point conversion
+
+`decodeCodePoint` rejects non-integers, negatives and values above 0x10FFFF, returning undefined instead of letting `String.fromCodePoint` throw a RangeError. Parsing garbage gives NaN, which fails the integer check.
+
+```ts ! html.ts
+export interface DecodedHtmlEntity {
+	text: string;
+	length: number;
+}
+
+function decodeCodePoint(codePoint: number): string | undefined {
+	if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+		return undefined;
+	}
+	return String.fromCodePoint(codePoint);
+}
+```
+
+## !!steps Decoding one entity
+
+The five named entities are `amp`, `lt`, `gt`, `quot` and `apos`. Numeric forms start with `#x` or `#X` for hex, or `#` for decimal. Anything else, including other named entities such as `nbsp`, yields undefined.
+
+```ts ! html.ts
+export function decodeHtmlEntity(entity: string): string | undefined {
+	switch (entity) {
+		case "amp":
+			return "&";
+		case "lt":
+			return "<";
+		case "gt":
+			return ">";
+		case "quot":
+			return '"';
+		case "apos":
+			return "'";
+	}
+
+	if (entity.startsWith("#x") || entity.startsWith("#X")) {
+		return decodeCodePoint(Number.parseInt(entity.slice(2), 16));
+	}
+
+	if (entity.startsWith("#")) {
+		return decodeCodePoint(Number.parseInt(entity.slice(1), 10));
+	}
+
+	return undefined;
+}
+```
+
+## !!steps Decoding at a position
+
+`decodeHtmlEntityAt` expects the index to point at an ampersand. It looks for a semicolon within 16 characters and returns the decoded text and how many source characters were consumed, so a scanner can advance past the entity.
+
+```ts ! html.ts
+export function decodeHtmlEntityAt(html: string, index: number): DecodedHtmlEntity | undefined {
+	const semicolonIndex = html.indexOf(";", index + 1);
+	if (semicolonIndex === -1 || semicolonIndex - index > 16) {
+		return undefined;
+	}
+
+	const entity = html.slice(index + 1, semicolonIndex);
+	const decoded = decodeHtmlEntity(entity);
+	if (decoded === undefined) {
+		return undefined;
+	}
+
+	return { text: decoded, length: semicolonIndex - index + 1 };
+}
+```
+
+</Scrollycoding>
+
+Callers are expected to leave the original text alone when undefined comes back, which is why both functions signal failure with undefined rather than throwing.

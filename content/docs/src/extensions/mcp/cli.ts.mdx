@@ -1,0 +1,312 @@
+---
+title: "cli.ts"
+description: "Implements the pi mcp subcommand: add, remove, list, login and logout for MCP servers outside a running session."
+source: "src/extensions/mcp/cli.ts"
+full: true
+---
+
+`pi mcp` lets users, and agents running bash, manage MCP servers without opening a session. It edits `mcp.json`, connects to every configured server to report its state, and performs OAuth sign-in through the browser. Running sessions pick up new credentials on their next turn.
+
+The file is loaded lazily through [cli.lazy.ts](/docs/src/extensions/mcp/cli.lazy.ts) from [main.ts](/docs/src/main.ts). It relies on [config.ts](/docs/src/extensions/mcp/config.ts) for reading and writing the config, [runtime.ts](/docs/src/extensions/mcp/runtime.ts) for connections and sign-in, [mcp-servers.ts](/docs/src/core/mcp-servers.ts) for validation, and [trust-manager.ts](/docs/src/core/trust-manager.ts) to decide whether the project config may be read. Every command returns an exit code instead of calling `process.exit`, and output goes through injectable `log` and `error` functions.
+
+<Scrollycoding>
+
+## !!steps Help text and options
+
+The usage text documents every flag. Note the default exposure `codemode`, and that `--oauth-client-secret` may be an environment reference or a `!command`. The `McpCommandOptions` interface lists what a caller (or a test) can inject: directories, a credential store, a URL opener, and output functions.
+
+```ts ! cli.ts
+const HELP = `${chalk.bold("Usage:")}
+  ${APP_NAME} mcp add <server> [options] -- <command> [args...]
+  ${APP_NAME} mcp add <server> [options] --url <url>
+  ${APP_NAME} mcp remove <server> [-l]
+  ${APP_NAME} mcp list [--json]
+  ${APP_NAME} mcp login <server> [--timeout <seconds>]
+  ${APP_NAME} mcp logout <server>
+// ...
+export interface McpCommandOptions {
+	cwd: string;
+	agentDir: string;
+	/** Defaults to `mcp-auth.json` in the agent directory. */
+	credentials?: McpOAuthCredentialStore;
+	/** Defaults to the platform browser. */
+	openUrl?: (url: string) => void;
+	/** Defaults to console output. */
+	log?: (line: string) => void;
+	error?: (line: string) => void;
+}
+```
+
+## !!steps A small argument parser
+
+`parseOptions` handles three kinds of options: flags, single values, and repeatable lists. It stops at `--` or once `maxPositionals` positional arguments were seen, and everything after that is passed through untouched. That is how `add name npx -y pkg --flag` keeps `--flag` for the server command instead of treating it as an option of `pi`.
+
+Unknown options and missing values print an error and return undefined, which callers turn into exit code 1.
+
+```ts ! cli.ts
+function parseOptions(
+	args: string[],
+	known: Record<string, "flag" | "value" | "list">,
+	error: (line: string) => void,
+	maxPositionals = Number.POSITIVE_INFINITY,
+): ParsedOptions | undefined {
+	const positional: string[] = [];
+	const values = new Map<string, string | true>();
+	const lists = new Map<string, string[]>();
+	for (let index = 0; index < args.length; index++) {
+		const arg = OPTION_ALIASES.get(args[index]) ?? args[index];
+		// !mark(1:4)
+		if (arg === "--" || positional.length >= maxPositionals) {
+			positional.push(...args.slice(arg === "--" ? index + 1 : index));
+			break;
+		}
+		if (!arg.startsWith("--")) {
+			positional.push(arg);
+			continue;
+		}
+```
+
+## !!steps Dispatch and trust
+
+`runMcpCommand` shows help for no command, `help`, `--help`, or `-h`. `add` and `remove` are handled first because they only edit files. The other commands need the merged config, so the project trust store is consulted. If a project `mcp.json` exists but the project is untrusted, a note explains why it is ignored.
+
+Trust is read-only here; the command never grants it. The user must start a session in the project to be asked.
+
+```ts ! cli.ts
+export async function runMcpCommand(args: string[], options: McpCommandOptions): Promise<number> {
+	const log = options.log ?? ((line: string) => console.log(line));
+	const error = options.error ?? ((line: string) => console.error(line));
+	const [command, ...rest] = args;
+	if (command === undefined || command === "help" || args.includes("--help") || args.includes("-h")) {
+		log(HELP);
+		return 0;
+	}
+
+	const projectConfig = join(options.cwd, CONFIG_DIR_NAME, "mcp.json");
+	if (command === "add" || command === "remove") {
+		return command === "add"
+			? add(rest, projectConfig, options, log, error)
+			: remove(rest, projectConfig, options, log, error);
+	}
+	// !mark(1:5)
+	const projectTrusted = new ProjectTrustStore(options.agentDir).get(options.cwd) === true;
+	const loaded = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted });
+	const untrustedNote =
+		!projectTrusted && existsSync(projectConfig)
+			? `${projectConfig} is ignored because the project is not trusted. Start ${APP_NAME} in the project to trust it.`
+			: undefined;
+```
+
+## !!steps Login and logout lookup
+
+Both commands find the named server and build a connection to it. `connection.oauthUrl` is defined only for HTTP servers without an `Authorization` header, so asking to log in to anything else fails with an explanation. Logout just removes the stored credential keyed by name and URL.
+
+For login, `--timeout` must be a positive number, and the connection is always closed in a `finally`, even on failure.
+
+```ts ! cli.ts
+			const entry = loaded.servers.find((server) => server.name === name);
+			if (!entry) {
+				error(
+					`No MCP server named "${name}".${untrustedNote ? ` ${untrustedNote}` : ""} Configured: ${loaded.servers.map((server) => server.name).join(", ") || "none"}.`,
+				);
+				return 1;
+			}
+			const connection = createConnection(entry, options, credentials);
+			// !mark(1:5)
+			const url = connection.oauthUrl;
+			if (!url) {
+				error(`MCP server "${name}" does not use OAuth. Only HTTP servers without an Authorization header do.`);
+				return 1;
+			}
+			if (command === "logout") {
+				const removed = credentials.remove(name, url);
+				log(removed ? `Signed out of MCP server "${name}".` : `No stored credentials for MCP server "${name}".`);
+				return 0;
+			}
+```
+
+## !!steps Building a server config for add
+
+`add` parses with `maxPositionals` of 2, so the server name and the command executable are positional and the rest is the command's own arguments. Exactly one of `--url` or a command must be given. Options that belong to the other transport are rejected with a clear message, for example `--env` with `--url`.
+
+```ts ! cli.ts
+	const { positional, values, lists } = parsed;
+	const [name, ...command] = positional;
+	const url = values.get("url");
+	// !mark
+	if (!name || (url === undefined) === (command.length === 0)) {
+		error(usage);
+		return 1;
+	}
+	const value = (option: string) => {
+		const found = values.get(option);
+		return typeof found === "string" ? found : undefined;
+	};
+	const exposure = value("exposure");
+	const httpOnly = [
+		"header",
+		"bearer-token-env-var",
+		"oauth-client-id",
+		"oauth-client-secret",
+		"oauth-callback-port",
+		"oauth-client-name",
+	];
+	const stdioOnly = ["env", "cwd"];
+	// !mark(1:3)
+	const misplaced = (url === undefined ? httpOnly : stdioOnly).find(
+		(option) => values.has(option) || lists.has(option),
+	);
+```
+
+## !!steps HTTP and stdio shapes
+
+For HTTP servers, `--bearer-token-env-var NAME` becomes an `Authorization: Bearer ${NAME}` header, so the token stays in the environment and not in the file. OAuth options are gathered into an `oauth` object only if any was given. Stdio servers get `command`, optional `args`, `env`, and `cwd`.
+
+The config is then run through `validateMcpServerConfig`, which returns a string on failure. Note `--oauth-callback-port` is converted with `Number` before validation, so a bad value is caught there.
+
+```ts ! cli.ts
+		const headers = parsePairs("header", lists.get("header"), error);
+		if (!headers) return 1;
+		const bearer = value("bearer-token-env-var");
+		// !mark
+		if (bearer !== undefined) headers.Authorization = `Bearer \${${bearer}}`;
+		const port = value("oauth-callback-port");
+		const oauth = {
+			...(value("oauth-client-id") === undefined ? {} : { clientId: value("oauth-client-id") }),
+			...(value("oauth-client-secret") === undefined ? {} : { clientSecret: value("oauth-client-secret") }),
+			...(port === undefined ? {} : { callbackPort: Number(port) }),
+			...(value("oauth-client-name") === undefined ? {} : { clientName: value("oauth-client-name") }),
+		};
+		config = {
+			url,
+			...(Object.keys(headers).length > 0 ? { headers } : {}),
+			...(Object.keys(oauth).length > 0 ? { oauth } : {}),
+		};
+```
+
+## !!steps Writing the file
+
+The target is the project file with `--local`, else the global file. `addMcpServerConfig` from [config.ts](/docs/src/extensions/mcp/config.ts) reports whether it replaced an entry. The command then warns when a project config is not trusted yet, and prints the follow-up: `mcp list`, plus `mcp login` when an HTTP server has no `Authorization` header and so may need OAuth.
+
+```ts ! cli.ts
+	const project = values.has("local");
+	const path = project ? projectConfig : join(options.agentDir, "mcp.json");
+	const scope = project ? "project" : "global";
+	let replaced: boolean;
+	try {
+		replaced = addMcpServerConfig(path, name, validated);
+	} catch (addError) {
+		error(`Could not update ${path}: ${errorMessage(addError)}`);
+		return 1;
+	}
+	log(`${replaced ? "Replaced" : "Added"} ${scope} MCP server "${name}" in ${path}.`);
+	if (project && new ProjectTrustStore(options.agentDir).get(options.cwd) !== true) {
+		log(`The project is not trusted, so ${path} is ignored until you start ${APP_NAME} in the project and trust it.`);
+	}
+	// HTTP servers without an Authorization header may use OAuth.
+	const mayNeedSignIn =
+		"url" in validated &&
+		!Object.keys(validated.headers ?? {}).some((header) => header.toLowerCase() === "authorization");
+```
+
+## !!steps Remove with a helpful miss
+
+`remove` deletes from the chosen file. When nothing was removed, it loads the config as if the project were trusted and checks whether the same name exists in the other scope. The error then says whether to add or omit `--local`, which handles the most common mistake.
+
+```ts ! cli.ts
+	if (removed) {
+		log(`Removed ${scope} MCP server "${name}" from ${path}.`);
+		return 0;
+	}
+	// !mark(1:3)
+	const other = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted: true }).servers.find(
+		(server) => server.name === name && server.scope !== scope,
+	);
+	error(
+		`No ${scope} MCP server named "${name}" in ${path}.${other ? ` It is defined in ${other.source}${other.scope === "project" ? "; use --local" : "; omit --local"}.` : ""}`,
+	);
+	return 1;
+```
+
+## !!steps Listing by connecting
+
+`list` connects to all enabled servers in parallel with `Promise.all`, reads the connection state and tool names, and closes each connection. Disabled servers are reported without connecting. Per-tool exposure is shown only when it differs from the server's default, and resource counts appear only if the server has resources.
+
+The exit code is 1 when there are config errors or any enabled server is not connected, which makes the command usable in scripts.
+
+```ts ! cli.ts
+			if (!report.enabled) return report;
+			const connection = createConnection(entry, options, credentials);
+			try {
+				await connection.getClient();
+			} catch {
+				// The connection records the state and error.
+			}
+			report.state = connection.state;
+			report.tools = connection.tools.map((tool) => tool.name);
+			const overrides = connection.tools.flatMap((tool) => {
+				const exposure = getMcpToolExposure(entry.config, tool.name);
+				return exposure === report.exposure ? [] : [[tool.name, exposure] as const];
+			});
+			if (overrides.length > 0) report.toolExposure = Object.fromEntries(overrides);
+// ...
+	const failed = loaded.errors.length > 0 || reports.some((report) => report.enabled && report.state !== "connected");
+```
+
+## !!steps The sign-in flow
+
+Login first tries to connect. Success means the user is already signed in. Failure for any reason other than `needs-auth` is reported as a connection error. Only a real challenge starts the OAuth flow: the authorization URL is printed and opened in the browser, and `promptForRedirectUrl` supplies a fallback.
+
+After sign-in the stored challenge is cleared and the connection is rebuilt with `reconnect` to prove the new credentials work. The sign-in machinery itself, including the local callback server, lives in [oauth.ts](/docs/src/extensions/mcp/oauth.ts) and [runtime.ts](/docs/src/extensions/mcp/runtime.ts).
+
+```ts ! cli.ts
+	const openUrl = options.openUrl ?? openBrowser;
+	const interactive = process.stdin.isTTY === true && options.openUrl === undefined;
+	try {
+		await signInMcpServer({
+			serverUrl: url,
+			store: credentials.forServer(name, url),
+			settings: connection.oauthSettings(),
+			challenge: connection.challenge,
+			prompt: {
+				showAuthorizationUrl: (authorizationUrl) => {
+					log(`Sign in to MCP server "${name}" in your browser:\n${authorizationUrl.href}`);
+					openUrl(authorizationUrl.href);
+				},
+				promptForRedirectUrl: (signal) => waitForRedirectUrl(signal, timeoutMs, interactive),
+			},
+		});
+```
+
+## !!steps Waiting for the browser
+
+`waitForRedirectUrl` links two abort sources: the sign-in's own signal (the callback arrived) and a timeout. In a non-interactive run, such as an agent calling bash, it waits for an abort and returns undefined, so only the browser callback can finish the flow. In a terminal it also asks the user to paste the redirect URL, which helps when the browser runs on another machine.
+
+Readline errors, including the abort, resolve to undefined, and the timer and listener are always cleaned up.
+
+```ts ! cli.ts
+	const controller = new AbortController();
+	const abort = () => controller.abort();
+	signal.addEventListener("abort", abort, { once: true });
+	const timer = setTimeout(abort, timeoutMs);
+	try {
+		// !mark(1:4)
+		if (!interactive) {
+			await new Promise<void>((resolve) =>
+				controller.signal.addEventListener("abort", () => resolve(), { once: true }),
+			);
+			return undefined;
+		}
+		const readline = createInterface({ input: process.stdin, output: process.stderr });
+		try {
+			return await readline.question(
+				"If the browser cannot reach this machine, paste the URL it was redirected to: ",
+				{ signal: controller.signal },
+			);
+```
+
+</Scrollycoding>
+
+The file is a thin command layer: parsing and messaging here, persistence in [config.ts](/docs/src/extensions/mcp/config.ts), connections and OAuth in the runtime. The server log written by these connections is the one defined in [log.ts](/docs/src/extensions/mcp/log.ts), stored beside the config in the agent directory.
+
+Structurally, each subcommand is a plain function returning a number, with all output injected, which is what makes the command testable without spawning a process.

@@ -1,0 +1,50 @@
+---
+title: "deprecation.ts"
+description: "Prints each deprecation warning at most once per process"
+source: "src/utils/deprecation.ts"
+full: true
+---
+
+`deprecation.ts` gives the rest of the codebase one way to announce that a feature is going away. Messages are remembered in a module-level set so a hot code path cannot spam the terminal.
+
+It is deliberately tiny: yellow text through `console.warn`, deduplicated by exact message string.
+
+<Scrollycoding>
+
+## !!steps The seen set
+
+A module-level `Set` stores every message already printed. Deduplication is by exact string, so a message that embeds a changing value (a path, a name) will print again for each distinct value.
+
+```ts ! deprecation.ts
+import chalk from "chalk";
+
+const emittedDeprecationWarnings = new Set<string>();
+```
+
+## !!steps Warning once
+
+`warnDeprecation` checks the set first, records the message, and then writes a yellow line prefixed with `Deprecation warning:`. The message is recorded before printing, so even a failing `console.warn` cannot cause a repeat.
+
+```ts ! deprecation.ts
+export function warnDeprecation(message: string): void {
+	// !mark(1:2)
+	if (emittedDeprecationWarnings.has(message)) return;
+	emittedDeprecationWarnings.add(message);
+	console.warn(chalk.yellow(`Deprecation warning: ${message}`));
+}
+```
+
+## !!steps Test reset
+
+`clearDeprecationWarningsForTests` empties the set so unit tests can assert on warnings independently. The name marks it as test-only; production code never calls it.
+
+```ts ! deprecation.ts
+/** Clear deprecation warning state. Exported for tests. */
+export function clearDeprecationWarningsForTests(): void {
+	emittedDeprecationWarnings.clear();
+}
+```
+
+</Scrollycoding>
+
+Because the state lives in module scope, the dedupe window is the lifetime of the process. Any module can use it without coordination. Note that no other file in `src` currently imports it.

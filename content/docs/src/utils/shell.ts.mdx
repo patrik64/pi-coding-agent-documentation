@@ -1,0 +1,187 @@
+---
+title: "shell.ts"
+description: "Finds a usable bash or PowerShell, builds the child environment, and kills process trees on every platform"
+source: "src/utils/shell.ts"
+full: true
+---
+
+Tools that run commands need to know which shell to launch, which environment to give it, how to clean its output, and how to kill it and its descendants. This file answers those four questions for macOS, Linux and Windows.
+
+Consumers are [bash-executor.ts](/docs/src/core/bash-executor.ts), [bash.ts](/docs/src/core/tools/bash.ts) and [powershell.ts](/docs/src/core/tools/powershell.ts). The bin directory it prepends to `PATH` comes from [config.ts](/docs/src/config.ts), which is also where tools such as fd and ripgrep are installed by [tools-manager.ts](/docs/src/utils/tools-manager.ts).
+
+<Scrollycoding>
+
+## !!steps Shell configuration and legacy WSL bash
+
+`ShellConfig` is the shell binary plus the args that precede the command. The legacy `C:\Windows\System32\bash.exe` (the old WSL launcher) cannot take `-c` reliably, so it gets `-s` and the command is sent on stdin via `commandTransport: "stdin"`. Everything else uses `-c`.
+
+```ts ! shell.ts
+export interface ShellConfig {
+	shell: string;
+	args: string[];
+	commandTransport?: "argv" | "stdin";
+}
+
+/**
+ * Find bash executable on PATH (cross-platform)
+ */
+function isLegacyWslBashPath(path: string): boolean {
+	const normalized = path.replace(/\//g, "\\").toLowerCase();
+	return /^[a-z]:\\windows\\(?:system32|sysnative)\\bash\.exe$/.test(normalized);
+}
+
+function getBashShellConfig(shell: string): ShellConfig {
+	return isLegacyWslBashPath(shell) ? { shell, args: ["-s"], commandTransport: "stdin" } : { shell, args: ["-c"] };
+}
+```
+
+## !!steps Looking up an executable
+
+On Windows it runs `where` and then checks the first hit exists, since `where` can report stale paths. On Unix it trusts `which` without an existence check, so Termux and unusual filesystems work. Both have a 5 second timeout and swallow errors.
+
+The doc comment above `isLegacyWslBashPath` ("Find bash executable on PATH") belongs to `findExecutableOnPath`, not to the function it sits on.
+
+```ts ! shell.ts
+function findExecutableOnPath(executable: string): string | null {
+	if (process.platform === "win32") {
+		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
+		try {
+			const result = spawnSync("where", [executable], {
+				encoding: "utf-8",
+				timeout: 5000,
+				windowsHide: true,
+			});
+			if (result.status === 0 && result.stdout) {
+				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
+				if (firstMatch && existsSync(firstMatch)) {
+					return firstMatch;
+				}
+			}
+		} catch {
+			// Ignore errors
+		}
+		return null;
+	}
+```
+
+## !!steps Resolution order for bash
+
+An explicit path wins and throws if missing, with no silent fallback. On Windows it tries Git for Windows under `ProgramFiles` and `ProgramFiles(x86)`, then `bash.exe` on `PATH`. The error message lists install options and which paths were searched.
+
+```ts ! shell.ts
+export function getShellConfig(customShellPath?: string): ShellConfig {
+	// 1. Check user-specified shell path
+	if (customShellPath) {
+		if (existsSync(customShellPath)) {
+			return getBashShellConfig(customShellPath);
+		}
+		throw new Error(`Custom shell path not found: ${customShellPath}`);
+	}
+
+	if (process.platform === "win32") {
+		// 2. Try Git Bash in known locations
+		const paths: string[] = [];
+		const programFiles = process.env.ProgramFiles;
+		if (programFiles) {
+			paths.push(`${programFiles}\\Git\\bin\\bash.exe`);
+		}
+```
+
+## !!steps Unix fallback and PowerShell
+
+On Unix the order is `/bin/bash`, `bash` on PATH, then plain `sh -c`, so a minimal container still works. PowerShell is Windows-only and prefers `pwsh.exe` (PowerShell 7) over `powershell.exe`. The fixed args skip profiles, disable prompts and bypass execution policy.
+
+```ts ! shell.ts
+	// Unix: try /bin/bash, then bash on PATH, then fallback to sh
+	if (existsSync("/bin/bash")) {
+		return getBashShellConfig("/bin/bash");
+	}
+
+	const bashOnPath = findExecutableOnPath("bash");
+	if (bashOnPath) {
+		return getBashShellConfig(bashOnPath);
+	}
+
+	return { shell: "sh", args: ["-c"] };
+}
+
+export const POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] as const;
+```
+
+## !!steps Environment with the managed bin directory
+
+`getShellEnv` prepends pi's bin directory to `PATH` so commands the model runs can find the downloaded `fd` and `rg`. It looks up the actual key case-insensitively because Windows calls it `Path`, and it does not add the directory twice.
+
+```ts ! shell.ts
+export function getShellEnv(): NodeJS.ProcessEnv {
+	const binDir = getBinDir();
+	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	const currentPath = process.env[pathKey] ?? "";
+	const pathEntries = currentPath.split(delimiter).filter(Boolean);
+	const hasBinDir = pathEntries.includes(binDir);
+	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
+```
+
+## !!steps Sanitizing binary output
+
+Control characters other than tab, newline and carriage return are removed, along with `U+FFF9` to `U+FFFB`, which crash the string-width measurement used by the terminal UI. The regex only matches single UTF-16 code units, so surrogate pairs cannot be split.
+
+```ts ! shell.ts
+export function sanitizeBinaryOutput(str: string): string {
+	// All removed characters are single UTF-16 code units, so surrogate pairs are never split.
+	return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFF9-\uFFFB]/g, "");
+}
+```
+
+## !!steps Tracking detached children
+
+Commands run in their own process group so they can be killed as a unit. Their pids are tracked in a set so `killTrackedDetachedChildren` can kill all of them when pi receives a shutdown signal.
+
+```ts ! shell.ts
+const trackedDetachedChildPids = new Set<number>();
+
+export function trackDetachedChildPid(pid: number): void {
+	trackedDetachedChildPids.add(pid);
+}
+
+export function untrackDetachedChildPid(pid: number): void {
+	trackedDetachedChildPids.delete(pid);
+}
+
+export function killTrackedDetachedChildren(): void {
+	for (const pid of trackedDetachedChildPids) {
+		killProcessTree(pid);
+	}
+	trackedDetachedChildPids.clear();
+}
+```
+
+## !!steps Killing a whole tree
+
+On Windows it runs `taskkill /F /T` from the System32 directory so a poisoned `PATH` cannot substitute it, and consumes the async `error` event. On Unix it sends `SIGKILL` to the negative pid, which targets the whole process group, and falls back to the single pid if that throws. Both are best-effort.
+
+```ts ! shell.ts
+export function killProcessTree(pid: number): void {
+	if (process.platform === "win32") {
+		// Use the trusted System32 executable so cleanup does not depend on PATH.
+		try {
+			const child = spawn(
+				join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				["/F", "/T", "/PID", String(pid)],
+				{
+					stdio: "ignore",
+					detached: true,
+					windowsHide: true,
+				},
+			);
+			// A failed spawn emits "error" asynchronously; consume it to avoid crashing Node.
+			child.once("error", () => {});
+		} catch {
+			// Ignore errors if taskkill fails.
+		}
+	} else {
+```
+
+</Scrollycoding>
+
+The kill path is `SIGKILL` only, with no graceful `SIGTERM` first, so commands get no chance to clean up. The negative-pid trick only works if the child was spawned detached into its own group, which is why tracking and detaching go together.

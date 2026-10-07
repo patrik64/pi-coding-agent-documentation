@@ -1,0 +1,282 @@
+---
+title: "auth-storage.ts"
+description: "File-backed credential store for auth.json: lock-protected writes, a revision-cached read path, and a validating read-only variant"
+source: "src/core/auth-storage.ts"
+full: true
+---
+
+This file implements the `CredentialStore` interface from pi-ai on top of a single JSON file, `auth.json`, in the agent directory. It stores API keys and OAuth tokens per provider, and it deliberately does nothing else: deciding which credential to use and refreshing OAuth tokens belongs to [model-runtime.ts](/docs/src/core/model-runtime.ts).
+
+The interesting problem is that several pi processes (and several `AuthStorage` instances inside one process) share the same file. So the file backend takes a cross-process lock for every read-modify-write, and the in-process read path avoids re-reading the file unless its revision changed. A second, much simpler class serves callers that must never write.
+
+<Scrollycoding>
+
+## !!steps A backend interface with a sync and an async lock
+
+Everything in `AuthStorage` talks to an `AuthStorageBackend`. The callback receives the current raw file text and returns a `result` plus an optional `next` string. If `next` is present it is written back while the lock is still held, so read-modify-write is atomic.
+
+The write options matter: mode `0o600` applies only when the file is created, which keeps credentials private by default while leaving administrator-managed modes alone on an existing file.
+
+```ts ! auth-storage.ts
+// The mode applies only on creation so administrator-managed modes and ACLs remain intact.
+const AUTH_FILE_WRITE_OPTIONS = { encoding: "utf-8", mode: 0o600 } as const;
+
+// ...
+export interface AuthStorageBackend {
+	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
+	withLockAsync<T>(
+		fn: (current: string | undefined) => Promise<LockResult<T>>,
+		options?: AuthOperationOptions,
+	): Promise<T>;
+}
+```
+
+## !!steps Synchronous locking by spinning
+
+The sync path exists so constructors and `reload()` can stay synchronous. `proper-lockfile` reports contention with the `ELOCKED` code, and the loop retries up to ten times at 20 ms intervals. Any other error, or the last attempt, is rethrown.
+
+The wait is a busy loop on `Date.now()`, which blocks the event loop. That is acceptable for a few hundred milliseconds in the worst case, and the comment explains the trade: it avoids turning every caller async.
+
+```ts ! auth-storage.ts
+	private acquireLockSyncWithRetry(path: string): () => void {
+		const maxAttempts = 10;
+		const delayMs = 20;
+		let lastError: unknown;
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				return lockfile.lockSync(path, { realpath: false });
+			} catch (error) {
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				if (code !== "ELOCKED" || attempt === maxAttempts) {
+					throw error;
+				}
+				lastError = error;
+				const start = Date.now();
+				while (Date.now() - start < delayMs) {
+					// Sleep synchronously to avoid changing callers to async.
+				}
+			}
+		}
+```
+
+## !!steps Async locking with jittered backoff and abort
+
+The async path is the one used for OAuth refresh, which can take seconds, so it must be cancellable. It disables `proper-lockfile`'s own retries and runs its own loop with a 30 second deadline equal to the stale threshold.
+
+Delay doubles from 10 ms, is capped at one second, and gets random jitter up to 2x so competing processes do not retry in lockstep. The abort signal is checked before each attempt and again after acquiring, in which case the lock is released before throwing so an aborted caller never leaves the file locked.
+
+```ts ! auth-storage.ts
+		const staleMs = 30_000;
+		const maxDelayMs = 2_000;
+		const deadline = Date.now() + staleMs;
+		let retry = 0;
+		while (true) {
+			signal?.throwIfAborted();
+			let release: (() => Promise<void>) | undefined;
+			try {
+				release = await lockfile.lock(this.authPath, {
+					realpath: false,
+					retries: 0,
+					stale: staleMs,
+					onCompromised,
+				});
+			} catch (error) {
+				signal?.throwIfAborted();
+				const code =
+					typeof error === "object" && error !== null && "code" in error
+						? String((error as { code?: unknown }).code)
+						: undefined;
+				const remainingMs = deadline - Date.now();
+				if (code !== "ELOCKED" || remainingMs <= 0) throw error;
+				const baseDelayMs = Math.min(10 * 2 ** retry, maxDelayMs / 2);
+				retry++;
+				const delayMs = Math.min(Math.round(baseDelayMs * (1 + Math.random())), remainingMs);
+```
+
+## !!steps Detecting a compromised lock
+
+A lock held for longer than the stale window can be taken over by another process, and `proper-lockfile` reports that through `onCompromised`. `withLockAsync` records the flag and calls `throwIfCompromised` after every phase: after acquiring, after the callback, and after the write.
+
+Checking after the write means a caller learns its update may have raced even when the bytes already landed. Unlock errors in the `finally` block are swallowed because a compromised lock cannot be released cleanly anyway.
+
+```ts ! auth-storage.ts
+		let release: (() => Promise<void>) | undefined;
+		let lockCompromised = false;
+		let lockCompromisedError: Error | undefined;
+		const throwIfCompromised = () => {
+			if (lockCompromised) {
+				throw lockCompromisedError ?? new Error("Auth storage lock was compromised");
+			}
+		};
+
+		try {
+			release = await this.acquireLockAsync(options?.signal, (error) => {
+				lockCompromised = true;
+				lockCompromisedError = error;
+			});
+
+			throwIfCompromised();
+			options?.signal?.throwIfAborted();
+			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
+			const { result, next } = await fn(current);
+			throwIfCompromised();
+```
+
+## !!steps A read-only store that validates strictly
+
+`ReadOnlyAuthStorage` is for contexts that should consume credentials without ever touching the file, for example a process that must not refresh tokens. It parses once, caches the result, and treats a missing file as an empty store.
+
+Unlike the writable store, it validates the shape of every credential: an `api_key` needs an optional string `key` and a string-valued `env`, and an `oauth` entry needs string `access` and `refresh` plus a finite numeric `expires`. Anything else throws a message naming the provider.
+
+```ts ! auth-storage.ts
+		for (const [providerId, credential] of Object.entries(parsed)) {
+			if (typeof credential !== "object" || credential === null || Array.isArray(credential)) {
+				throw new Error(`Invalid auth.json credential for provider "${providerId}"`);
+			}
+			const value = credential as Record<string, unknown>;
+			if (value.type === "api_key") {
+				const validKey = value.key === undefined || typeof value.key === "string";
+				const validEnv =
+					value.env === undefined ||
+					(typeof value.env === "object" &&
+						value.env !== null &&
+						!Array.isArray(value.env) &&
+						Object.values(value.env).every((entry) => typeof entry === "string"));
+				if (validKey && validEnv) continue;
+			} else if (
+				value.type === "oauth" &&
+```
+
+## !!steps Resolving key values lazily
+
+An `api_key` credential's `key` is not necessarily the secret itself. It may be an environment reference or a shell command, which [resolve-config-value.ts](/docs/src/core/resolve-config-value.ts) turns into the real value at read time.
+
+The read-only store skips resolution when the value is a command (`isCommandConfigValue`), returning a clone instead, so a read-only consumer never executes a shell command from `auth.json`. The writable store has no such guard and resolves whatever is there. `list` returns only provider ids and types and never resolves anything.
+
+```ts ! auth-storage.ts
+	async read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined> {
+		options?.signal?.throwIfAborted();
+		const credential = this.load()[providerId];
+		options?.signal?.throwIfAborted();
+		if (!credential) return undefined;
+		if (credential.type !== "api_key" || !credential.key || isCommandConfigValue(credential.key)) {
+			return structuredClone(credential);
+		}
+		return { ...credential, key: resolveConfigValue(credential.key, credential.env) };
+	}
+```
+
+## !!steps An in-memory backend for tests and embedding
+
+`InMemoryAuthStorageBackend` has the same contract with no file. Async calls are serialized through a promise chain: each operation awaits the previous one (ignoring its failure), so two concurrent `modify` calls cannot interleave. `raceWithAbortSignal` from [abort.ts](/docs/src/utils/abort.ts) lets a caller stop waiting without cancelling the queued work.
+
+```ts ! auth-storage.ts
+	withLockAsync<T>(
+		fn: (current: string | undefined) => Promise<LockResult<T>>,
+		options?: AuthOperationOptions,
+	): Promise<T> {
+		const previous = this.asyncChain;
+		const operation = (async () => {
+			await previous.catch(() => {});
+			options?.signal?.throwIfAborted();
+			const { result, next } = await fn(this.value);
+			options?.signal?.throwIfAborted();
+			if (next !== undefined) {
+				this.value = next;
+			}
+			return result;
+		})();
+		this.asyncChain = operation.catch(() => {});
+		return raceWithAbortSignal(operation, options?.signal);
+	}
+```
+
+## !!steps Sharing one read cache per file path
+
+`AuthStorage` keeps an `AuthFileReadState` (parsed data plus the file revision it came from). A module-level variable shares that state between every instance created for the same path, so several instances in a process do not each re-parse the file.
+
+The constructor only calls `reload()` when `getFileRevision` from [paths.ts](/docs/src/utils/paths.ts) differs from the cached revision. The shared slot holds a single path, so an instance for a different path gets its own private state.
+
+```ts ! auth-storage.ts
+	private constructor(storage: AuthStorageBackend, authPath?: string) {
+		this.storage = storage;
+		this.authPath = authPath;
+		this.readState =
+			authPath && sharedAuthFileReadState?.authPath === authPath ? sharedAuthFileReadState.readState : { data: {} };
+		if (authPath && !sharedAuthFileReadState) {
+			sharedAuthFileReadState = { authPath, readState: this.readState };
+		}
+		if (authPath) {
+			const revision = getFileRevision(authPath);
+			if (revision !== undefined && revision === this.readState.revision) return;
+		}
+		this.reload();
+	}
+```
+
+## !!steps Coalescing concurrent reloads
+
+`readLatestData` is the read path. If the revision is unchanged it returns the cached object with no lock. Otherwise the first caller starts a reload and stores it in `readState.reload`; later callers join the same promise and bump a reader count.
+
+When the last reader leaves while the reload is still pending (all were aborted), the reload itself is aborted. Callers without a signal fall back to the last good snapshot if the reload fails, so a corrupt file does not break reads.
+
+```ts ! auth-storage.ts
+		const revision = getFileRevision(this.authPath);
+		if (revision !== undefined && revision === this.readState.revision) return this.readState.data;
+		if (!this.readState.reload) {
+			const controller = new AbortController();
+			const reload: AuthFileReload = {
+				controller,
+				promise: this.reloadFromStorageAsync({ signal: controller.signal }),
+				readers: 0,
+			};
+			this.readState.reload = reload;
+			// ...
+		const reload = this.readState.reload;
+		reload.readers++;
+		try {
+			const result = raceWithAbortSignal(reload.promise, options?.signal);
+			return options?.signal ? await result : await result.catch(() => this.readState.data);
+		} finally {
+			reload.readers--;
+			if (reload.readers === 0 && this.readState.reload === reload) {
+				this.readState.reload = undefined;
+				reload.controller.abort();
+			}
+		}
+```
+
+## !!steps Modify as a locked read-modify-write
+
+`modify` is how OAuth refresh and login persist credentials. Inside the lock it re-parses the file, hands the current credential to the callback, and merges the result back. Because it reads inside the lock, a token refreshed by another process is seen rather than overwritten.
+
+Returning `undefined` from the callback means "no change": nothing is written, but the freshly read data still updates the cache. Afterwards the in-memory read state is updated so the next `read` does not re-parse.
+
+```ts ! auth-storage.ts
+		let latestData = this.readState.data;
+		let revision: string | undefined;
+		const result = await this.storage.withLockAsync(async (content) => {
+			const currentData = this.parseStorageData(content);
+			const next = await fn(currentData[provider]);
+			if (next === undefined) {
+				latestData = currentData;
+				revision = this.authPath ? getFileRevision(this.authPath) : undefined;
+				return { result: currentData[provider] };
+			}
+
+			const merged: AuthStorageData = { ...currentData, [provider]: next };
+			latestData = merged;
+			return { result: next, next: JSON.stringify(merged, null, 2) };
+		}, options);
+		this.updateReadState(latestData, revision);
+```
+
+</Scrollycoding>
+
+The runtime in [model-runtime.ts](/docs/src/core/model-runtime.ts) is the main consumer: it hands an `AuthStorage` to pi-ai as its credential store, and [auth-guidance.ts](/docs/src/core/auth-guidance.ts) and [runtime-credentials.ts](/docs/src/core/runtime-credentials.ts) sit nearby for user messaging and in-memory overrides. The directory comes from [config.ts](/docs/src/config.ts).
+
+Structurally the file is three storage backends (file, in-memory, plus the read-only class that bypasses backends entirely) and one facade. The standalone `readStoredCredential` at the bottom is a fire-and-forget synchronous peek that swallows every error and returns `undefined`.

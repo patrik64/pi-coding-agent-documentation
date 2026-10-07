@@ -1,0 +1,93 @@
+---
+title: "bug-report-upload.ts"
+description: "Sends a prepared bug report bundle to the Radius gateway as multipart form data and turns the reply into an id or an error"
+source: "src/core/bug-report-upload.ts"
+full: true
+---
+
+A bug report is assembled in [bug-report.ts](/docs/src/core/bug-report.ts). This
+file is the network half: one function, `uploadBugReport`, that posts the
+bundle's files to a gateway and returns the id of the stored report.
+
+The gateway address comes from [radius.ts](/docs/src/core/radius.ts). An access
+token is optional, which is how a report can be filed anonymously or attributed
+to a Radius account.
+
+<Scrollycoding>
+
+## !!steps Options and the multipart body
+
+All options are optional. The body is `FormData` with one part per file, using
+the same file list that the zip export uses, so both delivery methods always
+contain the same content.
+
+```ts ! bug-report-upload.ts
+interface UploadBugReportOptions {
+	token?: string;
+	signal?: AbortSignal;
+	gatewayUrl?: string;
+}
+
+/** Upload a report as multipart form data, anonymously or attributed to a Radius account. */
+export async function uploadBugReport(
+	bundle: BugReportBundle,
+	options: UploadBugReportOptions = {},
+): Promise<{ id: string }> {
+	const body = new FormData();
+	for (const file of bugReportFiles(bundle)) {
+		body.append(file.name, new Blob([file.data], { type: file.contentType }), file.name);
+	}
+```
+
+## !!steps The request
+
+The URL is built against `/v1/bug-reports` with the override or the default
+gateway. The Authorization header is only added when a token exists, and the
+caller's abort signal is passed through so the dialog can cancel the upload.
+
+```ts ! bug-report-upload.ts
+	const response = await fetch(new URL("/v1/bug-reports", options.gatewayUrl ?? getRadiusGatewayUrl()), {
+		method: "POST",
+		headers: options.token ? { Authorization: `Bearer ${options.token}` } : undefined,
+		body,
+		signal: options.signal,
+	});
+```
+
+## !!steps Parsing a reply that may not be JSON
+
+The body is parsed defensively: a failed `json()` becomes `null` rather than
+a thrown error, so a gateway returning HTML or nothing still produces a clean
+failure message. Success requires all three conditions: HTTP ok, `ok: true`
+in the JSON, and a string id.
+
+```ts ! bug-report-upload.ts
+	const json = (await response.json().catch(() => null)) as {
+		ok?: boolean;
+		bug_report?: { id?: string };
+		error?: string;
+		description?: string;
+	} | null;
+	// !mark(1:3)
+	if (response.ok && json?.ok === true && typeof json.bug_report?.id === "string") {
+		return { id: json.bug_report.id };
+	}
+```
+
+## !!steps Choosing the best error text
+
+On failure the message prefers the server's `description`, then its `error`
+code, then the HTTP status text, then the numeric status. The result is always
+thrown as an `Error` with a fixed prefix.
+
+```ts ! bug-report-upload.ts
+	const detail = json && !json.ok ? json.description || json.error : undefined;
+	throw new Error(`Bug report upload failed: ${detail || response.statusText || response.status}`);
+}
+```
+
+</Scrollycoding>
+
+The function has no retry logic and does not redact anything itself; redaction
+happens when the bundle is built. Auth for the token is managed by
+[auth-storage.ts](/docs/src/core/auth-storage.ts).
