@@ -8,6 +8,9 @@ The sidebar mirrors the project's file tree — one page per source file, each a
 transitions, explaining the file step by step alongside excerpts of the real
 code. Every excerpt is quoted verbatim and checked against the source.
 
+## Try it
+https://pi-coding-agent-documentation.vercel.app
+
 ## View
 
 deploy it with `pnpm build` (any Next.js host); locally it runs at http://localhost:3000.
