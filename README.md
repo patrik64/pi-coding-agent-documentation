@@ -11,6 +11,9 @@ code. Every excerpt is quoted verbatim and checked against the source.
 ## Try it
 https://pi-coding-agent-documentation.vercel.app
 
+<img width="2900" height="1396" alt="image" src="https://github.com/user-attachments/assets/de654d67-011c-4929-92ad-062e4874ab74" />
+
+
 ## View
 
 deploy it with `pnpm build` (any Next.js host); locally it runs at http://localhost:3000.
