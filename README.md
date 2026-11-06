@@ -13,6 +13,9 @@ https://pi-coding-agent-documentation.vercel.app
 
 <img width="2900" height="1396" alt="image" src="https://github.com/user-attachments/assets/de654d67-011c-4929-92ad-062e4874ab74" />
 
+<img width="2912" height="1460" alt="image" src="https://github.com/user-attachments/assets/c93eb031-19ab-4cc8-95b1-2181768e2d0f" />
+
+
 
 ## View
 
