@@ -13,15 +13,20 @@ It renders immediately from a cached snapshot of [model-runtime.ts](/docs/src/co
 
 ## !!steps State and the all or scoped choice
 
-The component keeps four lists: all models, the scoped models, the `activeModels` for the current scope, and the `filteredModels` after search. The scope starts as `scoped` whenever scoped models exist.
+The component keeps four lists: all models, the scoped models, the `activeModels` for the current scope, and the `filteredModels` after search. The scope starts as `scoped` whenever scoped models exist. `MAX_VISIBLE` is the list window height, shared by drawing and paging. `capturesViewportInput` tells the fullscreen TUI to send viewport keys such as PageUp and PageDown to this dialog instead of scrolling the transcript behind it.
 
 ```ts ! model-selector.ts
 type ModelScope = "all" | "scoped";
+
+const MAX_VISIBLE = 10;
 
 /**
  * Component that renders a model selector with search
  */
 export class ModelSelectorComponent extends Container implements Focusable {
+	readonly capturesViewportInput: boolean = true;
+	private searchInput: Input;
+// ...
 	private listContainer: Container;
 	private allModels: ModelItem[] = [];
 	private scopedModelItems: ModelItem[] = [];
@@ -109,7 +114,7 @@ The constructor builds borders, a scope header (or a warning to use `/login` whe
 
 ## !!steps Background refresh with a timeout
 
-A 15 second timer aborts the refresh. The outcome is turned into a status line: timeout, one failed catalog, several failed catalogs, or success. After that the snapshot is reloaded and the current search is reapplied. A `closed` flag prevents updates after the dialog is gone, and the `finally` always clears the timer.
+A 15 second timer aborts the refresh. The outcome is turned into a status line: timeout, one failed catalog, several failed catalogs, or success. After that the snapshot is reloaded and the current search is reapplied. The user may have moved the cursor while the refresh was running, and new catalog entries can shift rows, so the highlighted model is remembered before the reload and passed to `filterModels` to be selected again. A `closed` flag prevents updates after the dialog is gone, and the `finally` always clears the timer.
 
 ```ts ! model-selector.ts
 	private async refreshModels(): Promise<void> {
@@ -136,8 +141,10 @@ A 15 second timer aborts the refresh. The outcome is turned into a status line: 
 					this.refreshStatusSuccess = true;
 				}
 			}
+			const selectedModel = this.filteredModels[this.selectedIndex]?.model;
 			this.loadModelsFromSnapshot();
-			this.filterModels(this.searchInput.getValue());
+			// The user may have moved while the refresh was in flight, and the refresh can shift rows.
+			this.filterModels(this.searchInput.getValue(), selectedModel);
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.closed) return;
@@ -185,7 +192,7 @@ The current model sorts first, the default model second, then providers alphabet
 
 ## !!steps Filtering, including the word default
 
-Search text is built from id, provider and name, plus the word `default` for the default model. Typing a prefix of `default` additionally pins the default model to the top. A non-empty query moves the selection to the first row.
+Search text is built from id, provider and name, plus the word `default` for the default model. Typing a prefix of `default` additionally pins the default model to the top. A preferred model, passed after a catalog refresh, keeps the selection if it is still listed. Otherwise a non-empty query moves the selection to the first row, and clearing the query keeps the position clamped to the list.
 
 ```ts ! model-selector.ts
 	private isDefaultModel(model: Model<any>): boolean {
@@ -196,7 +203,7 @@ Search text is built from id, provider and name, plus the word `default` for the
 		const normalized = query.trim().toLowerCase();
 		return normalized.length > 0 && "default".startsWith(normalized);
 	}
-	private filterModels(query: string): void {
+	private filterModels(query: string, preferredModel?: Model<any>): void {
 		if (query) {
 			const filtered = fuzzyFilter(this.activeModels, query, (item) => {
 				const defaultText = this.isDefaultModel(item.model) ? " default" : "";
@@ -215,28 +222,31 @@ Search text is built from id, provider and name, plus the word `default` for the
 		} else {
 			this.filteredModels = this.activeModels;
 		}
-		// When filtering by a query, move the selector to the top row so the best
-		// match is highlighted. When the query is cleared, keep the current position
-		// clamped to the (restored) list length.
-		this.selectedIndex = query ? 0 : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+		// Keep the preferred model selected if it is still listed. Otherwise, when filtering
+		// by a query, move the selector to the top row so the best match is highlighted.
+		// When the query is cleared, keep the current position clamped to the (restored) list length.
+		const preferredIndex = preferredModel
+			? this.filteredModels.findIndex((item) => modelsAreEqual(preferredModel, item.model))
+			: -1;
+		if (preferredIndex >= 0) this.selectedIndex = preferredIndex;
+		else this.selectedIndex = query ? 0 : Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
 		this.updateList();
 	}
 ```
 
 ## !!steps Drawing the list
 
-The list is a window of 10 rows centered on the selection. Each row shows a cursor, a check for the current model, the id, a provider badge and a default badge. Below it come a scroll counter, then an error, a no-results message or the selected model's full name, and finally the refresh status.
+The list is a window of `MAX_VISIBLE` rows centered on the selection. Each row shows a cursor, a check for the current model, the id, the model name in parentheses, a provider badge and a default badge. The name is shown only when `getDistinctModelName` from [model-search.ts](/docs/src/modes/interactive/model-search.ts) finds words in it that the id lacks, as with a renamed override; a name that only restates the id is left out. Below the list come a scroll counter, then an error, a no-results message or the selected model's full name, and finally the refresh status.
 
 ```ts ! model-selector.ts
 	private updateList(): void {
 		this.listContainer.clear();
 
-		const maxVisible = 10;
 		const startIndex = Math.max(
 			0,
-			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredModels.length - maxVisible),
+			Math.min(this.selectedIndex - Math.floor(MAX_VISIBLE / 2), this.filteredModels.length - MAX_VISIBLE),
 		);
-		const endIndex = Math.min(startIndex + maxVisible, this.filteredModels.length);
+		const endIndex = Math.min(startIndex + MAX_VISIBLE, this.filteredModels.length);
 
 		// Show visible slice of filtered models
 		for (let i = startIndex; i < endIndex; i++) {
@@ -251,8 +261,10 @@ The list is a window of 10 rows centered on the selection. Each row shows a curs
 			const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
 			const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
 			const modelText = isSelected ? theme.fg("accent", item.id) : item.id;
+			const name = getDistinctModelName({ id: item.id, name: item.model.name });
+			const nameText = name ? theme.fg("muted", ` (${name})`) : "";
 			const providerBadge = theme.fg("muted", `[${item.provider}]`);
-			const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${defaultBadge}`;
+			const line = `${cursor}${currentMarker}${modelText}${nameText} ${providerBadge}${defaultBadge}`;
 
 			this.listContainer.addChild(new Text(line, 0, 0));
 		}
@@ -275,11 +287,12 @@ The list is a window of 10 rows centered on the selection. Each row shows a curs
 
 ## !!steps Keys
 
-Up and down wrap around. Enter selects; the save key selects and persists as default, but only if that callback was given. Cancel disposes and calls back. Tab toggles scope only if scoped models exist. Everything else goes to the search box and refilters.
+Up and down wrap around. The selection page keys move by one window, clamped at the ends rather than wrapping; `getSelectPageIndex` from pi-tui computes the target and returns undefined for any other key. Enter selects; the save key selects and persists as default, but only if that callback was given. Cancel disposes and calls back. Tab toggles scope only if scoped models exist. Everything else goes to the search box and refilters.
 
 ```ts ! model-selector.ts
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		const pageIndex = getSelectPageIndex(kb, keyData, this.selectedIndex, this.filteredModels.length, MAX_VISIBLE);
 		if (kb.matches(keyData, "tui.input.tab")) {
 			if (this.scopedModelItems.length > 0) {
 				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
@@ -290,6 +303,12 @@ Up and down wrap around. Enter selects; the save key selects and persists as def
 			}
 			return;
 // ...
+		// Page up/down
+		else if (pageIndex !== undefined) {
+			if (this.filteredModels.length === 0) return;
+			this.selectedIndex = pageIndex;
+			this.updateList();
+		}
 		// Enter
 		else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selectedModel = this.filteredModels[this.selectedIndex];

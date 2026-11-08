@@ -1,10 +1,12 @@
 {
   "title": "cli",
   "pages": [
-    "experimental",
     "args.ts",
     "auth-check.ts",
     "auth-command.ts",
+    "auth-login.ts",
+    "auth-logout.ts",
+    "auth-terminal.ts",
     "config-selector.ts",
     "credential-print.ts",
     "file-processor.ts",

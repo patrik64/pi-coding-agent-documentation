@@ -1,6 +1,6 @@
 ---
 title: "interactive-mode.ts"
-description: "The terminal UI controller: owns the TUI layout, routes editor input and slash commands to the session, renders agent events, and handles shutdown and crashes"
+description: "The terminal UI controller: owns the TUI layout, routes editor input and slash commands to the session, renders agent events, reports program status to the terminal, and handles shutdown and crashes"
 source: "src/modes/interactive/interactive-mode.ts"
 full: true
 ---
@@ -16,13 +16,16 @@ private methods: one per slash command (`handleModelCommand`, `handleCloneComman
 and so on), one per selector overlay, plus path formatting for the startup
 resource listing, login flows, and extension UI plumbing. The control flow that
 matters is short: construct, `init`, `run`, then react to editor submissions and
-session events until shutdown. This walkthrough follows that spine and skips the
-long tail.
+session events until shutdown. This walkthrough follows that spine, then the
+pieces of state that cut across it: extension dialogs and overlays, logins, and
+the program status reported to the terminal.
 
 The visual pieces live in [components](/docs/src/modes/interactive/components/index.ts)
 such as [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts)
 and [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts),
 while [chat-viewport.ts](/docs/src/modes/interactive/chat-viewport.ts) lays them out.
+Whether pi is working, waiting for the user, done or failed is tracked by
+[program-status-reporter.ts](/docs/src/modes/interactive/program-status-reporter.ts).
 
 <Scrollycoding>
 
@@ -86,8 +89,9 @@ field. It is a getter that reads `runtimeHost.session` each time.
 ## !!steps The constructor wires the runtime hooks
 
 Two callbacks are registered on the runtime. Before a session is invalidated,
-extension UI (widgets, custom editors, headers) is reset. When a new session is
-bound, the mode re-renders and re-applies the theme. This is the interactive
+`resetExtensionUI` removes everything the outgoing extensions put on screen:
+stacked dialogs, overlays, widgets, custom editors, headers and footers. When a
+new session is bound, the mode re-renders and re-applies the theme. This is the interactive
 counterpart of `rebindSession` in [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts).
 
 The renderer is created from the TUI mode setting, and `ui` is a reference that
@@ -138,7 +142,9 @@ handlers: Ctrl+C, Ctrl+D, and a submit handler that only says startup is still
 in progress and puts the text back. Typing is accepted but nothing is sent.
 
 The UI is started before extensions are initialized, with a comment explaining
-why: `session_start` handlers may open interactive dialogs.
+why: `session_start` handlers may open interactive dialogs. The first program
+status (`idle`) is reported as soon as the terminal is running. The terminal
+holds it until it has confirmed OSC 7501 support, so an early report is not lost.
 
 ```ts ! interactive-mode.ts
 		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
@@ -150,6 +156,8 @@ why: `session_start` handlers may open interactive dialogs.
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
+		// !mark
+		this.programStatus.report();
 		this.ensurePngTranscoder();
 
 		this.themeController.applyFromSettings();
@@ -183,6 +191,63 @@ before the conversation.
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
+```
+
+## !!steps Changelogs for pi and its extension packages
+
+Early in `init`, before the UI starts, two kinds of changelog are loaded; both
+are skipped for resumed sessions and shown once, right after the loaded
+resources, by `showStartupNoticesIfNeeded`. Pi's own comes from
+`getChangelogForDisplay`. Each
+extension installed from a package that ships a changelog gets one too. Packages
+are deduplicated by source key, since one package can provide several
+extensions. The last version shown is stored per package in settings. A fresh
+install only records its version, and a saved version that cannot be parsed is
+replaced by the current one instead of showing the whole history.
+
+New entries get the package name put into their headings so they read like
+pi's own. They appear under "Extension Updates", or as one "Updated ... to
+v..." line each when the changelog is collapsed. All changelog Markdown goes
+through `createChangelogMarkdown`, which applies the Markdown transformers
+registered for the `changelog` surface.
+
+```ts ! interactive-mode.ts
+	private getExtensionChangelogUpdates(): ExtensionChangelogUpdate[] {
+		// Skip changelog for resumed/continued sessions (already have messages)
+		if (this.session.state.messages.length > 0) {
+			return [];
+		}
+// ...
+		for (const { sourceInfo } of this.session.resourceLoader.getExtensions().extensions) {
+			if (sourceInfo.origin !== "package" || !sourceInfo.baseDir || !sourceInfo.changelogPath) {
+				continue;
+			}
+
+			const key = getSourcePackageKey(sourceInfo);
+// ...
+			const lastVersion = this.settingsManager.getExtensionChangelogVersion(key);
+			if (!lastVersion) {
+				// Fresh install - record the version, don't show changelog
+				this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
+				continue;
+			}
+
+			const newEntries = getNewEntries(parseChangelog(sourceInfo.changelogPath), lastVersion);
+			if (!newEntries) {
+				// Unreadable saved version: show nothing and record the current one so later updates compare again
+				this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
+				continue;
+			}
+			if (newEntries.length > 0) {
+				this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
+				const name = pkg.name || sourceInfo.source;
+				// Prefix each "## [x.y.z]" heading with the package name so entries render like Pi's own.
+				const markdown = newEntries
+					.map((entry) => entry.content.replace(/^##\s+/, `## ${name} `))
+					.join("\n\n")
+					.trim();
+				updates.push({ name, version: pkg.version, markdown });
+			}
 ```
 
 ## !!steps run: background checks, warnings, initial prompts
@@ -374,6 +439,47 @@ the call.
 									content.arguments,
 ```
 
+## !!steps Program status follows the event stream
+
+Terminals that implement the Program Status Protocol (OSC 7501) can show
+whether a program is working, waiting for the user, done or failed, which helps
+when pi runs in a background tab. `InteractiveMode` owns one
+[ProgramStatusReporter](/docs/src/modes/interactive/program-status-reporter.ts)
+and passes it every session event before the switch, so run and compaction
+state is worked out in one place rather than in each case. The reporter gets
+the terminal and the session name through callbacks, because both can change
+after construction.
+
+`rebindCurrentSession` calls `reset`, so a session that was just switched to
+does not inherit the previous session's `done` or `error`. Dialogs and logins
+add `blocked` on top with `setBlocked`, as later steps show.
+
+```ts ! interactive-mode.ts
+	/** Reports working, blocked, done, and error states to terminals that support OSC 7501. */
+	private readonly programStatus = new ProgramStatusReporter(
+		() => this.ui.terminal,
+		() => this.sessionManager.getSessionName(),
+	);
+// ...
+	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
+		const session = this.session;
+
+		this.unsubscribe?.();
+		this.unsubscribe = undefined;
+		// !mark
+		this.programStatus.reset();
+		this.applyRuntimeSettings();
+// ...
+	private async handleEvent(event: AgentSessionEvent): Promise<void> {
+		if (!this.isInitialized) {
+			await this.init();
+		}
+
+		this.footer.invalidate();
+		// !mark
+		this.programStatus.handleEvent(event);
+```
+
 ## !!steps Finishing or failing a message
 
 On `message_end`, the component is switched out of streaming state. An aborted
@@ -400,6 +506,218 @@ which triggers diff computation for edit tools.
 						for (const [, component] of this.pendingTools.entries()) {
 							component.setArgsComplete();
 						}
+```
+
+## !!steps User bash output while the agent works
+
+A `!` command typed while the agent is streaming cannot go into the chat yet:
+the session holds its result back until the run ends, so it cannot land between
+a tool call and its result. Its `BashExecutionComponent` waits in
+`pendingBashComponents`, shown in the pending area above the editor.
+`updatePendingMessagesDisplay` rebuilds that area with these boxes first and the
+queued steering and follow-up messages after them, so queuing a message does not
+hide the output. On `agent_settled`, when the session records the deferred
+results, the boxes move into the chat.
+
+New boxes start in the current expand state, and the pending area is one of the
+containers that Ctrl+O walks, so the output can be expanded while the agent is
+still running.
+
+```ts ! interactive-mode.ts
+			case "agent_settled":
+				// The session records deferred user bash results when the run settles; show them there too.
+				this.flushPendingBashComponents();
+				this.ui.requestRender();
+				await this.checkShutdownRequested();
+				break;
+// ...
+		for (const container of [this.loadedResourcesContainer, this.chatContainer, this.pendingMessagesContainer]) {
+// ...
+	private updatePendingMessagesDisplay(): void {
+		this.pendingMessagesContainer.clear();
+		// User bash output shown while the agent works lives here until it moves to the chat.
+		for (const component of this.pendingBashComponents) {
+			this.pendingMessagesContainer.addChild(component);
+		}
+// ...
+		const isDeferred = this.session.isStreaming;
+		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
+		this.bashComponent.setExpanded(this.toolOutputExpanded);
+
+		if (isDeferred) {
+			// Show in pending area when agent is streaming
+			this.pendingMessagesContainer.addChild(this.bashComponent);
+			this.pendingBashComponents.push(this.bashComponent);
+```
+
+## !!steps Cache-warming notices collapse into one line
+
+When the [cache warmer](/docs/src/core/cache-warmer.ts) refreshes the prompt
+cache, its persisted usage entry is shown as a dim line, if cache notices are
+enabled. During a long pause that would add one line per refresh. Instead, if
+the previous notice is still the last child of the chat and carries the same
+note, the new cost is added to a shared total and the existing line is
+invalidated. The text is computed by a closure over `total`, so re-rendering
+picks up the new sum. Anything appended in between starts a fresh line. Each
+refresh is still stored as its own usage entry.
+
+```ts ! interactive-mode.ts
+	private addCacheWarmingUsage(entry: UsageEntry): void {
+		if (!this.settingsManager.getShowCacheMissNotices()) return;
+		// Back-to-back warms collapse into one line with the cumulative cost.
+		const previous = this.cacheWarmingNotice;
+		if (previous && this.chatContainer.children.at(-1) === previous.component && previous.note === entry.note) {
+			previous.total.cost += entry.usage.cost.total;
+			previous.component.invalidate();
+			return;
+		}
+		const total = { cost: entry.usage.cost.total };
+		const component = new ThemedText(() => theme.fg("dim", formatCacheWarmingUsage(total.cost, entry.note)), 1, 0);
+		this.cacheWarmingNotice = { component, total, note: entry.note };
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(component);
+	}
+```
+
+## !!steps Extension dialogs form a stack
+
+Extension dialogs (`select`, `confirm`, `input`, `editor` and inline `custom`
+components) take the editor slot. A second dialog used to replace the visible
+one and leave its promise pending forever. Now they share one stack,
+`extensionDialogs`: a new dialog hides the visible one, and closing the visible
+one shows the previous dialog, or the editor when none is left. Closing a
+dialog lower in the stack just removes it. This also makes dialogs opened from
+inside a custom component work.
+
+Each entry carries an optional blocked status, and `showTopExtensionDialog`
+reports the visible one under the `extension-dialog` source. `confirm` reports
+kind `permission`; select, input and editor report `question` with the dialog
+title. An extension that installs a custom editor while a dialog is open no
+longer takes the slot; the new editor appears when the last dialog closes.
+
+```ts ! interactive-mode.ts
+	/**
+	 * Show an extension dialog in the editor slot.
+	 * Dialogs form a stack: a new dialog hides the visible one, and closing the visible dialog shows
+	 * the previous one again. Every dialog stays answerable, so no dialog promise is left pending,
+	 * and dialogs opened from inside another dialog (for example a confirm from a custom component) work.
+	 */
+	private pushExtensionDialog(component: ExtensionDialogComponent, blocked?: BlockedStatus): void {
+		this.disposeActiveSelector();
+		this.extensionDialogs.push({ component, blocked });
+		this.showTopExtensionDialog();
+	}
+
+	/** Remove an extension dialog. If it was visible, show the previous dialog or the editor. */
+	private removeExtensionDialog(component: ExtensionDialogComponent): void {
+		const index = this.extensionDialogs.findIndex((dialog) => dialog.component === component);
+		if (index === -1) return;
+		this.extensionDialogs.splice(index, 1);
+		if (index === this.extensionDialogs.length) this.showTopExtensionDialog();
+	}
+
+	private showTopExtensionDialog(): void {
+		const top = this.extensionDialogs.at(-1);
+		const component = top?.component ?? this.editor;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(component);
+		this.ui.setFocus(component);
+		this.programStatus.setBlocked("extension-dialog", top?.blocked);
+		this.ui.requestRender();
+	}
+```
+
+## !!steps Custom components, overlays and reload
+
+`ctx.ui.custom` hosts both inline components, which join the dialog stack, and
+overlays drawn over the screen. The editor text is saved first, using
+`getExpandedText` when the editor has it, so a large paste collapsed to a marker
+comes back as the full text. An extension can pass `blocked` to say the
+component waits for the user. Each blocking overlay gets its own numbered status
+source, so closing one leaves other open questions reported. The source stays
+set while the overlay is hidden with `setHidden`, because the question is still
+unanswered.
+
+Each overlay is recorded in `extensionOverlays` with its `removeOverlay`
+function, which `done` and `resetExtensionUI` share. It hides that overlay
+rather than the topmost one, clears its blocked status and disposes the
+component. Deleting the map entry first makes a second call a no-op. On
+`/reload` or a session switch, the reset calls every recorded function, newest
+first and including hidden overlays, and leaves pi's own overlays (such as the
+easter egg) alone. It used to call `hideOverlay` once, which removed only the
+topmost overlay, whoever owned it. As with inline dialogs, the promises of
+removed overlays are left pending.
+
+```ts ! interactive-mode.ts
+	private resetExtensionUI(): void {
+// ...
+		// Reload and session switches replace every extension without calling done(): remove their overlays,
+		// newest first, the same way done() does, but leave the promises pending as for inline dialogs.
+		for (const removeOverlay of [...this.extensionOverlays.values()].reverse()) removeOverlay();
+// ...
+		const savedText = this.editor.getExpandedText?.() ?? this.editor.getText();
+		const isOverlay = options?.overlay ?? false;
+// ...
+			// An overlay stays blocked until its interaction ends, also while setHidden() hides it.
+			const overlayStatusSource =
+				isOverlay && options?.blocked ? `extension-overlay:${this.nextBlockingOverlayId++}` : undefined;
+// ...
+			// Shared by done() and resetExtensionUI(). Removing the map entry first makes a second call a no-op.
+			const removeOverlay = () => {
+				if (!overlayHandle || !this.extensionOverlays.delete(overlayHandle)) return;
+				// Remove this overlay, not the topmost one: another overlay may have opened above it.
+				overlayHandle.hide();
+				if (overlayStatusSource) this.programStatus.setBlocked(overlayStatusSource, undefined);
+				disposeComponent();
+			};
+// ...
+						overlayHandle = this.ui.showOverlay(c, resolveOptions());
+						this.extensionOverlays.set(overlayHandle, removeOverlay);
+						if (overlayStatusSource) this.programStatus.setBlocked(overlayStatusSource, options?.blocked);
+// ...
+						this.pushExtensionDialog(c, options?.blocked);
+```
+
+## !!steps Logins report blocked too
+
+`/login` with an argument resolves the provider with `findMatchingProviders`
+from [provider-matching.ts](/docs/src/core/provider-matching.ts), the same exact
+id-or-name match, ignoring case, that the shell command
+[pi auth login](/docs/src/cli/auth-login.ts) uses. While `loginProvider` waits
+for a browser, a device code or an API key, it reports `blocked` with kind
+`auth` under its own `login` source, and clears it in `finally` whether the
+login succeeds, fails or is cancelled. After a Radius login, whether to offer an
+MCP server entry is decided by `planRadiusMcpServer` in
+[radius-mcp.ts](/docs/src/core/radius-mcp.ts), which the CLI shares.
+
+```ts ! interactive-mode.ts
+		const providerOptions = findMatchingProviders(this.getLoginProviderOptions(), providerRef);
+// ...
+	private async loginProvider(
+		dialog: LoginDialogComponent,
+		providerId: string,
+		providerName: string,
+		method: "api_key" | "oauth",
+	): Promise<void> {
+		this.programStatus.setBlocked("login", { kind: "auth", message: `Log in to ${providerName}` });
+		try {
+			await this.session.modelRuntime.login(
+				providerId,
+				method,
+				{
+					signal: dialog.signal,
+					prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
+					notify: (event) => this.notifyAuthDialog(dialog, event),
+				},
+				{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() },
+			);
+		} finally {
+			this.programStatus.setBlocked("login", undefined);
+		}
+	}
+// ...
+		const plan = planRadiusMcpServer(providerId, getAgentDir(), this.sessionManager.getCwd());
+		if (!plan) return;
 ```
 
 ## !!steps Ctrl+C, Ctrl+D and graceful shutdown
@@ -469,7 +787,8 @@ other, which is why so much state (`streamingComponent`, `pendingTools`,
 modules own the pieces it composes: [footer.ts](/docs/src/modes/interactive/components/footer.ts)
 and [custom-editor.ts](/docs/src/modes/interactive/components/custom-editor.ts)
 for the chrome, [external-editor.ts](/docs/src/modes/interactive/external-editor.ts)
-for the external editor shortcut, and [bug-report.ts](/docs/src/modes/interactive/bug-report.ts)
+for the external editor shortcut, [program-status-reporter.ts](/docs/src/modes/interactive/program-status-reporter.ts)
+for terminal status reports, and [bug-report.ts](/docs/src/modes/interactive/bug-report.ts)
 for the crash path. The same session is driven headlessly by
 [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) and
 [print-mode.ts](/docs/src/modes/print-mode.ts).

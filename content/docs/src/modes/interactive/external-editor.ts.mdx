@@ -7,13 +7,13 @@ full: true
 
 Long prompts are awkward in a terminal input box, so interactive mode can hand the current text to the user's `$EDITOR`-style command and take the result back. `editInExternalEditor` is that round trip: write a temp file, run the editor attached to the terminal, read the file back, clean up.
 
-It is one function with a small result union, called from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts). The BOM handling comes from [text.ts](/docs/src/utils/text.ts).
+It is one function with a small result union, called from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) for the main prompt and from [extension-editor.ts](/docs/src/modes/interactive/components/extension-editor.ts) for extension editor dialogs. The BOM handling comes from [text.ts](/docs/src/utils/text.ts).
 
 <Scrollycoding>
 
 ## !!steps Inputs and outputs
 
-The caller passes the full command string and the current content. The result is either `complete` with the new text, or `failed` with nothing: no distinction between "editor missing" and "editor exited non-zero".
+The caller passes the full command string and the current content. The result is either `complete` with the new text, or `failed` with a message ready to show the user. Failures used to be silent, because the UI redrew over the terminal right away; now the interactive mode puts the message in the status line, and the extension editor shows it inline.
 
 ```ts ! external-editor.ts
 export interface ExternalEditorOptions {
@@ -21,7 +21,7 @@ export interface ExternalEditorOptions {
 	content: string;
 }
 
-export type ExternalEditorResult = { status: "complete"; content: string } | { status: "failed" };
+export type ExternalEditorResult = { status: "complete"; content: string } | { status: "failed"; message: string };
 ```
 
 ## !!steps A private temp file
@@ -43,32 +43,44 @@ export async function editInExternalEditor(options: ExternalEditorOptions): Prom
 
 ## !!steps Async spawn, not spawnSync
 
-The comment records a real Windows bug: a synchronous child call can leave Node's console input read active after stdin is paused, so the parent and vim race for input until Ctrl+C. Hence an async `spawn` with `stdio: "inherit"` wrapped in a promise.
+The first comment records a real Windows bug: a synchronous child call can leave Node's console input read active after stdin is paused, so the parent and vim race for input until Ctrl+C. Hence an async `spawn` with `stdio: "inherit"` wrapped in a promise. On Windows the command runs through a shell.
 
-A spawn error resolves to `null`, which is not 0, so it is treated as failure. On Windows the command runs through a shell.
+The promise resolves to the exit code, or to the signal name when the editor was killed, or to `null` when it could not be started at all. The second comment explains a known limit that is accepted on purpose: the editor inherits pi's working directory so project-relative paths keep working, even though a Windows editor launched from a deep WSL directory can fail on the long path. Rather than changing the directory, the failure is reported.
 
 ```ts ! external-editor.ts
 		// Do not use spawnSync here. On Windows, synchronous child_process calls can keep
 		// Node/libuv's console input read active after the parent pauses stdin, racing
 		// vim/nvim for the console input buffer until Ctrl+C cancels the pending read.
-		const exitCode = await new Promise<number | null>((resolve) => {
+		// Null means the editor could not be launched.
+		const exit = await new Promise<number | NodeJS.Signals | null>((resolve) => {
+			// The editor inherits pi's cwd so project-relative paths, integrated terminals,
+			// and similar editor features keep working. A long cwd can break Windows editors:
+			// Windows rejects working directories over MAX_PATH, and WSL launches Windows
+			// editors (code, notepad.exe) from the cwd's \\wsl.localhost\... path (#11592).
+			// The cwd is intentionally not changed; failures are reported to the user instead.
 			const child = spawn(editor, [...editorArgs, filePath], {
 				stdio: "inherit",
 				shell: process.platform === "win32",
 			});
 			// !mark(1:2)
 			child.on("error", () => resolve(null));
-			child.on("close", (code) => resolve(code));
+			child.on("close", (code, signal) => resolve(code ?? signal));
 		});
 ```
 
-## !!steps Reading back and cleaning up
+## !!steps Reporting failure, reading back and cleaning up
 
-On success the file is read, a leading BOM is stripped, and a single trailing newline is removed (editors add one that the user did not type). The `finally` removes the whole directory, ignoring errors, on every path including failure.
+A launch failure and a non-zero exit get different messages, and the second one says the prompt was left unchanged. On success the file is read, a leading BOM is stripped, and a single trailing newline is removed (editors add one that the user did not type). The `finally` removes the whole directory, ignoring errors, on every path including failure.
 
 ```ts ! external-editor.ts
-		if (exitCode !== 0) {
-			return { status: "failed" };
+		if (exit === null) {
+			return { status: "failed", message: `Failed to launch external editor: ${options.command}` };
+		}
+		if (exit !== 0) {
+			return {
+				status: "failed",
+				message: `External editor exited with ${typeof exit === "number" ? `code ${exit}` : exit}; prompt unchanged`,
+			};
 		}
 
 		// !mark

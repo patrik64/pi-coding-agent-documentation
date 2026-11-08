@@ -113,13 +113,13 @@ export class RetryStatusIndicator extends StatusIndicator {
 
 ## !!steps Compaction and branch summary
 
-Compaction picks its label from the reason: manual, threshold or overflow. Overflow adds a prefix saying that context overflowed. Branch summary is a fixed label.
+Compaction picks its label from the reason: manual, threshold or overflow. Overflow adds a prefix saying that context overflowed. An optional `colorFn` replaces both the spinner and the label color. The interactive mode passes one when the status is embedded in an editor that draws its own border, so the indicator uses that border's color instead of accent and muted. Branch summary is a fixed label.
 
 ```ts ! status-indicator.ts
 export type CompactionStatusReason = "manual" | "threshold" | "overflow";
 
 export class CompactionStatusIndicator extends StatusIndicator {
-	constructor(ui: TUI, reason: CompactionStatusReason) {
+	constructor(ui: TUI, reason: CompactionStatusReason, colorFn?: (text: string) => string) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		// !mark(1:4)
 		const label =
@@ -129,8 +129,8 @@ export class CompactionStatusIndicator extends StatusIndicator {
 		super(
 			"compaction",
 			ui,
-			(spinner) => theme.fg("accent", spinner),
-			(text) => theme.fg("muted", text),
+			colorFn ?? ((spinner) => theme.fg("accent", spinner)),
+			colorFn ?? ((text) => theme.fg("muted", text)),
 			label,
 		);
 	}

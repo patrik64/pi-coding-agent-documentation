@@ -34,12 +34,27 @@ function replaceTabs(text: string): string {
 
 `renderIntraLineDiff` runs `diffWords` on the old and new content and builds two strings. Unchanged parts go to both, removed parts only to the old line, added parts only to the new one. Changed parts are wrapped in `theme.inverse`.
 
-```ts ! diff.ts
-function renderIntraLineDiff(oldContent: string, newContent: string): { removedLine: string; addedLine: string } {
-	const wordDiff = Diff.diffWords(oldContent, newContent);
+The indentation the two lines share is cut off before diffing and used as the starting value of both strings. `diffWords` groups whitespace with the following word, so text inserted before otherwise unchanged code (say `const result = ` in front of `await`) would otherwise take the shared indent into the added part, and the removed line would lose its indentation.
 
-	let removedLine = "";
-	let addedLine = "";
+```ts ! diff.ts
+/**
+ * Compute word-level diff and render with inverse on changed parts.
+ * Separates common indentation before diffing so a leading insertion cannot consume it.
+ */
+function renderIntraLineDiff(oldContent: string, newContent: string): { removedLine: string; addedLine: string } {
+	let commonIndentLength = 0;
+	while (
+		commonIndentLength < oldContent.length &&
+		oldContent[commonIndentLength] === newContent[commonIndentLength] &&
+		/\s/.test(oldContent[commonIndentLength])
+	) {
+		commonIndentLength++;
+	}
+
+	const commonIndent = oldContent.slice(0, commonIndentLength);
+	const wordDiff = Diff.diffWords(oldContent.slice(commonIndentLength), newContent.slice(commonIndentLength));
+	let removedLine = commonIndent;
+	let addedLine = commonIndent;
 	let isFirstRemoved = true;
 	let isFirstAdded = true;
 
@@ -50,7 +65,7 @@ function renderIntraLineDiff(oldContent: string, newContent: string): { removedL
 
 ## !!steps Keeping indentation unhighlighted
 
-For the first removed part and the first added part, leading whitespace is split off and appended without inverse. Without this, an indentation change would paint the whole margin. Only the first part of each kind gets this treatment. The unchanged branch at the end appends text to both lines.
+For the first removed part and the first added part, any remaining leading whitespace is split off and appended without inverse. Without this, an indentation change beyond the shared prefix would paint the whole margin. Only the first part of each kind gets this treatment. The unchanged branch at the end appends text to both lines.
 
 ```ts ! diff.ts
 			// Strip leading whitespace from the first removed part

@@ -13,21 +13,17 @@ The renderer lives apart from [tools/read.ts](/docs/src/core/tools/read.ts) so d
 
 ## !!steps The line range suffix
 
-When the model passes `offset` and/or `limit`, the header shows a warning-colored `:start-end` suffix, like a file location. A missing limit gives an open-ended `:start`. The check uses `== null` rather than `=== undefined` because, as the comment says, strict tool schemas make models send null for omitted optional fields.
+When the model passes `offset` and/or `limit`, the header shows a warning-colored `:start-end` suffix, like a file location. The text comes from `formatReadLineRange` in [render-utils.ts](/docs/src/core/tools/render-utils.ts), which the session tree selector also uses, so both label ranges identically. The offset and limit are typed `unknown` here because models sometimes send numeric strings or `null`; the shared helper parses those and returns an empty string for anything malformed, which `styledReadLineRange` then leaves unstyled and empty instead of printing `NaN`.
 
 ```ts ! read.ts
-type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
-function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
-	// Strict tool schemas make models send null for omitted optional fields.
-	// !mark
-	if (args?.offset == null && args?.limit == null) return "";
-	const startLine = args.offset ?? 1;
-	const endLine = args.limit != null ? startLine + args.limit - 1 : "";
-	return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+type ReadRenderArgs = { path?: string; file_path?: string; offset?: unknown; limit?: unknown };
+function styledReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
+	const range = formatReadLineRange(args?.offset, args?.limit);
+	return range ? theme.fg("warning", range) : "";
 }
 function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: string): string {
 	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
-	return `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${formatReadLineRange(args, theme)}`;
+	return `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${styledReadLineRange(args, theme)}`;
 }
 ```
 
@@ -105,7 +101,7 @@ function formatCompactReadCall(
 			// !mark
 			theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
 			theme.fg("customMessageText", classification.label) +
-			formatReadLineRange(args, theme) +
+			styledReadLineRange(args, theme) +
 			expandHint
 		);
 	}

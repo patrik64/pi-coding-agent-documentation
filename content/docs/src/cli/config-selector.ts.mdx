@@ -26,15 +26,16 @@ export interface ConfigSelectorOptions {
 }
 ```
 
-## !!steps Theme before TUI
+## !!steps Theme and keybindings before TUI
 
-The theme is initialized from settings before any rendering, and the promise wraps the whole interactive session. The screen is created from user settings: hardware cursor visibility and clear-on-shrink behavior.
+The theme is initialized from settings before any rendering, and the user's keybindings are loaded through [keybindings.ts](/docs/src/core/keybindings.ts) and installed globally, so the selector honors remapped keys just as the interactive TUI does. The promise wraps the whole interactive session. The screen is created from user settings: hardware cursor visibility and clear-on-shrink behavior.
 
 ```ts ! config-selector.ts
 export async function selectConfig(options: ConfigSelectorOptions): Promise<void> {
 	// Initialize theme before showing TUI
 	// !mark
 	initTheme(options.settingsManager.getTheme(), true);
+	setKeybindings(KeybindingsManager.create(options.agentDir));
 
 	return new Promise((resolve) => {
 		const ui: TUI = new TuiMainScreen(

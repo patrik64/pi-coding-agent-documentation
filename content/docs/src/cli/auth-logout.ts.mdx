@@ -1,0 +1,90 @@
+---
+title: "auth-logout.ts"
+description: "Implements `pi auth logout`: removes a provider's stored credential from auth.json, leaving environment variables and models.json alone"
+source: "src/cli/auth-logout.ts"
+full: true
+---
+
+`pi auth logout <provider>` is the shell version of `/logout`. It removes whatever `pi auth login` or `/login` stored for one provider and exits. Like `/logout`, it only touches `auth.json`: an API key from an environment variable or a `models.json` entry stays in effect, and the messages say so, so a user is not surprised when the provider still works.
+
+The command is small. It needs no terminal input, so it takes the plain `AuthOutput` from [auth-terminal.ts](/docs/src/cli/auth-terminal.ts), and the removal goes through `logout` on [model-runtime.ts](/docs/src/core/model-runtime.ts). [main.ts](/docs/src/main.ts) calls it with a 15 second timeout signal. The counterpart is [auth-login.ts](/docs/src/cli/auth-login.ts).
+
+<Scrollycoding>
+
+## !!steps Exactly one provider argument
+
+The options are just the runtime, the output and a signal. Anything other than a single positional provider prints the usage line and exits with 1.
+
+```ts ! auth-logout.ts
+/** Dependencies of `runAuthLogout`, injected so tests can capture the output. */
+export interface AuthLogoutOptions {
+	modelRuntime: ModelRuntime;
+	terminal: AuthOutput;
+	signal: AbortSignal;
+}
+
+const AUTH_LOGOUT_USAGE = `${APP_NAME} auth logout <provider>`;
+// ...
+export async function runAuthLogout(args: string[], options: AuthLogoutOptions): Promise<number> {
+	const { modelRuntime, terminal, signal } = options;
+	const [providerRef, ...rest] = args;
+	if (providerRef === undefined || providerRef.startsWith("-") || rest.length > 0) {
+		terminal.error(`Usage: ${AUTH_LOGOUT_USAGE}`);
+		return 1;
+	}
+```
+
+## !!steps Matching against what is stored
+
+The stored credentials are listed first. The reference is matched against known providers by id or display name through [provider-matching.ts](/docs/src/core/provider-matching.ts), but the command runs without extensions, so providers registered by an extension are unknown here. For those, a stored credential whose provider id equals the typed reference is still found, which means logging out of an extension provider works by id.
+
+Only when neither a provider nor a credential matches is the reference unknown; the error then lists the stored provider ids, which are the only useful answers. A known provider with nothing stored exits with 0. Logout is idempotent, so a script can run it unconditionally.
+
+```ts ! auth-logout.ts
+	const provider = findMatchingProviders(modelRuntime.getProviders(), providerRef)[0];
+	// Providers registered by extensions are not loaded here, so their stored credentials match by id alone.
+	const credential = stored.find((candidate) => candidate.providerId === (provider?.id ?? providerRef));
+	if (!provider && !credential) {
+		terminal.error(`Unknown provider "${replaceControlCharacters(providerRef)}".`);
+		const storedIds = stored.map((credential) => credential.providerId).sort();
+		terminal.error(`Stored credentials: ${storedIds.join(", ") || "none"}`);
+		return 1;
+	}
+	const providerName = provider?.name ?? providerRef;
+	if (!credential) {
+		terminal.write(
+			`No stored credentials for ${providerName}. Environment variables and models.json config are unchanged.`,
+		);
+		return 0;
+	}
+```
+
+## !!steps Removing the credential
+
+As with login, a `CredentialSynchronizationError` means the credential is gone but the runtime could not rebuild its model state, and the message says the removal itself happened. The final message distinguishes an OAuth logout from removing an API key.
+
+```ts ! auth-logout.ts
+	try {
+		await modelRuntime.logout(credential.providerId, { signal });
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (error instanceof CredentialSynchronizationError) {
+			terminal.error(
+				`Credentials removed for ${providerName}, but local model state could not be synchronized: ${message}`,
+			);
+		} else {
+			terminal.error(`Logout failed: ${message}`);
+		}
+		return 1;
+	}
+	terminal.write(
+		credential.type === "oauth"
+			? `Logged out of ${providerName}.`
+			: `Removed stored API key for ${providerName}. Environment variables and models.json config are unchanged.`,
+	);
+	return 0;
+```
+
+</Scrollycoding>
+
+Logout removes the credential by the stored provider id, not by the typed reference, so `pi auth logout Anthropic` and `pi auth logout anthropic` remove the same entry. The provider reference is passed through `replaceControlCharacters` before it is echoed in an error.

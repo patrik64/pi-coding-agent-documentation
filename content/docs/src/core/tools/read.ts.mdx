@@ -1,11 +1,11 @@
 ---
 title: "read.ts"
-description: "The read tool: text files with offset/limit paging and head truncation, plus image files that are resized and attached"
+description: "The read tool: text files streamed with offset/limit paging and head truncation, plus image files that are resized and attached"
 source: "src/core/tools/read.ts"
 full: true
 ---
 
-The read tool is how the model looks at files. For text it returns numbered paging hints rather than whole giant files: output is cut to 2000 lines or 50KB, and the notice at the end tells the model exactly which `offset` to use to continue. For images it detects the type, optionally resizes, and returns an image block alongside a short text note.
+The read tool is how the model looks at files. For text it returns numbered paging hints rather than whole giant files: output is cut to 2000 lines or 50KB, and the notice at the end tells the model exactly which `offset` to use to continue. Text files are streamed: every line is counted, but only the lines that can be shown are kept, so reading one line of a multi-gigabyte log no longer loads the whole file. For images it detects the type, optionally resizes, and returns an image block alongside a short text note.
 
 Like [write.ts](/docs/src/core/tools/write.ts) it goes through a replaceable operations object, so remote backends can supply their own file access. Truncation is delegated to `truncateHead` in [truncate.ts](/docs/src/core/tools/truncate.ts), and image handling to [image-process.ts](/docs/src/utils/image-process.ts) and [mime.ts](/docs/src/utils/mime.ts).
 
@@ -58,7 +58,7 @@ function toReadOutput(content: (TextContent | ImageContent)[]): ReadToolOutput {
 
 ## !!steps Operations and defaults
 
-Three operations: read bytes, check access, and detect an image MIME type. The last is optional, and when a backend does not supply it, no file is ever treated as an image. The local default checks `R_OK` and uses `detectSupportedImageMimeTypeFromFile`, which inspects file contents, not just the extension.
+Four operations: read bytes, check access, detect an image MIME type and, optionally, stream the file in chunks. When a backend does not supply `detectImageMimeType`, no file is ever treated as an image. When it does not supply `createReadStream`, text files fall back to `readFile` and are loaded whole, so existing custom backends keep working unchanged. The local default checks `R_OK` and uses `detectSupportedImageMimeTypeFromFile`, which inspects file contents, not just the extension.
 
 ```ts ! read.ts
 export interface ReadOperations {
@@ -68,13 +68,37 @@ export interface ReadOperations {
 	access: (absolutePath: string) => Promise<void>;
 	/** Detect image MIME type, return null or undefined for non-images */
 	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
+	/**
+	 * Stream file contents in chunks. When present, text files are read through it and only the lines
+	 * that will be shown are kept in memory; otherwise readFile loads the whole file. Stop reading when
+	 * the signal aborts; the read tool also stops consuming the stream then.
+	 */
+	createReadStream?: (absolutePath: string, options: { signal?: AbortSignal }) => AsyncIterable<Uint8Array>;
 }
 
 const defaultReadOperations: ReadOperations = {
 	readFile: (path) => fsReadFile(path),
+	createReadStream: readLocalFileChunks,
 	access: (path) => fsAccess(path, constants.R_OK),
 	detectImageMimeType: detectSupportedImageMimeTypeFromFile,
 };
+```
+
+## !!steps Streaming a local file like readFile
+
+The local stream opens the file once and stats the handle. A regular file is read only up to the size it had when opened, which is what `fs.readFile` does: text appended during the read is not counted and a file that keeps growing still ends. A file that reports size 0, such as a `/proc` file, and other file types like FIFOs are read until EOF. The abort signal goes to the stream, and the handle is closed in `finally` however the consumer stops.
+
+```ts ! read.ts
+async function* readLocalFileChunks(path: string, { signal }: { signal?: AbortSignal }): AsyncIterable<Uint8Array> {
+	const handle = await fsOpen(path, "r");
+	try {
+		const stats = await handle.stat();
+		const end = stats.isFile() && stats.size > 0 ? stats.size - 1 : undefined;
+		yield* handle.createReadStream({ end, signal, autoClose: false });
+	} finally {
+		await handle.close();
+	}
+}
 ```
 
 ## !!steps Abort handling without a mutation queue
@@ -139,44 +163,132 @@ Failure to process is not an error: the model gets a text note instead. In both 
 								}
 ```
 
-## !!steps The text branch: offset and limit
+## !!steps Two ways to select lines
 
-The whole file is read and split on newlines. `offset` converts to a zero-based start, and an offset past the end is an error with the real line count so the model can correct itself.
+Both selection paths return the same `SelectedLines`: the file's line count, a `TruncationResult` for the selected range, and the size of the first selected line for the oversized-line notice. Line counts follow `text.split("\n")`, as before. Streaming is used only for whole-number offsets and nonnegative whole-number limits. Fractional offsets or a negative limit keep the old in-memory path, because array slicing is what defined their meaning; `limit: -1`, for example, selects every line but the last.
 
-A user-supplied `limit` is applied first and recorded in `userLimitedLines`. Without a limit, everything from the offset onward goes to truncation, which then decides how much fits.
+`selectLinesFromBuffer` is that old algorithm: decode, split, slice, then `truncateHead`.
 
 ```ts ! read.ts
-								// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
+/** The lines a read shows, with the file's line count; line counts follow `text.split("\n")`. */
+interface SelectedLines {
+	totalFileLines: number;
+	truncation: TruncationResult;
+	/** Bytes of the first selected line, for the notice when it alone exceeds the byte limit. */
+	firstLineBytes: number;
+}
+// ...
+function isStreamableRange(offset: number | undefined, limit: number | undefined): boolean {
+	return (
+		(offset === undefined || Number.isInteger(offset)) &&
+		(limit === undefined || (Number.isInteger(limit) && limit >= 0))
+	);
+}
+
+/** Select lines from a whole file in memory: for operations without createReadStream and unusual ranges. */
+function selectLinesFromBuffer(buffer: Buffer, startLine: number, limit: number | undefined): SelectedLines {
+	const allLines = buffer.toString("utf-8").split("\n");
+	const endLine = limit === undefined ? undefined : Math.min(startLine + limit, allLines.length);
+	const truncation = truncateHead(allLines.slice(startLine, endLine).join("\n"));
+	const firstLineBytes = truncation.firstLineExceedsLimit ? Buffer.byteLength(allLines[startLine], "utf-8") : 0;
+	return { totalFileLines: allLines.length, truncation, firstLineBytes };
+}
+```
+
+## !!steps Storing only what can be shown
+
+`selectLinesFromStream` decodes chunks with a streaming `TextDecoder` configured to behave like `Buffer.toString`: invalid bytes become replacement characters and a UTF-8 BOM is kept. Lines inside the selected range are assembled from pieces, but a line already past 50KB stops collecting text and only its size is tracked, so a 1 GB first line still produces the usual oversized-line notice without being held in memory.
+
+Storing stops once the stored lines pass either cap, plus one more line. That extra line matters because `truncateHead` ignores a trailing empty line: if storing stopped on an empty line, the stored text would end in a newline and `truncateHead` could report "not truncated" for text that is.
+
+```ts ! read.ts
+	const appendToLine = (text: string, start: number, end: number) => {
+		lineHasText = true;
+		if (!pieces) return;
+		const piece = text.slice(start, end);
+		// A line over the byte cap is never shown, and a first line over it is only measured: never store
+		// all of a 1 GB line.
+		if (lineBytes <= DEFAULT_MAX_BYTES) pieces.push(piece);
+		lineBytes += Buffer.byteLength(piece, "utf-8");
+	};
+	const finishLine = () => {
+		if (pieces) {
+			if (selectedLines === 0) firstLineBytes = lineBytes;
+			// Storing continues one line past the caps: truncateHead ignores a trailing empty line, so the
+			// line after the cap must be there for it to decide truncation as for the full text.
+			if (storedLines.length > DEFAULT_MAX_LINES || storedBytes > DEFAULT_MAX_BYTES) storedPastCaps = true;
+			const text = pieces.join("");
+			storedBytes += Buffer.byteLength(text, "utf-8") + (storedLines.length > 0 ? 1 : 0);
+			storedLines.push(text);
+		}
+		selectedLines++;
+		lastLineEmpty = !lineHasText;
+		pieces = storedPastCaps ? undefined : [];
+		lineBytes = 0;
+		lineHasText = false;
+	};
+```
+
+## !!steps Counting the rest and patching the totals
+
+The loop checks the abort signal between chunks, and leaving the loop closes the stream, so an aborted read actually stops reading instead of finishing in the background. Lines outside the range are only counted. `truncateHead` then runs on the stored lines, and its `totalLines` and `totalBytes`, which only saw the stored part, are replaced with the counts for the whole selected range, computed the way `truncateHead` would have counted the full text.
+
+```ts ! read.ts
+	for await (const chunk of chunks) {
+		// Leaving the loop closes the stream.
+		if (signal?.aborted) throw new Error("Operation aborted");
+		select(decoder.decode(chunk, { stream: true }));
+	}
+	select(decoder.decode());
+	if (line >= startLine && line < endLine) finishLine();
+	const truncation: TruncationResult = {
+		...truncateHead(storedLines.join("\n")),
+		// truncateHead's counts for the joined selected lines, which drop a trailing empty line.
+		totalLines: selectedBytes === 0 ? 0 : selectedLines - (lastLineEmpty ? 1 : 0),
+		totalBytes: selectedBytes,
+	};
+	return { totalFileLines: line + 1, truncation, firstLineBytes };
+}
+```
+
+## !!steps The text branch: offset and limit
+
+`offset` converts to a zero-based start line, and the tool picks the streaming path when the backend can stream and the range allows it. An offset past the end is an error with the real line count so the model can correct itself. The user's `limit` is honored before truncation, and `userLimitedLines` records how many lines it allowed.
+
+```ts ! read.ts
+								// Read text content. Convert offset from 1-indexed input to 0-indexed line access.
 								const startLine = offset ? Math.max(0, offset - 1) : 0;
 								const startLineDisplay = startLine + 1;
+								const { totalFileLines, truncation, firstLineBytes } =
+									ops.createReadStream && isStreamableRange(offset, limit)
+										? await selectLinesFromStream(
+												ops.createReadStream(absolutePath, { signal }),
+												startLine,
+												limit,
+												signal,
+											)
+										: selectLinesFromBuffer(await ops.readFile(absolutePath), startLine, limit);
+								if (aborted) return;
 								// Check if offset is out of bounds.
-								if (startLine >= allLines.length) {
-									throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
+								if (startLine >= totalFileLines) {
+									throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 								}
-								let selectedContent: string;
-								let userLimitedLines: number | undefined;
-								// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
-								if (limit !== undefined) {
-									const endLine = Math.min(startLine + limit, allLines.length);
-									selectedContent = allLines.slice(startLine, endLine).join("\n");
-									userLimitedLines = endLine - startLine;
-								} else {
-									selectedContent = allLines.slice(startLine).join("\n");
-								}
+								// A user-specified limit is honored before truncation.
+								const userLimitedLines =
+									limit === undefined ? undefined : Math.min(startLine + limit, totalFileLines) - startLine;
 ```
 
 ## !!steps Truncation notices that tell the model what to do next
 
-After `truncateHead`, there are four outcomes, each with a different message. An oversized first line gives a `sed ... | head -c` fallback. A line-limit or byte-limit truncation gives a `Showing lines X-Y of N` notice with the next `offset`, and the byte version names the limit. If only the caller's `limit` stopped output early, a simpler `N more lines` notice is used. Otherwise the text is returned as is.
+There are four outcomes, each with a different message. An oversized first line gives a `sed ... | head -c` fallback, sized from `firstLineBytes`. A line-limit or byte-limit truncation gives a `Showing lines X-Y of N` notice with the next `offset`, and the byte version names the limit. If only the caller's `limit` stopped output early, a simpler `N more lines` notice is used. Otherwise the text is returned as is. Both selection paths produce identical text, notices and details.
 
 The truncation details are stored in `details` for the first two cases so renderers can show them.
 
 ```ts ! read.ts
-								const truncation = truncateHead(selectedContent);
 								let outputText: string;
 								if (truncation.firstLineExceedsLimit) {
 									// First line alone exceeds the byte limit. Point the model at a bash fallback.
-									const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
+									const firstLineSize = formatSize(firstLineBytes);
 									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
 									details = { truncation };
 								} else if (truncation.truncated) {
@@ -190,9 +302,9 @@ The truncation details are stored in `details` for the first two cases so render
 										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
 									}
 									details = { truncation };
-								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
+								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalFileLines) {
 									// User-specified limit stopped early, but the file still has more content.
-									const remaining = allLines.length - (startLine + userLimitedLines);
+									const remaining = totalFileLines - (startLine + userLimitedLines);
 									const nextOffset = startLine + userLimitedLines + 1;
 									outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
 								} else {
@@ -205,7 +317,7 @@ The truncation details are stored in `details` for the first two cases so render
 
 On success the listener is removed before resolving; on error it is removed in the catch block and the rejection is skipped if the abort already rejected. The outer `then` attaches `structuredContent` to every successful result.
 
-The final wrapper function turns the definition into an `AgentTool` via [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts).
+The final wrapper function turns the definition into a `TypeBoxAgentTool` via [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts).
 
 ```ts ! read.ts
 								content = [{ type: "text", text: outputText }];
@@ -222,7 +334,7 @@ The final wrapper function turns the definition into an `AgentTool` via [tool-de
 				},
 			).then((result) => ({ ...result, structuredContent: toReadOutput(result.content) }));
 // ...
-export function createReadTool(cwd: string, options?: ReadToolOptions): AgentTool<typeof readSchema> {
+export function createReadTool(cwd: string, options?: ReadToolOptions): TypeBoxAgentTool<typeof readSchema> {
 	return wrapToolDefinition(createReadToolDefinition(cwd, options));
 }
 ```
@@ -231,4 +343,4 @@ export function createReadTool(cwd: string, options?: ReadToolOptions): AgentToo
 
 The tool is exported from [index.ts](/docs/src/core/tools/index.ts) and drawn by [read.ts](/docs/src/core/tools/renderers/read.ts) in the renderers directory. Its counterparts for changing files are [edit.ts](/docs/src/core/tools/edit.ts) and [write.ts](/docs/src/core/tools/write.ts).
 
-Two small inconsistencies are worth knowing. A file that ends in a newline splits into a trailing empty element, so the "lines total" figure and the `Offset is beyond end of file` check count one more line than `truncateHead` does. And the bash fallback hint inserts `path` into the shell command without quoting it.
+Two small inconsistencies are worth knowing. A file that ends in a newline splits into a trailing empty element, so the "lines total" figure and the `Offset is beyond end of file` check count one more line than `truncateHead` does; the streaming path deliberately reproduces this. And the bash fallback hint inserts `path` into the shell command without quoting it.

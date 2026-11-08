@@ -1,0 +1,49 @@
+---
+title: "web-url.ts"
+description: "Validates and normalizes http and https URLs from sign-in flows, and makes any other URL string safe to print in a terminal"
+source: "src/utils/web-url.ts"
+full: true
+---
+
+Sign-in flows hand pi URLs it did not choose: an OAuth provider's authorization page, a device-code verification address, help links. pi both opens them and prints them, and each is a risk if the string is hostile. [open-browser.ts](/docs/src/utils/open-browser.ts) passes its target to the platform launcher, which also opens files and custom protocol handlers, and a printed string can carry terminal escape sequences.
+
+These two helpers used to be private to the `/login` dialog in [login-dialog.ts](/docs/src/modes/interactive/components/login-dialog.ts). They moved here when `pi auth login` ([auth-login.ts](/docs/src/cli/auth-login.ts)) added the same flows to the shell, so both use one rule: open only what `webUrl` accepts, and print everything through `displayUrl`.
+
+<Scrollycoding>
+
+## !!steps Only web URLs are opened
+
+`webUrl` returns the URL normalized if it parses and uses `http:` or `https:`, and `undefined` otherwise, so a `file:` path or a custom scheme from a provider is never handed to the launcher. `URL.canParse` avoids a try and catch around the constructor.
+
+Returning `url.href` rather than the input matters for printing too: the WHATWG parser percent-encodes control characters, which inside an OSC 8 terminal hyperlink would otherwise end the link early.
+
+```ts ! web-url.ts
+/**
+ * The `http:` or `https:` URL `value` names, normalized, or undefined. The shared launcher also opens files and custom
+ * protocols, so login only opens web URLs. Normalizing percent-encodes control characters, which would otherwise end a
+ * terminal hyperlink early.
+ */
+export function webUrl(value: string): string | undefined {
+	if (!URL.canParse(value)) return undefined;
+	const url = new URL(value);
+	// !mark
+	return url.protocol === "https:" || url.protocol === "http:" ? url.href : undefined;
+}
+```
+
+## !!steps Everything is printable
+
+A URL that is not a web URL is still shown, because the user may need to copy it by hand. `displayUrl` prints the normalized web URL when there is one, and otherwise the raw string with every run of control characters (ESC, BEL, newlines, C1 codes) replaced by a space through pi-tui's `replaceControlCharacters`. Either way the result cannot inject its own escape sequences.
+
+```ts ! web-url.ts
+import { replaceControlCharacters } from "@earendil-works/pi-tui";
+// ...
+export function displayUrl(value: string): string {
+	// !mark
+	return webUrl(value) ?? replaceControlCharacters(value);
+}
+```
+
+</Scrollycoding>
+
+The callers combine the two in the same way: print `displayUrl(url)`, and call the launcher only when `webUrl(url)` returns a value. In the TUI dialog, `webUrl` also decides whether text becomes a clickable hyperlink.

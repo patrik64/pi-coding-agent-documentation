@@ -13,7 +13,7 @@ Tools can supply their own `renderCall` and `renderResult` (types in [types.ts](
 
 ## !!steps State the component carries
 
-Tool identity, current args, the latest result, and flags for each lifecycle phase: args complete, execution started, partial or final. Image bookkeeping keeps the source data so unchanged images can be reused.
+Tool identity, current args, the latest result, and flags for each lifecycle phase: args complete, execution started, partial or final. `argsPending` marks streamed arguments that have not been drawn yet. The result can carry `durationMs`, the measured execution time of the tool. `outputPad` is the horizontal padding from the `outputPad` setting, which now applies to tool blocks like every other transcript block. Image bookkeeping keeps the source data so unchanged images can be reused.
 
 ```ts ! tool-execution.ts
 const FALLBACK_PREVIEW_LINES = 10;
@@ -21,6 +21,7 @@ const FALLBACK_PREVIEW_LINES = 10;
 export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
+	outputPad?: number;
 }
 
 export class ToolExecutionComponent extends Container {
@@ -42,18 +43,22 @@ export class ToolExecutionComponent extends Container {
 	private expanded = false;
 	private showImages: boolean;
 	private imageWidthCells: number;
+	private outputPad: number;
 	// !mark
 	private isPartial = true;
 	private toolDefinition?: ToolRenderers;
 	private ui: TUI;
 	private cwd: string;
-	// !mark(1:2)
+	// !mark(1:4)
 	private executionStarted = false;
 	private argsComplete = false;
+	/** `updateArgs()` ran since the last display update; the next render applies it. */
+	private argsPending = false;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
 		details?: any;
+		durationMs?: number;
 	};
 ```
 
@@ -88,6 +93,8 @@ All shell variants are built up front. A tool with a definition gets either the 
 
 Renderers receive a context with args, lifecycle flags, expanded state and a persistent `state` object. `invalidate` there also requests a TUI repaint, so a renderer can trigger a redraw on its own. `lastComponent` lets a renderer reuse its previous component.
 
+The context also carries `durationMs`, only once the result is final, and `outputPad`, which matters for `self` shell renderers that draw their own framing. `keyText` and `keyHint` are the host's own keybinding helpers. An extension that imported them from its own copy of the package would get a keybinding manager the host never configured, and hints such as the expand key would render without the key.
+
 ```ts ! tool-execution.ts
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
 		return {
@@ -109,6 +116,10 @@ Renderers receive a context with args, lifecycle flags, expanded state and a per
 			expanded: this.expanded,
 			showImages: this.showImages,
 			isError: this.result?.isError ?? false,
+			durationMs: this.isPartial ? undefined : this.result?.durationMs,
+			outputPad: this.outputPad,
+			keyText,
+			keyHint,
 		};
 	}
 ```
@@ -168,10 +179,17 @@ Every rendered part is wrapped in a `MouseRegion`. A left click flips `expanded`
 
 Each setter stores a value and calls `updateDisplay`. Some also request a render. `setImageWidthCells` clamps to an integer of at least one.
 
+`updateArgs` is the exception. A model can stream hundreds of argument deltas between two frames, and running the tool renderer for each one was a measurable cost. It now only stores the args, sets `argsPending` and asks for a render; the display is rebuilt once per frame.
+
 ```ts ! tool-execution.ts
+	/**
+	 * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
+	 * frames runs its renderer once per frame, not once per delta (#9265).
+	 */
 	updateArgs(args: any): void {
 		this.args = args;
-		this.updateDisplay();
+		this.argsPending = true;
+		this.ui.requestRender();
 	}
 
 	// !mark(1:5)
@@ -193,6 +211,8 @@ Each setter stores a value and calls `updateDisplay`. Some also request a render
 			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 			details?: any;
 			isError: boolean;
+			/** Execution time of a final result. */
+			durationMs?: number;
 		},
 		isPartial = false,
 	): void {
@@ -201,8 +221,8 @@ Each setter stores a value and calls `updateDisplay`. Some also request a render
 		this.updateDisplay();
 	}
 
-	setExpanded(expanded: boolean): void {
-		this.expanded = expanded;
+	setOutputPad(outputPad: number): void {
+		this.outputPad = outputPad;
 		this.updateDisplay();
 	}
 
@@ -220,10 +240,11 @@ Each setter stores a value and calls `updateDisplay`. Some also request a render
 
 ## !!steps Rendering the self shell
 
-In the `self` shell the component renders its container itself, adding one blank line above and then images. `handleMouse` shifts the y coordinate by one to account for that blank line and ignores clicks outside the content.
+`render` first applies pending arguments, which is where the deferred `updateArgs` work happens. In the `self` shell the component renders its container itself, adding one blank line above and then images. `handleMouse` shifts the y coordinate by one to account for that blank line and ignores clicks outside the content.
 
 ```ts ! tool-execution.ts
 	override render(width: number): string[] {
+		if (this.argsPending) this.updateDisplay();
 		if (this.hideComponent) {
 			return [];
 		}
@@ -272,10 +293,11 @@ In the `self` shell the component renders its container itself, adding one blank
 
 ## !!steps Choosing the background
 
-A pending call uses the pending color, an error uses the error color, anything else uses success. The color function is applied to the active container.
+`updateDisplay` clears `argsPending`, since every rebuild uses the current args. A pending call uses the pending color, an error uses the error color, anything else uses success. The color function and the current horizontal padding are applied to the active container.
 
 ```ts ! tool-execution.ts
 	private updateDisplay(): void {
+		this.argsPending = false;
 		// !mark(1:5)
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
@@ -289,6 +311,7 @@ A pending call uses the pending color, an error uses the error color, anything e
 			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
 			if (renderContainer instanceof Box) {
 				renderContainer.setBgFn(bgFn);
+				renderContainer.setPaddingX(this.outputPad);
 			}
 			renderContainer.clear();
 ```

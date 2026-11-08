@@ -166,7 +166,9 @@ from [model-resolver.ts](/docs/src/core/model-resolver.ts), and
 It also exports the package manager and resource loader types
 (`DefaultPackageManager`, `DefaultResourceLoader`, `loadProjectContextFiles`),
 which let an SDK user build their own loader and hand it to
-`createAgentSession`.
+`createAgentSession`. `PackageInstallFailure` describes a configured package
+that could not be installed while resolving, which the resolver now reports
+instead of failing.
 
 ```ts ! index.ts
 export { ModelRegistry } from "./core/model-registry.ts";
@@ -270,7 +272,9 @@ The tools block exports, per tool, an operations interface (for example
 The `*Operations` interfaces are the pluggable seam: an SDK user can supply
 remote file or shell operations (for SSH or a container) while keeping the
 built-in tool logic. Everything originates in
-[tools/index.ts](/docs/src/core/tools/index.ts).
+[tools/index.ts](/docs/src/core/tools/index.ts), except `formatReadLineRange`
+from [render-utils.ts](/docs/src/core/tools/render-utils.ts), exported so
+custom renderers can label a read range the same way the built-in one does.
 
 ```ts ! index.ts
 // Tools

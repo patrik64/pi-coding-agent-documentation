@@ -259,6 +259,6 @@ function indexedColors(saturation: number, appearance: ThemeAppearance | undefin
 
 </Scrollycoding>
 
-The output (`SystemThemeColors`) is plain data: hex strings, ANSI indices or empty strings, plus the detected appearance, so [theme.ts](/docs/src/modes/interactive/theme/theme.ts) can treat it like any theme. The `thinkingMax` and other thinking families here must stay in step with the `thinking*` tokens in [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts).
+The output (`SystemThemeColors`) is plain data: hex strings, ANSI indices or empty strings, plus the detected appearance, so [theme.ts](/docs/src/modes/interactive/theme/theme.ts) can treat it like any theme. The token list itself is defined in [theme-tokens.ts](/docs/src/modes/interactive/theme/theme-tokens.ts). Because `TOKEN_FAMILIES` is typed `Record<ThemeToken, FamilyName>`, a token added there does not compile until it gets a family here.
 
 One structural note: `generateSystemThemeColors` is a single 120-line function with several closures (`paint`, `target`, `limitPanel`, `solve`) sharing local state. That keeps the data tables at the top clean, but makes the solver hard to unit test in pieces; the exported surface is only the generator, the WCAG helpers and `terminalAppearance`.

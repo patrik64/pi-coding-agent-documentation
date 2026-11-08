@@ -7,7 +7,9 @@ full: true
 
 This is the half of the MCP integration that actually talks to servers. [index.ts](/docs/src/extensions/mcp/index.ts) holds the extension wiring, commands and UI, and loads this file through [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts) only when at least one server is configured, because importing it drags in the whole MCP client.
 
-The centre is `McpServerConnection`, a class wrapping one entry from [config.ts](/docs/src/extensions/mcp/config.ts). It owns a state (`connecting`, `connected`, `disconnected`, `needs-auth`, `failed`, `closed`), the tools and resources discovered at connect time, and the policy for what happens when a request fails.
+The centre is `McpServerConnection`, a class wrapping one entry from [config.ts](/docs/src/extensions/mcp/config.ts). It owns a state (`connecting`, `connected`, `disconnected`, `needs-auth`, `failed`, `closed`), the tools discovered at connect time, whether the server offers resources, and the policy for what happens when a request fails.
+
+OAuth comes from [oauth.ts](/docs/src/extensions/mcp/oauth.ts), which wraps the `@earendil-works/pi-mcp/oauth` package; types such as `McpAuthProvider` and `McpOAuthSettings` are now imported from that package directly. This file re-exports the credential store, the sign-in function and `McpSignInCancelledError`, so [index.ts](/docs/src/extensions/mcp/index.ts) and [cli.ts](/docs/src/extensions/mcp/cli.ts) get the whole OAuth stack through the same lazy import.
 
 <Scrollycoding>
 
@@ -84,11 +86,11 @@ Header and env values go through `resolveHeadersOrThrow` and `resolveConfigValue
 	});
 ```
 
-## !!steps Resources are optional and never block connecting
+## !!steps Resources are listed on demand
 
 Not every server implements `resources/templates/list`, so `withoutTemplates` converts a JSON-RPC "method not found" into an empty result and rethrows anything else.
 
-`fetchResources` runs both lists in parallel and swallows failures with `catch(() => [])`. A server whose resource lists break still connects; the resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) list and read on demand. MCP App resources are filtered out of the counts, since they are handled elsewhere.
+The connection no longer lists resources when it connects. Doing so held back a server's tools until both lists finished, and a server with a large resource catalog (a whole drive, say) could keep its tools out of the first prompt. The lists only fed counts in `/mcp` and `pi mcp list`, which now just say that a server offers resources. The resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) call the paging and listing methods below when the model asks; they go through `withClient` as read-only requests, so they get the transient-error retry.
 
 ```ts ! runtime.ts
 async function withoutTemplates<T>(list: () => Promise<T>, empty: T): Promise<T> {
@@ -100,16 +102,19 @@ async function withoutTemplates<T>(list: () => Promise<T>, empty: T): Promise<T>
 		throw error;
 	}
 }
-
 // ...
-async function fetchResources(
-	client: McpClient,
-): Promise<{ resources: Resource[]; resourceTemplates: ResourceTemplate[] }> {
-	const [resources, resourceTemplates] = await Promise.all([
-		// !mark(1:2)
-		client.listResources().catch(() => []),
-		listTemplates(client).catch(() => []),
-	]);
+	resourcesPage(cursor: string | undefined, options: McpRequestOptions): Promise<ListResourcesResult> {
+		return this.withClient((client) => client.listResourcesPage(cursor, options), true);
+	}
+
+	resourceTemplatesPage(cursor: string | undefined, options: McpRequestOptions): Promise<ListResourceTemplatesResult> {
+		return this.withClient(
+			(client) =>
+				// !mark
+				withoutTemplates(() => client.listResourceTemplatesPage(cursor, options), { resourceTemplates: [] }),
+			true,
+		);
+	}
 ```
 
 ## !!steps Choosing an auth provider in the constructor
@@ -222,7 +227,7 @@ The sleep takes the `shutdown` signal, so `close()` cuts the wait short, and the
 
 `connectOnce` creates a client that advertises the project directory as an MCP root, forwards the server's log notifications to the [log.ts](/docs/src/extensions/mcp/log.ts) sink, and registers an abort listener so a shutdown during connecting closes the client. The close is memoized, because a second `client.close()` can return before the first finished closing the transport.
 
-After `connect`, it subscribes to `list_changed` notifications and to close events, then fetches tools and resources in parallel, skipping the tools request for servers that do not advertise the capability. Two checks guard the commit: a shutdown, or a connection that dropped during setup, throws before any field is assigned.
+After `connect`, it subscribes to the tools `list_changed` notification and to close events, then fetches the tools, skipping the request for servers that do not advertise the capability. Resources are only noted from the server's capabilities. Two checks guard the commit: a shutdown, or a connection that dropped during setup, throws before any field is assigned.
 
 ```ts ! runtime.ts
 		let closing: Promise<void> | undefined;
@@ -236,21 +241,22 @@ After `connect`, it subscribes to `list_changed` notifications and to close even
 			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
 			await client.connect(transport);
 			// ...
-			const [tools, resources] = await Promise.all([
-				client.serverCapabilities?.tools ? client.listTools() : [],
-				hasResources ? fetchResources(client) : { resources: [], resourceTemplates: [] },
-			]);
+			// Servers without the tools capability (prompts or resources only) do not answer tools/list.
+			const tools = client.serverCapabilities?.tools ? await client.listTools() : [];
 			// !mark(1:2)
 			if (this.closed) throw new Error("shut down while connecting");
 			if (client.connectionState !== "connected") throw new Error("connection closed during setup");
 			this.client = client;
+			this.tools = tools;
+			// !mark
+			this.hasResources = client.serverCapabilities?.resources !== undefined;
 ```
 
 ## !!steps Failure reporting keeps the stderr tail
 
 `connectFailed` turns an error into a user-facing one and updates state. A sign-in error moves to `needs-auth` with the friendly message and no error text. Anything else becomes `failed`, or `closed` if shutdown caused it.
 
-For stdio servers the last 2000 characters of stderr, captured in the catch of `connectOnce`, are appended to the error, which is usually what explains a bad command or missing dependency. `handleClientClose` does a similar thing for a dropped connection, but ignores the event if the client was already replaced or the connection closed on purpose.
+For stdio servers the last 2000 characters of stderr, captured in the catch of `connectOnce` with `sliceTail` so the cut never splits a surrogate pair, are appended to the error, which is usually what explains a bad command or missing dependency. `handleClientClose` does a similar thing for a dropped connection, but ignores the event if the client was already replaced or the connection closed on purpose.
 
 ```ts ! runtime.ts
 	private connectFailed(error: unknown): Error {
@@ -273,7 +279,7 @@ For stdio servers the last 2000 characters of stderr, captured in the catch of `
 
 ## !!steps Live refresh and careful shutdown
 
-When the server sends `list_changed`, `refreshTools` and `refreshResources` re-fetch and call `onTools` so the agent's tool set is rebuilt. Both check that the client is still the current one, so a late response from a replaced client cannot overwrite newer data.
+When the server sends the tools `list_changed` notification, `refreshTools` re-fetches and calls `onTools` so the agent's tool set is rebuilt. It checks that the client is still the current one, so a late response from a replaced client cannot overwrite newer data. Resource list changes need no handling any more, since nothing is cached.
 
 `close` aborts the shutdown controller, marks the state, and waits for both the live client and any connect in flight. Then it awaits `authProvider.settled()`. The comment explains why: a refresh the server already answered may have rotated the refresh token, and exiting before it is saved would lose the grant.
 

@@ -67,6 +67,8 @@ function saveProjectTrustPromptResult(trustStore: ProjectTrustStore, result: Pro
 
 An explicit override wins over everything. Next, a folder with nothing that needs trust (no project settings, extensions or packages) is trusted without asking. That check is what keeps ordinary directories from ever prompting.
 
+A stored decision still applies to such a folder. If the user once chose "Do not trust", the store answers `false` and that wins over the automatic yes; only when nothing is stored does it fall back to `true`. Before this, a folder without trust-requiring resources reported itself trusted to extensions even after the user had declined it.
+
 ```ts ! project-trust.ts
 export async function resolveProjectTrusted(options: ResolveProjectTrustedOptions): Promise<boolean> {
 // !mark(1:2)
@@ -75,7 +77,7 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
 	}
 // !mark(1:2)
 	if (!hasTrustRequiringProjectResources(options.cwd)) {
-		return true;
+		return options.trustStore.get(options.cwd) ?? true;
 	}
 ```
 
@@ -109,7 +111,7 @@ If a handler returns a result, it decides. Only the string `yes` means trusted, 
 
 ## !!steps Stored decision, default policy, then prompt
 
-A stored decision, trusted or not, ends the chain. Otherwise `defaultProjectTrust` applies: always and never decide immediately, and ask falls through.
+A stored decision, trusted or not, ends the chain. Otherwise `defaultProjectTrust` applies, falling back to the shipped default from [settings-defaults.ts](/docs/src/core/settings-defaults.ts), which is `ask`: always and never decide immediately, and ask falls through.
 
 Without a UI (print or RPC modes), ask means no. With a UI, the user chooses, the result is saved, and cancelling yields false. Every unresolved path fails closed.
 
@@ -121,7 +123,7 @@ Without a UI (print or RPC modes), ask means no. With a UI, the user chooses, th
 	}
 
 // !mark(1:8)
-	switch (options.defaultProjectTrust ?? "ask") {
+	switch (options.defaultProjectTrust ?? SETTINGS_DEFAULTS.defaultProjectTrust) {
 		case "always":
 			return true;
 		case "never":

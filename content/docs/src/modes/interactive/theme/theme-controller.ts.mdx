@@ -7,7 +7,7 @@ full: true
 
 Choosing a theme used to be a one-time lookup. With the `system` theme and light/dark pairs it became a live relationship: the theme depends on the setting, on the terminal's colors, and on whether the terminal switches between light and dark while pi is running. `InteractiveThemeController` owns that relationship for one TUI.
 
-It is a thin coordinator over the global theme state in [theme.ts](/docs/src/modes/interactive/theme/theme.ts). The system theme itself is generated in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) from whatever colors this controller feeds in. Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts), and the controller is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and also by experimental TUIs such as [client-tui.ts](/docs/src/experimental/client-tui.ts).
+It is a thin coordinator over the global theme state in [theme.ts](/docs/src/modes/interactive/theme/theme.ts). The system theme itself is generated in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) from whatever colors this controller feeds in. Settings come from [settings-manager.ts](/docs/src/core/settings-manager.ts), and the controller is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
 
 <Scrollycoding>
 

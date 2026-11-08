@@ -7,22 +7,31 @@ full: true
 
 Extensions can register Markdown transformers that rewrite message text before it is rendered. This tiny file turns a list of them into a single function the Markdown components can call with the current width.
 
-The contract types (`MarkdownTransformer`, `MarkdownTransformContext`) live in [types.ts](/docs/src/core/extensions/types.ts). The built-in consumer is [mermaid.ts](/docs/src/modes/interactive/components/mermaid.ts).
+The contract types (`MarkdownTransformer`, `MarkdownTransformContext`) live in [types.ts](/docs/src/core/extensions/types.ts). Each transformer chooses the surfaces it runs on: user, assistant and thinking text by default, and optionally `custom` (custom messages and skill blocks), `summary` (branch and compaction summaries) and `changelog` (the What's New and update notices). That filtering happens in [runner.ts](/docs/src/core/extensions/runner.ts), which wraps each transformer so unlisted types pass through, so this file only ever sees a plain list. The built-in consumer is [mermaid.ts](/docs/src/modes/interactive/components/mermaid.ts).
 
 <Scrollycoding>
 
 ## !!steps Binding the message context
 
-`createMarkdownTransform` captures what is known when a message is created (its type and whether it is streaming) and returns a function that only needs the markdown and the available width, which are known at render time.
+`createMarkdownTransform` captures what is known when a message is created and returns a function that only needs the markdown and the available width, which are known at render time. The message type is fixed. `messageId` and `timestamp` identify the persisted session entry, so they are set only when a message is rendered from the session file; live messages leave them undefined.
+
+`isStreaming` is a callback rather than a value. Assistant messages reuse their Markdown components while a response streams, so a value captured at creation would still say "streaming" after the stream ends. Reading it on every transform lets a transformer that waits for complete text (as the Mermaid one does) run on the final render.
 
 ```ts ! markdown-transform.ts
+/** Applies extension Markdown transformers. `isStreaming` is read per transform, so a reused component sees a stream end. */
 export function createMarkdownTransform(
 	messageType: MarkdownTransformContext["messageType"],
-	isStreaming: boolean,
+	isStreaming: () => boolean,
 	transformers: readonly MarkdownTransformer[],
+	messageId?: string,
+	timestamp?: string,
 ): (markdown: string, availableWidth: number) => string {
 	return (markdown, availableWidth) =>
-		applyMarkdownTransformers(markdown, { messageType, isStreaming, availableWidth }, transformers);
+		applyMarkdownTransformers(
+			markdown,
+			{ messageType, isStreaming: isStreaming(), availableWidth, messageId, timestamp },
+			transformers,
+		);
 }
 ```
 
@@ -53,4 +62,4 @@ function applyMarkdownTransformers(
 
 </Scrollycoding>
 
-Because errors are silently swallowed there is no diagnostic for a failing transformer. See [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts) and [user-message.ts](/docs/src/modes/interactive/components/user-message.ts) for components that render Markdown.
+Because errors are silently swallowed there is no diagnostic for a failing transformer. See [assistant-message.ts](/docs/src/modes/interactive/components/assistant-message.ts) and [user-message.ts](/docs/src/modes/interactive/components/user-message.ts) for transcript messages, and [custom-message.ts](/docs/src/modes/interactive/components/custom-message.ts), [skill-invocation-message.ts](/docs/src/modes/interactive/components/skill-invocation-message.ts), [branch-summary-message.ts](/docs/src/modes/interactive/components/branch-summary-message.ts) and [compaction-summary-message.ts](/docs/src/modes/interactive/components/compaction-summary-message.ts) for the newer surfaces.

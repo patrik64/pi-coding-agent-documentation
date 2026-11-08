@@ -92,7 +92,7 @@ interface SessionData {
 
 ## !!steps Template assembly
 
-Five files are read from the export template directory, including vendored copies of marked and highlight.js, so the output works offline. Session data is base64-encoded to sidestep escaping problems inside a script tag. Placeholders are substituted with string `replace`, which matters: a replacement string containing `$` patterns would be interpreted specially, and each placeholder is replaced only once.
+Six files are read from the export template directory, including vendored copies of marked, its `marked-cjk-friendly` extension (for bold and italic next to CJK punctuation) and highlight.js, so the output works offline. Session data is base64-encoded to sidestep escaping problems inside a script tag. Placeholders are substituted with string `replace`, which matters: a replacement string containing `$` patterns would be interpreted specially, and each placeholder is replaced only once.
 
 ```ts ! index.ts
 	// Base64 encode session data to avoid escaping issues
@@ -110,6 +110,7 @@ Five files are read from the export template directory, including vendored copie
 		.replace("{{JS}}", templateJs)
 		.replace("{{SESSION_DATA}}", sessionDataBase64)
 		.replace("{{MARKED_JS}}", markedJs)
+		.replace("{{MARKED_CJK_FRIENDLY_JS}}", markedCjkFriendlyJs)
 		.replace("{{HIGHLIGHT_JS}}", hljsJs);
 ```
 

@@ -5,16 +5,19 @@ source: "src/modes/interactive/components/assistant-message.ts"
 full: true
 ---
 
-`AssistantMessageComponent` turns a model reply into terminal output. It is
-rebuilt in full whenever the message changes, which is how streaming works:
-the caller passes a new partial `AssistantMessage` to `updateContent` as tokens
-arrive and the container is cleared and refilled.
+`AssistantMessageComponent` turns a model reply into terminal output. Streaming
+works by calling `updateContent` again with each new partial `AssistantMessage`:
+the container is cleared and refilled in content order. The `Markdown`
+components themselves are kept between updates when the same kind of block sits
+at the same position, so a streamed answer does not re-parse and re-highlight
+the blocks it has already rendered.
 
 Tool calls are not drawn here; they are separate components such as
 [tool-execution.ts](/docs/src/modes/interactive/components/tool-execution.ts).
 Markdown is post-processed through [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts)
 using transformers from [extensions/types.ts](/docs/src/core/extensions/types.ts),
-and the component is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+and the component is created by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts),
+which also passes the message id and timestamp that transformers receive.
 
 <Scrollycoding>
 
@@ -22,13 +25,25 @@ and the component is created by [interactive-mode.ts](/docs/src/modes/interactiv
 
 The three OSC 133 constants are semantic prompt markers (zone start, end and
 final) that supporting terminals use to know where a block of output begins and
-ends. The fields hold display settings plus `lastMessage`, so the component can
-re-render itself, and a per-run map of user toggles for thinking blocks.
+ends. A `MarkdownSlot` records one `Markdown` block of the last update and
+whether it held text or thinking. The fields hold display settings,
+`lastMessage` so the component can re-render itself, the message id and
+timestamp for transformers, a per-run map of user toggles for thinking blocks,
+and the slots from the previous update.
 
 ```ts ! assistant-message.ts
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+/**
+ * A Markdown block of the last update. The next update reuses it at the same position for the same kind of content, so
+ * a streamed answer keeps the blocks it already rendered, also once the stream ends.
+ */
+interface MarkdownSlot {
+	kind: "text" | "thinking";
+	markdown: Markdown;
+}
 
 /**
  * Component that renders a complete assistant message
@@ -43,7 +58,10 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private isStreaming = false;
+	private messageId?: string;
+	private timestamp?: string;
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
+	private markdownSlots: MarkdownSlot[] = [];
 ```
 
 ## !!steps Re-rendering on every change
@@ -51,7 +69,9 @@ export class AssistantMessageComponent extends Container {
 Each setter stores its value and rebuilds from `lastMessage`. `invalidate` does
 the same, so a theme change re-renders content with new colors. Changing the
 global `hideThinkingBlock` clears the per-block overrides, so the global
-setting wins again.
+setting wins again. `setOutputPad` also throws away the kept `Markdown`
+blocks, because a `Markdown` takes its padding only at construction and a
+reused one would keep the old indent.
 
 ```ts ! assistant-message.ts
 	override invalidate(): void {
@@ -69,8 +89,11 @@ setting wins again.
 		}
 	}
 
-	setHiddenThinkingLabel(label: string): void {
-		this.hiddenThinkingLabel = label;
+// ...
+	setOutputPad(padding: number): void {
+		this.outputPad = padding;
+		// Markdown takes its padding at construction.
+		this.markdownSlots = [];
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -96,12 +119,15 @@ them would end the zone in the wrong place.
 	}
 ```
 
-## !!steps Text blocks in order
+## !!steps Reusing Markdown blocks
 
-`updateContent` clears the container and adds a leading spacer only if there is
-visible text or thinking. Then it walks the content array in order. Text
-blocks become `Markdown` components with zero vertical padding, trimmed, and
-with a transform keyed by role and streaming state.
+`updateContent` clears the container but keeps the previous slots. The
+`markdownBlock` helper is called for each Markdown block in order: if the slot
+at the same index held the same kind, its `Markdown` is reused and only gets
+the new text through `setText`; otherwise `create` builds a fresh one. During
+streaming the earlier blocks of an answer rarely change, so `Markdown` can keep
+its already rendered top-level blocks instead of parsing and highlighting the
+whole reply for every token.
 
 ```ts ! assistant-message.ts
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
@@ -110,15 +136,49 @@ with a transform keyed by role and streaming state.
 
 		// Clear content container
 		this.contentContainer.clear();
+		const previousSlots = this.markdownSlots;
+		this.markdownSlots = [];
+		const markdownBlock = (kind: MarkdownSlot["kind"], text: string, create: () => Markdown): Markdown => {
+			const slot = previousSlots[this.markdownSlots.length];
+			const markdown = slot?.kind === kind ? slot.markdown : create();
+			markdown.setText(text);
+			this.markdownSlots.push({ kind, markdown });
+			return markdown;
+		};
+```
 
-		const hasVisibleContent = message.content.some(
-			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
-		);
+## !!steps Lazy spacers
 
-		if (hasVisibleContent) {
-			this.contentContainer.addChild(new Spacer(1));
-		}
+Spacing follows what actually renders. Instead of checking ahead for visible
+content, `needsSpacer` starts true and `addVisibleChild` inserts one blank line
+right before the next visible block, then clears the flag. The result is a
+blank line before the first visible block and after each visible thinking run
+that is followed by more content, with nothing trailing before the separately
+rendered tool calls.
 
+```ts ! assistant-message.ts
+		// Spacers are added lazily, right before the next visible content block. This puts a blank
+		// line before the first visible block and after each visible thinking run that is followed
+		// by more visible content, while hidden thinking runs without a label contribute nothing.
+		let needsSpacer = true;
+		const addVisibleChild = (child: Component) => {
+			if (needsSpacer) {
+				this.contentContainer.addChild(new Spacer(1));
+				needsSpacer = false;
+			}
+			this.contentContainer.addChild(child);
+		};
+```
+
+## !!steps Text blocks in order
+
+The loop walks the content array in order. Text blocks become trimmed
+`Markdown` components with zero vertical padding. The transform is keyed by
+role and gets the message id and timestamp. Streaming state is passed as a
+getter, not a value: a reused `Markdown` keeps the transform it was built with,
+so the closure must read the current `isStreaming` when the stream ends.
+
+```ts ! assistant-message.ts
 		// Render content in order
 		let thinkingRunIndex = 0;
 		for (let i = 0; i < message.content.length; i++) {
@@ -126,10 +186,22 @@ with a transform keyed by role and streaming state.
 			if (content.type === "text" && content.text.trim()) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
-				this.contentContainer.addChild(
-					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
-						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
-					}),
+				const text = content.text.trim();
+				addVisibleChild(
+					markdownBlock(
+						"text",
+						text,
+						() =>
+							new Markdown(text, this.outputPad, 0, this.markdownTheme, undefined, {
+								transform: createMarkdownTransform(
+									"assistant",
+									() => this.isStreaming,
+									this.markdownTransformers,
+									this.messageId,
+									this.timestamp,
+								),
+							}),
+					),
 				);
 ```
 
@@ -137,8 +209,11 @@ with a transform keyed by role and streaming state.
 
 Adjacent thinking blocks are merged into a single run: the inner loop consumes
 them, and `i--` hands the first non-thinking block back to the outer loop. Empty
-thinking is dropped. A trailing spacer is added only when more visible content
-follows, avoiding a blank line before tool execution blocks.
+thinking is dropped. Each run gets an index, used for click overrides, and a
+hidden run whose label is blank is skipped entirely. It still uses up its index,
+so overrides on later runs stay attached to the right run. Before this check
+existed, an empty label (for example from `ctx.ui.setHiddenThinkingLabel("")`)
+still drew blank rows.
 
 ```ts ! assistant-message.ts
 			} else if (content.type === "thinking") {
@@ -159,43 +234,50 @@ follows, avoiding a blank line before tool execution blocks.
 					continue;
 				}
 
-				// Add spacing only when another visible assistant content block follows.
-				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
-				const hasVisibleContentAfter = message.content
-					.slice(i + 1)
-					.some((c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()));
-
+				const runIndex = thinkingRunIndex++;
+				const hidden = this.thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock;
+				// A hidden run with an empty label renders nothing, including no spacing.
+				if (hidden && !this.hiddenThinkingLabel.trim()) {
+					continue;
+				}
 ```
 
 ## !!steps Click to toggle thinking
 
-Each run is either a dimmed italic label or full markdown in the thinking color.
-Which one wins is the per-run override, falling back to the global flag. A
-`MouseRegion` wraps it so a left click flips only that run and re-renders.
+A run is either a dimmed italic label or full markdown in the thinking color,
+the latter going through the same slot reuse as text. A `MouseRegion` wraps it
+so a left click flips only that run and re-renders. Afterwards `needsSpacer` is
+set, so a blank line appears only if another visible block follows.
 
 ```ts ! assistant-message.ts
-				const runIndex = thinkingRunIndex++;
-				const hidden = this.thinkingVisibilityOverrides.get(runIndex) ?? this.hideThinkingBlock;
+				const thinking = thinkingBlocks.join("\n\n");
 				const thinkingComponent = hidden
 					? new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0)
-					: new Markdown(
-							thinkingBlocks.join("\n\n"),
-							this.outputPad,
-							0,
-							this.markdownTheme,
-							{
-								color: (text: string) => theme.fg("thinkingText", text),
-								italic: true,
-							},
-							{
-								transform: createMarkdownTransform(
-									"assistant-thinking",
-									this.isStreaming,
-									this.markdownTransformers,
+					: markdownBlock(
+							"thinking",
+							thinking,
+							() =>
+								new Markdown(
+									thinking,
+									this.outputPad,
+									0,
+									this.markdownTheme,
+									{
+										color: (text: string) => theme.fg("thinkingText", text),
+										italic: true,
+									},
+									{
+										transform: createMarkdownTransform(
+											"assistant-thinking",
+											() => this.isStreaming,
+											this.markdownTransformers,
+											this.messageId,
+											this.timestamp,
+										),
+									},
 								),
-							},
 						);
-				this.contentContainer.addChild(
+				addVisibleChild(
 					new MouseRegion(thinkingComponent, (event) => {
 						if (event.type !== "click" || event.button !== "left") return undefined;
 						this.thinkingVisibilityOverrides.set(runIndex, !hidden);
@@ -203,9 +285,9 @@ Which one wins is the per-run override, falling back to the global flag. A
 						return { handled: true };
 					}),
 				);
-				if (hasVisibleContentAfter) {
-					this.contentContainer.addChild(new Spacer(1));
-				}
+				// Add spacing only when another visible assistant content block follows.
+				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
+				needsSpacer = true;
 			}
 ```
 
@@ -246,6 +328,7 @@ message is replaced by "Operation aborted".
 
 </Scrollycoding>
 
-The design is stateless in the sense that the message is the only source of
-truth: every setter funnels into `updateContent`, so there is no incremental
-patching to keep consistent. The cost is rebuilding the whole tree per token.
+The message is the only source of truth: every setter funnels into
+`updateContent`, so there is no incremental patching of the tree to keep
+consistent. The `Markdown` slots are a cache underneath that rule, not state of
+their own; dropping them, as `setOutputPad` does, only costs a re-parse.

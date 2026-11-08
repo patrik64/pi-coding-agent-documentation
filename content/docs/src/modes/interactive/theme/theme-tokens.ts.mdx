@@ -1,0 +1,126 @@
+---
+title: "theme-tokens.ts"
+description: "The one table of theme color tokens, giving each token's slot, description and optional fallback, from which the token types, the theme schema and the fallback logic are derived"
+source: "src/modes/interactive/theme/theme-tokens.ts"
+full: true
+---
+
+The list of theme tokens used to be written out in several places: two string unions in [theme.ts](/docs/src/modes/interactive/theme/theme.ts), a TypeBox object in the old runtime validator, the `required` and `properties` lists of a hand-written JSON Schema, and fallback code repeated in two functions. Adding a token meant touching all of them. This file replaces them with one table. Each of the 57 entries says whether the token is a foreground or background color, what it is used for, and, for the five newer optional tokens, which token it falls back to.
+
+Everything else is derived. [theme.ts](/docs/src/modes/interactive/theme/theme.ts) re-exports the token types and uses the table to split colors by slot and fill fallbacks. [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts) builds the `colors` object of the theme schema from it, so which tokens are required and the editor descriptions both come from here. [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) keys its family table by `ThemeToken`, so a new token does not compile until it gets a color family there. The file has no imports, so any module can depend on it cheaply.
+
+<Scrollycoding>
+
+## !!steps A descriptor per token
+
+A descriptor has a slot, a description and an optional fallback. `defineThemeTokens` returns its argument unchanged, but checks two rules when the module loads: a fallback must name an existing token, and it must be in the same slot. The slot rule matters because an empty value means "terminal default", which is the default foreground in one slot and the default background in the other, so a background token cannot borrow a foreground token's value.
+
+The `const` type parameter keeps the literal types of every entry, which the types in the later steps need in order to read each token's slot and fallback.
+
+```ts ! theme-tokens.ts
+export interface ThemeTokenDescriptor {
+	slot: "foreground" | "background";
+	description: string;
+	fallback?: string;
+}
+
+export type ThemeTokenDescriptors = Readonly<Record<string, ThemeTokenDescriptor>>;
+
+function defineThemeTokens<const T extends ThemeTokenDescriptors>(tokens: T): T {
+	for (const [name, descriptor] of Object.entries(tokens)) {
+		if (descriptor.fallback === undefined) continue;
+		const fallback = tokens[descriptor.fallback];
+		// !mark(1:3)
+		if (fallback === undefined) {
+			throw new Error(`Theme token ${name} has unknown fallback ${descriptor.fallback}`);
+		}
+		// !mark(1:3)
+		if (fallback.slot !== descriptor.slot) {
+			throw new Error(`Theme token ${name} has fallback ${descriptor.fallback} in a different color slot`);
+		}
+	}
+	return tokens;
+}
+```
+
+## !!steps The table
+
+The order of entries is the order in theme files and in the published schema, grouped by role: core UI, scrollbar, backgrounds and message text, tool boxes, markdown, diffs, syntax, thinking levels and bash mode. The descriptions are the hover text editors show for `theme.schema.json`.
+
+Five tokens have a fallback: the scrollbar track falls back to `muted`, the thumb to `text`, `searchMatchBg` to `selectedBg`, `searchMatchText` to `text`, and `thinkingMax` to `thinkingXhigh`. These were added after users already had theme files, and the fallback keeps those files valid.
+
+```ts ! theme-tokens.ts
+/** Theme token metadata in the same order used by theme files and the published JSON Schema. */
+export const THEME_TOKENS = defineThemeTokens({
+	accent: { slot: "foreground", description: "Primary accent color (logo, selected items, cursor)" },
+	border: { slot: "foreground", description: "Normal borders" },
+// ...
+	thinkingText: { slot: "foreground", description: "Thinking block text color" },
+	// !mark(1:5)
+	scrollbarTrack: {
+		slot: "foreground",
+		description: "Fullscreen scrollbar track foreground (falls back to muted when omitted)",
+		fallback: "muted",
+	},
+	scrollbarThumb: {
+		slot: "foreground",
+		description: "Fullscreen scrollbar thumb foreground (falls back to text when omitted)",
+		fallback: "text",
+	},
+	selectedBg: { slot: "background", description: "Selected item background" },
+	searchMatchBg: {
+		slot: "background",
+		description: "Transcript search match background and current-match text (falls back to selectedBg when omitted)",
+		fallback: "selectedBg",
+	},
+// ...
+	thinkingXhigh: { slot: "foreground", description: "Thinking level border: xhigh" },
+	// !mark(1:5)
+	thinkingMax: {
+		slot: "foreground",
+		description: "Thinking level border: max (falls back to thinkingXhigh when omitted)",
+		fallback: "thinkingXhigh",
+	},
+	bashMode: { slot: "foreground", description: "Editor border color in bash mode" },
+});
+```
+
+## !!steps Slots become types
+
+`ThemeToken` is every key of the table. `ThemeColor` maps each token to itself when its slot is `foreground` and to `never` otherwise, then indexes the mapped type to collapse it into a union. `ThemeBg` is everything left over.
+
+These replace the two hand-written unions that [theme.ts](/docs/src/modes/interactive/theme/theme.ts) used to declare. It re-exports them, so components still import the types from there, and `theme.fg` and `theme.bg` still accept only tokens of their own slot.
+
+```ts ! theme-tokens.ts
+export type ThemeToken = keyof typeof THEME_TOKENS;
+export type ThemeColor = {
+	[K in ThemeToken]: (typeof THEME_TOKENS)[K]["slot"] extends "foreground" ? K : never;
+}[ThemeToken];
+export type ThemeBg = Exclude<ThemeToken, ThemeColor>;
+```
+
+## !!steps Written colors and resolved colors
+
+A token with a fallback is optional in a theme file; every other token is required. `ThemeColorValues` is the shape of `colors` as a theme file writes it, and [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts) types its generated schema with it. `ResolvedThemeColorValues` is the shape after `withThemeTokenFallbacks` in theme.ts has filled every gap, with all 57 tokens present.
+
+Both are generic over the value type, so the schema can use them with its own color value type and theme.ts with the values left after variable references are resolved, which is what the `Theme` constructor takes.
+
+```ts ! theme-tokens.ts
+type OptionalToken = {
+	[K in ThemeToken]: (typeof THEME_TOKENS)[K] extends { fallback: string } ? K : never;
+}[ThemeToken];
+
+type RequiredToken = Exclude<ThemeToken, OptionalToken>;
+
+export type ThemeColorValues<Value> = {
+	[K in RequiredToken]: Value;
+} & {
+	[K in OptionalToken]?: Value;
+};
+
+export type ResolvedThemeColorValues<Value> = Record<ThemeToken, Value>;
+```
+
+</Scrollycoding>
+
+Adding a token now takes one entry here, values in [dark.json](/docs/src/modes/interactive/theme/dark.json) and [light.json](/docs/src/modes/interactive/theme/light.json) if it is required, and a family in system-theme.ts. The types, the runtime schema and the fallback code follow on their own. The committed `schemas/theme.schema.json` has to be regenerated with [generate-schemas.ts](/docs/scripts/generate-schemas.ts); a test fails while it is stale.

@@ -105,12 +105,22 @@ There is a ladder of layouts. If the overflow label does not fit, the full statu
 
 ## !!steps Input priority, part one
 
-`handleInput` is an ordered chain. Extension shortcuts win first, then the clipboard image paste key. Interrupt is next, but only fires its handler when autocomplete is closed; otherwise the key falls through to the base editor so Escape cancels the autocomplete popup. A dynamic `onEscape` beats the registered action.
+`handleInput` is an ordered chain. Extension shortcuts win first. Next, while the autocomplete menu is open, the selection page keys go straight to the base editor to page the menu; this runs before any app action so a user can bind page down to Ctrl+V even though that key pastes images by default. Then comes the clipboard image paste key. Interrupt is next, but only fires its handler when autocomplete is closed; otherwise the key falls through to the base editor so Escape cancels the autocomplete popup. A dynamic `onEscape` beats the registered action.
 
 ```ts ! custom-editor.ts
 	handleInput(data: string): void {
 		// Check extension-registered shortcuts first
 		if (this.onExtensionShortcut?.(data)) {
+			return;
+		}
+
+		// Selection page keys move an open autocomplete menu before app actions run.
+		// This lets users bind Ctrl+V even though it pastes images by default.
+		if (
+			this.isShowingAutocomplete() &&
+			(this.keybindings.matches(data, "tui.select.pageUp") || this.keybindings.matches(data, "tui.select.pageDown"))
+		) {
+			super.handleInput(data);
 			return;
 		}
 
@@ -157,4 +167,4 @@ Ctrl+D exits only when the editor is empty; with text it falls through so it can
 
 </Scrollycoding>
 
-The class sits between the TUI library editor and the application: the base class knows text editing, this one knows the agent's actions. Its priority order (extensions, paste, interrupt, exit, history, other actions) is the part most worth keeping in mind when adding a new keybinding. One quirk: if the interrupt key is pressed with no handler registered, the key is passed to the base editor rather than dropped.
+The class sits between the TUI library editor and the application: the base class knows text editing, this one knows the agent's actions. Its priority order (extensions, autocomplete paging, paste, interrupt, exit, history, other actions) is the part most worth keeping in mind when adding a new keybinding. One quirk: if the interrupt key is pressed with no handler registered, the key is passed to the base editor rather than dropped.

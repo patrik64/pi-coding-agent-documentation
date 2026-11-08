@@ -100,7 +100,10 @@ method has a command, the running package lives under that manager's global
 root, and the package directory and its parent are writable. Otherwise it
 returns undefined and
 `getSelfUpdateUnavailableInstruction` explains why, for example that the path
-is not writable, with the command the user can run themselves.
+is not writable, with the command the user can run themselves. It names the
+package manager only when that manager owns the install; path-based detection
+also matches wrappers that merely live under a manager's directory, such as one
+under `PNPM_HOME`, and those get a generic instruction instead.
 
 ```ts ! config.ts
 export function getSelfUpdateCommand(
@@ -115,6 +118,43 @@ export function getSelfUpdateCommand(
 		return undefined;
 	}
 	return command;
+}
+```
+
+## !!steps A user-configured update command
+
+Installs that pi cannot update itself, such as Nix, mise or a custom wrapper,
+can tell `pi update` what to run instead. `PI_SELF_UPDATE_COMMAND` wins over the
+global `selfUpdateCommand` setting. The variable is split on whitespace with no
+quoting support, while the setting is already an argv array.
+
+The placeholders `{packageName}`, `{version}` and `{installSpec}` are filled per
+argument from the release being installed, and the result goes through the same
+`makeSelfUpdateCommandStep` as the built-in commands. The caller in
+[package-manager-cli.ts](/docs/src/package-manager-cli.ts) then checks whether
+the version actually changed.
+
+```ts ! config.ts
+export function getConfiguredSelfUpdateArgv(setting: string[] | undefined): string[] | undefined {
+	const fromEnv = process.env.PI_SELF_UPDATE_COMMAND?.trim().split(/\s+/).filter(Boolean);
+	if (fromEnv?.length) return fromEnv;
+	return setting?.length ? setting : undefined;
+}
+
+/** Fill the `{packageName}`, `{version}`, and `{installSpec}` placeholders of a configured self-update command. */
+export function makeConfiguredSelfUpdateCommand(
+	argv: string[],
+	release: { packageName: string; version: string },
+): SelfUpdateCommand {
+	const values: Record<string, string> = {
+		packageName: release.packageName,
+		version: release.version,
+		installSpec: `${release.packageName}@${release.version}`,
+	};
+	const [command = "", ...args] = argv.map((arg) =>
+		arg.replace(/\{(packageName|version|installSpec)\}/g, (_, name: string) => values[name]),
+	);
+	return makeSelfUpdateCommandStep(command, args);
 }
 ```
 

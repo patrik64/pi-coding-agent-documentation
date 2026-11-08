@@ -1,21 +1,24 @@
 ---
 title: "exec.ts"
-description: "execCommand, a promise-based child process runner with timeout, abort and forced-kill support for extensions and tools"
+description: "execCommand, a promise-based child process runner with timeout, abort, an output byte cap and forced-kill support for extensions and tools"
 source: "src/core/exec.ts"
 full: true
 ---
 
-Extensions and custom tools often need to run a program and look at its output. `execCommand` wraps `spawn` into a single awaitable call that never rejects: it always resolves with stdout, stderr, an exit code and a flag saying whether pi killed the process.
+Extensions and custom tools often need to run a program and look at its output. `execCommand` wraps `spawn` into a single awaitable call that resolves with stdout, stderr, an exit code and flags saying whether pi killed the process and whether the output was cut off. A failure to start the program (for example a missing binary) is reported as a failed result, not a rejection; the only rejection left is an invalid `maxBuffer` option.
 
-It is the non-shell counterpart to the shell executor in [bash-executor.ts](/docs/src/core/bash-executor.ts). Here arguments are passed as an array with `shell: false`, so there is no quoting or injection concern. Extension APIs declared in [types.ts](/docs/src/core/extensions/types.ts) expose it to plugin authors.
+It is the non-shell counterpart to the shell executor in [bash-executor.ts](/docs/src/core/bash-executor.ts). Here arguments are passed as an array with `shell: false`, so there is no quoting or injection concern. Extension APIs declared in [types.ts](/docs/src/core/extensions/types.ts) expose it to plugin authors as `pi.exec`.
 
 <Scrollycoding>
 
 ## !!steps Options and result
 
-Callers can pass an abort signal, a timeout in milliseconds and a working directory override. The result carries `killed` so callers can tell a timeout or abort from a real failure exit.
+Callers can pass an abort signal, a timeout in milliseconds, a working directory override and a combined output byte limit. The default limit is 256 MiB, lowered to the runtime's maximum string length when that is smaller, because the collected output has to fit in a JavaScript string. The result carries `killed` so callers can tell a timeout, abort or overflow from a real failure exit, and `truncated` to say the output is incomplete.
 
 ```ts ! exec.ts
+const DEFAULT_EXEC_MAX_BUFFER = Math.min(256 * 1024 * 1024, bufferConstants.MAX_STRING_LENGTH);
+const FORCE_KILL_DELAY_MS = 5000;
+
 /**
  * Options for executing shell commands.
  */
@@ -26,6 +29,11 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/**
+	 * Combined stdout/stderr byte limit; exceeding it terminates the command with `truncated: true`.
+	 * Nonnegative integer up to the runtime string limit. Default: 256 MiB, capped by that limit.
+	 */
+	maxBuffer?: number;
 }
 
 /**
@@ -35,13 +43,16 @@ export interface ExecResult {
 	stdout: string;
 	stderr: string;
 	code: number;
+	/** The command was terminated by pi: timeout, abort, or output over `maxBuffer`. */
 	killed: boolean;
+	/** Output exceeded `maxBuffer`; stdout and stderr are incomplete and `code` is nonzero. */
+	truncated: boolean;
 }
 ```
 
-## !!steps Spawning
+## !!steps Validating the cap and spawning
 
-The promise executor never rejects. stdin is ignored so the child cannot block waiting for input, and both output streams are piped for collection. Note that the `cwd` parameter is positional while `options.cwd` in `ExecOptions` is not read anywhere in this function, so that field is effectively unused.
+An explicit `maxBuffer` that is not a nonnegative integer within the string limit throws a `RangeError` before anything is spawned; since the function is `async`, the caller sees a rejected promise. stdin is ignored so the child cannot block waiting for input, and both output streams are piped for collection. The `cwd` parameter is positional; `options.cwd` in `ExecOptions` is not read anywhere in this function, so that field is effectively unused.
 
 ```ts ! exec.ts
 export async function execCommand(
@@ -50,36 +61,46 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
-	return new Promise((resolve) => {
-		const proc = spawn(command, args, {
-			cwd,
-			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+	const maxBuffer = options?.maxBuffer ?? DEFAULT_EXEC_MAX_BUFFER;
+	if (!Number.isInteger(maxBuffer) || maxBuffer < 0 || maxBuffer > bufferConstants.MAX_STRING_LENGTH) {
+		throw new RangeError(`maxBuffer must be an integer between 0 and ${bufferConstants.MAX_STRING_LENGTH} bytes`);
+	}
+
+	const proc = spawn(command, args, {
+		cwd,
+		shell: false,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
 ```
 
-## !!steps Two-stage kill
+## !!steps Per-stream decoders and a two-stage kill
 
-`killProcess` is idempotent thanks to the `killed` flag. It sends SIGTERM first, then SIGKILL five seconds later if the process still has not been marked killed. Since `proc.killed` becomes true as soon as a signal is sent successfully, that check is weaker than it looks: after the SIGTERM it is usually already true, so the SIGKILL fallback rarely fires.
+Each stream gets its own `StringDecoder`, which holds back the first bytes of a multi-byte UTF-8 character until the rest arrives in the next chunk. Decoding each chunk on its own used to turn a split character into replacement characters. `killProcess` is idempotent thanks to the `killed` flag. It sends SIGTERM, then SIGKILL after five seconds if the child has neither an exit code nor a signal code. That check matters: `proc.killed` turns true as soon as a signal is sent, so testing it would skip the SIGKILL for children that ignore SIGTERM.
 
 ```ts ! exec.ts
-		let stdout = "";
-		let stderr = "";
-		let killed = false;
-		let timeoutId: NodeJS.Timeout | undefined;
+	let stdout = "";
+	let stderr = "";
+	// Decode across chunks: a multi-byte UTF-8 character can be split between two chunks,
+	// and decoding each chunk separately would corrupt it (earendil-works/pi#11312).
+	const stdoutDecoder = new StringDecoder("utf8");
+	const stderrDecoder = new StringDecoder("utf8");
+	let outputBytes = 0;
+	let truncated = false;
+	let killed = false;
+	let timeoutId: NodeJS.Timeout | undefined;
+	let forceKillId: NodeJS.Timeout | undefined;
 
-		const killProcess = () => {
-			if (!killed) {
-				killed = true;
-				proc.kill("SIGTERM");
-				// Force kill after 5 seconds if SIGTERM doesn't work
-				setTimeout(() => {
-					if (!proc.killed) {
-						proc.kill("SIGKILL");
-					}
-				}, 5000);
+	const killProcess = () => {
+		if (killed) return;
+		killed = true;
+		proc.kill("SIGTERM");
+		forceKillId = setTimeout(() => {
+			// `proc.killed` only says a signal was sent, so check whether the child actually exited.
+			if (proc.exitCode === null && proc.signalCode === null) {
+				proc.kill("SIGKILL");
 			}
-		};
+		}, FORCE_KILL_DELAY_MS);
+	};
 ```
 
 ## !!steps Abort and timeout
@@ -87,48 +108,97 @@ export async function execCommand(
 An already-aborted signal kills immediately; otherwise a one-shot listener is attached. A positive timeout arms a timer that calls the same kill path. Both triggers share `killProcess`, so `killed` is true for either.
 
 ```ts ! exec.ts
-		// Handle abort signal
-		if (options?.signal) {
-			if (options.signal.aborted) {
-				killProcess();
-			} else {
-				options.signal.addEventListener("abort", killProcess, { once: true });
-			}
+	if (options?.signal) {
+		if (options.signal.aborted) {
+			killProcess();
+		} else {
+			options.signal.addEventListener("abort", killProcess, { once: true });
 		}
+	}
 
-		// Handle timeout
-		if (options?.timeout && options.timeout > 0) {
-			timeoutId = setTimeout(() => {
-				killProcess();
-			}, options.timeout);
-		}
+	if (options?.timeout && options.timeout > 0) {
+		timeoutId = setTimeout(killProcess, options.timeout);
+	}
 ```
 
-## !!steps Collecting output and finishing
+## !!steps Enforcing the byte cap
 
-Output is concatenated as strings with no size cap. Completion uses `waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) instead of the plain `close` event, so descendants that inherited the stdio handles cannot keep the promise pending forever. On success a null exit code becomes 0; on error the code is 1. Both paths clean up the timer and the abort listener.
+Both streams draw from one shared byte budget. A chunk that fits is counted and passed on; the chunk that crosses the limit is sliced to the remaining bytes, the flag is set and the process is killed. Both pipes are destroyed rather than paused, because Node resumes a child's stdio when it exits and a descendant still writing into an open pipe would keep `waitForChildProcess` waiting. Everything after the first overflow is dropped.
 
 ```ts ! exec.ts
-		proc.stdout?.on("data", (data) => {
-			stdout += data.toString();
-		});
+	// Keep only bytes within the combined cap (#11360). Close both pipes on overflow so writing
+	// descendants cannot keep waitForChildProcess busy after the child exits. Pausing is not
+	// enough: Node resumes the child's stdio on exit.
+	const takeWithinCap = (data: Buffer): Buffer | undefined => {
+		if (truncated) return undefined;
+		const remaining = maxBuffer - outputBytes;
+		if (data.length <= remaining) {
+			outputBytes += data.length;
+			return data;
+		}
+		truncated = true;
+		proc.stdout?.destroy();
+		proc.stderr?.destroy();
+		killProcess();
+		return remaining > 0 ? data.subarray(0, remaining) : undefined;
+	};
 
-		proc.stderr?.on("data", (data) => {
-			stderr += data.toString();
-		});
+	proc.stdout?.on("data", (data: Buffer) => {
+		const chunk = takeWithinCap(data);
+		if (chunk) stdout += stdoutDecoder.write(chunk);
+	});
 
-		// Wait for process termination without hanging on inherited stdio handles
-		// held open by detached descendants.
-		waitForChildProcess(proc)
-			.then((code) => {
-				if (timeoutId) clearTimeout(timeoutId);
-				if (options?.signal) {
-					options.signal.removeEventListener("abort", killProcess);
-				}
-				resolve({ stdout, stderr, code: code ?? 0, killed });
-			})
+	proc.stderr?.on("data", (data: Buffer) => {
+		const chunk = takeWithinCap(data);
+		if (chunk) stderr += stderrDecoder.write(chunk);
+	});
+```
+
+## !!steps Waiting, spawn errors and cleanup
+
+Completion uses `waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) instead of the plain `close` event, so a descendant that merely holds the inherited pipes open cannot keep the promise pending; one that keeps writing does, until the timeout, an abort or the byte cap ends it. A child-process error such as `ENOENT` becomes exit code 1, and its message is kept as stderr when the program wrote nothing, so the caller learns why the command failed. One `finally` clears the timeout, the pending SIGKILL timer and the abort listener on every path.
+
+```ts ! exec.ts
+	let code: number | null;
+	try {
+		// Do not hang on inherited stdio handles held open by detached descendants.
+		code = await waitForChildProcess(proc);
+	} catch (error) {
+		if (!(error instanceof Error)) throw error;
+		// Child-process errors (e.g. ENOENT) are failed executions, not host failures.
+		code = 1;
+		if (!stderr) stderr = error.message;
+	} finally {
+		clearTimeout(timeoutId);
+		clearTimeout(forceKillId);
+		options?.signal?.removeEventListener("abort", killProcess);
+	}
+```
+
+## !!steps Flushing and the final result
+
+The decoders are flushed only when nothing was truncated. After a cut, a decoder may hold the first half of a character whose rest was discarded, and flushing it would append a replacement character that never was in the accepted output. A null exit code becomes 0, but a truncated run is forced to a nonzero code so it can never read as success.
+
+```ts ! exec.ts
+	// On truncation, discard any incomplete UTF-8 suffix buffered by either decoder.
+	// Flushing it would append a replacement character that was not in the accepted output.
+	if (!truncated) {
+		stdout += stdoutDecoder.end();
+		stderr += stderrDecoder.end();
+	}
+
+	const exitCode = code ?? 0;
+	return {
+		stdout,
+		stderr,
+		// A truncated result must never read as success.
+		code: truncated && exitCode === 0 ? 1 : exitCode,
+		killed,
+		truncated,
+	};
+}
 ```
 
 </Scrollycoding>
 
-The pending SIGKILL timer is never cleared, so a killed run can leave a five-second timer alive after the promise has resolved. Callers should treat `killed` plus a nonzero `code` as the signal that a command was cut short.
+Callers should treat `killed` plus a nonzero `code` as the signal that a command was cut short, and check `truncated` before trusting that stdout is complete.

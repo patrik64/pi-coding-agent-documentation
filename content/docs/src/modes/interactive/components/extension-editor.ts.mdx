@@ -28,6 +28,8 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 	private tui: TUI;
 	private keybindings: KeybindingsManager;
 	private externalEditorCommand: string;
+	/** Shows external editor failures; renders nothing while empty. */
+	private externalEditorStatus = new Text("", 1, 0);
 
 	private _focused = false;
 	get focused(): boolean {
@@ -73,7 +75,7 @@ The command is resolved with a fixed precedence: an explicitly passed command, t
 
 ## !!steps Frame, title and editor
 
-The layout is added top to bottom: border, spacer, accent title, an optional description, then the `Editor` itself. Prefill text is set only when truthy. The submit callback is wired directly to the editor's `onSubmit`, which is why Enter and Shift+Enter behave as in the main editor.
+The layout is added top to bottom: border, spacer, accent title, an optional description, then the `Editor` itself. Prefill text is set only when truthy. The submit callback is wired directly to the editor's `onSubmit`, which is why Enter and Shift+Enter behave as in the main editor. Right below the editor sits `externalEditorStatus`, an empty `Text` that only shows something after an external editor run fails.
 
 ```ts ! extension-editor.ts
 		// Add top border
@@ -101,6 +103,7 @@ The layout is added top to bottom: border, spacer, accent title, an optional des
 			this.onSubmitCallback(text);
 		};
 		this.addChild(this.editor);
+		this.addChild(this.externalEditorStatus);
 ```
 
 ## !!steps Hint line
@@ -155,7 +158,7 @@ Cancel is checked first, then the external-editor binding, and everything else g
 
 ## !!steps Handing off to the external editor
 
-The current text is read first, then the TUI is stopped so the child process gets the terminal. The result only replaces the editor text when its status is `complete`, so a cancelled or failed session keeps what the user had typed. The `finally` block always restarts the TUI and requests a full render (`true` forces a complete repaint), which matters because the external program has scribbled over the screen.
+The current text is read first, then the TUI is stopped so the child process gets the terminal. The result only replaces the editor text when its status is `complete`, so a cancelled or failed session keeps what the user had typed. A failure's message (could not launch, or exited with a code or signal) is shown in warning color under the editor, and any earlier message is cleared on the next run, so the user learns why nothing changed. The `finally` block always restarts the TUI and requests a full render (`true` forces a complete repaint), which matters because the external program has scribbled over the screen.
 
 ```ts ! extension-editor.ts
 	private async handleOpenExternalEditor(): Promise<void> {
@@ -167,7 +170,8 @@ The current text is read first, then the TUI is stopped so the child process get
 				command: this.externalEditorCommand,
 				content,
 			});
-// !mark(1:2)
+// !mark
+			this.externalEditorStatus.setText(result.status === "failed" ? theme.fg("warning", result.message) : "");
 			if (result.status === "complete") {
 				this.editor.setText(result.content);
 			}

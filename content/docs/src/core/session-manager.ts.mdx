@@ -114,7 +114,7 @@ export function parseSessionEntries(content: string): FileEntry[] {
 
 Discovery needs only the header, so `readSessionHeader` scans at most one mebibyte from the start of the file, and reads in 4 KiB chunks. A non-session first entry or an oversized prefix means the file is not treated as a session during discovery.
 
-`findMostRecentSession` sorts `.jsonl` files by modification time and returns the first whose header matches the working directory (when a directory filter applies). Any filesystem error yields null instead of throwing, since discovery is best-effort.
+`findMostRecentSession` sorts `.jsonl` files by modification time and returns the first whose header matches the working directory (when a directory filter applies). `sessionCwdMatches` compares with `pathsEqual`, so on Windows a differently cased drive letter still matches. Any filesystem error yields null instead of throwing, since discovery is best-effort.
 
 ```ts ! session-manager.ts
 const SESSION_READ_BUFFER_SIZE = 1024 * 1024;
@@ -241,7 +241,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 
 ## !!steps The projection keeps provenance
 
-`buildSessionProjection` returns more than messages: each entry in the projected list remembers its raw `sourceEntry`, which lets UIs map model-visible messages back to the tree. Context edits are collected into a map by target id and applied while projecting.
+`buildSessionProjection` returns more than messages: each entry in the projected list remembers its raw `sourceEntry`, which lets UIs map model-visible messages back to the tree. Context edits are collected into a map by target id and applied while projecting. `projectContextEntry`, which applies one edit to one entry, is exported so [branch-summarization.ts](/docs/src/core/compaction/branch-summarization.ts) can show the summarizer the same edited content the model saw. (A stale doc comment about building the session context still sits above its own one-line comment.)
 
 An older compaction entry can appear in the list when its id falls inside the newest retained range; the check on `index` above zero makes sure only the newest one, at position zero, contributes messages.
 
@@ -278,7 +278,7 @@ An older compaction entry can appear in the list when its id falls inside the ne
 
 The constructor is private; callers use `create`, `open`, `continueRecent`, `inMemory` or `forkFrom`. It resolves the working directory, creates the session directory when persisting, and then takes one of three routes: open a given file, load entries supplied by the caller, or start a fresh session.
 
-In-memory mode passes an empty directory and `persist` false, so nothing ever touches disk.
+In-memory mode passes an empty directory and `persist` false, so nothing ever touches disk. `forkFrom` writes the new header and every copied entry through a single file descriptor; reopening the file once per entry was slow where open and close are expensive, as under filesystem security monitors.
 
 ```ts ! session-manager.ts
 	private constructor(
@@ -379,14 +379,27 @@ The comment on `_hasConversation` explains why the trigger is the user message a
 
 Every `append` method builds an entry whose `parentId` is the current leaf and goes through `_appendEntry`, which updates the index, advances the leaf and persists. `appendMessage` is typed to refuse summary messages; those must use their own methods so they stay top-level entries.
 
+If the write throws (a full disk, a busy or timed-out network drive), `_appendEntry` undoes the in-memory append and restores the previous leaf before rethrowing. Otherwise the unwritten entry would become the parent of the next one, the file would hold an entry pointing to a missing parent, and a resume would lose everything before that gap, including the first system message that declares the tools.
+
 `appendCompaction` additionally stores the current system message in the entry, re-stamped with the compaction time. When `firstKeptEntryId` is null it defaults to the compaction entry's own id.
 
 ```ts ! session-manager.ts
 	private _appendEntry(entry: SessionEntry): void {
+		const previousLeafId = this.leafId;
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			// Keep memory in line with the file: an entry that was not written must not become the
+			// parent of later entries, or the file would hold entries pointing to a missing parent.
+			// !mark(1:3)
+			this.fileEntries.pop();
+			this.byId.delete(entry.id);
+			this.leafId = previousLeafId;
+			throw error;
+		}
 	}
 // ...
 // !mark

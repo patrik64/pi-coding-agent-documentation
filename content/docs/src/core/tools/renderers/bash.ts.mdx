@@ -11,27 +11,16 @@ One factory serves both shells. `createShellRenderers(prompt)` takes the prompt 
 
 <Scrollycoding>
 
-## !!steps Constants and the duration formatter
+## !!steps Constants
 
-Collapsed output shows the last five visual lines. `BASH_UPDATE_THROTTLE_MS` is exported so the execution side can throttle streaming updates to the same 100 ms cadence.
-
-`formatDuration` has three bands: seconds with one decimal under a minute, `Xm Ys` under an hour, and `Xh Ym Zs` beyond that. The minute and hour bands floor the seconds first, so there is no fractional part past the first minute.
+Collapsed output shows the last five visual lines. `BASH_UPDATE_THROTTLE_MS` is exported so the execution side can throttle streaming updates to the same 100 ms cadence. The duration formatting and the elapsed-time logic that used to live here moved into [render-utils.ts](/docs/src/core/tools/render-utils.ts) as `startToolTimer` and `toolTimerText`, so the codemode renderer can show the same timer.
 
 ```ts ! bash.ts
+import { getTextOutput, invalidArgText, startToolTimer, str, toolTimerText } from "../render-utils.ts";
+import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
+
 const BASH_PREVIEW_LINES = 5;
 export const BASH_UPDATE_THROTTLE_MS = 100;
-function formatDuration(ms: number): string {
-	const seconds = ms / 1000;
-	// !mark
-	if (seconds < 60) return `${seconds.toFixed(1)}s`;
-
-	const totalSeconds = Math.floor(seconds);
-	const minutes = Math.floor(totalSeconds / 60);
-	const remainder = totalSeconds % 60;
-	if (minutes < 60) return `${minutes}m ${remainder}s`;
-
-	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
-}
 ```
 
 ## !!steps The call line
@@ -102,11 +91,11 @@ Expanded mode prints every line. Collapsed mode hands the text to `VisualLinePre
 	}
 ```
 
-## !!steps Truncation warnings and elapsed time
+## !!steps Truncation warnings and the timer line
 
 If output was truncated or spilled to a file, a single yellow bracketed line lists the full output path and how the cut happened: by lines (showing N of M) or by bytes (the limit from [truncate.ts](/docs/src/core/tools/truncate.ts), defaulting to `DEFAULT_MAX_BYTES`).
 
-The last line is the timer. While the result is partial the label is `Elapsed` and the end time falls back to the current clock; when final it says `Took`.
+The last line is the timer text computed by the result renderer, such as `Elapsed 3.1s` or `Took 12.0s`, added only when there is one.
 
 ```ts ! bash.ts
 	if (truncation?.truncated || fullOutputPath) {
@@ -127,57 +116,34 @@ The last line is the timer. While the result is partial the label is `Elapsed` a
 		component.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
 	}
 
-	if (startedAt !== undefined) {
-		const label = options.isPartial ? "Elapsed" : "Took";
-		const endTime = endedAt ?? Date.now();
-		component.addChild(new Text(`\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`, 0, 0));
-	}
+	if (timerText) component.addChild(new Text(`\n${theme.fg("muted", timerText)}`, 0, 0));
+}
 ```
 
-## !!steps The call renderer records the start time
+## !!steps Call and result renderers
 
-`createShellRenderers` returns the two hooks. `renderCall` runs repeatedly as arguments stream in; the first time `executionStarted` is true it stamps `state.startedAt` on the per-call state object and clears `endedAt`. It reuses the previous `Text` component when one exists instead of allocating a new one on each update.
+`createShellRenderers` returns the two hooks. `renderCall` runs repeatedly as arguments stream in; it starts the row's clock through `startToolTimer` once execution begins, and reuses the previous `Text` component when one exists instead of allocating a new one on each update.
+
+`renderResult` asks `toolTimerText` for the timing line. That helper keeps a one-second redraw interval running while the result is partial, so the elapsed time ticks even when the command prints nothing, and for a final result prefers the duration recorded with the result, which survives a session reload. The component is then rebuilt from scratch and invalidated, which is simpler than diffing and cheap for a handful of children.
 
 ```ts ! bash.ts
 export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> {
 	return {
 		renderCall(args, _theme, context) {
-			const state = context.state;
-			// !mark(1:4)
-			if (context.executionStarted && state.startedAt === undefined) {
-				state.startedAt = Date.now();
-				state.endedAt = undefined;
-			}
+			startToolTimer(context);
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
 			text.setText(formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt));
 			return text;
 		},
-```
-
-## !!steps The result renderer drives a one-second timer
-
-While a result is partial and the clock has started, `renderResult` starts a one-second interval that calls `context.invalidate()`, forcing a re-render so the elapsed time ticks even when the command prints nothing. When the result is final, or errored, it fixes `endedAt` with `??=` and clears the interval.
-
-The component is rebuilt from scratch on every call, then invalidated, which is simpler than diffing and cheap for a handful of children. The interval lives on `state`, so a remounted component can still clear it.
-
-```ts ! bash.ts
 		renderResult(result, options, _theme, context) {
-			const state = context.state;
-			// !mark(1:3)
-			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
-				state.interval = setInterval(() => context.invalidate(), 1000);
-			}
-			// !mark
-			if (!options.isPartial || context.isError) {
-				state.endedAt ??= Date.now();
-				if (state.interval) {
-					clearInterval(state.interval);
-					state.interval = undefined;
-				}
-			}
+			const timerText = toolTimerText(context, options.isPartial);
 			const component = (context.lastComponent as Container | undefined) ?? new Container();
+			rebuildBashResultRenderComponent(component, result as any, options, context.showImages, timerText);
+			component.invalidate();
+			return component;
+		},
 ```
 
 </Scrollycoding>
 
-The type for the hooks comes from [extensions/types.ts](/docs/src/core/extensions/types.ts), the same `ToolDefinition` that extension authors implement, so built-in and custom tools render through one interface. Structurally the file is a pure view: no I/O, all state passed through the render context. One quirk: `formatDuration` and the other helpers are module-private, and the theme is imported as a singleton here while the sibling renderers receive it as a parameter.
+The type for the hooks comes from [extensions/types.ts](/docs/src/core/extensions/types.ts), the same `ToolDefinition` that extension authors implement, so built-in and custom tools render through one interface. Structurally the file is a pure view: no I/O, all state passed through the render context. One quirk: the theme is imported as a singleton here while the sibling renderers receive it as a parameter.

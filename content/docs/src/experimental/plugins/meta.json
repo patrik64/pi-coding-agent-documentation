@@ -1,7 +1,0 @@
-{
-  "title": "plugins",
-  "pages": [
-    "bundled.ts",
-    "package.ts"
-  ]
-}

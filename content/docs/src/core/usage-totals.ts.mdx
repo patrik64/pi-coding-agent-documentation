@@ -47,6 +47,8 @@ export function addUsageToTotals(totals: UsageTotals, usage: Usage): void {
 
 `combineUsage` returns a new `Usage` with every counter and every cost component summed. The optional fields `cacheWrite1h` and `reasoning` are kept only if at least one side reports them, so a sum of two usages from providers that never report reasoning does not grow a spurious zero.
 
+Costs can now be marked `totalFromProvider` when the total is what the provider billed rather than a catalog estimate. A sum keeps that mark only when both parts have it, since adding one estimate makes the whole total an estimate.
+
 ```ts ! usage-totals.ts
 export function combineUsage(first: Usage, second: Usage): Usage {
 	return {
@@ -62,6 +64,15 @@ export function combineUsage(first: Usage, second: Usage): Usage {
 			? { reasoning: (first.reasoning ?? 0) + (second.reasoning ?? 0) }
 			: {}),
 		totalTokens: first.totalTokens + second.totalTokens,
+		cost: {
+			// ...
+			total: first.cost.total + second.cost.total,
+			// A sum is provider-reported only when every part is.
+			// !mark
+			totalFromProvider: first.cost.totalFromProvider === true && second.cost.totalFromProvider === true,
+		},
+	};
+}
 ```
 
 ## !!steps Where usage can come from

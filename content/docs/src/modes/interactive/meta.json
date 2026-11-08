@@ -9,6 +9,7 @@
     "interactive-mode.ts",
     "model-catalog-refresh.ts",
     "model-search.ts",
+    "program-status-reporter.ts",
     "session-share.ts",
     "tui-renderer.ts"
   ]

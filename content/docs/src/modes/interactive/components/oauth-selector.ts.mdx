@@ -66,10 +66,16 @@ export function formatAuthSelectorProviderStatus(provider: AuthSelectorProvider)
 
 ## !!steps Constructing the dialog
 
-The type labels are only shown when the list mixes auth types. The title depends on the mode. The search input submits the selected provider, and the first filter call does the initial render.
+The type labels are only shown when the list mixes auth types. The title depends on the mode. The search input submits the selected provider, and the first filter call does the initial render. `MAX_VISIBLE` is the list window height, used for drawing and paging, and `capturesViewportInput` makes the fullscreen TUI deliver PageUp and PageDown to this dialog instead of scrolling the transcript.
 
 ```ts ! oauth-selector.ts
+const MAX_VISIBLE = 8;
+
+/**
+ * Component that renders an auth provider selector
+ */
 export class OAuthSelectorComponent extends Container implements Focusable {
+	readonly capturesViewportInput: boolean = true;
 	private searchInput: Input;
 
 // ...
@@ -136,18 +142,17 @@ Search matches name, id, auth type and method name. The selected index is clampe
 
 ## !!steps Rendering rows
 
-The list shows 8 rows centered on the selection. Each row combines cursor, name, optional type label and the status suffix, in a `TruncatedText` so long names never wrap. The empty message differs for login, logout and filtered-out cases.
+The list shows `MAX_VISIBLE` rows centered on the selection. Each row combines cursor, name, optional type label and the status suffix, in a `TruncatedText` so long names never wrap. The empty message differs for login, logout and filtered-out cases.
 
 ```ts ! oauth-selector.ts
 	private updateList(): void {
 		this.listContainer.clear();
 
-		const maxVisible = 8;
 		const startIndex = Math.max(
 			0,
-			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredProviders.length - maxVisible),
+			Math.min(this.selectedIndex - Math.floor(MAX_VISIBLE / 2), this.filteredProviders.length - MAX_VISIBLE),
 		);
-		const endIndex = Math.min(startIndex + maxVisible, this.filteredProviders.length);
+		const endIndex = Math.min(startIndex + MAX_VISIBLE, this.filteredProviders.length);
 
 		for (let i = startIndex; i < endIndex; i++) {
 			const provider = this.filteredProviders[i];
@@ -191,11 +196,12 @@ The list shows 8 rows centered on the selection. Each row combines cursor, name,
 
 ## !!steps Input handling
 
-Unlike [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts), up and down do not wrap. Enter selects, cancel calls back, and everything else edits the search.
+Unlike [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts), up and down do not wrap. The selection page keys jump by one window, clamped to the list, using `getSelectPageIndex` from pi-tui. Enter selects, cancel calls back, and everything else edits the search.
 
 ```ts ! oauth-selector.ts
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		const pageIndex = getSelectPageIndex(kb, keyData, this.selectedIndex, this.filteredProviders.length, MAX_VISIBLE);
 		// Up arrow
 		if (kb.matches(keyData, "tui.select.up")) {
 			if (this.filteredProviders.length === 0) return;
@@ -206,6 +212,12 @@ Unlike [model-selector.ts](/docs/src/modes/interactive/components/model-selector
 		else if (kb.matches(keyData, "tui.select.down")) {
 			if (this.filteredProviders.length === 0) return;
 			this.selectedIndex = Math.min(this.filteredProviders.length - 1, this.selectedIndex + 1);
+			this.updateList();
+		}
+		// Page up/down
+		else if (pageIndex !== undefined) {
+			if (this.filteredProviders.length === 0) return;
+			this.selectedIndex = pageIndex;
 			this.updateList();
 		}
 		// Enter

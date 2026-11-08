@@ -41,7 +41,7 @@ function getCreateJiti(): Promise<typeof createJiti> {
 
 In a plain Node installation an extension that imports a pi package must resolve it to the same instance the host uses. `getAliases` builds that table once. It points the coding-agent package to the sibling index file, and resolves the agent core, tui and ai packages either to the workspace build or to whatever `import.meta.resolve` finds.
 
-The table also maps the old `@mariozechner` scope and the old `@sinclair/typebox` name to the current entries, so extensions written before the renames keep working. The comment notes that the root `pi-ai` specifier resolves to the compat entry, a superset of the core one.
+The table also maps the old `@mariozechner` scope and the old `@sinclair/typebox` name to the current entries, so extensions written before the renames keep working. The root `pi-ai` specifier and `/compat` do not point into pi-ai at all: they resolve to the built [pi-ai-extension-view.ts](/docs/src/core/extensions/pi-ai-extension-view.ts) next to the loader, which is pi-ai's compat entry plus TypeBox's `Type`, `Static`, `TSchema` and a `StringEnum`, exports pi-ai itself dropped when it moved tool validation to pi-schema. The `/models` subpath is aliased too; it was missing, and extensions importing helpers from it failed to load.
 
 ```ts ! loader.ts
 	_aliases = {
@@ -50,6 +50,7 @@ The table also maps the old `@mariozechner` scope and the old `@sinclair/typebox
 		"@earendil-works/pi-tui": piTuiEntry,
 		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
 		"@earendil-works/pi-ai/compat": piAiCompatEntry,
+		"@earendil-works/pi-ai/models": piAiModelsEntry,
 		"@earendil-works/pi-ai/oauth": piAiOauthEntry,
 		"@earendil-works/pi-ai": piAiCompatEntry,
 		// !mark(1:2)
@@ -58,6 +59,7 @@ The table also maps the old `@mariozechner` scope and the old `@sinclair/typebox
 		"@mariozechner/pi-tui": piTuiEntry,
 		"@mariozechner/pi-ai/providers/all": piAiProvidersEntry,
 		"@mariozechner/pi-ai/compat": piAiCompatEntry,
+		"@mariozechner/pi-ai/models": piAiModelsEntry,
 		"@mariozechner/pi-ai/oauth": piAiOauthEntry,
 		"@mariozechner/pi-ai": piAiCompatEntry,
 		typebox: typeboxEntry,
@@ -150,6 +152,8 @@ Invalidation also runs every tracked event bus unsubscribe. `trackEventBusSubscr
 
 Registration methods write into the `Extension` record rather than the runtime. `registerTool` insists on an object parameter schema and calls `refreshTools`. `registerCommand` requires a non-empty name and a handler function. `registerFlag` rejects defaults whose type does not match the declared type. Errors mention the extension path, which is what the user sees in the load diagnostics.
 
+`registerMarkdownTransformer` takes an optional `messageTypes` list naming the surfaces the transformer applies to. Without it the transformer covers user messages, assistant text and assistant thinking, which is what it always covered; other surfaces are opt-in.
+
 `on` wraps each handler so the same function can be registered twice and unsubscribed independently, and returns a function that removes just that registration. Flag access is scoped: `getFlag` returns `undefined` for flags the extension never declared, even if another extension did.
 
 ```ts ! loader.ts
@@ -171,7 +175,7 @@ Registration methods write into the `Extension` record rather than the runtime. 
 
 ## !!steps MCP server registration rules
 
-`registerMcpServer` validates the config with `validateMcpServerConfig` from [mcp-servers.ts](/docs/src/core/mcp-servers.ts) and refuses a name already owned by another extension. It also rejects names that differ only by `-` versus `_`, since those would share a tool namespace after `mcpNamespace` normalization.
+`registerMcpServer` validates the config with `validateMcpServerConfig` from [mcp-servers.ts](/docs/src/core/mcp-servers.ts) and refuses a name already owned by another extension. It also rejects names that differ only by `-` versus `_`, since those would share a tool namespace after normalization by `mcpNamespace`, which now comes from the shared pi-mcp package.
 
 The server record stores a `structuredClone` of the config, so later mutation by the extension cannot alter the registered server, and the actual registration is deferred through `applyRuntimeChange`, like providers. The ownership and clash checks read the registry when the call is made, while the registration itself is only applied on commit.
 
@@ -194,7 +198,9 @@ The server record stores a `structuredClone` of the config, so later mutation by
 
 `loadExtensionModule` imports the file with jiti, `moduleCache: false`, and takes the default export as the factory. If it is not a function the loader returns `undefined`, which becomes the "does not export a valid factory function" error.
 
-Resolution options depend on the runtime flavor from the first step. The loader keeps its own cache of factories keyed by path. A cache token ties entries to a working directory and a generation counter, so changing directories or calling `clearExtensionCache` invalidates everything.
+The path is canonicalized (symlinks resolved) before the import. jiti resolves an extension's own dependencies relative to the path it was given, and package managers such as pnpm install packages as symlinks into an isolated store, so importing through the symlink could not find the dependencies the extension declared.
+
+Resolution options depend on the runtime flavor from the first step. The loader keeps its own cache of factories keyed by path. A cache token ties entries to a working directory and a generation counter, so changing directories (compared with `pathsEqual`, case-insensitively on Windows) or calling `clearExtensionCache` invalidates everything.
 
 ```ts ! loader.ts
 	const resolutionOptions = usesEmbeddedModules
@@ -207,7 +213,8 @@ Resolution options depend on the runtime flavor from the first step. The loader 
 		...resolutionOptions,
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	// !mark
+	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;

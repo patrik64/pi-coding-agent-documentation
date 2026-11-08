@@ -5,31 +5,26 @@ source: "src/modes/interactive/theme/theme.ts"
 full: true
 ---
 
-Every colored character in the TUI goes through this file. It defines the vocabulary of theme tokens (`accent`, `mdHeading`, `toolDiffAdded` and about fifty more), the `Theme` class that turns a token into an escape sequence, and the machinery that finds, loads, validates and hot-reloads themes.
+Every colored character in the TUI goes through this file. It holds the `Theme` class that turns a theme token (`accent`, `mdHeading`, `toolDiffAdded` and about fifty more) into an escape sequence, and the machinery that finds, loads, validates and hot-reloads themes. The token vocabulary itself is defined in [theme-tokens.ts](/docs/src/modes/interactive/theme/theme-tokens.ts) and re-exported from here.
 
-Themes come from four places: the generated system theme, the built-in `dark` and `light` JSON files ([dark.json](/docs/src/modes/interactive/theme/dark.json), [light.json](/docs/src/modes/interactive/theme/light.json)), user files in the custom themes directory, and themes registered by extensions. The JSON shape is validated by [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts), and the system theme is built by [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts).
+Themes come from four places: the generated system theme, the built-in `dark` and `light` JSON files ([dark.json](/docs/src/modes/interactive/theme/dark.json), [light.json](/docs/src/modes/interactive/theme/light.json)), user files in the custom themes directory, and themes registered by extensions. The JSON shape is validated by [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts), and the system theme is built by [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts).
 
-The file ends with adapters that translate the theme into the shapes `pi-tui` components expect: markdown, select list, editor and settings list themes, plus syntax highlighting.
+The file ends with adapters that translate the theme into the shapes `pi-tui` components expect: markdown, select list, editor and settings list themes, plus syntax highlighting and a small per-owner highlight cache.
 
 <Scrollycoding>
 
 ## !!steps Foreground and background tokens
 
-Tokens are split into `ThemeColor` (foreground) and `ThemeBg` (background). The split is enforced in the types, and `ThemeStyle` explains why: an empty string means "terminal default", which is the default foreground in one slot and the default background in the other, so a token is only accepted in its own slot.
+Tokens are split into `ThemeColor` (foreground) and `ThemeBg` (background). Both types are derived from the slot of each entry in the token table and re-exported here, so components keep importing them from theme.ts. The split is enforced in the types, and `ThemeStyle` explains why: an empty string means "terminal default", which is the default foreground in one slot and the default background in the other, so a token is only accepted in its own slot.
 
-A handful of tokens are optional in theme JSON: scrollbar track and thumb, `thinkingMax`, and the search match pair. Older themes without them keep working because of the fallbacks in the next step.
+The theme document types come from [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts) as a type-only import, which costs nothing at runtime. A handful of tokens are optional in theme JSON: scrollbar track and thumb, `thinkingMax`, and the search match pair. Older themes without them keep working because of the fallbacks in the next step.
 
 ```ts ! theme.ts
-export type ThemeBg =
-	| "selectedBg"
-	| "searchMatchBg"
-	| "userMessageBg"
-	| "customMessageBg"
-	| "toolPendingBg"
-	| "toolSuccessBg"
-	| "toolErrorBg";
+/** The schema that validates this shape lives in `theme-schema.ts`; importing the type is free. */
+import type { ThemeColorValue as ColorValue, ValidatedThemeJson as ThemeJson } from "./theme-schema.ts";
 
-export type ThemeToken = ThemeColor | ThemeBg;
+export type { ValidatedThemeJson as ThemeJson } from "./theme-schema.ts";
+export type { ThemeBg, ThemeColor, ThemeToken } from "./theme-tokens.ts";
 
 /**
  * Tokens are only accepted in their own slot, because "" (terminal default) means the default foreground
@@ -46,7 +41,7 @@ export interface ThemeStyle extends TextAttributes {
 
 A theme file can define `vars` and refer to them by name from `colors`. `resolveVarRefs` returns numbers, empty strings, hex values and `oklch(...)` or `okhsl(...)` expressions as they are, and otherwise follows variable names recursively. A `visited` set turns a cycle into a clear "Circular variable reference" error, and a missing name is an error too.
 
-`withThemeColorFallbacks` fills the optional tokens from related required ones: the track from `muted`, the thumb from `text`, `thinkingMax` from `thinkingXhigh`, and the search colors from the selection and text colors.
+`withThemeTokenFallbacks` fills the optional tokens. It no longer names them: it walks the token table and copies the fallback's value into every optional token that is missing, so the track gets `muted`, the thumb `text`, `thinkingMax` gets `thinkingXhigh`, and the search colors get the selection and text colors. `createTheme` calls it after variable resolution, so a fallback copies an already resolved value.
 
 ```ts ! theme.ts
 function resolveVarRefs(
@@ -66,6 +61,23 @@ function resolveVarRefs(
 	}
 	visited.add(value);
 	return resolveVarRefs(vars[value], vars, visited);
+}
+// ...
+function withThemeTokenFallbacks<Value>(values: ThemeColorValues<Value>): ResolvedThemeColorValues<Value> {
+	const resolved = { ...values } as Partial<ResolvedThemeColorValues<Value>>;
+	for (const [rawName, descriptor] of Object.entries(THEME_TOKENS)) {
+		if (!("fallback" in descriptor)) continue;
+		const name = rawName as ThemeToken;
+		if (resolved[name] !== undefined) continue;
+		const fallback = descriptor.fallback as ThemeToken;
+		const fallbackValue = resolved[fallback];
+		// !mark(1:3)
+		if (fallbackValue === undefined) {
+			throw new Error(`Theme token ${rawName} has unresolved fallback ${descriptor.fallback}`);
+		}
+		resolved[name] = fallbackValue;
+	}
+	return resolved as ResolvedThemeColorValues<Value>;
 }
 ```
 
@@ -100,9 +112,16 @@ function detectAppearance(foregrounds: Color[], backgrounds: Color[]): ThemeAppe
 
 Rendering is hot, so the `Theme` constructor does the expensive work once. For every token it builds the foreground or background escape sequence for the detected color mode (truecolor, 256, or 16) and stores it in a map, making `fg()` and `bg()` a lookup and string concat.
 
-A token whose value is `""` has no color of its own. It gets the reset code (`39m` or `49m`) and is recorded in a list so that the `colors` getter can later fill it from the terminal's reported defaults. Optional tokens are defaulted here as well, so the same fallback logic exists in both this constructor and `withThemeColorFallbacks`.
+The constructor first runs `withThemeTokenFallbacks` again on the colors it receives, so a `Theme` constructed directly, without going through theme JSON, also gets the optional tokens. `splitThemeColors` then sorts tokens into foregrounds and backgrounds by their slot in the token table.
+
+A token whose value is `""` has no color of its own. It gets the reset code (`39m` or `49m`) and is recorded in a list so that the `colors` getter can later fill it from the terminal's reported defaults.
 
 ```ts ! theme.ts
+		const { fgColors: foregrounds, bgColors: backgrounds } = splitThemeColors(
+			withThemeTokenFallbacks({ ...fgColors, ...bgColors }),
+		);
+		const concreteForegrounds: Color[] = [];
+		const concreteBackgrounds: Color[] = [];
 		// Returns the escape sequence for the token's own slot.
 		const addToken = (token: ThemeToken, value: string | number, isBackground: boolean): string => {
 			// !mark(1:3)
@@ -204,7 +223,7 @@ Custom files are listed by actually loading each one, so a file whose JSON is in
 
 ## !!steps Loading with an optional validator
 
-Validation is pluggable. By default `parseThemeJson` only checks that the value is an object with a `colors` map. A presentation can call `setThemeJsonValidator` to install the full schema check. The doc comment gives the reason: validating user-authored JSON needs typebox, and a presentation using only built-in themes should not pay about 17 MB of module graph for it.
+Validation is pluggable. By default `parseThemeJson` only checks that the value is an object with a `colors` map. A presentation can call `setThemeJsonValidator` to install the full schema check from [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts), as [main.ts](/docs/src/main.ts) does. The doc comment gives the reason: validating user-authored JSON needs typebox, and a presentation using only built-in themes should not pay about 17 MB of module graph for it.
 
 `loadTheme` then resolves by priority: the reserved system name first, then registered themes, then JSON built-ins and custom files. `getThemeByName` swallows errors and returns `undefined`, for callers that only want to test existence.
 
@@ -359,7 +378,7 @@ Reloads are debounced by 100 ms. The timer callback re-checks that the current t
 
 The bottom of the file maps the theme onto the interfaces that `pi-tui` widgets want. `getMarkdownTheme` binds each markdown role to an `md*` token. `getSelectListTheme`, `getEditorTheme` and `getSettingsListTheme` do the same for lists and the editor border.
 
-Syntax highlighting maps highlight.js scope names to `syntax*` tokens. The highlight theme object is cached per `Theme` instance, so a theme switch rebuilds it once. When no supported language is given, code is not auto-detected: the comment explains that detection mislabels prose as AppleScript and colors random words as keywords, so it falls back to plain `mdCodeBlock` color.
+Syntax highlighting maps highlight.js scope names to `syntax*` tokens. The highlight theme object is cached per `Theme` instance, so a theme switch rebuilds it once. When no supported language is given, code is not auto-detected: the comment explains that detection mislabels prose as AppleScript and colors random words as keywords, so it falls back to plain `mdCodeBlock` color. A highlighter error falls back to the same color. `getMarkdownTheme` now passes `highlightCode` itself rather than keeping its own copy of this logic.
 
 ```ts ! theme.ts
 function getCliHighlightTheme(t: Theme): CliHighlightTheme {
@@ -381,6 +400,56 @@ export function highlightCode(code: string, lang?: string): string[] {
 	if (!validLang) {
 		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 	}
+	const opts = {
+		language: validLang,
+		ignoreIllegals: true,
+		theme: getCliHighlightTheme(theme),
+	};
+	try {
+		return highlight(code, opts).split("\n");
+	} catch {
+		// !mark
+		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
+	}
+}
+```
+
+## !!steps A highlight cache per owner
+
+Tool rows are redrawn far more often than their content changes, and highlighting a long file each time is wasted work. `CodeHighlighter` keeps the last result for one owner, such as a write tool row in [write.ts](/docs/src/core/tools/renderers/write.ts) or a codemode script, and returns it again while nothing it depends on has changed.
+
+It checks four things. Code and language are obvious. The theme check uses `getGlobalTheme`, the real instance on `globalThis`, because the exported `theme` is a proxy whose identity never changes. The grammar count from [syntax-highlight.ts](/docs/src/utils/syntax-highlight.ts) grows when deferred grammars load, which can change how code that embeds another language is colored. Keeping the cache on the owner rather than in a process-wide map means a cached result lives exactly as long as the row that shows it.
+
+```ts ! theme.ts
+export class CodeHighlighter {
+	private last?: {
+		code: string;
+		lang: string | undefined;
+		theme: Theme | undefined;
+		languageCount: number;
+		lines: readonly string[];
+	};
+
+	/** Like {@link highlightCode}. The result is shared with later calls, so callers must not modify it. */
+	highlight(code: string, lang: string | undefined): readonly string[] {
+		// Renderers cannot tell a theme change from any other redraw, so the highlighter checks what its result depends on.
+		const currentTheme = getGlobalTheme();
+		const languageCount = getHighlightLanguageCount();
+		const last = this.last;
+		// !mark(1:6)
+		if (
+			last?.code === code &&
+			last.lang === lang &&
+			last.theme === currentTheme &&
+			last.languageCount === languageCount
+		) {
+			return last.lines;
+		}
+		const lines = highlightCode(code, lang);
+		this.last = { code, lang, theme: currentTheme, languageCount, lines };
+		return lines;
+	}
+}
 ```
 
 </Scrollycoding>

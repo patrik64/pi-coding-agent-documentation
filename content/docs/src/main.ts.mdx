@@ -7,7 +7,8 @@ full: true
 
 `main` is the one place where everything the user typed becomes a running
 agent. It does not run the agent loop itself. Its job is sequencing: handle the
-commands that never need a session (`auth`, `install`, `mcp`, `--export`),
+commands that never need a session (`auth`, including `auth login` and
+`auth logout`, `install`, `mcp`, `--export`),
 decide which of four app modes applies, pick or create a session, build the
 runtime through the SDK, and finally hand control to a mode.
 
@@ -56,8 +57,10 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
 ## !!steps Subcommands run before anything is parsed
 
 The first thing `main` does is try the commands that are not a chat at all.
-`--offline` is detected by scanning raw `args`, before parsing, because it
-also sets environment variables that other modules read.
+Before that it installs the full theme JSON validator, because commands such
+as `pi config` and startup selectors can load user-authored themes long before
+the runtime exists. `--offline` is detected by scanning raw `args`, before
+parsing, because it also sets environment variables that other modules read.
 `runAuthCommand` is tried first, with its own `parseArgs` call on the subcommand's
 arguments and its own exit codes: `check` returns 0 for ready, 1 for not ready,
 2 for invalid.
@@ -68,6 +71,8 @@ returns a boolean saying whether it consumed the invocation.
 ```ts ! main.ts
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	// Commands and startup selectors can load user-authored themes before runtime creation.
+	setThemeJsonValidator(validateThemeJson);
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
@@ -87,6 +92,76 @@ export async function main(args: string[], options?: MainOptions) {
 		const { runMcpCommand } = await loadMcpCommand();
 		process.exitCode = await runMcpCommand(args.slice(1), { cwd, agentDir });
 		return;
+	}
+```
+
+## !!steps Login and logout from the shell
+
+`runAuthCommand` routes `auth login` and `auth logout` to
+[auth-login.ts](/docs/src/cli/auth-login.ts) and
+[auth-logout.ts](/docs/src/cli/auth-logout.ts) before the parser for the other
+auth commands runs, and strips `--offline`, which `main` already applied.
+
+Login gets a small runtime of its own: settings with project trust off (so
+only global proxy and timeout settings apply), and a `ModelRuntime` created
+without model network access. Ctrl+C aborts a controller instead of killing
+the process, so a cancelled login can print a message and exit with 1. The
+terminal adapter comes from [auth-terminal.ts](/docs/src/cli/auth-terminal.ts),
+and `getOrCreateDeviceId` supplies the persistent device id that some OAuth
+flows (the ChatGPT login, for one) send to the provider.
+
+```ts ! main.ts
+async function runAuthLoginCommand(args: string[]): Promise<number> {
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+	const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false, signal: AbortSignal.timeout(15_000) });
+
+	const controller = new AbortController();
+	const interrupt = () => controller.abort();
+	process.on("SIGINT", interrupt);
+	try {
+		return await runAuthLogin(args, {
+			modelRuntime,
+			terminal: createProcessLoginTerminal(interrupt),
+			agentDir,
+			cwd,
+			getDeviceId: () => settingsManager.getOrCreateDeviceId(),
+			signal: controller.signal,
+		});
+	} finally {
+		process.off("SIGINT", interrupt);
+	}
+}
+// ...
+	if (args[0] === "auth" && args[1] === "login") {
+		// main() already applied --offline.
+		process.exitCode = await runAuthLoginCommand(args.slice(2).filter((arg) => arg !== "--offline"));
+		return true;
+	}
+```
+
+## !!steps A working directory that was deleted
+
+If the shell's directory was removed while it stayed open, `process.cwd()`
+throws `ENOENT`. `main` turns that into a one-line error instead of a stack
+trace, right after the managed-install cleanup and before anything reads
+settings from the cwd.
+
+```ts ! main.ts
+	let cwd: string;
+	try {
+		cwd = process.cwd();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		console.error(
+			chalk.red(
+				"Error: The current working directory no longer exists. Change to an existing directory and try again.",
+			),
+		);
+		process.exit(1);
 	}
 ```
 
@@ -213,7 +288,9 @@ saved default if it is in scope, otherwise the first scoped model.
 
 Note that these are diagnostics, not exits. They are gathered and reported
 together once the runtime exists. Model resolution itself lives in
-[model-resolver.ts](/docs/src/core/model-resolver.ts).
+[model-resolver.ts](/docs/src/core/model-resolver.ts); `main` tells it when
+`--api-key` was given, since an inline key goes to whichever provider is
+selected and stored credentials must then not break a tie between providers.
 
 ```ts ! main.ts
 	if (!options.model && scopedModels.length > 0 && !hasExistingSession) {
@@ -240,7 +317,10 @@ discovers what the project contains. If there is anything trust-requiring and no
 `--approve` or `--no-approve` override, a `resolveProjectTrust` callback asks
 (through [trust-manager.ts](/docs/src/core/trust-manager.ts) and
 [project-trust.ts](/docs/src/core/project-trust.ts)) and the answer is cached
-per cwd.
+per cwd. Otherwise the saved decision for the cwd wins, and only a project
+with nothing trust-requiring and no saved decision is trusted automatically. A
+saved "do not trust" therefore holds even for a project that has no
+extensions, so `ctx.isProjectTrusted()` reports it correctly.
 
 The factory is called again for every new runtime, such as after `/new` or a
 session switch, which is why it keeps `projectTrustByCwd` outside itself.
@@ -254,9 +334,7 @@ session switch, which is why it keeps `projectTrustByCwd` outside itself.
 			parsed.projectTrustOverride === undefined && cachedProjectTrust === undefined && hasTrustRequiringResources;
 		const projectTrusted = shouldResolveProjectTrust
 			? false
-			: (cachedProjectTrust ??
-				parsed.projectTrustOverride ??
-				(!hasTrustRequiringResources || trustStore.get(cwd) === true));
+			: (cachedProjectTrust ?? parsed.projectTrustOverride ?? trustStore.get(cwd) ?? !hasTrustRequiringResources);
 		const runtimeSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted });
 ```
 
@@ -291,7 +369,9 @@ hint to retry with `-ne`.
 ## !!steps Help, model list and piped input
 
 With the runtime built, help can finally list extension flags, and
-`--list-models` can query the model runtime. Both exit right away.
+`--list-models` can query the model runtime. Both print the combined startup
+diagnostics, runtime ones included, so warnings such as a configured package
+that failed to install are not hidden, and exit right away.
 
 Piped stdin is then read, except in RPC mode where stdin belongs to the
 protocol. If input was piped into what would have been interactive mode, the

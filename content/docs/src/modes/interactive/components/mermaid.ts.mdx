@@ -5,7 +5,7 @@ source: "src/modes/interactive/components/mermaid.ts"
 full: true
 ---
 
-This file is a `MarkdownTransformer` (see [types.ts](/docs/src/core/extensions/types.ts)) that finds fenced `mermaid` blocks and renders them as terminal art using the `grok-mermaid` library. Diagram rows are re-emitted as Markdown inline code spans, so the normal Markdown renderer preserves their spacing.
+This file is a `MarkdownTransformer` (see [types.ts](/docs/src/core/extensions/types.ts)) that finds fenced `mermaid` blocks and renders them as terminal art using the `lovely-mermaid` library, which replaced `grok-mermaid`. Diagram rows are re-emitted as Markdown inline code spans, so the normal Markdown renderer preserves their spacing.
 
 Whether it runs depends on the `MermaidRenderingMode` setting from [settings-manager.ts](/docs/src/core/settings-manager.ts). Chaining happens in [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts).
 
@@ -13,14 +13,16 @@ Whether it runs depends on the `MermaidRenderingMode` setting from [settings-man
 
 ## !!steps Detecting Mermaid blocks
 
-The file parses Markdown with a `Marked` lexer rather than regexes. `isMermaid` accepts a `code` token whose first info-string word is `mermaid`, case-insensitively. Because only top-level tokens are scanned, blocks nested in lists or quotes are left alone.
+The file parses Markdown with a `Marked` lexer rather than regexes. `isMermaid` accepts a `code` token whose first info-string word is `mermaid`, case-insensitively. Because only top-level tokens are scanned, blocks nested in lists or quotes are left alone. The theme option needs only `fg` and `getFgAnsi`, so tests can pass a small stub instead of a full `Theme`.
 
 ```ts ! mermaid.ts
 const markdownParser = new Marked();
 
+type MermaidTheme = Pick<Theme, "fg" | "getFgAnsi">;
+
 interface MermaidTransformerOptions {
 	getMode: () => MermaidRenderingMode;
-	theme?: Theme;
+	theme?: MermaidTheme;
 }
 
 function isMermaid(token: Token): token is Token & { type: "code"; text: string; lang?: string } {
@@ -46,45 +48,52 @@ function codeSpan(line: string): string {
 }
 ```
 
-## !!steps Theming spans
+## !!steps Theming and links
 
-`grok-mermaid` returns styled spans with a class. `styleSpan` maps each class to a theme color: borders muted, edges accent, titles bold accent, and `none` left unstyled.
+`lovely-mermaid` does the ANSI styling itself through `toAnsi`, given an `AnsiTheme` of SGR parameters per role. `foreground` turns a theme color into such a parameter by stripping the leading escape and the trailing `m` from `getFgAnsi`. Borders are muted, edges accent, node text and edge labels use body text, and titles add bold (`1;`) to the accent color.
+
+Diagrams can carry links from Mermaid `click` directives. Wrapping a whole box in an OSC 8 hyperlink would make its borders clickable too, so only spans with the `text` role keep their `href`, and only when the terminal reports hyperlink support. Every other span is copied without the link.
 
 ```ts ! mermaid.ts
-function styleSpan(span: Span, theme: Theme): string {
-	switch (span.cls) {
-		case "border":
-			return theme.fg("borderMuted", span.text);
-		case "text":
-			return theme.fg("text", span.text);
-		case "edge":
-			return theme.fg("accent", span.text);
-		case "edgeLabel":
-			return theme.fg("muted", span.text);
-		case "title":
-			return theme.fg("accent", theme.bold(span.text));
-		case "none":
-			return span.text;
-	}
-}
-
-function themedLines(art: MermaidArt, theme: Theme): string[] {
-	return art.styled.map((row) => row.map((span) => styleSpan(span, theme)).join(""));
+function themedLines(art: MermaidArt, theme: MermaidTheme): string[] {
+	const foreground = (color: ThemeColor) => theme.getFgAnsi(color).slice(2, -1);
+	const ansiTheme: AnsiTheme = {
+		border: foreground("borderMuted"),
+		text: foreground("text"),
+		edge: foreground("accent"),
+		edgeLabel: foreground("text"),
+		title: `1;${foreground("accent")}`,
+	};
+	const linkLabels = getCapabilities().hyperlinks;
+	const displayArt: MermaidArt = {
+		...art,
+		// Only osc 8 the text, not the whole box.
+		styled: art.styled.map((row) =>
+			row.map((span) => {
+				if (span.href === undefined || (linkLabels && span.role === "text")) return span;
+				const unlinked = { ...span };
+				delete unlinked.href;
+				return unlinked;
+			}),
+		),
+	};
+	return toAnsi(displayArt, ansiTheme);
 }
 ```
 
 ## !!steps When not to transform
 
-The transformer bails out and returns the markdown unchanged when the mode is `off`, when the message is `assistant-thinking`, or when streaming is in progress unless the mode is `streaming`.
+The transformer bails out and returns the markdown unchanged when the mode is `off`, when streaming is in progress unless the mode is `streaming`, or when the surface is anything other than `user`, `assistant` or `summary`. Transformers can now be registered for more surfaces (custom messages, the changelog), so the check is an allow-list: diagrams appear in user and assistant text and in expanded branch and compaction summaries, but not in thinking or other surfaces.
 
 ```ts ! mermaid.ts
 /** Create a transformer that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
 export function createMermaidMarkdownTransformer(options: MermaidTransformerOptions): MarkdownTransformer {
 	return (markdown, context) => {
 		const mode = options.getMode();
+		// Diagrams render in user and assistant text and in model-written summaries, not in thinking or other surfaces.
 		if (
 			mode === "off" ||
-			context.messageType === "assistant-thinking" ||
+			(context.messageType !== "user" && context.messageType !== "assistant" && context.messageType !== "summary") ||
 			(context.isStreaming && mode !== "streaming")
 		) {
 			return markdown;
@@ -112,7 +121,6 @@ Each token is mapped back to text. Non-Mermaid tokens return their `raw`. If ren
 				// Markdown hard breaks keep every diagram row on its own line.
 				return `${lines.map(codeSpan).join("  \n")}\n`;
 			})
-// ...
 			.join("");
 	};
 }
@@ -120,4 +128,4 @@ Each token is mapped back to text. Non-Mermaid tokens return their `raw`. If ren
 
 </Scrollycoding>
 
-The result is joined back into one string, so the rest of the pipeline sees ordinary Markdown. The module-level `markdownParser` is shared across calls. The `theme` option is optional, which lets the transformer run unstyled in tests or non-TUI contexts.
+The result is joined back into one string, so the rest of the pipeline sees ordinary Markdown. The module-level `markdownParser` is shared across calls. The `theme` option is optional; without it the renderer's plain rows are used, which lets the transformer run unstyled in tests or non-TUI contexts.

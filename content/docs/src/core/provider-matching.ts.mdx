@@ -1,0 +1,58 @@
+---
+title: "provider-matching.ts"
+description: "Resolves a provider reference typed by the user to providers by exact id or display name, ignoring case"
+source: "src/core/provider-matching.ts"
+full: true
+---
+
+Login and logout accept a provider reference from the user, either the id
+(`openai`) or the display name shown in the UI. This file is the one rule for
+turning that text into providers. It was lifted out of the interactive mode's
+`/login` handler when `pi auth login` and `pi auth logout` arrived, so the
+slash command and the shell commands in
+[auth-login.ts](/docs/src/cli/auth-login.ts) and
+[auth-logout.ts](/docs/src/cli/auth-logout.ts) resolve names the same way.
+
+<Scrollycoding>
+
+## !!steps Normalizing the reference
+
+Only the reference is trimmed and lower-cased; provider ids and names are
+lower-cased but not trimmed. An empty or whitespace-only reference matches
+nothing rather than everything, so callers can treat an empty result as
+"unknown provider".
+
+The function is generic over anything with `id` and `name`. The shell commands
+pass `ModelRuntime.getProviders()` directly, while `/login` passes its own
+selector entries.
+
+```ts ! provider-matching.ts
+/** Match provider IDs and display names exactly, ignoring case and surrounding whitespace in the reference. */
+export function findMatchingProviders<T extends { id: string; name: string }>(
+	providers: readonly T[],
+	providerRef: string,
+): T[] {
+	// !mark(1:2)
+	const normalized = providerRef.trim().toLowerCase();
+	if (!normalized) return [];
+```
+
+## !!steps Exact matches only, all of them
+
+A provider matches when its id or its name equals the reference. There is no
+prefix or fuzzy matching, which keeps a typo from logging in to, or deleting
+the credentials of, a provider the user did not mean.
+
+It returns every match instead of the first. In `/login` the same provider can
+appear once per auth method, so several matches that share one id open the
+auth-method selector for that provider. The CLI commands take the first match.
+
+```ts ! provider-matching.ts
+	return providers.filter(
+		// !mark
+		(provider) => provider.id.toLowerCase() === normalized || provider.name.toLowerCase() === normalized,
+	);
+}
+```
+
+</Scrollycoding>

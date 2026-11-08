@@ -32,6 +32,11 @@ changes: `agent_end` gains `willRetry` (so a UI can keep its spinner while the
 session retries or compacts), and a set of session-level events is added for
 queue changes, compaction, auto-retry, appended entries and bash output.
 
+`agent_settled` carries `aborted`, so a host can tell a cancelled run from one
+that finished. Interactive mode uses it to report the terminal's program status
+as idle rather than done after an abort (see
+[program-status-reporter.ts](/docs/src/modes/interactive/program-status-reporter.ts)).
+
 Tool execution events can carry a `parentToolCallId` when a tool made the call
 through `ctx.executeTool()`. `parseSkillBlock` above it is the inverse of the
 skill expansion done in `_expandSkillCommand`, used by UIs to render a skill
@@ -51,7 +56,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; aborted: boolean }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -69,9 +74,13 @@ controllers, a pending list of custom messages, and many extension-binding
 fields. Most mutable flags exist to answer one question precisely: is the
 session idle?
 
-The constructor subscribes to the agent, installs six hooks, builds the
-runtime (tools, extension runner) and, when no explicit tool list was given,
-restores the tool loadout declared in the transcript.
+The constructor subscribes to the agent, installs six hooks and builds the
+runtime (tools, extension runner). When the initial tools come from the
+`defaultTools` setting rather than an explicit `--tools` list, it then replaces
+them with the loadout the transcript records, so a resumed session gets back
+the tools it had. `--tools` entries of the form `+name` or `-name` modify the
+setting instead of replacing it, so they are kept as `_defaultToolModifiers`
+and applied on top of the restored loadout.
 
 ```ts ! agent-session.ts
 	constructor(config: AgentSessionConfig) {
@@ -95,7 +104,8 @@ restores the tool loadout declared in the transcript.
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
+		// !mark
+		if (this._usesDefaultTools) this._restoreToolsFromTranscript(this._defaultToolModifiers);
 	}
 ```
 
@@ -134,6 +144,46 @@ are persisted by their own code paths, as the comment says.
 			}
 			// !mark
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+```
+
+## !!steps Queued messages are fixed up on delivery
+
+Before any of that, a user `message_start` is matched against the steering and
+follow-up queues kept for display, so the UI sees the updated queue in the
+same event. An image-only message has empty text, and its queue entry is the
+empty string, so the match now runs even when there is no text. A guard on
+the text used to skip such messages, leaving them in the displayed queue after
+they were delivered.
+
+Images in idle prompts are resized to the model's limits, but steering and
+follow-up messages used to be sent and saved at full size. `_queueSteer` and
+`_queueFollowUp` now mark messages that carry images in a `WeakSet`, and on
+delivery the images are normalized in place, with resize hints appended to the
+text, before extensions, listeners and persistence see the message. Doing it
+at delivery rather than when queuing keeps queuing synchronous, so a slow
+resize cannot leave a message stranded after the run ends, and it uses the
+model that is current when the message is actually sent.
+
+```ts ! agent-session.ts
+		if (event.type === "message_start" && event.message.role === "user") {
+			this._overflowRecoveryAttempted = false;
+			const messageText = contentText(event.message.content, "");
+			// Check steering queue first
+			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+// ...
+			}
+			// Normalize queued images at delivery, before events and persistence see the message,
+			// so they get the same resize as idle prompts with the current model's limits (#11738).
+			// !mark(1:4)
+			if (this._queuedMessagesWithImages.has(event.message)) {
+				this._queuedMessagesWithImages.delete(event.message);
+				await this._normalizeQueuedMessageImages(event.message);
+			}
+		}
 ```
 
 ## !!steps Extensions can rewrite a message before it is saved
@@ -182,6 +232,8 @@ always blocks.
 `isError` or usage, then runs image normalization after the hook so images
 injected by extensions are resized too, using the limits of the current model.
 If nothing changed it returns `undefined` and the original result stands.
+(The `tool_execution_end` event forwarded to extensions also carries the
+tool's `durationMs` when the agent measured it.)
 
 ```ts ! agent-session.ts
 		const content = hookResult?.content ?? result.content ?? [];
@@ -245,17 +297,41 @@ is saved as a custom entry. See
 ## !!steps What prompt does before the model is called
 
 `prompt()` is a long gate. Slash commands from extensions run immediately,
-even while streaming. The `input` extension event can swallow or transform the
-text. Skill and template expansion follow. If a run is active, the message is
-queued as a steer or follow-up (and a missing `streamingBehavior` throws).
+even while streaming. A prompt is refused while a manual compaction or a tree
+navigation's branch summary is in progress (the error message mentions only
+compaction). Everything after that runs in
+`_preparePrompt`: the `input` extension event can swallow or transform the
+text, skill and template expansion follow, and if a run is active the message
+is queued as a steer or follow-up (a missing `streamingBehavior` throws).
+Otherwise it requires a model and usable auth and returns a trigger describing
+the run to start.
 
-Otherwise it flushes pending bash and custom messages, requires a model and
-usable auth, checks compaction against the last assistant message, and only then
-emits `before_agent_start`. The comments explain the order: images are
-normalized after that event so an extension that switches model changes the
-resize profile.
+Input hooks and the auth check are asynchronous, so `_promptPreflightCount`
+is raised around them. `navigateTree` refuses while it is non-zero; before
+this, a navigation could switch the branch underneath a prompt that had not
+started yet. There is no gap afterwards because `_startRun` marks the run
+active synchronously.
 
 ```ts ! agent-session.ts
+		if (this._compactionAbortController !== undefined || this._branchSummaryAbortController !== undefined) {
+			throw new Error(
+				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+			);
+		}
+
+		// Reserve the context through async input hooks and auth checks so tree navigation cannot
+		// start meanwhile (#9154). _startRun marks the run active synchronously, so there is no gap.
+		// !mark(1:7)
+		this._promptPreflightCount++;
+		let trigger: BeforeAgentStartTrigger | undefined;
+		try {
+			trigger = await this._preparePrompt(text, options);
+		} finally {
+			this._promptPreflightCount--;
+		}
+		if (trigger) await this._startRun(trigger, () => preflightResult?.("started"));
+	}
+// ...
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
 			if (!options?.streamingBehavior) {
@@ -264,23 +340,107 @@ resize profile.
 				);
 			}
 // ...
+		return { messageType: "user", prompt: expandedText, images: currentImages };
+```
+
+## !!steps Starting a run
+
+Every run starts in `_startRun`, whether it comes from `prompt()` or from a
+custom message sent with `triggerTurn`. The session counts as busy from the
+first line, before `before_agent_start` handlers run. A message sent while
+they run is therefore queued into this run instead of starting a second one,
+and an abort requested meanwhile is honored as soon as the run exists:
+`_handleAgentEvent` calls `agent.abort()` on `agent_start` when the abort flag
+is set.
+
+If preparation throws, the busy flag is cleared and idle waiters are released.
+Bash and custom messages held back while the run was starting are flushed
+before its first request, which places them ahead of the starting message just
+as they would have been while idle. Then the live model and thinking level are
+recorded on the branch, and pending tool names are dropped because the run
+records the loadout in the transcript.
+
+```ts ! agent-session.ts
+	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		// !mark
+		this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		let messages: AgentMessage[];
+		try {
+			messages = await this._prepareRun(trigger);
+		} catch (error) {
+			this._isAgentRunActive = false;
+			this._flushPendingBashMessages();
+			this._flushPendingCustomMessages();
+			this._resolveIdleWaitIfIdle();
+			throw error;
+		}
+		// Messages held while the run was starting go before its starting messages, as they would
+		// have while idle. No run exists yet, so they cannot split a tool call from its result.
+		this._flushPendingBashMessages();
+		this._flushPendingCustomMessages();
+		onStarted?.();
+
+		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		// The run records the loadout in the transcript; restored tools that did not register by now
+		// are dropped, so a tool that never registers does not stay pending.
+		this._pendingToolNames.clear();
+```
+
+## !!steps Building the starting messages
+
+`_prepareRun` checks compaction against the last assistant message, then
+emits `before_agent_start` with the trigger. The event is a union on
+`messageType`: `"user"` carries the prompt text and images, `"custom"` carries
+the starting custom message. Custom-message runs used to skip the event, and
+after their first tool call the next-turn refresh patched away the prompt
+sections handlers had added, changing the system prompt mid-run and breaking
+the provider's prompt cache.
+
+The comments explain the order: images are normalized after the event so an
+extension that switches model changes the resize profile. The starting message
+is followed by pending `nextTurn` messages and the handlers' messages, and a
+system patch goes first when the prompt changed.
+
+```ts ! agent-session.ts
+	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
 		// Check if we need to compact before sending (catches aborted responses).
-		// The user's new prompt is sent below, so do not call agent.continue() here.
+		// The starting message is sent below, so do not call agent.continue() here.
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) {
 			// !mark
 			await this._checkCompaction(lastAssistant, false);
 		}
 
-		// Emit before_agent_start before normalizing images so extension-driven model
-		// selection determines the resize profile used for the request and history.
 		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(
+		// !mark
+		const result = await this._extensionRunner.emitBeforeAgentStart(trigger, this._baseSystemPromptOptions);
+// ...
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._normalizePromptImages(trigger.images);
+// ...
+		}
+		// Inject any pending "nextTurn" messages as context alongside the starting message
+		messages.push(...this._pendingNextTurnMessages);
+		this._pendingNextTurnMessages = [];
+// ...
+		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+		if (updateMessage) messages.unshift(updateMessage);
+		return messages;
+	}
 ```
 
 ## !!steps The run loop after the agent returns
 
-`_runAgentPrompt` calls `agent.prompt` and then loops. After each agent run,
+After preparation, `_startRun` calls `agent.prompt` and then loops. After each agent run,
 `_handlePostAgentRun` decides whether to continue: a retryable error with
 budget left (`_prepareRetry` sleeps with backoff, and the failed response is
 remembered so routing knows it is a retry), a compaction that wants a retry,
@@ -288,9 +448,9 @@ or queued messages. If nothing continues, the `agent_before_settle` boundary
 gives extensions one last chance to keep the run going.
 
 The `finally` block always clears transient state, flushes pending bash and
-custom messages, and emits `agent_settled`, which is what resolves
-`waitForIdle`. A user abort sets a flag checked between each step so
-the loop exits promptly.
+custom messages, and emits `agent_settled` (with `aborted` set from the abort
+flag), which is what resolves `waitForIdle`. A user abort sets a flag checked
+between each step so the loop exits promptly.
 
 ```ts ! agent-session.ts
 		try {
@@ -330,7 +490,11 @@ usage is compared against the threshold.
 Two guards prevent false triggers: a message from a different model than the
 current one never counts as overflow, and any message older than the latest
 compaction entry is ignored. Before the retry, the failed attempt is durably
-omitted from the projection with a context-edit entry.
+omitted from the projection with context-edit entries, together with its tool
+results. `_omitRecoveryAttempt` finds those results in the projected context
+(matching by entry id too, since an earlier edit may have replaced the
+projected copy), so the pair stays together whether the attempt came from this
+run or a resumed session. An unpaired tool result would fail the next request.
 
 ```ts ! agent-session.ts
 		if (contextOverflow || recoverableLength) {
@@ -348,7 +512,7 @@ omitted from the projection with a context-edit entry.
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			// !mark(1:4)
 			this._overflowRecoveryAttempted = true;
-			this._omitRecoveryAttempt(assistantMessage, toolResults);
+			this._omitRecoveryAttempt(assistantMessage);
 			const retry = await this._runAutoCompaction("overflow", willRetry);
 			if (retry) this._failedResponse = assistantMessage;
 			return retry;
@@ -363,9 +527,12 @@ becomes a steer or follow-up unless `triggerTurn` is false; then it is put in
 mid-turn could place it between an assistant tool call and the tool result,
 which providers that validate order reject on replay.
 
-If it is called from inside the `agent_settled` emission, starting a turn is
-deferred until the emission finishes, using `_deferredSettledActions`.
-`prompt()` does the same.
+With `triggerTurn` while idle, the message starts a run through `_startRun`
+with a `custom` trigger, so it gets the same compaction check,
+`before_agent_start` event and system patch as a prompt. If it is called from
+inside the `agent_settled` emission, the whole call is replayed after the
+emission finishes, using `_deferredSettledActions`, so the delivery decision
+is made again against the state at that point. `prompt()` does the same.
 
 ```ts ! agent-session.ts
 		if (options?.deliverAs === "nextTurn") {
@@ -379,10 +546,10 @@ deferred until the emission finishes, using `_deferredSettledActions`.
 		} else if (options?.triggerTurn) {
 			// !mark(1:3)
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				this._deferredSettledActions.push(async () => await this.sendCustomMessage(message, options));
 				return;
 			}
-			await this._runAgentPrompt(appMessage);
+			await this._startRun({ messageType: "custom", message: appMessage });
 		} else if (this.isStreaming) {
 ```
 
@@ -420,6 +587,49 @@ decide the rest: only `direct` tools that are active, plus every `codemode` or
 			return exposure === "codemode" || exposure === "deferred" || (exposure === "direct" && active.has(tool.name));
 		});
 	}
+```
+
+## !!steps Restoring the loadout from the transcript
+
+`_restoreToolsFromTranscript` runs at construction (when tools come from
+`defaultTools`) and after tree navigation. It replays every system message on
+the branch, including those before a compaction, because compaction snapshots
+are derived from them. A branch with no system message keeps the current
+tools. Tools the branch removed stay off.
+
+Extension tools the branch never mentioned were registered after it recorded
+its loadout, so they are activated as newly registered tools would be;
+built-in tools follow `defaultTools` instead. The `--tools` modifiers apply
+last. Names not registered yet, such as tools of MCP servers still
+connecting, stay pending and activate when they register.
+
+Setting the loadout is order-stable: `_applyToolLoadout` keeps tools that stay
+active in their current order and appends new ones, so passing the same names
+in a different order does not change the prompt.
+
+```ts ! agent-session.ts
+	private _restoreToolsFromTranscript(modifiers: readonly string[] = []): void {
+		this._pendingToolNames.clear();
+		// All system messages on the branch, including those before a compaction. Compaction snapshots
+		// are derived from these, so replaying them gives the current loadout.
+		const systemMessages = this.sessionManager
+			.getBranch()
+			.flatMap((entry) => (entry.type === "message" && entry.message.role === "system" ? [entry.message] : []));
+		// No recorded loadout: keep the current tools.
+		if (systemMessages.length === 0) return;
+// ...
+		// Extension tools the branch never mentioned were registered after it recorded its loadout, so
+		// they are activated like newly registered tools. Built-in tools follow `defaultTools` instead.
+		const newTools = [...this._toolRegistry.keys()].filter(
+			(name) =>
+				!mentioned.has(name) && !this._baseToolDefinitions.has(name) && this._isActivatedOnRegistration(name),
+		);
+		// The recorded loadout plus the new tools, with `--tools +name`/`-name` applied.
+		// !mark(1:4)
+		const names = applyToolModifiers(
+			[...getCurrentTools(systemMessages).map((tool) => tool.name), ...newTools],
+			modifiers,
+		);
 ```
 
 ## !!steps System prompt as diffs in the transcript
@@ -463,7 +673,10 @@ thinking level for the new model comes from `_getThinkingLevelForModelSwitch`
 it to what the model supports and appends a transcript entry only if the
 level actually changed.
 
-`cycleModel` uses the scoped models list if present, else all available models.
+`cycleModel` uses the scoped models list if present, else all available
+models. `getNextCycleIndex` handles a current model that is not in the list:
+forward picks the first entry and backward the last, so a scope of one model
+still switches to it instead of reporting that there is nothing to cycle to.
 
 ```ts ! agent-session.ts
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
@@ -487,13 +700,53 @@ level actually changed.
 	}
 ```
 
+## !!steps Recording the selection on the branch
+
+Tree navigation can leave the latest `model_change` or
+`thinking_level_change` on another branch, so a resume would restore a stale
+selection. `_recordSelection` runs at the start of every run and appends the
+live model and thinking level to the current branch when the branch implies
+something else.
+
+The thinking-level check compares after clamping to the current model. A
+level that was clamped on resume, such as `xhigh` running as `high`, therefore
+does not overwrite the level the user asked for.
+
+```ts ! agent-session.ts
+	private _recordSelection(): void {
+		const branch = this.sessionManager.getBranch();
+		this._recordModelSelection(branch);
+		this._recordThinkingLevel(branch);
+	}
+// ...
+	private _recordThinkingLevel(branch: SessionEntry[]): void {
+		const recorded = branch.findLast((entry) => entry.type === "thinking_level_change");
+		if (!recorded) return;
+		const recordedLevel = recorded.thinkingLevel as ThinkingLevel;
+		const availableLevels = this.getAvailableThinkingLevels();
+		// !mark(1:3)
+		const effective = availableLevels.includes(recordedLevel)
+			? recordedLevel
+			: this._clampThinkingLevel(recordedLevel, availableLevels);
+		if (effective === this.thinkingLevel) return;
+		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+	}
+```
+
 ## !!steps Reloading extensions and settings in place
 
-`reload` emits `session_shutdown` with reason `reload` on the old runner,
+`reload` first refuses while a run or compaction is in progress. Invalidating
+the runner under a running extension tool would make its next context access
+throw a stale-context error, and that failed tool result would be saved in the
+session. The guard does not cover a prompt still in preflight.
+
+It then emits `session_shutdown` with reason `reload` on the old runner,
 invalidates it, reloads settings and the resource loader, and builds a new
-runtime. Flag values are carried over. The tools that were active become
-pending names, so tools registered later by the new extensions (MCP servers
-still connecting) are activated when they appear.
+runtime. Flag values are carried over. Tools newly added to `defaultTools`
+are activated, with the `--tools` modifiers applied to both the old and new
+setting so a tool removed on the command line stays removed. The tools that
+were active become pending names, so tools registered later by the new
+extensions (MCP servers still connecting) are activated when they appear.
 
 The `session_start` event with reason `reload` is emitted only when a host has
 bound UI, commands, a shutdown handler or an error listener; a headless
@@ -501,10 +754,17 @@ session skips it.
 
 ```ts ! agent-session.ts
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		// !mark(1:6)
+		if (this.isStreaming) {
+			throw new Error("Wait for the current response to finish before reloading.");
+		}
+		if (this.isCompacting) {
+			throw new Error("Wait for compaction to finish before reloading.");
+		}
+
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
-		// !mark
 		oldRunner.invalidate();
 // ...
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
@@ -520,16 +780,25 @@ session skips it.
 ## !!steps Navigating the session tree
 
 `navigateTree` moves the leaf within the same file (unlike fork, which makes
-a new file). It refuses while streaming or compacting, treats navigation to the
-current leaf as a no-op, and collects the entries on the abandoned branch for
-an optional summary. Extensions can cancel, supply the summary, or override
-instructions and label through `session_before_tree`.
+a new file). It refuses while streaming, while a prompt is in preflight, and
+while compacting or another navigation is summarizing. It treats navigation to
+the current leaf as a no-op and collects the entries on the abandoned branch
+for an optional summary. Extensions can cancel, supply the summary, or
+override instructions and label through `session_before_tree`.
+
+The summary request uses the session's thinking level. When the stream
+function was created by [sdk.ts](/docs/src/core/sdk.ts), which marks it with
+`markRuntimeStreamFunction`, no credentials are resolved up front: that stream
+resolves auth itself, and a pre-resolved OAuth token would be taken as an
+explicit API key. The same applies to compaction summaries.
 
 Where the leaf lands depends on the target: for a user or custom message the
 leaf is its parent and the text goes back to the editor, so the user can edit
 and resubmit; any other entry becomes the leaf itself. A summary, if made, is
 attached at the new leaf, then the transcript is refreshed and the tool
-loadout is restored from it.
+loadout is restored from it. The branch-summary controller is released before
+`session_tree` is emitted, so handlers may prompt or navigate again; the
+`finally` block clears it only if no such nested navigation has taken it over.
 
 ```ts ! agent-session.ts
 			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
@@ -549,6 +818,9 @@ loadout is restored from it.
 			this._refreshFinalizedContext();
 			// !mark
 			this._restoreToolsFromTranscript();
+
+			// The selected context is installed; session_tree handlers may now prompt or navigate again.
+			this._branchSummaryAbortController = undefined;
 ```
 
 ## !!steps Disposing safely

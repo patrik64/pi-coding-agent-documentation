@@ -1,0 +1,84 @@
+---
+title: "radius-mcp.ts"
+description: "Plans the global mcp.json entry that points the Radius MCP server at a Radius login, reusing an existing entry or picking a free server name"
+source: "src/core/radius-mcp.ts"
+full: true
+---
+
+The Radius gateway also serves an MCP endpoint, and the right credential for it is the Radius login the user already has, not a separate MCP OAuth sign-in. An MCP server entry with `auth.provider` sends a pi provider's token instead of using OAuth (see [mcp-servers.ts](/docs/src/core/mcp-servers.ts)), so after a Radius login pi offers to write such an entry into the global `mcp.json`.
+
+This file only computes that change; it never writes. Both login paths share it: `/login` in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) asks the user before applying the plan and then reloads the session, while `pi auth login` in [auth-login.ts](/docs/src/cli/auth-login.ts) applies it without asking, since the login is what the server needs. Either caller writes the entry with `addMcpServerConfig` from [config.ts](/docs/src/extensions/mcp/config.ts). The endpoint itself, `RADIUS_MCP_URL`, comes from [radius.ts](/docs/src/core/radius.ts).
+
+<Scrollycoding>
+
+## !!steps The plan
+
+A plan is everything a caller needs to apply the change: the path of the global `mcp.json`, the server name, and the complete HTTP server config to store under it. Returning a value instead of writing keeps the decision testable and lets the interactive path show the file in its question before touching it.
+
+```ts ! radius-mcp.ts
+import path from "node:path";
+import { mcpNamespace } from "@earendil-works/pi-mcp";
+import { loadMcpConfig } from "../extensions/mcp/config.ts";
+import type { McpHttpServerConfig } from "./mcp-servers.ts";
+import { RADIUS_MCP_URL } from "./radius.ts";
+
+/** Change to the global mcp.json that points the Radius MCP server at a Radius login. */
+export interface RadiusMcpServerPlan {
+	mcpPath: string;
+	name: string;
+	config: McpHttpServerConfig;
+}
+```
+
+## !!steps Finding an existing Radius server
+
+The config is loaded with `projectTrusted: false`, so only the global file counts; `auth` is not allowed in project files anyway. A server is the Radius server when its URL equals `RADIUS_MCP_URL` once trailing slashes are removed from both, so an entry the user typed by hand is recognised whatever its name.
+
+If that server already uses this provider's login there is nothing to do, and the function returns undefined. Callers treat that as "do not ask, do not write", which is why logging in again stays quiet.
+
+```ts ! radius-mcp.ts
+export function planRadiusMcpServer(
+	providerId: string,
+	agentDir: string,
+	cwd: string,
+): RadiusMcpServerPlan | undefined {
+	// !mark
+	const normalizeUrl = (url: string) => url.replace(/\/+$/u, "");
+	const { servers } = loadMcpConfig({ agentDir, cwd, projectTrusted: false });
+	const existing = servers.find(
+		(server) => "url" in server.config && normalizeUrl(server.config.url) === normalizeUrl(RADIUS_MCP_URL),
+	);
+	// !mark
+	if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return undefined;
+```
+
+## !!steps Choosing a name and the config
+
+An existing entry keeps its name. A new one is called `radius`, or `radius-mcp`, `radius-mcp-2` and so on when that is taken. Names are compared by namespace, because two servers whose names differ only in `-` and `_` share a tool namespace and the config loader would reject the second.
+
+The config keeps the existing entry's other fields, such as exposure or description, and sets `auth.provider`. Any `oauth` block is deleted: with `auth` the server no longer uses an MCP OAuth sign-in, so its settings would only mislead. The spread makes a copy first, so the loaded entry is not modified.
+
+```ts ! radius-mcp.ts
+	let name = existing?.name ?? "radius";
+	if (!existing) {
+		const namespaces = new Set(servers.map((server) => mcpNamespace(server.name)));
+		// !mark(1:3)
+		for (let suffix = 1; namespaces.has(mcpNamespace(name)); suffix++) {
+			name = suffix === 1 ? "radius-mcp" : `radius-mcp-${suffix}`;
+		}
+	}
+	const config: McpHttpServerConfig =
+		existing && "url" in existing.config
+			// !mark(1:2)
+			? { ...existing.config, auth: { provider: providerId } }
+			: { url: RADIUS_MCP_URL, auth: { provider: providerId } };
+	// `auth` replaces the MCP OAuth sign-in.
+	// !mark
+	delete config.oauth;
+	return { mcpPath: path.join(agentDir, "mcp.json"), name, config };
+}
+```
+
+</Scrollycoding>
+
+Because the entry uses `auth.provider`, the MCP extension reads the Radius token from the model registry on every request, and `pi mcp login` points users to `pi auth login` for this server instead of starting an OAuth flow (see [cli.ts](/docs/src/extensions/mcp/cli.ts)).

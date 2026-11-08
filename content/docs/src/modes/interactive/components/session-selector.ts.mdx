@@ -15,7 +15,7 @@ The file holds three cooperating pieces. `SessionSelectorHeader` renders the tit
 
 Rows show the age of a session as a single short token. `formatSessionDate` walks down from "now" through minutes, hours, days, weeks, months and years, and each boundary uses the previous unit's count, so 6 days is `6d` and 7 days becomes `1w`. Months are approximated as 30 days and years as 365.
 
-`shortenPath` replaces a leading home directory with `~`, used for the working directory column in the all-folders view and for the optional path display.
+The working directory column in the all-folders view and the optional path display shorten a leading home directory to `~` with the shared `shortenHomePath` from [paths.ts](/docs/src/utils/paths.ts), which knows Windows path rules.
 
 ```ts ! session-selector.ts
 function formatSessionDate(date: Date): string {
@@ -80,17 +80,23 @@ Hints come from `keyHint`, in [keybinding-hints.ts](/docs/src/modes/interactive/
 
 ## !!steps Building a session tree from parent paths
 
-Forked sessions record the path of their parent, and threaded mode shows that ancestry. `buildSessionTree` first indexes every session by canonicalized path, then attaches each node to its parent if the parent is in the list, otherwise it becomes a root. A session whose parent was filtered out or lives elsewhere therefore appears at the top level instead of vanishing.
+Forked sessions record the path of their parent, and threaded mode shows that ancestry. `buildSessionTree` first indexes every session by a path key, then attaches each node to its parent if the parent is in the list, otherwise it becomes a root. A session whose parent was filtered out or lives elsewhere therefore appears at the top level instead of vanishing.
 
-Canonicalizing through [paths.ts](/docs/src/utils/paths.ts) matters because the same file can be spelled differently, for instance through a symlink or relative form. Each node also carries `latestActivity`, the newest modification time in its subtree, and siblings are sorted by it, so a thread with a recent fork floats to the top.
+The key comes from `getSessionPathKey`, which canonicalizes the path through [paths.ts](/docs/src/utils/paths.ts) and then lowercases it on Windows. That matters because the same file can be spelled differently, through a symlink, a relative form, or different letter case on a case-insensitive file system. The same key decides which row is the active session. Each node also carries `latestActivity`, the newest modification time in its subtree, and siblings are sorted by it, so a thread with a recent fork floats to the top.
 
 ```ts ! session-selector.ts
+/** Comparison key for a session file path; follows symlinks and ignores case on Windows. */
+function getSessionPathKey(path: string): string {
+	return getPathComparisonKey(canonicalizePath(path));
+}
+
+// ...
 	const roots: SessionTreeNode[] = [];
 
 	for (const session of sessions) {
-		const sessionPath = canonicalizePath(session.path) ?? session.path;
+		const sessionPath = getSessionPathKey(session.path);
 		const node = byPath.get(sessionPath)!;
-		const parentPath = canonicalizePath(session.parentSessionPath);
+		const parentPath = session.parentSessionPath ? getSessionPathKey(session.parentSessionPath) : undefined;
 
 		// !mark(1:5)
 		if (parentPath && byPath.has(parentPath)) {
@@ -266,6 +272,8 @@ Only if that fails does it call `unlink`. When both fail, the error shows the un
 `SessionSelectorComponent` extends `Container` and rebuilds its children whenever the mode changes. `buildBaseLayout` wraps any content in spacers and two accent borders, with an optional header. Entering rename mode builds a small panel with the input and a hint, hides the header, and routes all keys to the input except cancel.
 
 Rename is guarded: it is ignored when no rename callback was provided, or while the current scope is still loading, since the session metadata may be incomplete. After a successful rename it reloads the list, and `finally` ensures the UI returns to list mode even on failure.
+
+The component reports `capturesViewportInput` as true except in rename mode, so in fullscreen mode page keys move the session list instead of scrolling the transcript behind it.
 
 ```ts ! session-selector.ts
 	private buildBaseLayout(content: Component, options?: { showHeader?: boolean }): void {

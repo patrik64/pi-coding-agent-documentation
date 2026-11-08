@@ -110,7 +110,7 @@ export interface ModelsCallbacks {
 
 ## !!steps Building the dialog
 
-Models are keyed as `provider/id`. The header states that changes are session-only. Enabled ids may refer to models no longer available; those still show up, struck through and tagged unavailable.
+Models are keyed as `provider/id`. The header states that changes are session-only. Enabled ids may refer to models no longer available; those still show up, struck through and tagged unavailable. Rows show the id, then the model's display name in muted parentheses when `getDistinctModelName` from [model-search.ts](/docs/src/modes/interactive/model-search.ts) finds that the name adds words, then the provider badge.
 
 ```ts ! scoped-models-selector.ts
 	constructor(config: ModelsConfig, callbacks: ModelsCallbacks) {
@@ -209,7 +209,7 @@ The footer lists key hints, a count (or all enabled), and an unsaved marker. `re
 
 ## !!steps Key handling
 
-Each edit sets `isDirty`, refreshes and notifies. Reordering is only allowed for enabled models in an explicit list. Provider toggle clears the provider if all its models are on, else enables them all. Save calls `onPersist` and clears the dirty flag. Ctrl+C first clears search, then cancels.
+Each edit sets `isDirty`, refreshes and notifies. Reordering is only allowed for enabled models in an explicit list. Provider toggle clears the provider if all its models are on, else enables them all. Save calls `onPersist` and clears the dirty flag. Ctrl+C first clears search, then cancels. The selection page keys jump a screen at a time through pi-tui's `getSelectPageIndex`; the component sets `capturesViewportInput`, so in fullscreen mode those keys reach the list instead of scrolling the transcript.
 
 ```ts ! scoped-models-selector.ts
 		// Reorder enabled models

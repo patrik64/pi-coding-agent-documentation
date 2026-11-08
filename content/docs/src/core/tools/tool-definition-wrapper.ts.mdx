@@ -5,20 +5,36 @@ source: "src/core/tools/tool-definition-wrapper.ts"
 full: true
 ---
 
-Two shapes describe a tool in this codebase. A `ToolDefinition` (from [extensions/types.ts](/docs/src/core/extensions/types.ts)) is the rich form: schema, prompt metadata, renderers and an `execute` that receives an extension context. An `AgentTool` is the lean form the agent core runs. This file converts in both directions.
+Two shapes describe a tool in this codebase. A `ToolDefinition` (from [extensions/types.ts](/docs/src/core/extensions/types.ts)) is the rich form: schema, prompt metadata, renderers and an `execute` that receives an extension context. An `AgentTool` is the lean form the agent core runs. This file converts in both directions, and defines `TypeBoxAgentTool`, the TypeBox-typed variant of `AgentTool` that the built-in tool factories return.
 
 [AgentSession](/docs/src/core/agent-session.ts) keeps its registry definition-first, so plain tools passed in by an SDK caller are lifted into definitions with `createToolDefinitionFromAgentTool`. Tool factories such as [powershell.ts](/docs/src/core/tools/powershell.ts) use `wrapToolDefinition` directly.
 
 <Scrollycoding>
+
+## !!steps A TypeBox-typed AgentTool
+
+pi-agent-core no longer depends on TypeBox: it types a tool's `params` through pi-schema, which understands only the common TypeBox kinds. The built-in tools still build their schemas with TypeBox, so `TypeBoxAgentTool` restores precise typing for them. It is an `AgentTool` whose `execute` and `prepareArguments` take TypeBox's `Static` of the schema. Every `createXTool` factory in this folder, and codemode's tool, returns this type, and it spreads back into a `ToolDefinition` of the same schema.
+
+```ts ! tool-definition-wrapper.ts
+export type TypeBoxAgentTool<TParams extends TSchema = TSchema, TDetails = any> = Omit<
+	AgentTool<TParams, TDetails>,
+	"prepareArguments" | "execute"
+> & {
+	prepareArguments?: (args: unknown) => Static<TParams>;
+	execute: (
+		toolCallId: string,
+		params: Static<TParams>,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<TDetails>,
+	) => Promise<AgentToolResult<TDetails>>;
+};
+```
 
 ## !!steps The context factory type
 
 Extension tools get a context object on each call. The factory builds one for a given tool call id and abort signal. It is optional in the wrappers: built-in tools do not need a context.
 
 ```ts ! tool-definition-wrapper.ts
-import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { ExtensionToolContext, ToolDefinition } from "../extensions/types.ts";
-
 /** Creates the context for one tool call. */
 export type ToolContextFactory = (toolCallId: string, signal: AbortSignal | undefined) => ExtensionToolContext;
 ```

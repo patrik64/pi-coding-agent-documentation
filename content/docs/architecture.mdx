@@ -17,6 +17,14 @@ session and picks a mode. [index.ts](/docs/src/index.ts) is the other front
 door: the public SDK surface, built on
 [sdk.ts](/docs/src/core/sdk.ts).
 
+Some subcommands never build a session. `main.ts` routes them first: `pi auth`
+([auth-command.ts](/docs/src/cli/auth-command.ts), with
+[auth-login.ts](/docs/src/cli/auth-login.ts) and
+[auth-logout.ts](/docs/src/cli/auth-logout.ts) prompting through the
+line-based [auth-terminal.ts](/docs/src/cli/auth-terminal.ts)), `pi mcp`
+([cli.ts](/docs/src/extensions/mcp/cli.ts)), and the package and config
+commands of [package-manager-cli.ts](/docs/src/package-manager-cli.ts).
+
 ## The session is the center
 
 [agent-session.ts](/docs/src/core/agent-session.ts) is the hub. It wraps the
@@ -42,10 +50,33 @@ which insert summary entries instead of deleting history.
 [model-resolver.ts](/docs/src/core/model-resolver.ts) and
 [model-runtime.ts](/docs/src/core/model-runtime.ts) decide which model to talk
 to; [auth-storage.ts](/docs/src/core/auth-storage.ts) holds the credentials.
+A provider name typed by the user is matched by
+[provider-matching.ts](/docs/src/core/provider-matching.ts), and
+[client-identity.ts](/docs/src/core/client-identity.ts) tells pi-ai how
+requests should identify pi to providers.
 [resource-loader.ts](/docs/src/core/resource-loader.ts) discovers extensions,
 skills, prompt templates and themes, and
 [package-manager.ts](/docs/src/core/package-manager.ts) installs them from npm
 or git.
+
+## Configuration schemas
+
+The four files users edit each have one TypeBox schema, and the runtime types
+are derived from it: `models.json` from
+[model-config.ts](/docs/src/core/model-config.ts) (embedding pi-ai's pieces
+through [pi-ai-schemas.ts](/docs/src/core/pi-ai-schemas.ts)), `settings.json`
+from [settings-schema.ts](/docs/src/core/settings-schema.ts) with its defaults
+in [settings-defaults.ts](/docs/src/core/settings-defaults.ts),
+`keybindings.json` from
+[keybindings-schema.ts](/docs/src/core/keybindings-schema.ts) and
+[key-id-schema.ts](/docs/src/core/key-id-schema.ts), and themes from
+[theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts) over the
+token table in
+[theme-tokens.ts](/docs/src/modes/interactive/theme/theme-tokens.ts).
+[generate-schemas.ts](/docs/scripts/generate-schemas.ts) publishes them as
+JSON Schema files for editors, and
+[generate-references.ts](/docs/scripts/generate-references.ts) renders the
+`models.json` reference from the same field descriptions.
 
 ## Tools
 
@@ -67,8 +98,13 @@ Extensions are TypeScript modules loaded into the Pi process by
 [types.ts](/docs/src/core/extensions/types.ts), and
 [runner.ts](/docs/src/core/extensions/runner.ts) dispatches session events to
 them. [event-bus.ts](/docs/src/core/event-bus.ts) lets extensions talk to each
-other. The bundled [MCP extension](/docs/src/extensions/mcp/index.ts) is built
-the same way, over [runtime.ts](/docs/src/extensions/mcp/runtime.ts).
+other. Extensions that import pi-ai get
+[pi-ai-extension-view.ts](/docs/src/core/extensions/pi-ai-extension-view.ts),
+which keeps TypeBox's `Type` and `Static` available now that pi-ai itself has
+moved to pi-schema. The bundled
+[MCP extension](/docs/src/extensions/mcp/index.ts) is built the same way, over
+[runtime.ts](/docs/src/extensions/mcp/runtime.ts); the protocol work, OAuth
+sign-in included, lives in the separate pi-mcp package.
 
 ## Modes
 
@@ -79,6 +115,9 @@ them in the terminal through
 from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and pickers such as
 [session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts)
 and [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts).
+It also tells terminals that support it whether Pi is idle, working or waiting
+on the user, through
+[program-status-reporter.ts](/docs/src/modes/interactive/program-status-reporter.ts).
 [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) exposes the same session as
 JSONL commands over stdin and stdout, framed by
 [jsonl.ts](/docs/src/modes/rpc/jsonl.ts) and typed by

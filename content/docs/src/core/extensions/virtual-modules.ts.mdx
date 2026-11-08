@@ -13,12 +13,12 @@ The same table works in source runs and in compiled binaries, which is why the v
 
 ## !!steps Namespace imports of every bundled package
 
-Each import is a `* as` namespace so the whole module object can be handed over as the extension's view of that package.
+Each import is a `* as` namespace so the whole module object can be handed over as the extension's view of that package. The pi-ai entry points listed here are the subpaths extensions use directly: `/models` (helpers such as `clampThinkingLevel`), `/oauth` and `/providers/all`. Imports of `/models` used to fail with "Cannot find module" because it was missing from this table and from the loader's aliases.
 
 ```ts ! virtual-modules.ts
 // !mark(1:2)
 import * as bundledPiAgentCore from "@earendil-works/pi-agent-core";
-import * as bundledPiAiCompat from "@earendil-works/pi-ai/compat";
+import * as bundledPiAiModels from "@earendil-works/pi-ai/models";
 import * as bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
 import * as bundledPiAiProviders from "@earendil-works/pi-ai/providers/all";
 import * as bundledPiTui from "@earendil-works/pi-tui";
@@ -27,17 +27,19 @@ import * as bundledTypeboxCompile from "typebox/compile";
 import * as bundledTypeboxValue from "typebox/value";
 ```
 
-## !!steps The coding-agent package imports itself
+## !!steps The coding-agent package and the pi-ai view
 
-The last import pulls in the package's own [index.ts](/docs/src/index.ts), so extensions that import the coding-agent package get the public API.
+One import pulls in the package's own [index.ts](/docs/src/index.ts), so extensions that import the coding-agent package get the public API. The comment notes why that is safe: loader exports are not re-exported from the index, so there is no cycle back into the loader.
 
-The comment notes why that is safe: loader exports are not re-exported from the index, so there is no cycle back into the loader.
+The last import is not a package at all but [pi-ai-extension-view.ts](/docs/src/core/extensions/pi-ai-extension-view.ts), a local module that re-exports pi-ai's compat entry point and adds TypeBox's `Type`, `Static` and `TSchema` plus a TypeBox-typed `StringEnum`. pi-ai moved its tool validation to pi-schema and stopped exporting those, but extensions written against the old exports still import them from pi-ai.
 
 ```ts ! virtual-modules.ts
 // !mark(1:3)
 // This import is safe because loader.ts exports are not re-exported from index.ts.
 // Extensions can therefore import from @earendil-works/pi-coding-agent.
 import * as bundledPiCodingAgent from "../../index.ts";
+// !mark
+import * as bundledPiAiExtensionView from "./pi-ai-extension-view.ts";
 ```
 
 ## !!steps The typebox family, under old and new names
@@ -56,29 +58,32 @@ export const VIRTUAL_MODULES: Record<string, unknown> = {
 	"@sinclair/typebox/value": bundledTypeboxValue,
 ```
 
-## !!steps Two package scopes and the compat entry
+## !!steps Two package scopes and the pi-ai view
 
 The pi packages are registered twice, under `@earendil-works` and the older `@mariozechner` scope. Both scopes resolve to the same bundled objects.
 
-The pi-ai root maps to the compat entrypoint, a strict superset of the core entry, so extensions using the old global API keep working until compat is removed.
+Both the pi-ai root and `/compat` map to the extension view rather than to pi-ai itself. The view is a strict superset of pi-ai's core entry, so extensions using the old global API and pi-ai's former TypeBox re-exports keep working. `/models` is mapped in both scopes too.
 
 ```ts ! virtual-modules.ts
 	"@earendil-works/pi-agent-core": bundledPiAgentCore,
 	"@earendil-works/pi-tui": bundledPiTui,
-	// !mark(1:4)
+	// !mark(1:6)
 	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
-	// superset of the core entrypoint): existing extensions using the old
-	// global API keep working at runtime until compat is removed.
-	"@earendil-works/pi-ai": bundledPiAiCompat,
-	"@earendil-works/pi-ai/compat": bundledPiAiCompat,
+	// superset of the core entrypoint) plus TypeBox's Type, Static and TSchema:
+	// existing extensions using the old global API and pi-ai's former TypeBox
+	// re-exports keep working.
+	"@earendil-works/pi-ai": bundledPiAiExtensionView,
+	"@earendil-works/pi-ai/compat": bundledPiAiExtensionView,
+	"@earendil-works/pi-ai/models": bundledPiAiModels,
 	"@earendil-works/pi-ai/oauth": bundledPiAiOauth,
 	"@earendil-works/pi-ai/providers/all": bundledPiAiProviders,
 	"@earendil-works/pi-coding-agent": bundledPiCodingAgent,
 	"@mariozechner/pi-agent-core": bundledPiAgentCore,
 	"@mariozechner/pi-tui": bundledPiTui,
 	// !mark
-	"@mariozechner/pi-ai": bundledPiAiCompat,
-	"@mariozechner/pi-ai/compat": bundledPiAiCompat,
+	"@mariozechner/pi-ai": bundledPiAiExtensionView,
+	"@mariozechner/pi-ai/compat": bundledPiAiExtensionView,
+	"@mariozechner/pi-ai/models": bundledPiAiModels,
 	"@mariozechner/pi-ai/oauth": bundledPiAiOauth,
 	"@mariozechner/pi-ai/providers/all": bundledPiAiProviders,
 	"@mariozechner/pi-coding-agent": bundledPiCodingAgent,

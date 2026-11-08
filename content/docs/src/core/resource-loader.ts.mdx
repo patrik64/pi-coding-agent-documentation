@@ -59,7 +59,9 @@ function loadContextFileFromDir(dir: string): { path: string; content: string } 
 
 A linked git worktree nested inside its main repository (for example `repo/.worktrees/feat`) has its own copy of `AGENTS.md`, and the ancestor walk would also find the main repo's. Loading both applies the same context twice, so `findShadowedContextFile` identifies the main repo's file to skip.
 
-It bails out in the cases where the layout does not match: an ordinary repo, a sibling worktree outside the main repo, a bare layout, and submodules. Paths are canonicalized because git writes realpaths while the cwd may be symlinked, as with macOS `/tmp`. The git lookup uses `findGitPaths` from [footer-data-provider.ts](/docs/src/core/footer-data-provider.ts).
+It bails out in the cases where the layout does not match: an ordinary repo, a sibling worktree outside the main repo, a bare layout, and submodules. Paths are canonicalized because git writes realpaths while the cwd may be symlinked, as with macOS `/tmp`, and compared with `isPathWithin` and `pathsEqual` from [paths.ts](/docs/src/utils/paths.ts), which ignore case on Windows. The git lookup uses `findGitPaths` from [footer-data-provider.ts](/docs/src/core/footer-data-provider.ts).
+
+The ancestor walk then skips a file when its directory's real path plus its file name equals the shadowed path. It used to compare the file's own real path, which also skipped a worktree `AGENTS.md` that is a symlink to the main repo's copy, so neither file loaded.
 
 ```ts ! resource-loader.ts
 	const commonGitDir = canonicalizePath(gitPaths.commonGitDir);
@@ -67,12 +69,12 @@ It bails out in the cases where the layout does not match: an ordinary repo, a s
 	const mainRepoRoot = dirname(commonGitDir);
 	// False for an ordinary repo, where the two are the same dir, and for a sibling
 	// worktree (`git worktree add ../feat`), whose main repo is not an ancestor.
-	if (!worktreeRoot.startsWith(`${mainRepoRoot}${sep}`)) return undefined;
+	if (!isPathWithin(mainRepoRoot, worktreeRoot) || pathsEqual(worktreeRoot, mainRepoRoot)) return undefined;
 	// dirname of the common git dir is the main worktree root only when that dir is
 	// itself checked out from the same repo. In a bare layout (`proj/.bare` +
 	// `proj/main`) it is just the directory holding `.bare`, which tracks nothing; a
 	// submodule's gitdir has no `commondir`, so it lands under `.git/modules`.
-	if (canonicalizePath(join(mainRepoRoot, ".git")) !== commonGitDir) return undefined;
+	if (!pathsEqual(canonicalizePath(join(mainRepoRoot, ".git")), commonGitDir)) return undefined;
 	const worktreeContextFile = loadContextFileFromDir(worktreeRoot);
 	return worktreeContextFile ? join(mainRepoRoot, basename(worktreeContextFile.path)) : undefined;
 ```
@@ -146,7 +148,9 @@ Those pre-trust extensions are shown to the callback, which answers whether to t
 
 ## !!steps Merging CLI and configured paths
 
-Each resource type follows one recipe. Paths from CLI `-e`-style sources (resolved as temporary packages) come first, then enabled configured paths, then the explicit `additional*` paths. `mergePaths` resolves and canonicalizes each path and drops duplicates, so earlier sources win.
+Each resource type follows one recipe. Paths from CLI `-e`-style sources (resolved as temporary packages) come first, then enabled configured paths, then the explicit `additional*` paths. `mergePaths` resolves each path and drops duplicates by `getResourcePathKey` from [source-info.ts](/docs/src/core/source-info.ts) (realpath, case-folded on Windows), so earlier sources win.
+
+A package that fails to install no longer stops startup. The package manager skips it, as offline mode would, and returns it in `installFailures`; the loader turns each failure into an extension warning that names the package and says how to drop it (`pi remove <source>`, with `--local` for project packages, or "check the source" for `-e` sources). Install is retried on the next start or reload.
 
 With `noExtensions`, only CLI extension paths survive. Built-in extensions named in `disabledBuiltinExtensions` are filtered out by their `builtin:` prefix.
 
@@ -161,17 +165,19 @@ With `noExtensions`, only CLI extension paths survive. Built-in extensions named
 
 		const packageWarnings = collectExtensionPackageWarnings(extensionPaths, metadataByPath);
 		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
+		// !mark
+		mergeExtensionWarnings(extensionsResult, [...installWarnings, ...packageWarnings]);
 ```
 
 ## !!steps Loading the final extension set
 
-`loadFinalExtensionSet` avoids loading anything twice. Extensions already loaded in the pre-trust pass are reused by resolved path, and paths whose pre-trust load failed are not retried. Only the remaining paths load, with `builtin:` paths mapped to their factory and marked hidden.
+`loadFinalExtensionSet` avoids loading anything twice. Extensions already loaded in the pre-trust pass are reused, matched by resource path key rather than raw resolved path, and paths whose pre-trust load failed are not retried. Only the remaining paths load, with `builtin:` paths mapped to their factory and marked hidden.
 
 Results are reordered to match `extensionPaths`, inline extensions are appended, and `omitReplacedExtensions` drops replaceable built-ins that clash with another extension's tool, command or flag, adding a warning that tells the user how to enable the built-in.
 
 ```ts ! resource-loader.ts
 		const orderedExtensions = extensionPaths
-			.map((path) => loadedByPath.get(this.resolveExtensionLoadPath(path)))
+			.map((path) => loadedByPath.get(this.getExtensionPathKey(path)))
 			.filter((extension): extension is Extension => extension !== undefined);
 		orderedExtensions.push(...inlineExtensions.extensions);
 

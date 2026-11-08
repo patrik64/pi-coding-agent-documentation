@@ -1,13 +1,13 @@
 ---
 title: "truncate.ts"
-description: "Line-and-byte output limits shared by every tool: head truncation for file reads, tail truncation for shell output, and a middle cut for MCP results"
+description: "Line-and-byte output limits shared by every tool: head truncation for file reads, tail truncation for shell output, and surrogate-safe string slicing"
 source: "src/core/tools/truncate.ts"
 full: true
 ---
 
 Everything a tool returns ends up in the model's context window, so each tool needs a policy for output that is too large. This file holds those policies in one place. Two independent limits apply, 2000 lines and 50KB, and whichever is hit first wins.
 
-The two main functions differ in which end they keep. `truncateHead` keeps the beginning and is what [read.ts](/docs/src/core/tools/read.ts) uses, since the start of a file is the useful part and the model can continue with an offset. `truncateTail` keeps the end and is what [bash.ts](/docs/src/core/tools/bash.ts) and [bash-executor.ts](/docs/src/core/bash-executor.ts) use, because the last lines of a command are where errors and results are.
+The two main functions differ in which end they keep. `truncateHead` keeps the beginning and is what [read.ts](/docs/src/core/tools/read.ts) uses, since the start of a file is the useful part and the model can continue with an offset. `truncateTail` keeps the end and is what [bash.ts](/docs/src/core/tools/bash.ts) (through [output-accumulator.ts](/docs/src/core/tools/output-accumulator.ts)) and [bash-executor.ts](/docs/src/core/bash-executor.ts) use, because the last lines of a command are where errors and results are.
 
 Both return the same `TruncationResult` shape, so renderers and tool details can describe what happened (how many lines were shown, which limit applied) without caring which function ran.
 
@@ -190,7 +190,7 @@ function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
 
 ## !!steps Size formatting and single-line truncation
 
-`formatSize` produces the `50.0KB` style strings that appear in the truncation notices the tools append. `truncateLine` is the character-based cap for grep matches; it slices at `maxChars` UTF-16 units and appends a literal `... [truncated]` marker.
+`formatSize` produces the `50.0KB` style strings that appear in the truncation notices the tools append. `truncateLine` is the character-based cap for grep matches; it keeps at most `maxChars` UTF-16 units through `sliceHead` and appends a literal `... [truncated]` marker.
 
 ```ts ! truncate.ts
 /**
@@ -217,43 +217,39 @@ export function truncateLine(
 	if (line.length <= maxChars) {
 		return { text: line, wasTruncated: false };
 	}
-	return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
+	return { text: `${sliceHead(line, maxChars)}... [truncated]`, wasTruncated: true };
 }
 ```
 
-## !!steps Middle truncation for MCP output
+## !!steps Slicing without splitting surrogate pairs
 
-`truncateMiddle` is the newest addition and is used differently from the others: it keeps half of the byte budget from the start and half from the end and replaces the middle with a marker that says how many characters were removed. The doc comment says this follows Codex. It is not re-exported from [index.ts](/docs/src/core/tools/index.ts); its caller is the MCP extension in `src/extensions/mcp/tools.ts`.
-
-Both cut points are moved onto character boundaries with the same continuation-byte test, the head cut backwards and the tail cut forwards. `removedChars` is counted in code points, so the marker is accurate for emoji and CJK text.
+A character outside the Basic Multilingual Plane, such as an emoji, takes two UTF-16 units. A plain `slice` that cuts between them leaves a lone surrogate, which is invalid UTF-16: providers usually strip it, but it still reaches the session file, RPC and JSON clients whose strict encoders reject it, and extensions. `sliceHead` and `sliceTail` behave like `slice(0, n)` and `slice(-n)` but return one unit fewer when the cut would split a pair. Besides `truncateLine`, they are used by the codemode output limits in [execute.ts](/docs/src/extensions/codemode/execute.ts), the summarizer input in [compaction/utils.ts](/docs/src/core/compaction/utils.ts), and the MCP extension's summaries and stderr tails.
 
 ```ts ! truncate.ts
-/**
- * Keep the start and the end of `content`, half of `maxBytes` each, and replace the middle with a
- * `…N chars truncated…` marker, like Codex does for tool output. Cuts only at character boundaries.
- */
-export function truncateMiddle(content: string, maxBytes: number): MiddleTruncationResult {
-	const buf = Buffer.from(content, "utf-8");
-	const totalLines = splitLinesForCounting(content).length;
-	if (buf.length <= maxBytes) {
-		return { content, truncated: false, removedChars: 0, totalBytes: buf.length, totalLines };
-	}
-	// Continuation bytes (10xxxxxx) are not character starts.
-	const isBoundary = (index: number) => index >= buf.length || (buf[index] & 0xc0) !== 0x80;
-	let headEnd = Math.floor(maxBytes / 2);
-	while (headEnd > 0 && !isBoundary(headEnd)) headEnd--;
-	let tailStart = buf.length - (maxBytes - Math.floor(maxBytes / 2));
-	while (tailStart < buf.length && !isBoundary(tailStart)) tailStart++;
-	const head = buf.subarray(0, headEnd).toString("utf-8");
-	const tail = buf.subarray(tailStart).toString("utf-8");
-	const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString("utf-8")).length;
-	return {
-		content: `${head}…${removedChars} chars truncated…${tail}`,
-		truncated: true,
-		removedChars,
-		totalBytes: buf.length,
-		totalLines,
-	};
+/** Returns at most the first `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
+export function sliceHead(text: string, maxUnits: number): string {
+	const end = Math.max(0, maxUnits);
+	// A lone high surrogate before the cut would be invalid UTF-16; keep the whole character out instead.
+	return isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))
+		? text.slice(0, end - 1)
+		: text.slice(0, end);
+}
+
+/** Returns at most the last `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
+export function sliceTail(text: string, maxUnits: number): string {
+	if (maxUnits <= 0) return "";
+	const start = Math.max(0, text.length - maxUnits);
+	return isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))
+		? text.slice(start + 1)
+		: text.slice(start);
+}
+
+function isHighSurrogate(code: number): boolean {
+	return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+	return code >= 0xdc00 && code <= 0xdfff;
 }
 ```
 

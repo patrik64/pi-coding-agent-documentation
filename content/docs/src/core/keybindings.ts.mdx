@@ -1,32 +1,23 @@
 ---
 title: "keybindings.ts"
-description: "Defines every app keybinding with platform-specific defaults, migrates legacy names in keybindings.json, and wraps the TUI keybindings manager"
+description: "Defines every app keybinding with platform-specific defaults, migrates legacy names in keybindings.json, filters values by key syntax, and wraps the TUI keybindings manager"
 source: "src/core/keybindings.ts"
 full: true
 ---
 
 pi's terminal UI library ships a keybindings manager and a set of `tui.*` bindings for the editor and selectors. This file extends it with the application's own `app.*` bindings, adjusts a few defaults per platform, and loads the user's overrides from `keybindings.json` in the agent directory.
 
-Two things make it more than a table. First, default keys differ on Windows and WSL, where many Ctrl chords are taken by the terminal. Second, old config files used short names such as `cursorUp`, so a migration step renames them to the namespaced form. Display of the resulting keys is handled in [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), and the extension API exposes the manager type from [types.ts](/docs/src/core/extensions/types.ts).
+Two things make it more than a table. First, default keys differ on Windows and WSL, where many Ctrl chords are taken by the terminal. Second, old config files used short names such as `cursorUp`, so a migration step renames them to the namespaced form. Display of the resulting keys is handled in [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts), and the extension API exposes the manager type from [types.ts](/docs/src/core/extensions/types.ts). The binding table also feeds the published `keybindings.schema.json` through [keybindings-schema.ts](/docs/src/core/keybindings-schema.ts), and user values are checked against the key syntax in [key-id-schema.ts](/docs/src/core/key-id-schema.ts).
 
 <Scrollycoding>
 
-## !!steps Typing the app bindings into the TUI library
+## !!steps App bindings and their derived types
 
-`AppKeybindings` lists every app action as a key with value `true`. The module augmentation further down merges this interface into the TUI package's `Keybindings` interface, so the manager's methods accept `app.*` ids with full type checking.
+The app's own actions are declared once, in `APP_KEYBINDINGS`, and the types are derived from that table. `AppKeybinding` is the union of its keys, and `AppKeybindings` maps each id to `true`. Before this, a separate interface listed every id by hand next to the table. The module augmentation merges `AppKeybindings` into the TUI package's `Keybindings` interface, so the manager's methods accept `app.*` ids with full type checking.
 
-`useWindowsKeybindings` is true on win32 and on Linux under WSL, detected through `WSL_DISTRO_NAME` or `WSL_INTEROP`.
+`useWindowsKeybindings` is true on win32 and on Linux under WSL, detected through `WSL_DISTRO_NAME` or `WSL_INTEROP`. It is evaluated once, when the module loads, and several defaults below depend on it.
 
 ```ts ! keybindings.ts
-export interface AppKeybindings {
-	"app.interrupt": true;
-	"app.clear": true;
-	"app.exit": true;
-	"app.suspend": true;
-// ...
-// !mark
-export type AppKeybinding = keyof AppKeybindings;
-
 export function useWindowsKeybindings(
 	platform: NodeJS.Platform = process.platform,
 	env: NodeJS.ProcessEnv = process.env,
@@ -35,49 +26,28 @@ export function useWindowsKeybindings(
 	return platform === "win32" || (platform === "linux" && Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP));
 }
 
+const windowsKeybindings = useWindowsKeybindings();
+
+const APP_KEYBINDINGS = {
+	"app.interrupt": { defaultKeys: "escape", description: "Cancel or abort" },
+// ...
+} as const satisfies KeybindingDefinitions;
+
+// !mark(1:2)
+export type AppKeybinding = keyof typeof APP_KEYBINDINGS;
+export type AppKeybindings = { [K in AppKeybinding]: true };
+
 // !mark(1:3)
 declare module "@earendil-works/pi-tui" {
 	interface Keybindings extends AppKeybindings {}
 }
-
-const windowsKeybindings = useWindowsKeybindings();
-```
-
-## !!steps Overriding TUI defaults per platform
-
-`KEYBINDINGS` starts from the TUI defaults and spreads over the few that need platform handling. Undo is `ctrl+z` on Windows, `alt+z` under WSL and `ctrl+-` elsewhere. The previous and next prompt keys and search also change on Windows-like platforms.
-
-Each override spreads the original definition first, so descriptions are kept.
-
-```ts ! keybindings.ts
-export const KEYBINDINGS = {
-	...TUI_KEYBINDINGS,
-	"tui.editor.undo": {
-		...TUI_KEYBINDINGS["tui.editor.undo"],
-		// !mark
-		defaultKeys: process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z" : "ctrl+-",
-	},
-	"tui.altScreen.previousPrompt": {
-		...TUI_KEYBINDINGS["tui.altScreen.previousPrompt"],
-		// !mark
-		defaultKeys: windowsKeybindings ? "ctrl+up" : ["ctrl+shift+up", "ctrl+up"],
-	},
-	"tui.altScreen.nextPrompt": {
-		...TUI_KEYBINDINGS["tui.altScreen.nextPrompt"],
-		defaultKeys: windowsKeybindings ? "ctrl+down" : ["ctrl+shift+down", "ctrl+down"],
-	},
-	"tui.altScreen.search": {
-		...TUI_KEYBINDINGS["tui.altScreen.search"],
-		// !mark
-		defaultKeys: windowsKeybindings ? "ctrl+f" : "ctrl+shift+f",
-	},
 ```
 
 ## !!steps App actions and their defaults
 
 Each entry has `defaultKeys`, a string or array, and a `description`. Escape interrupts, `ctrl+c` clears the editor, `ctrl+d` exits only when the editor is empty, and `ctrl+z` suspends, with no default on Windows where there is no job control.
 
-The follow-up and dequeue keys change on Windows and WSL to different chords, `ctrl+q` and `alt+q`, instead of `alt+enter` and `alt+up`.
+On Windows and WSL, the follow-up and dequeue actions use `ctrl+q` and `alt+q` instead of `alt+enter` and `alt+up`. Paste is bound to both `alt+v` and `ctrl+v` there. Most Windows terminals handle Ctrl+V themselves and send a bracketed paste, so pi never sees the key. Some terminals pass the raw key through instead, and with only `alt+v` bound, pressing Ctrl+V in them did nothing.
 
 ```ts ! keybindings.ts
 	// !mark(1:3)
@@ -100,7 +70,8 @@ The follow-up and dequeue keys change on Windows and WSL to different chords, `c
 		description: "Restore queued messages",
 	},
 	"app.clipboard.pasteImage": {
-		defaultKeys: windowsKeybindings ? "alt+v" : "ctrl+v",
+		// !mark
+		defaultKeys: windowsKeybindings ? ["alt+v", "ctrl+v"] : "ctrl+v",
 		description: "Paste files on macOS, images, or text from clipboard",
 	},
 ```
@@ -137,6 +108,39 @@ Several session actions, such as new, tree, fork and resume, have empty default 
 		defaultKeys: "ctrl+p",
 		description: "Toggle all models for provider",
 	},
+```
+
+## !!steps Combining TUI and app bindings
+
+`KEYBINDINGS` is the full table the manager receives. It starts from the TUI defaults, replaces the few that need platform handling, and then spreads in the app bindings. Undo is `ctrl+z` on Windows, `alt+z` under WSL and `ctrl+-` elsewhere. The previous and next prompt keys and search also change on Windows-like platforms. Each override spreads the original definition first, so its description is kept.
+
+The same table is what [keybindings-schema.ts](/docs/src/core/keybindings-schema.ts) walks to publish one schema property per action.
+
+```ts ! keybindings.ts
+export const KEYBINDINGS = {
+	...TUI_KEYBINDINGS,
+	"tui.editor.undo": {
+		...TUI_KEYBINDINGS["tui.editor.undo"],
+		// !mark
+		defaultKeys: process.platform === "win32" ? "ctrl+z" : windowsKeybindings ? "alt+z" : "ctrl+-",
+	},
+	"tui.altScreen.previousPrompt": {
+		...TUI_KEYBINDINGS["tui.altScreen.previousPrompt"],
+		// !mark
+		defaultKeys: windowsKeybindings ? "ctrl+up" : ["ctrl+shift+up", "ctrl+up"],
+	},
+	"tui.altScreen.nextPrompt": {
+		...TUI_KEYBINDINGS["tui.altScreen.nextPrompt"],
+		defaultKeys: windowsKeybindings ? "ctrl+down" : ["ctrl+shift+down", "ctrl+down"],
+	},
+	"tui.altScreen.search": {
+		...TUI_KEYBINDINGS["tui.altScreen.search"],
+		// !mark
+		defaultKeys: windowsKeybindings ? "ctrl+f" : "ctrl+shift+f",
+	},
+	// !mark
+	...APP_KEYBINDINGS,
+} as const satisfies KeybindingDefinitions;
 ```
 
 ## !!steps Legacy names map to namespaced ids
@@ -216,23 +220,19 @@ function orderKeybindingsConfig(config: Record<string, unknown>): Record<string,
 
 ## !!steps Loading the file defensively
 
-`loadRawConfig` returns `undefined` for a missing file, bad JSON, or a non-object, and never throws. `toKeybindingsConfig` then keeps only string or string-array values, silently skipping entries of other types.
+`loadRawConfig` returns `undefined` for a missing file, bad JSON, or a non-object, and never throws. `toKeybindingsConfig` then checks each value against the compiled key syntax from [key-id-schema.ts](/docs/src/core/key-id-schema.ts), the same pattern editors apply through the published schema. A value is kept only if it is a valid key id or an array of valid key ids, so `ctrl+not-a-key`, `Ctrl+x`, a number, or an array with one bad entry is dropped. The `$schema` key is skipped so it is never treated as an action.
 
-Silent dropping keeps a broken config from preventing startup, at the cost of no feedback about what was ignored.
+The checking is stricter than before, when any string passed, but the dropping is still silent. That keeps a broken config from preventing startup, at the cost of no feedback about what was ignored.
 
 ```ts ! keybindings.ts
+const validateKeybindingValue = Compile(KeybindingValueSchema);
+
 function toKeybindingsConfig(value: Record<string, unknown>): KeybindingsConfig {
 	const config: KeybindingsConfig = {};
 	for (const [key, binding] of Object.entries(value)) {
-		// !mark(1:3)
-		if (typeof binding === "string") {
-			config[key] = binding as KeyId;
-			continue;
-		}
-		// !mark(1:3)
-		if (Array.isArray(binding) && binding.every((entry) => typeof entry === "string")) {
-			config[key] = binding as KeyId[];
-		}
+		// !mark(1:2)
+		if (key === "$schema") continue;
+		if (validateKeybindingValue.Check(binding)) config[key] = binding;
 	}
 	return config;
 }

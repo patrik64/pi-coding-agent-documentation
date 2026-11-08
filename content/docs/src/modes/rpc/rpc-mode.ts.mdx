@@ -124,7 +124,9 @@ reload) that delegate to the runtime.
 
 Note the `shutdownHandler`: an extension asking to quit does not exit
 immediately, it only sets `shutdownRequested`. The actual exit waits for a safe
-point.
+point. Because an idle session produces no further command response or
+`agent_settled` event that would notice the flag, the handler also schedules a
+check with `setImmediate`, which lets the requesting handler finish first.
 
 ```ts ! rpc-mode.ts
 	const rebindSession = async (): Promise<void> => {
@@ -138,6 +140,9 @@ point.
 // ...
 			shutdownHandler: () => {
 				shutdownRequested = true;
+				// An idle session has no command response or agent_settled left to check the flag.
+				// Check on the next tick so the requesting handler finishes first.
+				setImmediate(checkShutdownRequested);
 			},
 			onError: (err) => {
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
@@ -163,7 +168,7 @@ of buffering events without limit.
 		unsubscribe = session.subscribe((event) => {
 			output(toJsonEvent(event));
 			if (event.type === "agent_settled") {
-				void checkShutdownRequested();
+				checkShutdownRequested();
 			}
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
@@ -181,6 +186,10 @@ is accepted, queued, or handled immediately. If `prompt` rejects before that
 point, the error becomes the response; after it, errors are not reported
 again here, since the event stream carries the run's outcome.
 
+Because extension commands run inside `prompt()`, the run counts as an active
+command until it settles, so an extension that calls `ctx.shutdown()` from a
+command cannot stop the process mid-run.
+
 `steer` and `follow_up`, by contrast, await the session and return a
 disposition.
 
@@ -189,6 +198,8 @@ disposition.
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
 				let preflightSucceeded = false;
+				// Extension commands run inside prompt(); defer shutdown requests until it settles.
+				activeCommands++;
 				void session
 					.prompt(command.message, {
 						images: command.images,
@@ -203,6 +214,10 @@ disposition.
 						if (!preflightSucceeded) {
 							output(error(id, "prompt", e.message));
 						}
+					})
+					.finally(() => {
+						activeCommands--;
+						checkShutdownRequested();
 					});
 				return undefined;
 			}
@@ -285,23 +300,49 @@ prefix, matching how they are invoked from a prompt. Each entry keeps its
 				}
 ```
 
+## !!steps When an extension may shut down
+
+`checkShutdownRequested` is the safe-point test. It acts only when an extension
+asked to quit, no shutdown is already running, the input reader is attached,
+no command is being handled (a prompt counts until it settles), and the
+session is idle. Each of those conditions has a place that calls the check
+again when it ends: command completion, the prompt's `finally`,
+`agent_settled`, and the end of startup.
+
+The flag used to be checked only after a stdin command and on `agent_settled`,
+so a request made while idle, from a timer say, waited for the next command.
+One gap remains by design: a request made during an extension-started
+compaction (not idle, but no run to settle) still waits for the next command
+or run.
+
+```ts ! rpc-mode.ts
+	// Extension shutdown requests (ctx.shutdown()) wait until input is attached, no command is
+	// being handled, and the session is idle. See checkShutdownRequested().
+	let shutdownRequested = false;
+	let shuttingDown = false;
+	let inputReady = false;
+	let activeCommands = 0;
+// ...
+	function checkShutdownRequested(): void {
+		if (!shutdownRequested || shuttingDown || !inputReady || activeCommands > 0 || !session.isIdle) return;
+		void shutdown();
+	}
+```
+
 ## !!steps Shutdown order
 
-`shutdown` is idempotent in a blunt way: a second call exits immediately. The
-first call removes signal handlers, unsubscribes, disposes the runtime (so
-extensions get their shutdown event), detaches stdin, and flushes stdout before
+`shutdown` runs once; later calls, such as stdin closing after a signal
+already started shutdown, return without doing anything. The first call
+unsubscribes, disposes the runtime (so extensions get their shutdown event and
+pending credential writes are saved), detaches stdin, and flushes stdout before
 exiting. On `SIGTERM` the flush is skipped, so a terminating parent is not kept
 waiting on a pipe it no longer reads.
 
 ```ts ! rpc-mode.ts
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
-		if (shuttingDown) {
-			process.exit(exitCode);
-		}
+	/** Dispose the runtime and exit. Runs once; later calls (stdin EOF after a signal) do nothing. */
+	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
+		if (shuttingDown) return;
 		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		await runtimeHost.dispose();
@@ -314,6 +355,37 @@ waiting on a pipe it no longer reads.
 	}
 ```
 
+## !!steps Only a repeated signal skips cleanup
+
+`SIGTERM` (and `SIGHUP` outside Windows) start the same shutdown with exit
+codes 143 and 129. The handlers stay registered until the process exits:
+removing them during shutdown would let a second signal kill the process with
+the default action before `dispose` finished, for example during an MCP token
+refresh.
+
+Process managers often close stdin and send `SIGTERM` together, so a single
+signal during shutdown is not taken as a request to hurry. Only a second one
+forces an immediate `process.exit`.
+
+```ts ! rpc-mode.ts
+		for (const signal of signals) {
+			const exitCode = signal === "SIGHUP" ? 129 : 143;
+			// Handlers stay registered until exit: without one, a signal during shutdown would kill
+			// the process before dispose() finishes (for example a pending MCP token refresh).
+			process.on(signal, () => {
+				signalCount++;
+				killTrackedDetachedChildren();
+				if (!shuttingDown) {
+					void shutdown(exitCode, signal);
+				} else if (signalCount > 1) {
+					// Process managers often close stdin and send SIGTERM together, so one signal
+					// during shutdown is not a request to skip cleanup; a repeated one is.
+					process.exit(exitCode);
+				}
+			});
+		}
+```
+
 ## !!steps Parsing input lines
 
 Each stdin line is parsed independently. A bad line produces an error response
@@ -321,8 +393,9 @@ with command `parse` and no id, and the server keeps running. Lines whose
 `type` is `extension_ui_response` are routed to the matching pending dialog and
 never reach `handleCommand`. A reply for an unknown id is silently ignored.
 
-Responses are followed by `waitForRawStdoutBackpressure`, and a shutdown
-requested by an extension is honored after each command.
+Other lines count as active commands while `handleCommand` runs. Responses
+are followed by `waitForRawStdoutBackpressure`, and a shutdown requested by an
+extension is checked after each command.
 
 ```ts ! rpc-mode.ts
 		// Handle extension UI responses
@@ -344,9 +417,13 @@ requested by an extension is honored after each command.
 
 ## !!steps Staying alive until stdin closes
 
-The input reader is attached last, and `stdin` ending triggers `shutdown`. The
-function then returns a promise that never resolves, which is why its type is
-`Promise<never>`: the only exits are `process.exit` calls inside `shutdown`.
+The input reader is attached last, and `stdin` ending triggers `shutdown`. Only
+then is `inputReady` set and the shutdown check run once, which handles an
+extension that asked to quit during startup, for example from `session_start`.
+
+The function then returns a promise that never resolves, which is why its type
+is `Promise<never>`: the only exits are the `process.exit` calls in `shutdown`
+and in the signal handler.
 
 ```ts ! rpc-mode.ts
 	const onInputEnd = () => {
@@ -363,6 +440,9 @@ function then returns a promise that never resolves, which is why its type is
 			process.stdin.off("end", onInputEnd);
 		};
 	})();
+	inputReady = true;
+	// Handle a shutdown requested during startup (e.g. from session_start).
+	checkShutdownRequested();
 
 	// Keep process alive forever
 	return new Promise(() => {});

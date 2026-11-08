@@ -1,67 +1,53 @@
 ---
 title: "cache-warmer.ts"
-description: "Keeps a provider prompt cache entry alive by replaying the last request with a one-token output cap, when the expected savings justify the cost"
+description: "Keeps a provider prompt cache entry alive by replaying the last request with a one-token output cap, scheduling refreshes around the warm-or-stop policy from pi-ai"
 source: "src/core/cache-warmer.ts"
 full: true
 ---
 
 Prompt caching makes long conversations cheap, but cache entries expire after minutes of inactivity. If a user pauses and then continues, the whole prompt is billed again at write or input price. `CacheWarmer` avoids that by re-sending the same request shortly before expiry, capped at one output token, so the provider counts it as a cache read and extends the entry.
 
-Warming is not free, so each refresh is an economic decision: pay the small read cost now against the chance of avoiding a large miss later. The class is driven by [agent-session.ts](/docs/src/core/agent-session.ts), which tells it when a request was sent and when the agent settles. It sends requests through [model-runtime.ts](/docs/src/core/model-runtime.ts), records each refresh as a usage entry in [session-manager.ts](/docs/src/core/session-manager.ts), and reads its mode from [settings-manager.ts](/docs/src/core/settings-manager.ts). See also [cache-stats.ts](/docs/src/core/cache-stats.ts).
+Warming is not free, so each refresh is an economic decision: pay the small read cost now against the chance of avoiding a large miss later. The numbers behind that decision (safety windows, refresh delay, cache lifetime, replay safety, expected savings) now live in pi-ai's `cache-warming` module, so other hosts can warm caches with the same policy. This file keeps the host side: one active run, its timer, the extension hook, status for `/session`, and persisting each refresh.
+
+The class is driven by [agent-session.ts](/docs/src/core/agent-session.ts), which tells it when a request was sent and when the agent settles. It sends requests through [model-runtime.ts](/docs/src/core/model-runtime.ts), records each refresh as a usage entry in [session-manager.ts](/docs/src/core/session-manager.ts), and reads its mode from [settings-manager.ts](/docs/src/core/settings-manager.ts). [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) renders the warms in the transcript. See also [cache-stats.ts](/docs/src/core/cache-stats.ts).
 
 <Scrollycoding>
 
-## !!steps Safety constants
+## !!steps The policy comes from pi-ai
 
-Three limits bound the behavior. Streaming warming stops an hour after the real request. Idle warming stops after 30 minutes, because the continuation estimate gets worse with age. A refresh is sent only if it is expected to save five cents. The idle probability of 0.15 is a measured constant, not a per-session estimate.
+Everything numeric is imported. The two safety windows are one hour for streaming warming and 30 minutes for idle warming, both measured from the real request. A refresh is sent only if it is expected to save five cents. `getCacheWarmingDelayMs` schedules at 90% of the cache lifetime but never closer than ten seconds to expiry, and `getPromptCacheTtlMs` reads that lifetime from the model's `promptCache` table for the retention tier in use, chosen by the request option or the `PI_CACHE_RETENTION` environment variable.
 
-```ts ! cache-warmer.ts
-/** Streaming warming never continues past this long after the real request that started it. */
-const MAX_WARMING_AGE_MS = 60 * 60_000;
-/** Idle warming uses a shorter horizon because continuation estimates become less reliable with age. */
-const MAX_IDLE_WARMING_AGE_MS = 30 * 60_000;
-/** A refresh is sent only when it is expected to save at least this many dollars. */
-const CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS = 0.05;
-/**
- * Chance that a real request arrives before the cache entry expires while the
- * agent sits idle. Measured from our own usage; per-session estimates were not
- * better than this constant.
- */
-const IDLE_CONTINUATION_PROBABILITY = 0.15;
-```
-
-## !!steps Timing and TTL
-
-The delay is 90% of the lifetime but never closer than ten seconds to expiry. Lifetimes of ten seconds or less cannot be warmed. The lifetime itself comes from the model's `promptCache` table for the retention tier in use, chosen by the request option or the `PI_CACHE_RETENTION` environment variable.
+The decision types are re-exported so existing importers of this module, such as the extension runner, keep working unchanged.
 
 ```ts ! cache-warmer.ts
-/** Refresh at 90% of the TTL while preserving at least ten seconds of margin. */
-export function getCacheWarmingDelayMs(ttlMs: number): number | undefined {
-	if (ttlMs <= 10_000) return undefined;
-	return Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000)));
-}
-
+import {
+	type Api,
+	CACHE_WARMING_MAX_AGE_MS,
+	CACHE_WARMING_MAX_IDLE_AGE_MS,
+	CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS,
+	type CacheWarmingAction,
+	type CacheWarmingDecision,
+	type Context,
+	evaluateCacheWarming,
+	getCacheWarmingDelayMs,
+	getCacheWarmingRequestOptions,
+	getPromptCacheTtlMs,
+	isCacheWarmingReplayable,
+	type Model,
+	type ModelsSimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 // ...
-export function getPromptCacheTtlMs(model: Model<Api>, options: SimpleStreamOptions | undefined): number | undefined {
-	const retention =
-		options?.cacheRetention ??
-		(getProviderEnvValue("PI_CACHE_RETENTION", options?.env) === "long" ? "long" : "short");
-	if (retention === "none") return undefined;
-	const seconds = model.promptCache?.[retention];
-	return seconds === undefined ? undefined : seconds * 1000;
-}
+
+export type { CacheWarmingAction, CacheWarmingDecision };
 ```
 
-## !!steps When replaying is unsafe
+## !!steps The one input this file supplies
 
-Capping output at one token also changes `max_tokens`. For Anthropic models that use budget-based thinking, the thinking budget derives from `max_tokens`, and the provider keys the message cache on it, so the replay would miss the cache and might still think for thousands of tokens. Only requests without reasoning, on other APIs, or on models forced to adaptive thinking are replayable.
+The pi-ai evaluator needs the model, the phase and the prompt size. The prompt size comes from the session: the input, cache-read and cache-write tokens of the most recent assistant message on the branch, as reported by the provider.
+
+With that, pi-ai prices a hit as a cache read of the prompt and a miss as a cache write (or plain input when the model does not charge for writes). The cost of a miss is the difference, so only the avoidable extra counts. Expected savings is the continuation probability times that extra, minus the cost of the warm request itself. While the agent is streaming the probability is 1, since a request is in progress; idle uses a measured constant of 0.15.
 
 ```ts ! cache-warmer.ts
-export function isReplayable(model: Model<Api>, options: SimpleStreamOptions | undefined): boolean {
-	if (!options?.reasoning || model.api !== "anthropic-messages") return true;
-	return (model as Model<"anthropic-messages">).compat?.forceAdaptiveThinking === true;
-}
-
 /** Prompt size of the most recent real request on the branch, as reported by the provider. */
 function lastPromptTokens(entries: SessionEntry[]): number {
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -73,28 +59,39 @@ function lastPromptTokens(entries: SessionEntry[]): number {
 	}
 	return 0;
 }
+// ...
+	private evaluate(run: ActiveRun): CacheWarmingDecision {
+		return evaluateCacheWarming(run.model, lastPromptTokens(this.sessionManager.getBranch()), run.phase);
+	}
 ```
 
-## !!steps The decision record
+## !!steps The extension event and the status
 
-Each decision stores both prices, the probability and the expected savings, so `/session` can explain itself. Extensions get a smaller event with only the inputs and pi's proposed action, and may answer with `warm` or `stop`.
+A full decision stores both prices, the probability, the expected savings and whether the economics could be computed at all, so `/session` can explain itself. Extensions get a smaller event with only the inputs and pi's proposed action, and may answer with `warm` or `stop`.
+
+The status is what `/session` shows: inactive with a reason, a timer armed, or a refresh in flight. When warming stopped because of a decision, that decision is kept so the reason can include the numbers.
 
 ```ts ! cache-warmer.ts
-export interface CacheWarmingDecision {
-	/** "streaming" while the agent run that sent the request is still active. */
-	phase: "streaming" | "idle";
-	/** Price of this refresh: a cache read of the prompt plus one output token. */
-	warmCost: number;
-	/** Extra price of the next real request if the cache entry is lost. */
-	missCost: number;
-	/** Estimated chance that a real request arrives before the entry expires. */
-	continuationProbability: number;
-	/** `continuationProbability * missCost - warmCost`. */
-	expectedSavings: number;
-	/** False when the prompt size or the model's prices are unknown. */
-	economicsAvailable: boolean;
-	/** Pi's decision: "warm" when `expectedSavings` is at least $0.05. */
-	action: CacheWarmingAction;
+export interface CacheWarmingDecisionEvent
+	extends Pick<CacheWarmingDecision, "warmCost" | "missCost" | "continuationProbability" | "action"> {
+	type: "cache_warming_decision";
+}
+
+export interface CacheWarmingDecisionEventResult {
+	/** Override whether this refresh is sent. "stop" ends warming until the next real request. */
+	action?: CacheWarmingAction;
+}
+
+export interface CacheWarmingStatus {
+	/** "scheduled": a refresh timer is armed; "refreshing": a warm request is in flight. */
+	state: "inactive" | "scheduled" | "refreshing";
+	/** Why nothing is scheduled. */
+	reason?: string;
+	nextWarmAt?: number;
+	/** The pending decision, or the decision that stopped warming. */
+	decision?: CacheWarmingDecision;
+	/** True when an extension changed `decision.action`. */
+	extensionOverride?: boolean;
 }
 ```
 
@@ -119,6 +116,8 @@ export class CacheWarmer {
 
 `start` first clears any previous run, then walks a series of refusals, each recording a human-readable reason that `status` later shows: mode off, request not replayable, no cache lifetime, no usable delay. Only if all pass is a run created in the `streaming` phase and scheduled.
 
+The replay check matters because capping output at one token also changes `max_tokens`. For Anthropic models with budget-based thinking, the thinking budget derives from `max_tokens` and the provider keys the message cache on it, so the replay would miss the cache and might still think for thousands of tokens. `isCacheWarmingReplayable` therefore accepts only requests without reasoning, on other APIs, or on models forced to adaptive thinking.
+
 ```ts ! cache-warmer.ts
 	start(request: CacheWarmRequest, isCurrent: () => boolean): void {
 		this.clearRun();
@@ -127,7 +126,7 @@ export class CacheWarmer {
 			this.stop("cache warming disabled");
 			return;
 		}
-		if (!isReplayable(request.model, request.options)) {
+		if (!isCacheWarmingReplayable(request.model, request.options)) {
 			this.stop("request cannot be replayed safely");
 			return;
 		}
@@ -146,7 +145,8 @@ Each schedule computes the next fire time and a refresh deadline halfway through
 		// the planned pre-expiry margin for that delay and request dispatch; a
 		// late refresh is likely a full-price cache write, not a cache warm.
 		run.refreshDeadlineAt = run.nextWarmAt + Math.floor((run.ttlMs - run.delayMs) / 2);
-		const deadline = run.startedAt + (run.phase === "idle" ? MAX_IDLE_WARMING_AGE_MS : MAX_WARMING_AGE_MS);
+		const deadline =
+			run.startedAt + (run.phase === "idle" ? CACHE_WARMING_MAX_IDLE_AGE_MS : CACHE_WARMING_MAX_AGE_MS);
 		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
 			this.stop(run.phase === "idle" ? "30-minute idle safety limit reached" : "one-hour safety limit reached");
 			return;
@@ -158,7 +158,7 @@ Each schedule computes the next fire time and a refresh deadline halfway through
 
 ## !!steps Streaming versus idle
 
-When the agent run settles, mode `streaming` stops warming immediately. Otherwise the run flips to the `idle` phase, which uses the shorter 30-minute horizon and the low continuation probability. The mode setting therefore controls whether warming outlives the agent turn at all.
+When the agent run settles, mode `streaming` stops warming immediately. Otherwise the run flips to the `idle` phase, which uses the shorter 30-minute horizon and the low continuation probability. The mode setting therefore controls whether warming outlives the agent turn at all. A mode change while a run is active goes through the same rules, so switching to `off`, or to `streaming` while idle, stops the run at once.
 
 ```ts ! cache-warmer.ts
 	onAgentSettled(): void {
@@ -169,7 +169,7 @@ When the agent run settles, mode `streaming` stops warming immediately. Otherwis
 			return;
 		}
 		run.phase = "idle";
-		const deadline = run.startedAt + MAX_IDLE_WARMING_AGE_MS;
+		const deadline = run.startedAt + CACHE_WARMING_MAX_IDLE_AGE_MS;
 		if (run.nextWarmAt > deadline || Date.now() >= deadline) {
 			this.stop("30-minute idle safety limit reached");
 		}
@@ -178,18 +178,15 @@ When the agent run settles, mode `streaming` stops warming immediately. Otherwis
 
 ## !!steps The refresh path
 
-On timer fire the run is validated, the decision evaluated, and extensions consulted; a thrown extension handler falls back to pi's choice. The request is replayed with `maxTokens: 1` and no retries, under the run's abort signal. Success is persisted as a `cache_warm` usage entry, but errored or aborted replies are not. Any exception is swallowed because warming must never disturb the real agent run, and the next refresh is scheduled only if this run is still the active one.
+On timer fire the run is validated, the decision evaluated, and extensions consulted; a thrown extension handler falls back to pi's choice. The request is replayed with the options from `getCacheWarmingRequestOptions`: the original options with one output token, no retries, the run's abort signal, and `disableContinuation`. That last flag exists for Anthropic message threads, where the server continues a conversation from the previous reply; a warm request repeats the last request and must not replace the session's thread.
+
+Success is persisted as a `cache_warm` usage entry, but errored or aborted replies are not. Any exception is swallowed because warming must never disturb the real agent run, and the next refresh is scheduled only if this run is still the active one.
 
 ```ts ! cache-warmer.ts
 		run.extensionOverride = extensionOverride;
 		try {
 			const message = await this.models
-				.streamSimple(run.model, run.context, {
-					...run.options,
-					maxTokens: 1,
-					maxRetries: 0,
-					signal: run.controller.signal,
-				})
+				.streamSimple(run.model, run.context, getCacheWarmingRequestOptions(run.options, run.controller.signal))
 				.result();
 			if (!this.validateRun(run)) return;
 			if (message.stopReason !== "error" && message.stopReason !== "aborted") {
@@ -208,39 +205,21 @@ On timer fire the run is validated, the decision evaluated, and extensions consu
 		if (this.run === run) this.schedule(run);
 ```
 
-## !!steps The economics
-
-A hit costs a cache read of the last prompt. A miss costs a cache write if the model charges for writes, otherwise plain input. The cost of a miss is the difference, so only the avoidable extra counts. Expected savings is probability times that extra, minus the cost of the warm request itself. While the agent is streaming the probability is 1, since a request is in progress; idle uses the 0.15 constant.
-
-```ts ! cache-warmer.ts
-	private evaluate(run: ActiveRun): CacheWarmingDecision {
-		const model = run.model;
-		const promptTokens = lastPromptTokens(this.sessionManager.getBranch());
-		const cacheHitCost = price(model, { cacheRead: promptTokens });
-		const cacheMissCost = price(
-			model,
-			model.cost.cacheWrite > 0 ? { cacheWrite: promptTokens } : { input: promptTokens },
-		);
-		const warmCost = price(model, { cacheRead: promptTokens, output: 1 });
-		const missCost = Math.max(0, cacheMissCost - cacheHitCost);
-		const continuationProbability = run.phase === "idle" ? IDLE_CONTINUATION_PROBABILITY : 1;
-		const economicsAvailable = promptTokens > 0 && (cacheHitCost > 0 || cacheMissCost > 0);
-		const expectedSavings = continuationProbability * missCost - warmCost;
-```
-
 ## !!steps Status text
 
-The formatters at the bottom turn a status into one line for `/session`, such as a countdown to the next decision, or the reason warming stopped. A persisted warm is rendered in the transcript with its cost, trimming trailing zeros from the six-decimal figure.
+The formatters at the bottom turn a status into one line for `/session`, such as a countdown to the next decision, or the reason warming stopped.
+
+The transcript formatter takes a total cost rather than a single usage entry. Interactive mode collapses back-to-back warms with the same note into one line and updates its cumulative cost, while each warm is still persisted as its own usage entry. Trailing zeros are trimmed from the six-decimal figure.
 
 ```ts ! cache-warmer.ts
-/** One-line transcript text for persisted cache-warming usage. */
-export function formatCacheWarmingUsage(entry: UsageEntry): string {
-	const note = entry.note ? ` (${entry.note})` : "";
-	const cost = entry.usage.cost.total.toFixed(6).replace(/(\.\d{3}\d*?)0+$/, "$1");
-	return `Cache warmed${note}: $${cost}`;
+/** One-line transcript text for the total cost of one or more consecutive cache warms. */
+export function formatCacheWarmingUsage(totalCost: number, note?: string): string {
+	const noteText = note ? ` (${note})` : "";
+	const cost = totalCost.toFixed(6).replace(/(\.\d{3}\d*?)0+$/, "$1");
+	return `Cache warmed${noteText}: $${cost}`;
 }
 ```
 
 </Scrollycoding>
 
-The class holds at most one run and every exit goes through `stop`, which clears the timer and aborts any in-flight replay, so state cannot leak between turns. The `MAX_WARMING_AGE_MS` window is measured from the original request, and refreshes never extend it.
+The class holds at most one run and every exit goes through `stop`, which clears the timer and aborts any in-flight replay, so state cannot leak between turns. The safety windows are measured from the original request, and refreshes never extend them.

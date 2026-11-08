@@ -273,7 +273,7 @@ After every handler the runner rebuilds that preview with `buildContext`. If tha
 
 ## !!steps Prompt rewriting and input transforms
 
-`emitBeforeAgentStart` lets handlers add messages and replace the system prompt. The event's `systemPrompt` is a getter that renders from the current options each time, so a later handler observes an earlier one's override. An override sets `forceSystemPrompt` on the normalized options built by [system-prompt.ts](/docs/src/core/system-prompt.ts).
+`emitBeforeAgentStart` lets handlers add messages and replace the system prompt. It takes a `BeforeAgentStartTrigger`, the event minus its prompt fields, which is either a user prompt with images or the custom message that starts the run, and spreads it into each event. The event's `systemPrompt` is a getter that renders from the current options each time, so a later handler observes an earlier one's override. An override sets `forceSystemPrompt` on the normalized options built by [system-prompt.ts](/docs/src/core/system-prompt.ts).
 
 `emitInput` chains text transformations. A handler returning `handled` stops everything immediately, while `transform` updates the text and optionally images for the next handler. The final result is `continue` only when nothing changed.
 

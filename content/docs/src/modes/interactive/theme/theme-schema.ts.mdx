@@ -1,0 +1,192 @@
+---
+title: "theme-schema.ts"
+description: "TypeBox schema and validator for theme files, built from the token table and used both to check user themes at runtime and to generate the published theme.schema.json"
+source: "src/modes/interactive/theme/theme-schema.ts"
+full: true
+---
+
+Users can write their own theme files, so those files have to be validated. This file holds the TypeBox schema for a theme document and `validateThemeJson`, which turns schema failures into a readable error. It replaces two files that used to describe the same shape separately: `theme-json.ts`, a hand-written TypeBox schema used at runtime, and `theme-schema.json`, a hand-written JSON Schema for editors. Now there is one definition. The runtime compiles it, and [generate-schemas.ts](/docs/scripts/generate-schemas.ts) writes it out as `schemas/theme.schema.json`, published at `https://pi.dev/schemas/theme.schema.json`. That is the URL that [dark.json](/docs/src/modes/interactive/theme/dark.json) and [light.json](/docs/src/modes/interactive/theme/light.json) put in `$schema`.
+
+The `colors` object is not listed by hand. It is built from the token table in [theme-tokens.ts](/docs/src/modes/interactive/theme/theme-tokens.ts). [theme.ts](/docs/src/modes/interactive/theme/theme.ts) imports only types from this file. [main.ts](/docs/src/main.ts) installs the validator with `setThemeJsonValidator(validateThemeJson)` at the start of `main`, because commands and startup selectors can load user themes before the runtime exists.
+
+<Scrollycoding>
+
+## !!steps Why this is not in theme.ts
+
+Importing typebox costs about 17 MB of module graph, and looking up palette colors does not need it. So the validator lives in its own module, and only an entry point that loads user themes pays for it. A program that never installs the validator skips validation entirely, which is what already happens for the built-in themes.
+
+```ts ! theme-schema.ts
+/**
+ * Theme JSON validation, kept out of `theme.ts` on purpose.
+ *
+ * Validating user-authored theme files needs typebox, which costs ~17 MB of module graph to import.
+ * Palette lookup does not, so a presentation that only uses built-in themes should never pay for it.
+ * `main.ts` installs this validator before runtime resource loading; other consumers can opt in with
+ * `setThemeJsonValidator()`. Built-in themes do not need validation.
+ */
+
+import { type Static, type TProperties, Type } from "typebox";
+import { Compile } from "typebox/compile";
+import { THEME_TOKENS, type ThemeColorValues, type ThemeTokenDescriptors } from "./theme-tokens.ts";
+```
+
+## !!steps What a color value can be
+
+A value is either a string or an integer from 0 to 255 for the 256-color palette. The string can be a hex color, an OKLCH or OKHSL expression, the name of a variable, or an empty string for the terminal default. The schema cannot check that a string is a well-formed color or that a variable exists. Those checks happen later, when theme.ts resolves the theme.
+
+`colorValue` takes an optional description so that each token's property can carry its own editor text. The shape stays the same for every token, and generate-schemas.ts uses that to write it out once, as `$defs/ColorValue`.
+
+```ts ! theme-schema.ts
+function colorValue(description?: string) {
+	return Type.Union(
+		[
+			Type.String({
+				description:
+					"Hex color (#RGB or #RRGGBB), OKLCH or OKHSL color, variable reference, or empty string for terminal default",
+			}),
+			Type.Integer({
+				minimum: 0,
+				maximum: 255,
+				description: "256-color palette index (0-255)",
+			}),
+		],
+		description ? { description } : {},
+	);
+}
+
+export const ColorValueSchema = colorValue();
+
+export type ThemeColorValue = Static<typeof ColorValueSchema>;
+```
+
+## !!steps Colors built from the token table
+
+Each token becomes one property, with the token's description. A token is required unless it has a fallback. So the scrollbar, search-match and `thinkingMax` tokens are optional, and older themes that lack them still pass.
+
+`additionalProperties: false` rejects unknown keys, so a misspelled token such as `scrollbarThmb` is an error instead of being ignored. TypeBox cannot infer a static type from properties built in a loop, so `Type.Unsafe` gives the result the `ThemeColorValues` type from the token file.
+
+```ts ! theme-schema.ts
+function themeTokenProperties(tokens: ThemeTokenDescriptors): TProperties {
+	const properties: TProperties = {};
+	for (const [name, descriptor] of Object.entries(tokens)) {
+		const schema = colorValue(descriptor.description);
+		// !mark
+		properties[name] = descriptor.fallback === undefined ? schema : Type.Optional(schema);
+	}
+	return properties;
+}
+
+const ThemeColorsSchema = Type.Unsafe<ThemeColorValues<ThemeColorValue>>(
+	Type.Object(themeTokenProperties(THEME_TOKENS), {
+		description:
+			"Theme color definitions (scrollbar, thinkingMax, and search highlight colors are optional and use compatible fallbacks)",
+		// !mark
+		additionalProperties: false,
+	}),
+);
+```
+
+## !!steps The document and its closed objects
+
+A theme needs only `name` and `colors`. `appearance` records which background the theme is meant for, and theme.ts detects it from the colors when it is missing. `vars` maps names to color values. `export` holds the three optional backgrounds for HTML export, which default to colors derived from `userMessageBg`.
+
+The name pattern forbids `/`, because a theme setting written as `light/dark` names a pair of themes. `parseAutoThemeSetting` in theme.ts reads that syntax and [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) acts on it. The document, `colors` and `export` are all closed with `additionalProperties: false`. That is a breaking change: the old runtime validator accepted unknown keys, even though the hand-written JSON Schema did not. The changelog tells users to move custom colors under `vars`.
+
+```ts ! theme-schema.ts
+export const ThemeJsonSchema = Type.Object(
+	{
+		$schema: Type.Optional(Type.String({ description: "JSON schema reference" })),
+		name: Type.String({
+			// !mark
+			pattern: "^[^/]+$",
+			description:
+				"Theme name. Must not contain '/' because it is reserved for automatic light/dark theme settings.",
+		}),
+		appearance: Type.Optional(
+			Type.Union([Type.Literal("dark"), Type.Literal("light")], {
+				description: "Background the theme is designed for. Detected from the theme colors when omitted.",
+			}),
+		),
+		vars: Type.Optional(
+			Type.Record(Type.String(), ColorValueSchema, {
+				description: "Reusable color variables",
+			}),
+		),
+		colors: ThemeColorsSchema,
+		export: Type.Optional(
+// ...
+	{
+		title: "Pi Coding Agent Theme",
+		description: "Theme schema for Pi coding agent",
+		// !mark
+		additionalProperties: false,
+	},
+);
+```
+
+## !!steps The slash check comes first
+
+The schema is compiled once, when the module loads, so every later check runs a generated function. `ValidatedThemeJson` is derived from the schema, so the type and the validator cannot drift apart.
+
+`validateThemeJson` checks the name before it runs the schema, even though the schema's pattern would also reject a slash. Running the check first means the user sees why a slash is not allowed instead of a generic pattern error.
+
+```ts ! theme-schema.ts
+const compiledThemeSchema = Compile(ThemeJsonSchema);
+
+export type ValidatedThemeJson = Static<typeof ThemeJsonSchema>;
+
+/** Validate one theme document, throwing a message that names the offending tokens. */
+export function validateThemeJson(label: string, json: unknown): ValidatedThemeJson {
+	if (
+		typeof json === "object" &&
+		json !== null &&
+		"name" in json &&
+		typeof json.name === "string" &&
+		// !mark
+		json.name.includes("/")
+	) {
+		throw new Error(
+			`Invalid theme name "${json.name}": theme names cannot contain "/" because it is reserved for automatic light/dark theme settings.`,
+		);
+	}
+```
+
+## !!steps Turning errors into guidance
+
+TypeBox reports one error for each missing property. The validator collects every `required` error at `/colors` into one sorted list of missing tokens and records every other error as a path and a message. The final message tells the user to add the missing colors and points to the built-in themes as reference values.
+
+```ts ! theme-schema.ts
+	if (!compiledThemeSchema.Check(json)) {
+		const errors = Array.from(compiledThemeSchema.Errors(json));
+		const missingColors = new Set<string>();
+		const otherErrors: string[] = [];
+
+		for (const error of errors) {
+			// !mark(1:6)
+			if (error.keyword === "required" && error.instancePath === "/colors") {
+				const requiredProperties = (error.params as { requiredProperties?: string[] }).requiredProperties;
+				for (const requiredProperty of requiredProperties ?? []) {
+					missingColors.add(requiredProperty);
+				}
+				continue;
+			}
+
+			const path = error.instancePath || "/";
+			otherErrors.push(`  - ${path}: ${error.message}`);
+		}
+
+		let errorMessage = `Invalid theme "${label}":\n`;
+		if (missingColors.size > 0) {
+			errorMessage += "\nMissing required color tokens:\n";
+			errorMessage += Array.from(missingColors)
+				.sort()
+				.map((color) => `  - ${color}`)
+				.join("\n");
+			errorMessage += '\n\nPlease add these colors to your theme\'s "colors" object.';
+			errorMessage += "\nSee the built-in themes (dark.json, light.json) for reference values.";
+		}
+```
+
+</Scrollycoding>
+
+The validator runs only on themes loaded through `parseThemeJson` in theme.ts. The built-in themes are read with a plain cast, so a broken built-in file would not be caught at runtime. `test/config-schemas.test.ts` covers that gap: it validates dark.json through `validateThemeJson`, checks that unknown keys are rejected, and fails when the committed `theme.schema.json` no longer matches what generate-schemas.ts renders.

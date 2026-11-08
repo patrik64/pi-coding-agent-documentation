@@ -31,9 +31,31 @@ export interface AuthStorageBackend {
 }
 ```
 
+## !!steps Which lock errors are worth retrying
+
+`proper-lockfile` reports contention with the `ELOCKED` code, which always means "someone else holds it, try again". Windows adds a second transient case: a lock directory that was just removed can stay "delete pending" while another process (antivirus, an indexer, another pi checking the lock) still has a handle open, and creating it again fails with `EPERM` until that handle closes.
+
+`EPERM` is treated as retryable only on Windows, and only a few times, so a real permission problem still fails quickly. Every other error is rethrown at once.
+
+```ts ! auth-storage.ts
+// On Windows, a just-removed lock directory can stay "delete pending" while another process
+// (antivirus, indexer, another pi checking the lock) still has it open. mkdir then fails with
+// EPERM until that handle closes. Retry this briefly so real permission errors still fail fast.
+const MAX_EPERM_RETRIES = 5;
+
+function getRetryableLockErrorCode(error: unknown): "ELOCKED" | "EPERM" | undefined {
+	const code = error instanceof Error && "code" in error ? error.code : undefined;
+	if (code === "ELOCKED") return code;
+	if (code === "EPERM" && process.platform === "win32") return code;
+	return undefined;
+}
+```
+
 ## !!steps Synchronous locking by spinning
 
-The sync path exists so constructors and `reload()` can stay synchronous. `proper-lockfile` reports contention with the `ELOCKED` code, and the loop retries up to ten times at 20 ms intervals. Any other error, or the last attempt, is rethrown.
+The sync path exists so constructors and `reload()` can stay synchronous. It retries a retryable error up to ten times at 20 ms intervals; anything else, or the last attempt, is rethrown. Here the `EPERM` case is bounded by the same ten attempts rather than by `MAX_EPERM_RETRIES`.
+
+The lock call no longer passes `realpath: false`, so `proper-lockfile` resolves symlinks and locks the real file. Before that change, an agent directory whose `auth.json` was a symlink to a shared file used a different lock directory than the real path, and two processes could refresh the same OAuth token at once. Resolving the path requires the file to exist, which `ensureFileExists` guarantees before either lock is taken.
 
 The wait is a busy loop on `Date.now()`, which blocks the event loop. That is acceptable for a few hundred milliseconds in the worst case, and the comment explains the trade: it avoids turning every caller async.
 
@@ -41,57 +63,50 @@ The wait is a busy loop on `Date.now()`, which blocks the event loop. That is ac
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
 		const delayMs = 20;
-		let lastError: unknown;
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		for (let attempt = 1; ; attempt++) {
 			try {
-				return lockfile.lockSync(path, { realpath: false });
+				// Lock the resolved file so symlinked aliases of auth.json share one lock (#11655).
+				return lockfile.lockSync(path);
 			} catch (error) {
-				const code =
-					typeof error === "object" && error !== null && "code" in error
-						? String((error as { code?: unknown }).code)
-						: undefined;
-				if (code !== "ELOCKED" || attempt === maxAttempts) {
-					throw error;
-				}
-				lastError = error;
+				if (!getRetryableLockErrorCode(error) || attempt === maxAttempts) throw error;
 				const start = Date.now();
 				while (Date.now() - start < delayMs) {
 					// Sleep synchronously to avoid changing callers to async.
 				}
 			}
 		}
+	}
 ```
 
 ## !!steps Async locking with jittered backoff and abort
 
-The async path is the one used for OAuth refresh, which can take seconds, so it must be cancellable. It disables `proper-lockfile`'s own retries and runs its own loop with a 30 second deadline equal to the stale threshold.
+The async path is the one used for OAuth refresh, which can take seconds, so it must be cancellable. It disables `proper-lockfile`'s own retries and runs its own loop with a 30 second deadline equal to the stale threshold. Like the sync path, it locks the resolved file.
 
-Delay doubles from 10 ms, is capped at one second, and gets random jitter up to 2x so competing processes do not retry in lockstep. The abort signal is checked before each attempt and again after acquiring, in which case the lock is released before throwing so an aborted caller never leaves the file locked.
+The deadline is meant for waiting on another holder, so `EPERM` gets its own cap of five retries inside it. Delay doubles from 10 ms, is capped at one second, and gets random jitter up to 2x so competing processes do not retry in lockstep. The abort signal is checked before each attempt and again after acquiring, in which case the lock is released before throwing so an aborted caller never leaves the file locked.
 
 ```ts ! auth-storage.ts
 		const staleMs = 30_000;
 		const maxDelayMs = 2_000;
 		const deadline = Date.now() + staleMs;
 		let retry = 0;
+		let epermRetries = 0;
 		while (true) {
 			signal?.throwIfAborted();
 			let release: (() => Promise<void>) | undefined;
 			try {
+				// Lock the resolved file so symlinked aliases of auth.json share one lock (#11655).
 				release = await lockfile.lock(this.authPath, {
-					realpath: false,
 					retries: 0,
 					stale: staleMs,
 					onCompromised,
 				});
 			} catch (error) {
 				signal?.throwIfAborted();
-				const code =
-					typeof error === "object" && error !== null && "code" in error
-						? String((error as { code?: unknown }).code)
-						: undefined;
+				const code = getRetryableLockErrorCode(error);
 				const remainingMs = deadline - Date.now();
-				if (code !== "ELOCKED" || remainingMs <= 0) throw error;
+				if (!code || remainingMs <= 0) throw error;
+				// The 30s deadline is for waiting on another holder; cap EPERM retries separately.
+				if (code === "EPERM" && ++epermRetries > MAX_EPERM_RETRIES) throw error;
 				const baseDelayMs = Math.min(10 * 2 ** retry, maxDelayMs / 2);
 				retry++;
 				const delayMs = Math.min(Math.round(baseDelayMs * (1 + Math.random())), remainingMs);

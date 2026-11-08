@@ -293,6 +293,9 @@ after teardown, because there is no file to open.
 directory and then resumes it. The destination keeps the file's basename; on a
 collision a `-1`, `-2` suffix is appended until the name is free. If the
 source already lives in the session dir it is opened in place and not copied.
+That check uses `pathsEqual` from [paths.ts](/docs/src/utils/paths.ts), which
+compares case-insensitively on Windows, where `c:\Users` and `C:\Users` name
+the same directory.
 
 The copy happens after the `session_before_switch` check, so a cancelled
 import leaves nothing behind, and uses `COPYFILE_EXCL` as a last guard against
@@ -300,7 +303,7 @@ overwriting. A missing input throws `SessionImportFileNotFoundError`.
 
 ```ts ! agent-session-runtime.ts
 		let destinationPath = join(sessionDir, basename(resolvedPath));
-		const sourceAlreadyStored = resolve(destinationPath) === resolvedPath;
+		const sourceAlreadyStored = pathsEqual(destinationPath, resolvedPath);
 		if (!sourceAlreadyStored) {
 			const { name, ext } = parse(destinationPath);
 			let suffix = 1;
@@ -329,8 +332,15 @@ After `apply`, `finishSessionReplacement` first calls the host's
 post-switch work, since the old context it captured is stale.
 
 `createAgentSessionRuntime` is the entry point: it validates the cwd, calls the
-factory once, and stores the same factory for every later swap. `dispose`
-emits `session_shutdown` with reason `quit`.
+factory once, and stores the same factory for every later swap.
+
+`dispose` is the process-exit path. Like `teardownCurrent` it awaits
+`session.abort()` first; without that, disposing during tool execution
+disconnected persistence before the interrupted turn settled and left a stored
+tool call without its result. It then emits `session_shutdown` with reason
+`quit`, and finally waits for credential writes in progress: an OAuth refresh
+may already have spent the old single-use refresh token, so exiting before the
+new one is saved would lose the login.
 
 ```ts ! agent-session-runtime.ts
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -342,6 +352,20 @@ emits `session_shutdown` with reason `quit`.
 			await withSession(this.session.createReplacedSessionContext());
 		}
 	}
+// ...
+	async dispose(): Promise<void> {
+		// !mark
+		await this.session.abort();
+		await emitSessionShutdownEvent(this.session.extensionRunner, {
+			type: "session_shutdown",
+			reason: "quit",
+		});
+		this.beforeSessionInvalidate?.();
+		this.session.dispose();
+		// !mark
+		await this.services.modelRuntime.settleCredentialWrites();
+	}
+}
 // ...
 export async function createAgentSessionRuntime(
 	createRuntime: CreateAgentSessionRuntimeFactory,

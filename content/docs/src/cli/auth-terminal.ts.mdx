@@ -1,0 +1,93 @@
+---
+title: "auth-terminal.ts"
+description: "Line-based terminal I/O for `pi auth login` and `logout`: questions, hidden secret input, and opening the browser"
+source: "src/cli/auth-terminal.ts"
+full: true
+---
+
+The shell auth commands run without the TUI, so they need a much smaller terminal: write a line, ask a question, read a secret without echoing it, open a URL. This file defines that interface and its one real implementation on `process.stdin` and `process.stdout`.
+
+Keeping the interface separate is what makes [auth-login.ts](/docs/src/cli/auth-login.ts) and [auth-logout.ts](/docs/src/cli/auth-logout.ts) testable: tests pass a scripted terminal, and [main.ts](/docs/src/main.ts) passes the one built here. Questions are read with [terminal-question.ts](/docs/src/utils/terminal-question.ts) and URLs are opened with [open-browser.ts](/docs/src/utils/open-browser.ts).
+
+<Scrollycoding>
+
+## !!steps Two interfaces
+
+`AuthOutput` is all that logout needs: one method for normal output and one for errors. `LoginTerminal` adds input. `interactive` lets login refuse to start when there is no terminal to answer its prompts. Both reading methods take an `AbortSignal` and reject when it fires, which is how Ctrl+C and the provider's own cancellation end a prompt.
+
+```ts ! auth-terminal.ts
+/** Output shared by the terminal authentication commands. */
+export interface AuthOutput {
+	write(line: string): void;
+	error(line: string): void;
+}
+
+/** Line-based terminal I/O for `pi auth login`. Prompts reject when `signal` aborts. */
+export interface LoginTerminal extends AuthOutput {
+	/** Whether stdin and stdout are a terminal; login prompts need one. */
+	interactive: boolean;
+	question(message: string, signal: AbortSignal): Promise<string>;
+	/** Read a line without echoing it. */
+	secret(message: string, signal: AbortSignal): Promise<string>;
+	openUrl(url: string): void;
+}
+```
+
+## !!steps The process terminal
+
+Output goes to stdout and errors to stderr, one line per call. Questions use `questionTerminal`, which opens a readline interface for a single answer and always closes it again.
+
+`onInterrupt` is how the terminal tells its owner the user wants out. While a readline question is open, Ctrl+C and end of input reach readline rather than the process, so `questionTerminal` rejects the question and calls `onInterrupt`. [main.ts](/docs/src/main.ts) passes a function that aborts the login's controller, which cancels the whole login and not just the prompt. The same function is installed as the `SIGINT` handler, so Ctrl+C behaves the same whether a prompt is open or not.
+
+```ts ! auth-terminal.ts
+/** Terminal I/O on stdin and stdout. `onInterrupt` runs on Ctrl+C or EOF in a question, or Ctrl+C in a secret. */
+export function createProcessLoginTerminal(onInterrupt: () => void): LoginTerminal {
+	return {
+		interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+		write: (line) => process.stdout.write(`${line}\n`),
+		error: (line) => process.stderr.write(`${line}\n`),
+		question: (message, signal) => questionTerminal(message, { signal, output: process.stdout, onInterrupt }),
+		secret: (message, signal) => readSecret(message, signal, onInterrupt),
+		openUrl: openBrowser,
+	};
+}
+```
+
+## !!steps Reading a secret without echo
+
+API keys must not appear on screen or in terminal scrollback, so `readSecret` puts stdin in raw mode and assembles the line itself. Enter finishes the value. Ctrl+C arrives as a plain `\u0003` byte in raw mode rather than as a signal, so it is handed to `onInterrupt`, whose abort then rejects the prompt through `onAbort`. Backspace removes one whole character, using `Array.from` so a multi-unit character is not split, and other control characters are ignored.
+
+A chunk that starts with an escape byte, such as an arrow key, is dropped whole. `finish` always restores cooked mode, pauses stdin and ends the line, whether the prompt resolved or was aborted.
+
+```ts ! auth-terminal.ts
+		const onData = (data: Buffer) => {
+			const chunk = data.toString("utf8");
+			// Ignore escape sequences such as arrow keys.
+			if (chunk.startsWith("\u001b")) return;
+			for (const char of chunk) {
+				if (char === "\r" || char === "\n") {
+					finish();
+					resolve(value);
+					return;
+				}
+				if (char === "\u0003") {
+					onInterrupt();
+					return;
+				}
+				if (char === "\u007f" || char === "\b") {
+					value = Array.from(value).slice(0, -1).join("");
+				} else if (char >= " ") {
+					value += char;
+				}
+			}
+		};
+		process.stdout.write(message);
+		stdin.setRawMode(true);
+		stdin.resume();
+		stdin.on("data", onData);
+		signal.addEventListener("abort", onAbort, { once: true });
+```
+
+</Scrollycoding>
+
+`readSecret` calls `setRawMode` without checking for a TTY. That is safe only because login checks `interactive` before any prompt is shown.

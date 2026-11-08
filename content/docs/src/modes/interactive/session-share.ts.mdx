@@ -1,11 +1,11 @@
 ---
 title: "session-share.ts"
-description: "The /share flow: export the current branch, upload it to Radius, or fall back to a private GitHub gist, with a cancellable loader in the editor slot"
+description: "The /share flow: export the current branch and upload it to Radius or a private GitHub gist, as the share destination setting allows, with a cancellable loader in the editor slot"
 source: "src/modes/interactive/session-share.ts"
 full: true
 ---
 
-Sharing a session means producing a link someone else can open. This file implements the interactive path: it exports the active branch to a temporary file, tries to upload it as a Radius artifact, and if Radius is not configured falls back to a secret GitHub gist rendered through the share viewer.
+Sharing a session means producing a link someone else can open. This file implements the interactive path: it exports the active branch to a temporary file, tries to upload it as a Radius artifact, and if Radius is not configured falls back to a secret GitHub gist rendered through the share viewer. The session share destination setting (`auto`, `gist` or `radius`, chosen in [settings-selector.ts](/docs/src/modes/interactive/components/settings-selector.ts)) can skip Radius or forbid the fallback.
 
 Both upload paths temporarily replace the editor with a [bordered-loader.ts](/docs/src/modes/interactive/components/bordered-loader.ts) so the user can cancel with the abort key. The export itself is done by [session-export.ts](/docs/src/core/session-export.ts), and the entry point is called from [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
 
@@ -63,10 +63,20 @@ export function createShareTrailingEntries(
 
 `shareSession` works in a private temp dir that is always removed in `finally`. Order matters: JSONL export first, then Radius. Radius returning true means "handled" (success, failure or cancel), and nothing else runs.
 
-Only when Radius is unavailable does it check `gh auth status`. The error message distinguishes not logged in from not installed, though a missing `gh` with `spawnSync` normally returns an error object rather than throwing, so the `catch` branch may not be reached in that case (and then the status check reports "not logged in"). Then the HTML export is created with the current theme name.
+The destination setting decides how far that goes. `auto`, the default, tries Radius and falls back to a gist. `gist` skips Radius entirely. `radius` tries Radius and, when no Radius credential exists, shows an error pointing to `/login radius` instead of quietly publishing a gist the user did not ask for.
+
+Only when the gist path is reached does it check `gh auth status`. The error message distinguishes not logged in from not installed, though a missing `gh` with `spawnSync` normally returns an error object rather than throwing, so the `catch` branch may not be reached in that case (and then the status check reports "not logged in"). Then the HTML export is created with the current theme name.
 
 ```ts ! session-share.ts
-		if (await tryShareViaRadius(jsonlFile, context)) return;
+		const destination = context.session.settingsManager.getSessionShareDestination();
+		// !mark(1:7)
+		if (destination !== "gist") {
+			if (await tryShareViaRadius(jsonlFile, context)) return;
+			if (destination === "radius") {
+				context.showError("Radius authentication is not configured. Run '/login radius' first.");
+				return;
+			}
+		}
 
 		try {
 			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
@@ -86,7 +96,7 @@ Only when Radius is unavailable does it check `gh auth status`. The error messag
 
 ## !!steps Radius: credentials, loader, upload
 
-`tryShareViaRadius` bails out with `false` (so the gist path runs) when the provider is not registered or no credential is obtainable. The token is requested with `minOAuthValidityMs` of five minutes, so it will not expire mid-upload. Credential extraction uses `getAuthCredential` from [auth-command.ts](/docs/src/cli/auth-command.ts) and the runtime is [model-runtime.ts](/docs/src/core/model-runtime.ts).
+`tryShareViaRadius` bails out with `false` (so the caller falls back to a gist, or reports the missing login when the destination is `radius`) when the provider is not registered or no credential is obtainable. The token is requested with `minOAuthValidityMs` of five minutes, so it will not expire mid-upload. Credential extraction uses `getAuthCredential` from [auth-command.ts](/docs/src/cli/auth-command.ts) and the runtime is [model-runtime.ts](/docs/src/core/model-runtime.ts).
 
 Once it has a token it takes over the editor slot with a loader and wires `onAbort` to restore the editor and report cancellation.
 

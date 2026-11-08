@@ -1,0 +1,62 @@
+---
+title: "key-id-schema.ts"
+description: "Turns pi-tui's key names into a regular expression for key ids such as ctrl+shift+x, used to check keybinding values at runtime and in the published schema"
+source: "src/core/key-id-schema.ts"
+full: true
+---
+
+A value in `keybindings.json` is a key id such as `ctrl+shift+x`, or an array of them. This file turns pi-tui's key vocabulary into a regular expression for that syntax and wraps it in a TypeBox schema. Two places use it. [keybindings.ts](/docs/src/core/keybindings.ts) compiles `KeybindingValueSchema` and drops user bindings that do not match, and [keybindings-schema.ts](/docs/src/core/keybindings-schema.ts) uses it for every property of the published `keybindings.schema.json`. Pi and the user's editor therefore agree on which values are valid.
+
+It is a file of its own because keybindings-schema.ts imports the binding table from keybindings.ts. If keybindings.ts imported its value schema from there, the two modules would import each other. With the key syntax in a separate file, the imports form no cycle.
+
+<Scrollycoding>
+
+## !!steps Base keys from pi-tui's Key table
+
+pi-tui's `Key` object maps names to key ids, such as `escape`, `pageUp`, `f12` and symbols like `?` or `/`. It also holds helper functions such as `Key.ctrl`, which the `typeof value === "string"` filter skips. Each remaining id is escaped for use in a regular expression and added to an alternation, alongside `[a-z0-9]` for single letters and digits.
+
+`duplicateModifierPattern` matches any string that contains the same modifier twice, such as `ctrl+` followed later by another `ctrl+`.
+
+```ts ! key-id-schema.ts
+import { Key, type KeyId } from "@earendil-works/pi-tui";
+import { type TSchemaOptions, Type } from "typebox";
+
+const modifiers = ["ctrl", "shift", "alt", "super"] as const;
+const baseKeyPattern = `(?:[a-z0-9]|${Object.values(Key)
+	// !mark
+	.flatMap((value) => (typeof value === "string" ? [value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")] : []))
+	.join("|")})`;
+const duplicateModifierPattern = modifiers.map((modifier) => `${modifier}\\+.*${modifier}\\+`).join("|");
+```
+
+## !!steps The key id pattern
+
+A key id is up to four modifiers in any order, each followed by `+`, and then exactly one base key. A negative lookahead at the start rejects any repeated modifier. Matching is case-sensitive, so `Ctrl+x` and `control+x` are invalid, and so is `ctrl+not-a-key`. Order is free, so `alt+ctrl+?` is valid.
+
+`Type.Unsafe` gives the schema pi-tui's `KeyId` type, so a value that passes the check can be used as a key id without a cast.
+
+```ts ! key-id-schema.ts
+export const KeyIdSchema = Type.Unsafe<KeyId>(
+	Type.String({
+		// !mark
+		pattern: `^(?!.*(?:${duplicateModifierPattern}))(?:(?:${modifiers.join("|")})\\+){0,4}${baseKeyPattern}$`,
+		description: "Key identifier with optional ctrl, shift, alt, or super modifiers.",
+	}),
+);
+```
+
+## !!steps One key or several
+
+A binding is either one key id or an array of them, which matches the `defaultKeys` form in the binding tables. The factory takes options so that keybindings-schema.ts can attach each action's description while keeping the same shape. [generate-schemas.ts](/docs/scripts/generate-schemas.ts) relies on that shape being identical to write the value schema once, as `$defs/KeybindingValue`, and refer to it from every action.
+
+```ts ! key-id-schema.ts
+export function keybindingValueSchema(options?: TSchemaOptions) {
+	return Type.Union([KeyIdSchema, Type.Array(KeyIdSchema)], options);
+}
+
+export const KeybindingValueSchema = keybindingValueSchema();
+```
+
+</Scrollycoding>
+
+The pattern is built from pi-tui at module load, so a key name added to pi-tui becomes valid in both the runtime check and the next generated schema with no change here. An empty array is valid, which lets a user unbind an action by setting it to an empty list.

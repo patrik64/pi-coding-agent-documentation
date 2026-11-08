@@ -32,9 +32,9 @@ export interface PromptTemplate {
 
 ## !!steps Bash-style argument splitting
 
-`parseCommandArgs` is a small state machine. Whitespace separates arguments unless inside single or double quotes, and the quote characters themselves are removed.
+`parseCommandArgs` is a small state machine. Whitespace separates arguments unless inside single or double quotes, and the quote characters themselves are removed. A `hasToken` flag, rather than a non-empty `current`, decides whether an argument has started, so `""` and `''` are kept as empty arguments instead of disappearing.
 
-There is no escape handling and no check for unterminated quotes: an unclosed quote swallows the rest of the line as one argument. An empty quoted string yields no argument at all, because empty values are never pushed.
+A quote opens only at the start of an argument. That keeps apostrophes inside words literal, so `/fix don't break it` passes `don't` intact instead of swallowing the rest of the line. Inside a quoted argument, a backslash before the open quote's character produces that character. An unclosed quote is no longer fatal either: when the input ends inside one, the parser rewinds to the quote, keeps the quote character as text, and parses the rest normally.
 
 ```ts ! prompt-templates.ts
 /**
@@ -44,32 +44,53 @@ There is no escape handling and no check for unterminated quotes: an unclosed qu
 export function parseCommandArgs(argsString: string): string[] {
 	const args: string[] = [];
 	let current = "";
+	// Tracks whether a token has started, so quoted empty strings ("" or '') are kept as arguments
+	let hasToken = false;
 	let inQuote: string | null = null;
+	// Where the open quote started, so an unclosed quote can be re-read as literal text
+	let quoteStart = 0;
 
 	for (let i = 0; i < argsString.length; i++) {
 		const char = argsString[i];
 
-// !mark(1:3)
 		if (inQuote) {
-			if (char === inQuote) {
+			if (char === "\\" && argsString[i + 1] === inQuote) {
+				// A backslash before the open quote's character keeps it as text: "say \"hi\"" gives say "hi"
+				current += inQuote;
+				i++;
+			} else if (char === inQuote) {
 				inQuote = null;
 			} else {
 				current += char;
 			}
-// !mark(1:2)
-		} else if (char === '"' || char === "'") {
+// !mark
+		} else if ((char === '"' || char === "'") && !hasToken) {
+			// Quotes only open at the start of an argument, so apostrophes inside words stay literal
 			inQuote = char;
+			quoteStart = i;
+			hasToken = true;
 		} else if (/\s/.test(char)) {
-			if (current) {
+			if (hasToken) {
 				args.push(current);
 				current = "";
+				hasToken = false;
 			}
 		} else {
 			current += char;
+			hasToken = true;
+		}
+
+// !mark(1:6)
+		if (inQuote && i === argsString.length - 1) {
+			// Unclosed quote: keep the quote character as text and parse the rest normally
+			// (current was empty when the quote opened, because quotes only open a new argument)
+			inQuote = null;
+			current = argsString[quoteStart];
+			i = quoteStart;
 		}
 	}
 
-	if (current) {
+	if (hasToken) {
 		args.push(current);
 	}
 

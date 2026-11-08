@@ -241,7 +241,7 @@ The second character of the connector doubles as the fold indicator: `⊞` for a
 
 `getEntryDisplayText` produces the colored text after the prefix. User messages are `user: ` in accent, assistant messages `assistant: ` in success color, with fallbacks for an aborted turn, an error message (cut to 80 characters) or no content. Compaction shows its token count in thousands, and bookkeeping entries are dim bracketed tags.
 
-A tool result is shown as a description of the call that produced it, not its output. `toolCallMap`, filled during flattening from assistant `toolCall` blocks, links the result's `toolCallId` back to the name and arguments, and `formatToolCall` turns that into forms like `[read: ~/a.ts:10-59]`. The selected row is made bold.
+A tool result is shown as a description of the call that produced it, not its output. `toolCallMap`, filled during flattening from assistant `toolCall` blocks, links the result's `toolCallId` back to the name and arguments, and `formatToolCall` turns that into forms like `[read: ~/a.ts:10-59]`. Paths go through `shortenHomePath` from [paths.ts](/docs/src/utils/paths.ts), which also handles Windows paths, and the read line range comes from `formatReadLineRange` in [render-utils.ts](/docs/src/core/tools/render-utils.ts), so the label matches what the read tool itself shows and ignores the `null` that strict schemas use for omitted arguments. The selected row is made bold.
 
 ```ts ! tree-selector.ts
 				} else if (role === "toolResult") {
@@ -325,11 +325,56 @@ function compactRawKeys(keys: string[]): string {
 }
 ```
 
-## !!steps The container and label editing
+## !!steps A search line with a visible cursor
+
+`SearchLine` shows the query under the help. It is `Focusable`: when it has focus it reserves the last column, emits pi-tui's `CURSOR_MARKER` there, and paints an inverse space as a fake block cursor. The marker tells the terminal renderer where the real cursor belongs, so input methods place their composition window on the search line. Without focus it is plain truncated text.
+
+```ts ! tree-selector.ts
+/** Component that displays the current search query */
+class SearchLine implements Component, Focusable {
+	focused = false;
+	private treeList: TreeList;
+	// ...
+	render(width: number): string[] {
+		if (width <= 0) return [""];
+
+		const query = this.treeList.getSearchQuery();
+		const line = query
+			? `  ${theme.fg("muted", "Type to search:")} ${theme.fg("accent", query)}`
+			: `  ${theme.fg("muted", "Type to search:")} `;
+		if (!this.focused) return [truncateToWidth(line, width)];
+
+		const content = truncateToWidth(line, Math.max(0, width - 1));
+		return [`${content}${CURSOR_MARKER}\x1b[7m \x1b[27m`];
+	}
+```
+
+## !!steps The container and focus routing
 
 `TreeSelectorComponent` assembles the chrome: borders, a title, the help, the search line and the list. The list height is half the terminal, but at least five lines. An empty tree schedules `onCancel` after 100 ms, so the caller can leave a picker that has nothing to show.
 
-Labels are edited inline. Pressing the label key swaps the list for a `LabelInput` in the same slot and routes all input to it. On submit the list's node is updated in memory, `onLabelChange` is called so the caller can persist it, and the list returns. Focus is propagated so the terminal cursor sits in the right place for input methods.
+Focus goes to exactly one input. The `focused` setter gives it to the search line while no label is being edited, and to the label input otherwise, so the terminal cursor sits in the right place for input methods.
+
+```ts ! tree-selector.ts
+	// Focusable implementation - propagate to the active input for IME cursor positioning
+	private _focused = false;
+	get focused(): boolean {
+		return this._focused;
+	}
+	set focused(value: boolean) {
+		this._focused = value;
+		this.searchLine.focused = value && this.labelInput === null;
+		if (this.labelInput) {
+			this.labelInput.focused = value;
+		}
+	}
+```
+
+## !!steps Label editing
+
+Labels are edited inline. Pressing the label key swaps the list for a `LabelInput` in the same slot and routes all input to it. On submit the list's node is updated in memory, `onLabelChange` is called so the caller can persist it, and the list returns.
+
+Showing and hiding the input both re-run the `focused` setter with the current value, which moves focus between the search line and the label input. `capturesViewportInput` is true only while the list is showing. In fullscreen mode it makes viewport keys such as Page Up and Page Down reach the list instead of scrolling the transcript; while a single-line label is being typed, those keys scroll the transcript as usual.
 
 ```ts ! tree-selector.ts
 	private showLabelInput(entryId: string, currentLabel: string | undefined): void {
@@ -342,12 +387,24 @@ Labels are edited inline. Pressing the label key swaps the list for a `LabelInpu
 		};
 		this.labelInput.onCancel = () => this.hideLabelInput();
 
-		// Propagate current focused state to the new labelInput
-		this.labelInput.focused = this._focused;
+		// Propagate current focused state
+		this.focused = this._focused;
 
 		this.treeContainer.clear();
 		this.labelInputContainer.clear();
 		this.labelInputContainer.addChild(this.labelInput);
+	}
+
+	private hideLabelInput(): void {
+		this.labelInput = null;
+		this.focused = this._focused;
+		this.labelInputContainer.clear();
+		this.treeContainer.clear();
+		this.treeContainer.addChild(this.treeList);
+	}
+
+	get capturesViewportInput(): boolean {
+		return this.labelInput === null;
 	}
 ```
 

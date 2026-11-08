@@ -13,7 +13,7 @@ Colors come from [theme.ts](/docs/src/modes/interactive/theme/theme.ts) (the `us
 
 ## !!steps Constructor inputs
 
-The component stores the text, a Markdown theme (defaulting to `getMarkdownTheme()`), a horizontal padding and a list of `MarkdownTransformer`s that extensions can register (the type lives in [types.ts](/docs/src/core/extensions/types.ts)). It builds its child immediately.
+The component stores the text, a Markdown theme (defaulting to `getMarkdownTheme()`), a horizontal padding and a list of `MarkdownTransformer`s that extensions can register (the type lives in [types.ts](/docs/src/core/extensions/types.ts)). When the message is replayed from the session file, the host also passes its entry id and timestamp, which transformers receive in their context. It builds its child immediately.
 
 `setOutputPad` exists so the transcript can change padding later; it simply rebuilds.
 
@@ -23,18 +23,24 @@ export class UserMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private outputPad: number;
 	private markdownTransformers: readonly MarkdownTransformer[];
+	private messageId?: string;
+	private timestamp?: string;
 
 	constructor(
 		text: string,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		outputPad = 1,
 		markdownTransformers: readonly MarkdownTransformer[] = [],
+		messageId?: string,
+		timestamp?: string,
 	) {
 		super();
 		this.text = text;
 		this.markdownTheme = markdownTheme;
 		this.outputPad = outputPad;
 		this.markdownTransformers = markdownTransformers;
+		this.messageId = messageId;
+		this.timestamp = timestamp;
 		// !mark
 		this.rebuild();
 	}
@@ -44,7 +50,7 @@ export class UserMessageComponent extends Container {
 
 `rebuild` clears and adds a single `Markdown`. The comment explains a deliberate choice: no `Box` around it, because the Markdown can pad and paint its own background, and a Box would keep a second full-width copy of every line.
 
-The options matter for user text: ordered-list markers and backslash escapes are preserved, so what the user typed is shown as typed rather than renumbered or unescaped. The `transform` is built for the `"user"` role.
+The options matter for user text: ordered-list markers and backslash escapes are preserved, so what the user typed is shown as typed rather than renumbered or unescaped. The `transform` is built for the `"user"` surface; user text is never streamed, so its streaming callback always returns false.
 
 ```ts ! user-message.ts
 	private rebuild(): void {
@@ -65,7 +71,13 @@ The options matter for user text: ordered-list markers and backslash escapes are
 				{
 					preserveOrderedListMarkers: true,
 					preserveBackslashEscapes: true,
-					transform: createMarkdownTransform("user", false, this.markdownTransformers),
+					transform: createMarkdownTransform(
+						"user",
+						() => false,
+						this.markdownTransformers,
+						this.messageId,
+						this.timestamp,
+					),
 				},
 			),
 		);

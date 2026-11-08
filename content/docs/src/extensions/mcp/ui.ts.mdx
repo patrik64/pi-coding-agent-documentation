@@ -1,6 +1,6 @@
 ---
 title: "ui.ts"
-description: "The /mcp manager view: a single TUI component that swaps between live-updating menus, status messages and a sign-in screen that accepts a pasted redirect URL"
+description: "The /mcp manager view: a single TUI component that swaps between live-updating menus, cancellable status messages and a sign-in screen that accepts a pasted redirect URL"
 source: "src/extensions/mcp/ui.ts"
 full: true
 ---
@@ -13,7 +13,7 @@ It is built from the components of the terminal UI library plus pi's own [dynami
 
 ## !!steps The interface the manager logic sees
 
-`McpMenu` is a description of a screen, not a screen: title, items, optional error and the labels for the confirm and cancel hints. `McpUi` has three operations. `menu` takes a builder function plus an optional `subscribe`, so the menu can be rebuilt whenever server state changes while it is open, keeping the selected item. `redirectUrl` resolves when the user pastes a URL, cancels, or the abort signal fires because the browser callback arrived first.
+`McpMenu` is a description of a screen, not a screen: title, items, optional error and the labels for the confirm and cancel hints. `McpUi` has three operations. `menu` takes a builder function plus an optional `subscribe`, so the menu can be rebuilt whenever server state changes while it is open, keeping the selected item. `status` shows a message while something runs and, given `onCancel`, lets the cancel key stop it; the manager uses that to abort a sign-in that is waiting on the authorization server. `redirectUrl` resolves when the user pastes a URL, cancels, or the abort signal fires because the browser callback arrived first.
 
 ```ts ! ui.ts
 export interface McpMenu {
@@ -40,8 +40,9 @@ export interface McpUi {
 	 */
 	// !mark
 	menu(build: () => McpMenu, subscribe?: (listener: () => void) => () => void): Promise<string | undefined>;
-	/** Show a message while an operation runs. */
-	status(title: string, message: string): void;
+	/** Show a message while an operation runs. With `onCancel`, the cancel key calls it. */
+	// !mark
+	status(title: string, message: string, onCancel?: () => void): void;
 	/**
 	 * Show the authorization URL and wait for a pasted redirect URL. Resolves to undefined when
 	 * cancelled or when `signal` aborts (the browser reached the callback).
@@ -74,9 +75,16 @@ function frame(theme: Theme, title: string, body: Component[], footer?: string):
 
 ## !!steps Swapping content and moving focus
 
-The view holds one `content` container and one input handler. `setContent` replaces them together and requests a render. Focus is forwarded: the view is `Focusable`, and when the current screen has an input widget, it receives the focus state, with the previous target unfocused first. This keeps the text cursor correct when screens change.
+The view holds one `content` container and one input handler. `setContent` replaces them together and requests a render. The handler is typed as the input half of a `Component`, so a screen can pass a whole widget (the `SelectList` of a menu) or a small object with its own `handleInput`.
+
+That type also carries `capturesViewportInput`. In fullscreen mode, page and scroll keys normally scroll the transcript; a focused component that sets this flag receives them instead. `SelectList` sets it, and the view passes the current handler's answer through its own getter, so PageUp and PageDown move the `/mcp` list rather than the conversation behind it.
+
+Focus is forwarded too: the view is `Focusable`, and when the current screen has an input widget, it receives the focus state, with the previous target unfocused first. This keeps the text cursor correct when screens change.
 
 ```ts ! ui.ts
+// !mark
+type InputHandler = Pick<Component, "handleInput" | "capturesViewportInput">;
+// ...
 	get focused(): boolean {
 		return this._focused;
 	}
@@ -86,7 +94,12 @@ The view holds one `content` container and one input handler. `setContent` repla
 		if (this.inputTarget) this.inputTarget.focused = value;
 	}
 
-	private setContent(content: Container, inputHandler?: (data: string) => void, inputTarget?: Focusable): void {
+	// !mark(1:3)
+	get capturesViewportInput(): boolean {
+		return this.inputHandler?.capturesViewportInput === true;
+	}
+
+	private setContent(content: Container, inputHandler?: InputHandler, inputTarget?: Focusable): void {
 		// !mark
 		if (this.inputTarget) this.inputTarget.focused = false;
 		this.content = content;
@@ -100,7 +113,7 @@ The view holds one `content` container and one input handler. `setContent` repla
 
 ## !!steps A menu that rebuilds itself
 
-`menu` returns a promise that settles once, guarded by `settled`. Each `render` calls the builder again, restores the selected value (the user's last selection wins over the builder's default), and installs a `SelectList`. Selection changes are tracked so a later rebuild keeps the cursor on the same item. An empty menu shows the empty message and only listens for cancel.
+`menu` returns a promise that settles once, guarded by `settled`. Each `render` calls the builder again, restores the selected value (the user's last selection wins over the builder's default), and installs a `SelectList`. Selection changes are tracked so a later rebuild keeps the cursor on the same item. The list itself becomes the input handler, which gives it page keys and viewport capture. An empty menu shows the empty message and only listens for cancel.
 
 ```ts ! ui.ts
 	menu(build: () => McpMenu, subscribe?: (listener: () => void) => () => void): Promise<string | undefined> {
@@ -126,12 +139,11 @@ The view holds one `content` container and one input handler. `setContent` repla
 				const footer = `${keyHint("tui.select.confirm", menu.confirmLabel)} • ${keyHint("tui.select.cancel", menu.cancelLabel)}`;
 				if (menu.items.length === 0) {
 					body.push(new Text(this.theme.fg("muted", menu.empty ?? "Nothing to show."), 1, 0));
-					this.setContent(
-						frame(this.theme, menu.title, body, keyHint("tui.select.cancel", menu.cancelLabel)),
-						(data) => {
+					this.setContent(frame(this.theme, menu.title, body, keyHint("tui.select.cancel", menu.cancelLabel)), {
+						handleInput: (data) => {
 							if (this.keybindings.matches(data, "tui.select.cancel")) finish(undefined);
 						},
-					);
+					});
 					return;
 				}
 				const list = new SelectList(
@@ -149,13 +161,35 @@ The view holds one `content` container and one input handler. `setContent` repla
 				list.onSelect = (item) => finish(item.value);
 				list.onCancel = () => finish(undefined);
 				body.push(list);
-				this.setContent(frame(this.theme, menu.title, body, footer), (data) => list.handleInput(data));
+				// !mark
+				this.setContent(frame(this.theme, menu.title, body, footer), list);
 			};
 			render();
 			// !mark(1:3)
 			unsubscribe = subscribe?.(() => {
 				if (!settled) render();
 			});
+		});
+	}
+```
+
+## !!steps A status screen that can be cancelled
+
+Without `onCancel`, a status screen is just a framed message with no input handler. With it, the footer shows the cancel key and pressing it calls `onCancel`. The view does not decide what cancelling means; [index.ts](/docs/src/extensions/mcp/index.ts) passes a callback that aborts the sign-in's signal, which stops the OAuth flow at whatever request it is waiting on.
+
+```ts ! ui.ts
+	status(title: string, message: string, onCancel?: () => void): void {
+		const body = [new Spacer(1), new Text(this.theme.fg("muted", message), 1, 0)];
+		// !mark(1:4)
+		if (!onCancel) {
+			this.setContent(frame(this.theme, title, body));
+			return;
+		}
+		this.setContent(frame(this.theme, title, body, keyHint("tui.select.cancel", "cancel")), {
+			handleInput: (data) => {
+				// !mark
+				if (this.keybindings.matches(data, "tui.select.cancel")) onCancel();
+			},
 		});
 	}
 ```
@@ -191,26 +225,28 @@ The result feeds `promptForRedirectUrl` in [oauth.ts](/docs/src/extensions/mcp/o
 
 ## !!steps Input handling and rendering
 
-Key handling is a closure per screen: confirm submits a non-empty value, cancel gives up, the copy key copies the link, and anything else goes to the input. At the component level, `handleInput` delegates to the current handler. `render` clips every line to the terminal width, since a long authorization URL would otherwise overflow.
+Key handling is a small handler object per screen: confirm submits a non-empty value, cancel gives up, the copy key copies the link, and anything else goes to the input. At the component level, `handleInput` delegates to the current handler, if it has one. `render` clips every line to the terminal width, since a long authorization URL would otherwise overflow.
 
 ```ts ! ui.ts
-				(data) => {
-					// !mark(1:4)
-					if (this.keybindings.matches(data, "tui.select.confirm")) {
-						const value = input.getValue().trim();
-						if (value) finish(value);
-						return;
-					}
-					// !mark(1:3)
-					if (this.keybindings.matches(data, "tui.select.cancel")) {
-						finish(undefined);
-						return;
-					}
-					if (this.keybindings.matches(data, "app.message.copy")) {
-						void link.copy();
-						return;
-					}
-					input.handleInput(data);
+				{
+					handleInput: (data) => {
+						// !mark(1:4)
+						if (this.keybindings.matches(data, "tui.select.confirm")) {
+							const value = input.getValue().trim();
+							if (value) finish(value);
+							return;
+						}
+						// !mark(1:3)
+						if (this.keybindings.matches(data, "tui.select.cancel")) {
+							finish(undefined);
+							return;
+						}
+						if (this.keybindings.matches(data, "app.message.copy")) {
+							void link.copy();
+							return;
+						}
+						input.handleInput(data);
+					},
 				},
 				input,
 			);
@@ -218,7 +254,7 @@ Key handling is a closure per screen: confirm submits a non-empty value, cancel 
 	}
 
 	handleInput(data: string): void {
-		this.inputHandler?.(data);
+		this.inputHandler?.handleInput?.(data);
 		this.tui.requestRender();
 	}
 

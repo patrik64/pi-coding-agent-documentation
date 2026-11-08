@@ -1,19 +1,21 @@
 ---
 title: "cli.ts"
-description: "Implements the pi mcp subcommand: add, remove, list, login and logout for MCP servers outside a running session."
+description: "Implements the pi mcp subcommand: add, remove, list, login and logout for MCP servers outside a running session, including servers that use a pi provider's token."
 source: "src/extensions/mcp/cli.ts"
 full: true
 ---
 
-`pi mcp` lets users, and agents running bash, manage MCP servers without opening a session. It edits `mcp.json`, connects to every configured server to report its state, and performs OAuth sign-in through the browser. Running sessions pick up new credentials on their next turn.
+`pi mcp` lets users, and agents running bash, manage MCP servers without opening a session. It edits `mcp.json`, connects to every configured server to report its state, and performs OAuth sign-in through the browser. Running sessions pick up new credentials on their next turn. Servers that send a pi provider's token (`auth.provider`, such as the Radius server that [radius-mcp.ts](/docs/src/core/radius-mcp.ts) configures) are listed with that token, and their sign-in is left to `pi auth login` in [auth-login.ts](/docs/src/cli/auth-login.ts).
 
-The file is loaded lazily through [cli.lazy.ts](/docs/src/extensions/mcp/cli.lazy.ts) from [main.ts](/docs/src/main.ts). It relies on [config.ts](/docs/src/extensions/mcp/config.ts) for reading and writing the config, [runtime.ts](/docs/src/extensions/mcp/runtime.ts) for connections and sign-in, [mcp-servers.ts](/docs/src/core/mcp-servers.ts) for validation, and [trust-manager.ts](/docs/src/core/trust-manager.ts) to decide whether the project config may be read. Every command returns an exit code instead of calling `process.exit`, and output goes through injectable `log` and `error` functions.
+The file is loaded lazily through [cli.lazy.ts](/docs/src/extensions/mcp/cli.lazy.ts) from [main.ts](/docs/src/main.ts). It relies on [config.ts](/docs/src/extensions/mcp/config.ts) for reading and writing the config, [runtime.ts](/docs/src/extensions/mcp/runtime.ts) for connections and sign-in, [mcp-servers.ts](/docs/src/core/mcp-servers.ts) for validation, [trust-manager.ts](/docs/src/core/trust-manager.ts) to decide whether the project config may be read, [model-runtime.ts](/docs/src/core/model-runtime.ts) for provider tokens, and [terminal-question.ts](/docs/src/utils/terminal-question.ts) for the redirect-URL prompt. Every command returns an exit code instead of calling `process.exit`, and output goes through injectable `log` and `error` functions.
 
 <Scrollycoding>
 
 ## !!steps Help text and options
 
-The usage text documents every flag. Note the default exposure `codemode`, and that `--oauth-client-secret` may be an environment reference or a `!command`. The `McpCommandOptions` interface lists what a caller (or a test) can inject: directories, a credential store, a URL opener, and output functions.
+The usage text documents every flag. Note the default exposure `codemode`, that `--oauth-client-secret` may be an environment reference or a `!command`, and the newer `--oauth-client-registration` option, whose default `auto` prefers pi's Client ID Metadata Document. `-l` is now accepted by `login` and `logout` too, and `--timeout` limits the whole sign-in rather than only the wait for the browser.
+
+The `McpCommandOptions` interface lists what a caller (or a test) can inject: directories, a credential store, a provider-token reader, a URL opener, and output functions.
 
 ```ts ! cli.ts
 const HELP = `${chalk.bold("Usage:")}
@@ -21,14 +23,22 @@ const HELP = `${chalk.bold("Usage:")}
   ${APP_NAME} mcp add <server> [options] --url <url>
   ${APP_NAME} mcp remove <server> [-l]
   ${APP_NAME} mcp list [--json]
-  ${APP_NAME} mcp login <server> [--timeout <seconds>]
-  ${APP_NAME} mcp logout <server>
+  ${APP_NAME} mcp login <server> [-l] [--timeout <seconds>]
+  ${APP_NAME} mcp logout <server> [-l]
+// ...
+  --oauth-client-registration <mode>
+                          auto (default), cimd, or dcr
+// ...
+  --timeout <seconds>     Time limit for the whole sign-in (default: 300)`;
 // ...
 export interface McpCommandOptions {
 	cwd: string;
 	agentDir: string;
 	/** Defaults to `mcp-auth.json` in the agent directory. */
 	credentials?: McpOAuthCredentialStore;
+	/** Token of a pi provider, for servers with `auth.provider`. Defaults to the agent directory's `auth.json`. */
+	// !mark
+	providerToken?: (provider: string) => Promise<string | undefined>;
 	/** Defaults to the platform browser. */
 	openUrl?: (url: string) => void;
 	/** Defaults to console output. */
@@ -37,11 +47,41 @@ export interface McpCommandOptions {
 }
 ```
 
+## !!steps Provider tokens outside a session
+
+A server with `auth.provider` authenticates with the token of a pi provider login, not with its own OAuth. In a session the model registry supplies that token. Here, without a session, `pi mcp list` used to send nothing, so such servers always looked like they needed a sign-in.
+
+`createProviderTokenReader` fills the gap: it creates a `ModelRuntime` over the agent directory's `auth.json` on the first request, so commands that never meet such a server do not pay for it, and reads the provider's credential the way a session would, refreshing an expired OAuth token. Any failure returns undefined; the server's 401 then reports the missing sign-in. Every connection the command makes gets this reader.
+
+```ts ! cli.ts
+function getAuthProvider(entry: McpServerEntry): string | undefined {
+	return "url" in entry.config ? entry.config.auth?.provider : undefined;
+}
+// ...
+function createProviderTokenReader(agentDir: string): (provider: string) => Promise<string | undefined> {
+	let runtime: Promise<ModelRuntime> | undefined;
+	return async (provider) => {
+		// !mark(1:5)
+		runtime ??= ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			refreshOnCreate: false,
+		});
+		try {
+			return (await (await runtime).getAuth(provider))?.auth.apiKey;
+		} catch {
+			// Missing or unrefreshable credentials: the server's 401 then reports that sign-in is needed.
+			return undefined;
+		}
+	};
+}
+```
+
 ## !!steps A small argument parser
 
 `parseOptions` handles three kinds of options: flags, single values, and repeatable lists. It stops at `--` or once `maxPositionals` positional arguments were seen, and everything after that is passed through untouched. That is how `add name npx -y pkg --flag` keeps `--flag` for the server command instead of treating it as an option of `pi`.
 
-Unknown options and missing values print an error and return undefined, which callers turn into exit code 1.
+`-l` is expanded to `--local` through an alias table, but the original spelling is kept in `typed`, so an unknown option is reported the way the user wrote it. Unknown options and missing values print an error and return undefined, which callers turn into exit code 1.
 
 ```ts ! cli.ts
 function parseOptions(
@@ -54,7 +94,9 @@ function parseOptions(
 	const values = new Map<string, string | true>();
 	const lists = new Map<string, string[]>();
 	for (let index = 0; index < args.length; index++) {
-		const arg = OPTION_ALIASES.get(args[index]) ?? args[index];
+		// !mark(1:2)
+		const typed = args[index];
+		const arg = OPTION_ALIASES.get(typed) ?? typed;
 		// !mark(1:4)
 		if (arg === "--" || positional.length >= maxPositionals) {
 			positional.push(...args.slice(arg === "--" ? index + 1 : index));
@@ -99,20 +141,35 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 
 ## !!steps Login and logout lookup
 
-Both commands find the named server and build a connection to it. `connection.oauthUrl` is defined only for HTTP servers without an `Authorization` header, so asking to log in to anything else fails with an explanation. Logout just removes the stored credential keyed by name and URL.
+Both commands find the named server and build a connection to it. A mistyped name gets a suggestion: the first configured name within an edit distance of 2, computed by a small Levenshtein function. With `--local`, the server must actually come from the project file, which catches a user who thinks they are signing in to a project server that is really global.
 
-For login, `--timeout` must be a positive number, and the connection is always closed in a `finally`, even on failure.
+Servers with `auth.provider` have nothing to sign in to here, so the command points to `pi auth login` or `pi auth logout` for that provider. Otherwise `connection.oauthUrl` is defined only for HTTP servers without an `Authorization` header, so asking to log in to anything else fails with an explanation. Logout just removes the stored credential keyed by name and URL.
 
 ```ts ! cli.ts
 			const entry = loaded.servers.find((server) => server.name === name);
 			if (!entry) {
+				const names = loaded.servers.map((server) => server.name);
+				// !mark
+				const suggestion = names.find((candidate) => editDistance(candidate, name) <= 2);
 				error(
-					`No MCP server named "${name}".${untrustedNote ? ` ${untrustedNote}` : ""} Configured: ${loaded.servers.map((server) => server.name).join(", ") || "none"}.`,
+					`No MCP server named "${name}".${suggestion ? ` Did you mean "${suggestion}"?` : ""}${untrustedNote ? ` ${untrustedNote}` : ""} Configured: ${names.join(", ") || "none"}.`,
 				);
 				return 1;
 			}
-			const connection = createConnection(entry, options, credentials);
-			// !mark(1:5)
+			// !mark(1:4)
+			if (parsed.values.has("local") && entry.scope !== "project") {
+				error(`MCP server "${name}" is defined in ${entry.source}, not in the project; omit --local.`);
+				return 1;
+			}
+			const authProvider = getAuthProvider(entry);
+			// !mark(1:6)
+			if (authProvider) {
+				error(
+					`MCP server "${name}" uses the credentials of provider "${authProvider}". Run "${APP_NAME} auth ${command} ${authProvider}".`,
+				);
+				return 1;
+			}
+			const connection = createConnection(entry, options, credentials, providerToken);
 			const url = connection.oauthUrl;
 			if (!url) {
 				error(`MCP server "${name}" does not use OAuth. Only HTTP servers without an Authorization header do.`);
@@ -150,6 +207,7 @@ For login, `--timeout` must be a positive number, and the connection is always c
 		"oauth-client-secret",
 		"oauth-callback-port",
 		"oauth-client-name",
+		"oauth-client-registration",
 	];
 	const stdioOnly = ["env", "cwd"];
 	// !mark(1:3)
@@ -160,9 +218,9 @@ For login, `--timeout` must be a positive number, and the connection is always c
 
 ## !!steps HTTP and stdio shapes
 
-For HTTP servers, `--bearer-token-env-var NAME` becomes an `Authorization: Bearer ${NAME}` header, so the token stays in the environment and not in the file. OAuth options are gathered into an `oauth` object only if any was given. Stdio servers get `command`, optional `args`, `env`, and `cwd`.
+For HTTP servers, `--bearer-token-env-var NAME` becomes an `Authorization: Bearer ${NAME}` header, so the token stays in the environment and not in the file. OAuth options, including `clientRegistration`, are gathered into an `oauth` object only if any was given. Stdio servers get `command`, optional `args`, `env`, and `cwd`.
 
-The config is then run through `validateMcpServerConfig`, which returns a string on failure. Note `--oauth-callback-port` is converted with `Number` before validation, so a bad value is caught there.
+The config is then run through `validateMcpServerConfig`, which returns a string on failure. Note `--oauth-callback-port` is converted with `Number` before validation, so a bad value is caught there, and an unknown registration mode is rejected the same way.
 
 ```ts ! cli.ts
 		const headers = parsePairs("header", lists.get("header"), error);
@@ -176,6 +234,9 @@ The config is then run through `validateMcpServerConfig`, which returns a string
 			...(value("oauth-client-secret") === undefined ? {} : { clientSecret: value("oauth-client-secret") }),
 			...(port === undefined ? {} : { callbackPort: Number(port) }),
 			...(value("oauth-client-name") === undefined ? {} : { clientName: value("oauth-client-name") }),
+			...(value("oauth-client-registration") === undefined
+				? {}
+				: { clientRegistration: value("oauth-client-registration") }),
 		};
 		config = {
 			url,
@@ -230,13 +291,16 @@ The target is the project file with `--local`, else the global file. `addMcpServ
 
 ## !!steps Listing by connecting
 
-`list` connects to all enabled servers in parallel with `Promise.all`, reads the connection state and tool names, and closes each connection. Disabled servers are reported without connecting. Per-tool exposure is shown only when it differs from the server's default, and resource counts appear only if the server has resources.
+`list` connects to all enabled servers in parallel with `Promise.all`, reads the connection state and tool names, and closes each connection. Disabled servers are reported without connecting. Per-tool exposure is shown only when it differs from the server's default. Resources are no longer counted: listing every resource of a large server could take long and held back its tools, so the report only says that the server offers them.
+
+A server waiting for a sign-in gets a hint, which for an `auth.provider` server is `/login` with that provider instead of `pi mcp login`.
 
 The exit code is 1 when there are config errors or any enabled server is not connected, which makes the command usable in scripts.
 
 ```ts ! cli.ts
 			if (!report.enabled) return report;
-			const connection = createConnection(entry, options, credentials);
+			// !mark
+			const connection = createConnection(entry, options, credentials, providerToken);
 			try {
 				await connection.getClient();
 			} catch {
@@ -249,13 +313,23 @@ The exit code is 1 when there are config errors or any enabled server is not con
 				return exposure === report.exposure ? [] : [[tool.name, exposure] as const];
 			});
 			if (overrides.length > 0) report.toolExposure = Object.fromEntries(overrides);
+			// !mark
+			if (connection.hasResources) report.resources = true;
+// ...
+		if (report.state === "needs-auth") {
+			log(
+				report.authProvider
+					? `  sign in with: /login ${report.authProvider} in ${APP_NAME}`
+					: `  sign in with: ${APP_NAME} mcp login ${report.name}`,
+			);
+		}
 // ...
 	const failed = loaded.errors.length > 0 || reports.some((report) => report.enabled && report.state !== "connected");
 ```
 
 ## !!steps The sign-in flow
 
-Login first tries to connect. Success means the user is already signed in. Failure for any reason other than `needs-auth` is reported as a connection error. Only a real challenge starts the OAuth flow: the authorization URL is printed and opened in the browser, and `promptForRedirectUrl` supplies a fallback.
+Login first tries to connect. Success means the user is already signed in. Failure for any reason other than `needs-auth` is reported as a connection error. Only a real challenge starts the OAuth flow: the authorization URL is printed and opened in the browser, and `promptForRedirectUrl` supplies a fallback. The timeout is now a signal on the whole sign-in, `AbortSignal.timeout`, so it also bounds requests to the authorization server, and a timed-out sign-in reports that it was cancelled or not completed in time.
 
 After sign-in the stored challenge is cleared and the connection is rebuilt with `reconnect` to prove the new credentials work. The sign-in machinery itself, including the local callback server, lives in [oauth.ts](/docs/src/extensions/mcp/oauth.ts) and [runtime.ts](/docs/src/extensions/mcp/runtime.ts).
 
@@ -273,36 +347,36 @@ After sign-in the stored challenge is cleared and the connection is rebuilt with
 					log(`Sign in to MCP server "${name}" in your browser:\n${authorizationUrl.href}`);
 					openUrl(authorizationUrl.href);
 				},
-				promptForRedirectUrl: (signal) => waitForRedirectUrl(signal, timeoutMs, interactive),
+				promptForRedirectUrl: (signal) => waitForRedirectUrl(signal, interactive),
 			},
+			// !mark
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 ```
 
 ## !!steps Waiting for the browser
 
-`waitForRedirectUrl` links two abort sources: the sign-in's own signal (the callback arrived) and a timeout. In a non-interactive run, such as an agent calling bash, it waits for an abort and returns undefined, so only the browser callback can finish the flow. In a terminal it also asks the user to paste the redirect URL, which helps when the browser runs on another machine.
+`waitForRedirectUrl` no longer runs its own timer; the sign-in's signal covers both the browser callback arriving and the timeout. In a non-interactive run, such as an agent calling bash, it waits for that abort and returns undefined, so only the browser callback can finish the flow. In a terminal it also asks the user to paste the redirect URL, which helps when the browser runs on another machine.
 
-Readline errors, including the abort, resolve to undefined, and the timer and listener are always cleaned up.
+The prompt is the shared `questionTerminal` helper, which also rejects on Ctrl+C or end of input and always closes readline. Any rejection resolves to undefined, which cancels the sign-in.
 
 ```ts ! cli.ts
-	const controller = new AbortController();
-	const abort = () => controller.abort();
-	signal.addEventListener("abort", abort, { once: true });
-	const timer = setTimeout(abort, timeoutMs);
+async function waitForRedirectUrl(signal: AbortSignal, interactive: boolean): Promise<string | undefined> {
+	// !mark(1:4)
+	if (!interactive) {
+		if (!signal.aborted) await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+		return undefined;
+	}
 	try {
 		// !mark(1:4)
-		if (!interactive) {
-			await new Promise<void>((resolve) =>
-				controller.signal.addEventListener("abort", () => resolve(), { once: true }),
-			);
-			return undefined;
-		}
-		const readline = createInterface({ input: process.stdin, output: process.stderr });
-		try {
-			return await readline.question(
-				"If the browser cannot reach this machine, paste the URL it was redirected to: ",
-				{ signal: controller.signal },
-			);
+		return await questionTerminal("If the browser cannot reach this machine, paste the URL it was redirected to: ", {
+			signal,
+			output: process.stderr,
+		});
+	} catch {
+		return undefined;
+	}
+}
 ```
 
 </Scrollycoding>

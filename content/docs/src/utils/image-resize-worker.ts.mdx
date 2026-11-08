@@ -13,18 +13,20 @@ It is deliberately minimal: it validates one message, calls `resizeImageInProces
 
 ## !!steps Message shapes
 
-The request carries the bytes, MIME type and optional options. The response holds either a result (possibly null) or an error string.
+The request carries the bytes, MIME type and optional options. The response type is no longer declared here: it moved to [image-resize-core.ts](/docs/src/utils/image-resize-core.ts) so the worker and the parent share one definition. It holds either a result (possibly null) or an error string, always with the `IMAGE_RESIZE_WORKER_RESPONSE_TYPE` tag that lets the parent tell a real reply from messages Node posts on the channel itself.
 
 ```ts ! image-resize-worker.ts
+import {
+	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
+	type ImageResizeOptions,
+	type ResizeImageWorkerResponse,
+	resizeImageInProcess,
+} from "./image-resize-core.ts";
+
 interface ResizeImageWorkerRequest {
 	inputBytes: Uint8Array;
 	mimeType: string;
 	options?: ImageResizeOptions;
-}
-
-interface ResizeImageWorkerResponse {
-	result?: ResizedImage | null;
-	error?: string;
 }
 
 function isResizeImageWorkerRequest(value: unknown): value is ResizeImageWorkerRequest {
@@ -47,7 +49,7 @@ if (!port) {
 
 ## !!steps One message, one answer
 
-The handler uses `once`, so a worker serves exactly one request. Errors, including validation failures, are converted to a message string rather than crashing the worker. The parent creates a fresh worker per resize and terminates it afterward.
+The handler uses `once`, so a worker serves exactly one request. Errors, including validation failures, are converted to a message string rather than crashing the worker. Both replies carry the tag. The parent creates a fresh worker per resize and waits for it to terminate afterward.
 
 ```ts ! image-resize-worker.ts
 port.once("message", (message: unknown) => {
@@ -57,10 +59,13 @@ port.once("message", (message: unknown) => {
 				throw new Error("Invalid image resize worker request");
 			}
 			const result = await resizeImageInProcess(message.inputBytes, message.mimeType, message.options);
-			const response: ResizeImageWorkerResponse = { result };
+			// !mark
+			const response: ResizeImageWorkerResponse = { type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE, result };
 			port.postMessage(response);
 		} catch (error) {
 			const response: ResizeImageWorkerResponse = {
+				// !mark
+				type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 				error: error instanceof Error ? error.message : String(error),
 			};
 			port.postMessage(response);

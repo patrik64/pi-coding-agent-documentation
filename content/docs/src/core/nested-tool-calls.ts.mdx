@@ -117,7 +117,7 @@ Usage is accumulated separately from the record with `combineUsage` from [usage-
 
 The runner is deliberately ignorant of the agent. `NestedToolCallHost` is everything it needs: the current tool list, whether the agent runs tools sequentially, a way to run one call through the pipeline with a parent id, and an event sink.
 
-The three event variants mirror the normal `tool_execution_*` events plus `parentToolCallId`, which is how UIs in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and the JSON modes can nest them under the call that caused them.
+The three event variants mirror the normal `tool_execution_*` events plus `parentToolCallId`, which is how UIs in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and the JSON modes can nest them under the call that caused them. Like the top-level event, the end event can carry `durationMs`, the time the tool's `execute()` took on a monotonic clock, absent when the tool never ran.
 
 ```ts ! nested-tool-calls.ts
 /** `tool_execution_*` events of nested calls. */
@@ -137,6 +137,8 @@ export type NestedToolExecutionEvent =
 			toolName: string;
 			result: AgentToolResult<unknown>;
 			isError: boolean;
+			// !mark
+			durationMs?: number;
 			parentToolCallId: string;
 	  };
 
@@ -237,7 +239,7 @@ A call is exclusive when the agent runs tools sequentially, or when the target t
 
 The call goes through `host.runToolCall`, which applies the session's hooks. Partial results are forwarded to the caller's `onUpdate` and also emitted as update events.
 
-The `finally` block always deletes the call's scope and releases the queue, even if the pipeline throws. After the call, the record is finished and usage is added. The comment explains why usage is tracked here: nested results are never persisted themselves, so the recorder is the only place their cost survives.
+The `finally` block always deletes the call's scope and releases the queue, even if the pipeline throws. After the call, the record is finished and usage is added. The comment explains why usage is tracked here: nested results are never persisted themselves, so the recorder is the only place their cost survives. The end event copies the measured `durationMs` from the outcome only when there is one, so the field is absent rather than undefined.
 
 ```ts ! nested-tool-calls.ts
 		let outcome: AgentToolCallOutcome;
@@ -269,6 +271,7 @@ The `finally` block always deletes the call's scope and releases the queue, even
 			toolName: name,
 			result: outcome.result,
 			isError: outcome.isError,
+			...(outcome.durationMs === undefined ? {} : { durationMs: outcome.durationMs }),
 			parentToolCallId: callerId,
 		});
 		return outcome;

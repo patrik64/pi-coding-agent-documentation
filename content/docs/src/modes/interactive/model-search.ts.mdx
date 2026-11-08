@@ -1,13 +1,13 @@
 ---
 title: "model-search.ts"
-description: "Builds the searchable text strings for models so fuzzy matching ranks provider-qualified queries sensibly"
+description: "Builds the searchable text strings for models so fuzzy matching ranks provider-qualified queries sensibly, and decides when a model's display name is worth showing"
 source: "src/modes/interactive/model-search.ts"
 full: true
 ---
 
-Model pickers and the `/model` autocomplete use fuzzy matching over a single string per model. How that string is composed decides which results float to the top. This tiny file centralizes two such recipes, so the different pickers agree.
+Model pickers and the `/model` autocomplete use fuzzy matching over a single string per model. How that string is composed decides which results float to the top. This tiny file centralizes two such recipes, so the different pickers agree, plus a helper that decides whether a model's display name is worth printing next to its id.
 
-`getModelSearchText` is used by autocomplete in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and by [scoped-models-selector.ts](/docs/src/modes/interactive/components/scoped-models-selector.ts); `getModelSelectorSearchText` is used by [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts).
+`getModelSearchText` is used by autocomplete in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and by [scoped-models-selector.ts](/docs/src/modes/interactive/components/scoped-models-selector.ts); `getModelSelectorSearchText` is used by [model-selector.ts](/docs/src/modes/interactive/components/model-selector.ts). Both selectors use `getDistinctModelName` for their rows.
 
 <Scrollycoding>
 
@@ -33,6 +33,38 @@ export function getModelSearchText(item: ModelSearchItem): string {
 	const name = item.name ? ` ${item.name}` : "";
 	// !mark
 	return `${id} ${provider} ${provider}/${id} ${provider} ${id}${name}`;
+}
+```
+
+## !!steps Showing a name only when it adds information
+
+Selector rows print the model id. Most display names just restate it ("Claude Sonnet 4.5" for `claude-sonnet-4-5`), which would only add noise, but some carry real information, such as a renamed override that lists routing details. `getDistinctModelName` returns the name only in the second case.
+
+Both strings are lowercased and split into letter and digit words. A name word counts as covered if it is a whole id word or, when longer than one character, appears anywhere in the id with separators removed, which handles names that join or split words differently. Single characters must match a whole id word, so a "3" in the name is not hidden just because the id contains a date like `2603`. (The inline comment's own example, "4" against `mistral-small-2603`, would be uncovered even without that rule, since the id contains no 4.) If every name word is covered, the name is dropped.
+
+```ts ! model-search.ts
+const splitModelLabel = (value: string): string[] =>
+	value
+		.toLowerCase()
+		.split(/[^\p{L}\p{N}]+/u)
+		.filter(Boolean);
+
+/**
+ * Returns the model name when it has words the ID does not, e.g. a renamed override like
+ * "MiniMax M3 [rasmus@openrouter, parasail]" for "minimax/minimax-m3". Names that only
+ * restate the ID with different casing, separators, or a dropped namespace/version suffix
+ * ("Claude Sonnet 4.5 (EU)" for "eu.anthropic.claude-sonnet-4-5-20250929-v1:0") return undefined.
+ */
+export function getDistinctModelName(item: { id: string; name?: string }): string | undefined {
+	const name = item.name?.trim();
+	if (!name) return undefined;
+	const idWords = splitModelLabel(item.id);
+	const idTokens = new Set(idWords);
+	const compactId = idWords.join("");
+	// Single-character words must match a whole ID token: "4" is not covered by "mistral-small-2603".
+	// !mark
+	const isCovered = (word: string) => idTokens.has(word) || (word.length > 1 && compactId.includes(word));
+	return splitModelLabel(name).every(isCovered) ? undefined : name;
 }
 ```
 

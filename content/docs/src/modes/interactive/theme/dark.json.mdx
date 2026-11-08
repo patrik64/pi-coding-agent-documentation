@@ -5,7 +5,7 @@ source: "src/modes/interactive/theme/dark.json"
 full: true
 ---
 
-This is the built-in dark theme, shipped as data rather than code. A theme is a JSON document with a name, an appearance, a `vars` table of named colors, a `colors` table that assigns a value to every token, and an `export` block for the HTML session export. It is loaded and resolved by [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and checked against the schema in [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts), whose JSON Schema twin is [theme-schema.json](/docs/src/modes/interactive/theme/theme-schema.json).
+This is the built-in dark theme, shipped as data rather than code. A theme is a JSON document with a name, an appearance, a `vars` table of named colors, a `colors` table that assigns a value to every token, and an `export` block for the HTML session export. It is loaded and resolved by [theme.ts](/docs/src/modes/interactive/theme/theme.ts). Its shape is the one defined in [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts), whose token list comes from [theme-tokens.ts](/docs/src/modes/interactive/theme/theme-tokens.ts).
 
 Colors are written in `okhsl(hue saturation% lightness%)`, a perceptual color space, so the palette is designed by lightness rather than by hex guesswork. The light counterpart, [light.json](/docs/src/modes/interactive/theme/light.json), has the same keys with different numbers.
 
@@ -13,11 +13,11 @@ Colors are written in `okhsl(hue saturation% lightness%)`, a perceptual color sp
 
 ## !!steps Header and palette variables
 
-`appearance` tells pi what background the theme is made for (otherwise it is detected from the colors). The `vars` block defines seven hue families at about the same lightness (67%) plus `blueBg`, a dark blue used as a surface. Tokens below refer to these by name, so changing `violet` retargets every violet token at once.
+`$schema` points editors at the published theme schema on pi.dev, which [generate-schemas.ts](/docs/scripts/generate-schemas.ts) renders from the source. `appearance` tells pi what background the theme is made for (otherwise it is detected from the colors). The `vars` block defines seven hue families at about the same lightness (67%) plus `blueBg`, a dark blue used as a surface. Tokens below refer to these by name, so changing `violet` retargets every violet token at once.
 
 ```json ! dark.json
 {
-	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"$schema": "https://pi.dev/schemas/theme.schema.json",
 	"name": "dark",
 	"appearance": "dark",
 	"vars": {

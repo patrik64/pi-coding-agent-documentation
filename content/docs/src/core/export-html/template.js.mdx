@@ -82,6 +82,8 @@ Entries are indexed by id, tool calls by tool call id, and labels by the entry t
 
 Each entry becomes a node, then is attached to the node of its `parentId`. A missing parent, a self-parent, or a null parent all make the node a root, so a session with a pruned or damaged history still renders. Children are sorted by timestamp so older branches appear first.
 
+The sort loops over every node instead of recursing from the roots. A long session is one deep parent chain, deep enough to overflow the JavaScript call stack, and the export used to fail to render for such sessions. The other tree walks (building a root-to-leaf path, the node lookup map, marking which subtrees contain the active leaf) were made iterative for the same reason.
+
 ```js ! template.js
         // Build parent-child relationships
         for (const entry of entries) {
@@ -98,14 +100,13 @@ Each entry becomes a node, then is attached to the node of its `parentId`. A mis
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort children by timestamp. Iterative: long sessions form chains deeper than the JS call stack.
+        // !mark
+        for (const node of nodeMap.values()) {
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -147,6 +148,36 @@ The sidebar filter always keeps the current leaf visible. Assistant messages tha
             case 'all':
               passesFilter = true;
               break;
+```
+
+## !!steps System prompts where they occur
+
+Sessions record the system prompt as `system` messages in the transcript, and the export renders them in place. The first system entry on a branch (`isLeadingSystemEntry` walks the parents looking for an earlier system message or a compaction carrying one) is shown as the full prompt with its tool list. Later ones patch the prompt, so they render as a "System Prompt Update" titled with what changed, for example `project_context, -rules, tools +bash`, followed by the tools added and removed. The sidebar labels them `[system prompt]` and `[system update: ...]`. The helpers mirror the prompt-assembly functions in pi-ai.
+
+The header used to show the exporting agent's current prompt and tools, which may not be what the session ran with. It now does that only for older sessions that have no system entries. The header's cost is the sum of each response's provider-reported `cost.total`, falling back to the sum of the components for sessions recorded before totals were stored.
+
+```js ! template.js
+      /**
+       * Whether a system entry starts the prompt on its branch. Later system entries
+       * patch the prompt, so they render as updates instead of a full prompt.
+       */
+      function isLeadingSystemEntry(entry) {
+        let current = entry.parentId && entry.parentId !== entry.id ? byId.get(entry.parentId) : undefined;
+        while (current) {
+          if (carriesSystemState(current)) return false;
+          if (!current.parentId || current.parentId === current.id) break;
+          current = byId.get(current.parentId);
+        }
+        return true;
+      }
+// ...
+        // Sessions with system entries render the prompt and tools in the transcript, where they
+        // occur. Older sessions have none, so fall back to the exporting agent's current state.
+        // !mark(1:4)
+        if (!hasSystemEntries) {
+          if (systemPrompt) html += renderSystemPromptBlock('System Prompt', systemPrompt);
+          html += renderToolsList('Available Tools', tools);
+        }
 ```
 
 ## !!steps Escaping and URL safety
@@ -222,7 +253,7 @@ Long output shows a limited number of lines with a hint, plus a hidden full copy
 
 ## !!steps Custom tools use the pre-rendered HTML
 
-Built-in tools have their own cases in `renderToolCall`. The default case looks up `renderedTools` by call id. If the call, collapsed result or expanded result exists it is used: the expandable block is built only when collapsed and expanded differ, and otherwise the expanded HTML is shown directly. Tools with nothing pre-rendered get a JSON dump of their arguments.
+Built-in tools have their own cases in `renderToolCall`. The `read` header formats its line range with `formatReadLineRange`, which mirrors [render-utils.ts](/docs/src/core/tools/render-utils.ts) and parses numeric strings, because some models send `offset` and `limit` as strings and `25 + "13"` concatenates. The default case looks up `renderedTools` by call id. If the call, collapsed result or expanded result exists it is used: the expandable block is built only when collapsed and expanded differ, and otherwise the expanded HTML is shown directly. Tools with nothing pre-rendered get a JSON dump of their arguments.
 
 ```js ! template.js
           default: {
@@ -291,7 +322,7 @@ Built-in tools have their own cases in `renderToolCall`. The default case looks 
 
 ## !!steps Marked configured to match the terminal
 
-HTML in markdown is deliberately not rendered: the `html` and `tag` tokenizers return undefined, so tags show as text, like the terminal markdown renderer. Strikethrough uses a stricter pattern than the default, and links use the sanitizer above.
+HTML in markdown is deliberately not rendered: the `html` and `tag` tokenizers return undefined, so tags show as text, like the terminal markdown renderer. Strikethrough uses a stricter pattern than the default, and links use the sanitizer above. Emphasis uses the `emStrong` tokenizer from the vendored `marked-cjk-friendly` extension, which [index.ts](/docs/src/core/export-html/index.ts) inlines next to marked: under standard delimiter rules, bold and italic markers next to CJK punctuation were shown as literal asterisks.
 
 ```js ! template.js
       // Configure marked with syntax highlighting and TUI-compatible HTML handling

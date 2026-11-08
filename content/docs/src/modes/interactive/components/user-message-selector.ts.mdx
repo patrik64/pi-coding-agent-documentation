@@ -97,11 +97,12 @@ A trailing `(selected/total)` indicator appears only when something is scrolled 
 
 ## !!steps Wrapping navigation
 
-Up and down wrap around, unlike the trust dialog. Enter reports the entry id, Escape cancels. Note that with an empty list, `this.messages.length - 1` would be -1 on an up press, but the wrapper cancels the empty picker, so this path is not normally reached.
+Up and down wrap around, unlike the trust dialog. The selection page keys jump by one window through pi-tui's `getSelectPageIndex`, which clamps instead of wrapping. The list sets `capturesViewportInput`, so in fullscreen mode those keys page the list rather than scroll the transcript. Enter reports the entry id, Escape cancels. Note that with an empty list, `this.messages.length - 1` would be -1 on an up press, but the wrapper cancels the empty picker, so this path is not normally reached.
 
 ```ts ! user-message-selector.ts
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		const pageIndex = getSelectPageIndex(kb, keyData, this.selectedIndex, this.messages.length, this.maxVisible);
 		// Up arrow - go to previous (older) message, wrap to bottom when at top
 		// !mark(1:6)
 		if (kb.matches(keyData, "tui.select.up")) {
@@ -110,6 +111,11 @@ Up and down wrap around, unlike the trust dialog. Enter reports the entry id, Es
 		// Down arrow - go to next (newer) message, wrap to top when at bottom
 		else if (kb.matches(keyData, "tui.select.down")) {
 			this.selectedIndex = this.selectedIndex === this.messages.length - 1 ? 0 : this.selectedIndex + 1;
+		}
+		// Page up/down
+		else if (pageIndex !== undefined) {
+			if (this.messages.length === 0) return;
+			this.selectedIndex = pageIndex;
 		}
 		// Enter - select message and branch
 		else if (kb.matches(keyData, "tui.select.confirm")) {

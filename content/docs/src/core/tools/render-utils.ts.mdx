@@ -1,11 +1,11 @@
 ---
 title: "render-utils.ts"
-description: "Small formatting helpers shared by every tool renderer: path display, output text extraction and the generic call header"
+description: "Small formatting helpers shared by every tool renderer: path display, read line ranges, output text extraction, the generic call header and the elapsed-time line"
 source: "src/core/tools/render-utils.ts"
 full: true
 ---
 
-Each built-in tool has a renderer that decides how its call and result look in the terminal UI. Those renderers all need the same few chores: shorten a path, turn a result's content blocks into plain text, cope with arguments that are not strings, and print a generic header. This file collects them.
+Each built-in tool has a renderer that decides how its call and result look in the terminal UI. Those renderers all need the same few chores: shorten a path, turn a result's content blocks into plain text, cope with arguments that are not strings, print a generic header, and show how long a call has been running. This file collects them.
 
 The helpers are deliberately tolerant. Tool arguments come from a model and may be missing, null or the wrong type, so most functions accept `unknown` and degrade to a visible placeholder instead of throwing. The renderers in [renderers/index.ts](/docs/src/core/tools/renderers/index.ts) and the individual files such as [renderers/read.ts](/docs/src/core/tools/renderers/read.ts) are the consumers.
 
@@ -13,19 +13,14 @@ The helpers are deliberately tolerant. Tool arguments come from a model and may 
 
 ## !!steps Path display and terminal hyperlinks
 
-`shortenPath` replaces the home directory prefix with `~` and returns an empty string for non-strings. Note it is a plain `startsWith` check, so a sibling directory whose name merely begins with the home path would also be shortened.
+`shortenPath` returns an empty string for non-strings and otherwise delegates to `shortenHomePath` in [paths.ts](/docs/src/utils/paths.ts), which replaces a leading home directory with `~`. That helper only shortens absolute paths that really lie inside the home directory, comparing whole path segments (case-insensitively on Windows), so a sibling such as `/home/al2` is no longer mistaken for being under `/home/al`, as the old plain `startsWith` check did.
 
-`linkPath` wraps already-styled text in an OSC 8 hyperlink pointing at the absolute file URL, but only when the terminal reports hyperlink support. The raw path is resolved against the cwd with `resolvePath` from [paths.ts](/docs/src/utils/paths.ts).
+`linkPath` wraps already-styled text in an OSC 8 hyperlink pointing at the absolute file URL, but only when the terminal reports hyperlink support. The raw path is resolved against the cwd with `resolvePath` from the same file.
 
 ```ts ! render-utils.ts
 export function shortenPath(path: unknown): string {
 	if (typeof path !== "string") return "";
-	const home = os.homedir();
-	// !mark(1:3)
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
-	}
-	return path;
+	return shortenHomePath(path);
 }
 
 export function linkPath(styledText: string, rawPath: string, cwd: string): string {
@@ -56,6 +51,30 @@ export function replaceTabs(text: string): string {
 
 export function normalizeDisplayText(text: string): string {
 	return text.replace(/\r/g, "");
+}
+```
+
+## !!steps Read line-range labels
+
+`formatReadLineRange` builds the `:10-29` suffix shown after a read path, so the [read renderer](/docs/src/core/tools/renderers/read.ts) and the session [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts) label ranges the same way (the HTML export carries its own copy of the logic). It accepts numbers or numeric strings, because models sometimes send `"10"`. Strict schemas send omitted optional arguments as `null`, so both `null` and `undefined` count as absent. A missing offset starts at line 1, a missing limit shows only the start, and any value that does not parse drops the label entirely rather than printing `NaN`.
+
+```ts ! render-utils.ts
+function parseLineNumber(value: unknown): number | undefined {
+	if (typeof value === "string" && value.trim() !== "") value = Number(value);
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Format finite numbers or numeric strings as a read line range, omitting malformed ranges. */
+export function formatReadLineRange(offset: unknown, limit: unknown): string {
+	// Strict schemas represent omitted optional arguments as null.
+	if (offset == null && limit == null) return "";
+	const start = offset == null ? 1 : parseLineNumber(offset);
+	if (start === undefined) return "";
+	if (limit == null) return `:${start}`;
+	const count = parseLineNumber(limit);
+	if (count === undefined) return "";
+	const end = start + count - 1;
+	return `:${start}${end ? `-${end}` : ""}`;
 }
 ```
 
@@ -116,6 +135,56 @@ export function formatToolCallWithArgs(title: string, args: unknown, theme: Them
 }
 ```
 
+## !!steps A shared elapsed-time line
+
+The live timer used to live in the bash renderer; it moved here so the codemode renderer in [renderer.ts](/docs/src/extensions/codemode/renderer.ts) can show the same line. `startToolTimer`, called from `renderCall`, stamps the start once execution begins. `toolTimerText`, called from `renderResult`, starts a one-second interval that calls `context.invalidate()` while the result is partial, so `Elapsed` ticks even when the tool prints nothing, and stops it once the result is final or an error.
+
+For a final result, the duration recorded with the result (`context.durationMs`) wins over the renderer's own clock. It is measured monotonically and is stored with the session, so a reloaded session still shows `Took 4.2s` instead of nothing. The renderer clock remains the fallback for live progress and for results saved before durations were recorded.
+
+```ts ! render-utils.ts
+/** Duration as `4.2s` below a minute, then `1m 30s` and `2h 3m 4s`. */
+export function formatToolDuration(ms: number): string {
+	const seconds = ms / 1000;
+	if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+	const totalSeconds = Math.floor(seconds);
+	const minutes = Math.floor(totalSeconds / 60);
+	const remainder = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${remainder}s`;
+
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${remainder}s`;
+}
+// ...
+/** Start the row's clock once execution starts. Call from `renderCall`. */
+export function startToolTimer(context: ToolRenderContext<ToolTimerState>): void {
+	const state = context.state;
+	if (context.executionStarted && state.startedAt === undefined) {
+		state.startedAt = Date.now();
+		state.endedAt = undefined;
+	}
+}
+// ...
+export function toolTimerText(context: ToolRenderContext<ToolTimerState>, isPartial: boolean): string | undefined {
+	const state = context.state;
+	if (state.startedAt !== undefined && isPartial && !state.interval) {
+		state.interval = setInterval(() => context.invalidate(), 1000);
+	}
+	if (!isPartial || context.isError) {
+		state.endedAt ??= Date.now();
+		if (state.interval) {
+			clearInterval(state.interval);
+			state.interval = undefined;
+		}
+	}
+	// A final result's recorded duration wins: it is monotonic and survives reloads. The renderer's own clock is the
+	// fallback for live progress and for results stored without one.
+	if (!isPartial && context.durationMs !== undefined) return `Took ${formatToolDuration(context.durationMs)}`;
+	if (state.startedAt === undefined) return undefined;
+	const endTime = state.endedAt ?? Date.now();
+	return `${isPartial ? "Elapsed" : "Took"} ${formatToolDuration(endTime - state.startedAt)}`;
+}
+```
+
 ## !!steps The shared path renderer
 
 `renderToolPath` combines the earlier helpers. A `null` path (invalid argument) shows the error marker. An empty path uses the caller's `emptyFallback` if given, otherwise a dimmed `...`, which is what a still-streaming call looks like before the model has produced the path. A real path is shortened, accented and made clickable.
@@ -143,4 +212,4 @@ export function renderToolPath(
 
 </Scrollycoding>
 
-The helpers are imported by every file in the `renderers` folder, including [renderers/write.ts](/docs/src/core/tools/renderers/write.ts) and [renderers/edit.ts](/docs/src/core/tools/renderers/edit.ts). The file has no state and no dependency on the tool implementations, only on the theme type, which keeps render-only processes light. `formatToolCallWithArgs` is the one export not used by the built-in renderers; it serves tools with no renderer of their own, through the interactive tool-execution component and the MCP extension's tools.
+The helpers are imported by every file in the `renderers` folder, including [renderers/write.ts](/docs/src/core/tools/renderers/write.ts) and [renderers/edit.ts](/docs/src/core/tools/renderers/edit.ts). The file keeps no state of its own (the timer's lives in the render context) and has no dependency on the tool implementations, only on the theme and render-context types, which keeps render-only processes light. `formatToolCallWithArgs` is the one export not used by the built-in renderers; it serves tools with no renderer of their own, through the interactive tool-execution component and the MCP extension's tools.

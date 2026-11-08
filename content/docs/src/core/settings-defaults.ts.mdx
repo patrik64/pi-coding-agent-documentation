@@ -1,0 +1,85 @@
+---
+title: "settings-defaults.ts"
+description: "One constant object holding the default value of every setting that has a fixed default, shared by the settings getters and the published settings schema"
+source: "src/core/settings-defaults.ts"
+full: true
+---
+
+Each setting's default used to be written twice: once in a getter's fallback expression, such as `?? 16384`, and once in a trailing comment on the `Settings` interface. When the settings schema was published, it needed the defaults a third time, as `default` annotations editors could show. This file keeps them in one place instead. [settings-manager.ts](/docs/src/core/settings-manager.ts) falls back to these values in its getters, and [settings-schema.ts](/docs/src/core/settings-schema.ts) publishes the same values as schema defaults, so what an editor shows is what pi applies.
+
+A few other modules read single entries: [project-trust.ts](/docs/src/core/project-trust.ts) for the default trust policy, [settings-selector.ts](/docs/src/modes/interactive/components/settings-selector.ts) for the Anthropic extra-usage warning, and the codemode extension for its mode and inline budget. The file has a single import, so it is cheap to depend on from anywhere.
+
+<Scrollycoding>
+
+## !!steps One object, nested like settings.json
+
+The object mirrors the layout of the settings file, so `SETTINGS_DEFAULTS.compaction.reserveTokens` reads like the setting's own path. `as const` keeps literal types: `SETTINGS_DEFAULTS.transport` has the type `"auto"`, which a getter can return as a `TransportSetting` without a cast.
+
+The agent-level retry ceiling is not a local number. It is pi-ai's `DEFAULT_MAX_AGENT_RETRY_DELAY_MS`, 60 seconds, so the coding agent's default stays whatever the library considers the default.
+
+```ts ! settings-defaults.ts
+import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/retry";
+
+/** Runtime defaults shared by settings accessors and the published JSON Schema. */
+export const SETTINGS_DEFAULTS = {
+	transport: "auto",
+	sessionShareDestination: "auto",
+	steeringMode: "one-at-a-time",
+	followUpMode: "one-at-a-time",
+	compaction: {
+		enabled: true,
+		reserveTokens: 16384,
+		keepRecentTokens: 20000,
+	},
+	branchSummary: {
+		reserveTokens: 16384,
+		skipPrompt: false,
+	},
+	retry: {
+		enabled: true,
+		maxRetries: 3,
+		baseDelayMs: 2000,
+		// !mark
+		maxAgentDelayMs: DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+		provider: {
+			maxRetryDelayMs: 60000,
+		},
+	},
+```
+
+## !!steps Interface and terminal defaults
+
+The rest covers the interface: startup output, terminal images, markdown, codemode, cache warming and the fullscreen TUI options. The `"auto"` values mean "decide at runtime", for example from what the terminal supports, rather than a fixed number.
+
+Only settings with a fixed default appear. `httpIdleTimeoutMs` falls back to `DEFAULT_HTTP_IDLE_TIMEOUT_MS` from [http-dispatcher.ts](/docs/src/core/http-dispatcher.ts), and `theme` has no entry because an unset theme makes [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) fall back to the generated system theme. Some getters also add logic on top of these values. `getClearOnShrink` honors the `PI_CLEAR_ON_SHRINK` environment variable before it falls back to `false`, and a numeric `fullscreenWheelScrollLines` is clamped to between 1 and 100.
+
+```ts ! settings-defaults.ts
+	hideThinkingBlock: false,
+	showCacheMissNotices: false,
+	quietStartup: false,
+	defaultProjectTrust: "ask",
+// ...
+	terminal: {
+		showImages: true,
+		imageWidthCells: 60,
+		clearOnShrink: false,
+		showTerminalProgress: false,
+	},
+// ...
+	codemode: {
+		mode: "on",
+		inlineBudget: 3000,
+	},
+	// !mark
+	cacheWarming: "streaming",
+	tuiMode: "fullscreen",
+	fullscreenExitOutput: "transcript",
+	fullscreenScrollbar: "auto",
+	fullscreenCopyOnSelect: true,
+	fullscreenWheelScrollLines: "auto",
+} as const;
+```
+
+</Scrollycoding>
+
+Nothing checks that every schema default comes from this object. A new setting can still be given a literal default in the schema or in its getter, and the two can then disagree. The convention only holds as long as both sides keep reading from here.

@@ -115,7 +115,7 @@ The comment explains a deliberate choice. Rejecting from an abort event listener
 
 The result text echoes the path as the model supplied it. `details` is `undefined`, since there is nothing to render beyond the message. The renderers from [write.ts](/docs/src/core/tools/renderers/write.ts) are spread in last so the TUI can draw the call and result.
 
-`createWriteTool` converts the definition into the plain `AgentTool` form with `wrapToolDefinition` from [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts).
+`createWriteTool` converts the definition into the plain agent-tool form with `wrapToolDefinition` from [tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts). Its return type is `TypeBoxAgentTool`, an `AgentTool` whose `execute` is typed from the TypeBox schema, because pi-agent-core itself no longer depends on TypeBox.
 
 ```ts ! write.ts
 				return {
@@ -128,7 +128,7 @@ The result text echoes the path as the model supplied it. `details` is `undefine
 	};
 }
 
-export function createWriteTool(cwd: string, options?: WriteToolOptions): AgentTool<typeof writeSchema> {
+export function createWriteTool(cwd: string, options?: WriteToolOptions): TypeBoxAgentTool<typeof writeSchema> {
 	return wrapToolDefinition(createWriteToolDefinition(cwd, options));
 }
 ```

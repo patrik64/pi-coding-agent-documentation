@@ -125,13 +125,19 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 
 ## !!steps Timeout, abort and streaming
 
-The child's pid is tracked so it can be cleaned up when the host exits. A timer, if requested, marks `timedOut` and kills the tree. Both stdout and stderr feed the same `onData`, which is why the result is combined output. An abort signal kills the tree too, and an already-aborted signal is handled immediately.
+The child's pid is tracked so it can be cleaned up when the host exits. The time at which the shell itself exits is recorded, because the tool may keep waiting after that. A timer, if requested, marks `timedOut`, notes whether the shell had already exited by then, and kills the tree. The kill happens even when the shell is gone: on Unix the process-group kill still reaches background processes that hold the pipes. Both stdout and stderr feed the same `onData`, which is why the result is combined output. An abort signal kills the tree too, and an already-aborted signal is handled immediately.
 
-`waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) resolves on exit without hanging on stdio handles inherited by detached descendants.
+`waitForChildProcess` from [child-process.ts](/docs/src/utils/child-process.ts) keeps reading after the shell exits for as long as the pipes stay active, so output from background processes is not lost, but a quiet inherited handle does not hang the call.
 
 ```ts ! bash.ts
 			if (child.pid) trackDetachedChildPid(child.pid);
+			const startedAt = performance.now();
+			let shellExitedAfterMs: number | undefined;
+			child.once("exit", () => {
+				shellExitedAfterMs = performance.now() - startedAt;
+			});
 			let timedOut = false;
+			let exitedBeforeDeadlineAfterMs: number | undefined;
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			const onAbort = () => {
 				if (child.pid) killProcessTree(child.pid);
@@ -142,6 +148,9 @@ The child's pid is tracked so it can be cleaned up when the host exits. A timer,
 				if (timeoutMs !== undefined) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
+						exitedBeforeDeadlineAfterMs = shellExitedAfterMs;
+						// Also when the shell already exited: on Unix the group kill still reaches background
+						// processes holding the pipes. Windows cannot find them once the shell pid is gone.
 						if (child.pid) killProcessTree(child.pid);
 					}, timeoutMs);
 				}
@@ -153,13 +162,31 @@ The child's pid is tracked so it can be cleaned up when the host exits. A timer,
 					if (signal.aborted) onAbort();
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
-				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants.
+```
+
+## !!steps A timeout that remembers the shell's exit
+
+A command such as `server & sleep 1; exit 1` fails after one second, but the background server keeps writing to the inherited output, so the tool waits until the deadline. Reporting only "timed out" made the model treat a failed command as a slow one and retry with a longer timeout. `ShellTimeoutError` carries the shell's exit code and exit time when the shell finished before the deadline. Its message keeps the `timeout:<seconds>` form, so the tool's message matching works the same for custom `BashOperations` that throw plain errors.
+
+```ts ! bash.ts
+/**
+ * Timeout of the local shell backend. Its message keeps the `timeout:<seconds>` form custom operations throw.
+ * `shellExit` is set when the shell itself exited before the deadline, so the tool was only still waiting
+ * because background processes kept writing to the inherited stdout/stderr pipes (#11613).
+ */
+class ShellTimeoutError extends Error {
+	readonly shellExit: { exitCode: number; afterSeconds: number } | undefined;
+
+	constructor(timeout: number | undefined, shellExit: { exitCode: number; afterSeconds: number } | undefined) {
+		super(`timeout:${timeout}`);
+		this.shellExit = shellExit;
+	}
+}
 ```
 
 ## !!steps Outcome ordering and cleanup
 
-After the process ends, abort wins over timeout, and timeout wins over a normal exit. Both are reported by throwing errors whose messages the tool later pattern-matches, `aborted` and `timeout:` followed by the seconds. A missing exit code becomes 128 plus the signal number, or 1 if no signal is known.
+After the process ends, abort wins over timeout, and timeout wins over a normal exit. A missing exit code becomes 128 plus the signal number, or 1 if no signal is known. That code is resolved before the timeout check, so a `ShellTimeoutError` can include it, with the shell's exit time rounded to a tenth of a second. Abort is reported by throwing `aborted`, which the tool later pattern-matches.
 
 The `finally` block always untracks the pid, clears the timer and removes the abort listener.
 
@@ -170,13 +197,19 @@ The `finally` block always untracks the pid, clears the timer and removes the ab
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
-				if (timedOut) {
-					throw new Error(`timeout:${timeout}`);
-				}
 				// A signal-killed shell has no exit code. Use the standard shell convention so
 				// callers do not mistake the termination for a successful command.
 				const signalCode = child.signalCode;
-				return { exitCode: exitCode ?? (signalCode ? 128 + (osConstants.signals[signalCode] ?? 0) : 1) };
+				const resolvedExitCode = exitCode ?? (signalCode ? 128 + (osConstants.signals[signalCode] ?? 0) : 1);
+				if (timedOut) {
+					throw new ShellTimeoutError(
+						timeout,
+						exitedBeforeDeadlineAfterMs !== undefined
+							? { exitCode: resolvedExitCode, afterSeconds: Math.round(exitedBeforeDeadlineAfterMs / 100) / 10 }
+							: undefined,
+					);
+				}
+				return { exitCode: resolvedExitCode };
 			} finally {
 				if (child.pid) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -311,7 +344,7 @@ When the accumulator reports truncation, the text gets a footer in one of three 
 
 ## !!steps Mapping failures to messages
 
-If `exec` throws, output collected so far is finalized first so it is not lost. An error whose message is `aborted` becomes `Command aborted` appended to that output, and `timeout:N` becomes `Command timed out after N seconds`. Anything else is rethrown unchanged.
+If `exec` throws, output collected so far is finalized first so it is not lost. An error whose message is `aborted` becomes `Command aborted` appended to that output, and `timeout:N` becomes `Command timed out after N seconds`. When the local backend knows the shell had already exited, the status adds the exit code and time and says that background processes kept writing until the timeout, so the model sees both the command's real result and why the call still hit its deadline. Anything else is rethrown unchanged.
 
 ```ts ! bash.ts
 			try {
@@ -332,7 +365,13 @@ If `exec` throws, output collected so far is finalized first so it is not lost. 
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
-						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+						let status = `Command timed out after ${timeoutSecs} seconds`;
+						if (err instanceof ShellTimeoutError && err.shellExit) {
+							// Both facts matter: the command's real result, and that its background processes
+							// were still writing output when the timeout hit (#11613).
+							status += `. The shell exited with code ${err.shellExit.exitCode} after ${err.shellExit.afterSeconds} seconds, but background processes it started kept writing output until the timeout.`;
+						}
+						throw new Error(appendStatus(text, status));
 					}
 					throw err;
 				}
@@ -392,7 +431,7 @@ export function createBashToolDefinition(
 	return createShellToolDefinition(cwd, bashToolConfig, options);
 }
 
-export function createBashTool(cwd: string, options?: BashToolOptions): AgentTool<typeof bashSchema> {
+export function createBashTool(cwd: string, options?: BashToolOptions): TypeBoxAgentTool<typeof bashSchema> {
 	const definition = createBashToolDefinition(cwd, options);
 	const tool = wrapToolDefinition(definition);
 	Object.assign(tool, {

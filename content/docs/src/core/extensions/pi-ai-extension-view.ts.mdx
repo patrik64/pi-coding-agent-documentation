@@ -1,0 +1,80 @@
+---
+title: "pi-ai-extension-view.ts"
+description: "The module extensions get when they import @earendil-works/pi-ai: pi-ai's compat entry plus TypeBox's Type, Static and TSchema, and a TypeBox-typed StringEnum"
+source: "src/core/extensions/pi-ai-extension-view.ts"
+full: true
+---
+
+pi-ai used to re-export TypeBox's `Type`, `Static` and `TSchema`, so a lot of
+extension code writes `import { Type } from "@earendil-works/pi-ai"` to define
+tool parameters. When pi-ai moved its own schemas and tool validation to
+pi-schema it dropped those re-exports, which would have broken every such
+extension. This file is the shim that keeps them working: a module shaped like
+the old pi-ai, built from the new one plus the coding agent's TypeBox.
+
+Both extension loading paths point pi-ai imports here. In
+[loader.ts](/docs/src/core/extensions/loader.ts) the jiti aliases for
+`@earendil-works/pi-ai` and `@earendil-works/pi-ai/compat` resolve to the
+compiled `pi-ai-extension-view.js`, and in
+[virtual-modules.ts](/docs/src/core/extensions/virtual-modules.ts), used by the
+compiled binary, the same specifiers and their legacy `@mariozechner/pi-ai`
+names map to this module's namespace. Other pi-ai subpaths such as `/models`
+still go straight to pi-ai.
+
+<Scrollycoding>
+
+## !!steps The compat entry plus TypeBox
+
+`export *` from pi-ai's compat entry keeps everything extensions had before,
+including the old global API that compat preserves. The three TypeBox names are
+added back explicitly. They come from the coding agent's own `typebox`, the
+same copy extensions get when they import `typebox` directly, so a `Type`
+from either import builds identical schemas and `Static` infers the same
+types.
+
+```ts ! pi-ai-extension-view.ts
+import { type TUnsafe, Type } from "typebox";
+
+// !mark(1:3)
+export * from "@earendil-works/pi-ai/compat";
+export type { Static, TSchema } from "typebox";
+export { Type };
+```
+
+## !!steps A StringEnum that TypeBox can infer
+
+pi-ai still exports `StringEnum`, but it now returns a pi-schema `Schema`,
+which TypeBox's `Static` does not understand. Inside a `Type.Object` that
+would turn the enum field's inferred type into something unusable. This local
+version emits the same JSON (`type: "string"` with an `enum`, the shape Google
+and other providers that reject `anyOf`/`const` accept) but wraps it in
+`Type.Unsafe`, so its type is `TUnsafe` of the string union.
+
+A local export takes precedence over a name coming through `export *`, so
+extensions importing `StringEnum` from pi-ai get this one.
+
+```ts ! pi-ai-extension-view.ts
+/**
+ * Creates a string enum schema compatible with Google's API and other providers that don't support anyOf/const
+ * patterns: `{ type: "string", enum: [...] }`, typed for TypeBox's `Static`.
+ */
+export function StringEnum<T extends readonly string[]>(
+	values: T,
+	options?: { description?: string; default?: T[number] },
+): TUnsafe<T[number]> {
+	// !mark
+	return Type.Unsafe<T[number]>({
+		type: "string",
+		enum: values as unknown as T[number][],
+		...(options?.description && { description: options.description }),
+		...(options?.default && { default: options.default }),
+	});
+}
+```
+
+</Scrollycoding>
+
+The view only matters for the type names and `StringEnum`; tool arguments are
+validated as plain JSON Schema with pi-schema either way, so TypeBox-only
+features such as `Type.Refine` have no effect on validation. New extension
+code is expected to import TypeBox from `typebox` directly.

@@ -13,9 +13,9 @@ The result, `ResolvedPaths`, is consumed by [resource-loader.ts](/docs/src/core/
 
 ## !!steps The shape of the result
 
-Everything is reported as `ResolvedResource`: a path, an `enabled` flag, and `PathMetadata` with the originating source string, the scope (`user`, `project` or `temporary`), whether it came from a package or a top-level setting, and the package root. Disabled resources are still returned, so a configuration UI can show them.
+Everything is reported as `ResolvedResource`: a path, an `enabled` flag, and `PathMetadata` with the originating source string, the scope (`user`, `project` or `temporary`), whether it came from a package or a top-level setting, the package root, and the package's changelog file if it has one. Disabled resources are still returned, so a configuration UI can show them.
 
-`MissingSourceAction` is the answer a caller gives when a configured package is not installed: install it, skip it or fail.
+`installFailures` lists configured packages that could not be installed during this resolve. They are skipped rather than fatal, and [resource-loader.ts](/docs/src/core/resource-loader.ts) and `pi config` turn them into warnings. `MissingSourceAction` is the answer a caller gives when a configured package is not installed: install it, skip it or fail.
 
 ```ts ! package-manager.ts
 export interface PathMetadata {
@@ -23,6 +23,7 @@ export interface PathMetadata {
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
+	changelogPath?: string;
 	packageRoot?: string;
 }
 
@@ -37,6 +38,15 @@ export interface ResolvedPaths {
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
+	/** Configured packages that were skipped because installing them failed. */
+	installFailures?: PackageInstallFailure[];
+}
+
+/** A configured package that could not be installed while resolving resources. */
+export interface PackageInstallFailure {
+	source: string;
+	scope: SourceScope;
+	message: string;
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
@@ -69,7 +79,7 @@ function resourcePrecedenceRank(m: PathMetadata): number {
 
 Settings lists and package filters use a tiny pattern language, applied in `applyPatterns` in four ordered steps. Plain entries include (if there are none, everything is included). A `!` entry excludes by glob. A `+` entry force-includes an exact path, overriding exclusions, and a `-` entry force-excludes an exact path and wins over everything.
 
-Globs use `minimatch` against the relative path, the file name and the absolute path. The exact forms compare normalized strings only, with a `./` prefix tolerated.
+Globs use `minimatch` against the relative path, the file name and the absolute path. The exact forms compare normalized strings only, with a `./` prefix tolerated. Both forms pass the pattern through `normalizePath` from [paths.ts](/docs/src/utils/paths.ts) first, so a leading `~` expands to the home directory and an entry like `!~/notes/draft.md` works.
 
 ```ts ! package-manager.ts
 	// Step 1: Apply includes (or all if no includes)
@@ -109,7 +119,7 @@ This is why `!my-skill` disables a skill even though the actual file is `my-skil
 	const parentDirPosix = isSkillFile ? toPosixPath(parentDir!) : undefined;
 
 	return patterns.some((pattern) => {
-		const normalizedPattern = toPosixPath(pattern);
+		const normalizedPattern = toPosixPath(normalizePath(pattern));
 		if (
 			minimatch(rel, normalizedPattern) ||
 			minimatch(name, normalizedPattern) ||
@@ -220,7 +230,7 @@ For npm, the spec is split into name and version. A version is "pinned" only if 
 
 ## !!steps Identity and project-over-user dedupe
 
-The same package can be configured in both user and project settings. `getPackageIdentity` reduces a source to `npm:name`, `git:host/path` (so SSH and HTTPS URLs of one repo match) or `local:` plus the resolved path.
+The same package can be configured in both user and project settings. `getPackageIdentity` reduces a source to `npm:name`, `git:host/path` (so SSH and HTTPS URLs of one repo match) or `local:` plus the resolved path. Local paths go through `getPathComparisonKey`, which lowercases them on Windows, so `C:\Work\ext` and `c:\work\ext` count as the same package there.
 
 `dedupePackages` keeps the project entry when identities collide. The exception is a project entry with `autoload` false, which is a delta over the user entry: both are kept, so the project entry only toggles individual resources of the user's package.
 
@@ -249,7 +259,7 @@ The same package can be configured in both user and project settings. `getPackag
 
 `resolve` is the main entry. Project packages are listed before user ones and de-duplicated, then installed packages contribute resources. Next, top-level `extensions`, `skills`, `prompts` and `themes` settings entries are expanded for project first, then user. Auto-discovery of conventional directories follows, and finally built-in extensions are added.
 
-The accumulator only stores the first sighting of a path (`addResource` ignores later ones), so the order of these calls is itself a precedence rule.
+The accumulator only stores the first sighting of a path (`addResource` ignores later ones), so the order of these calls is itself a precedence rule. Packages that failed to install are collected along the way and returned with the paths.
 
 ```ts ! package-manager.ts
 		// Collect all packages with scope (project first so cwd resources win collisions)
@@ -263,35 +273,83 @@ The accumulator only stores the first sighting of a path (`addResource` ignores 
 
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
+// ...
+		return { ...this.toResolvedPaths(accumulator), installFailures };
 ```
 
 ## !!steps Installing what is missing, and going offline
 
-`resolvePackageSources` handles each source by type. Local paths are resolved against the scope's base directory. For npm and git it checks whether the install exists, and for npm also whether the installed version satisfies the configured range. If not, `installMissing` either installs directly, or asks `onMissing`.
+`resolvePackageSources` handles each source by type. Local paths are resolved against the scope's base directory. For npm and git it checks whether the install exists, and for npm also whether the installed version satisfies the configured range. If not, `installMissing` asks `onMissing` when one was given, then installs.
 
-Under `PI_OFFLINE` set to `1`, `true` or `yes`, no install or refresh happens. Temporary git sources that are not pinned are refreshed on each resolve, but a failed refresh keeps the cached checkout.
+An install that throws (no network, a missing package, a failing git prepare step) no longer aborts startup. The error is recorded as a `PackageInstallFailure` and the package's resources are skipped, the same outcome as offline mode. Under `PI_OFFLINE` set to `1`, `true` or `yes`, no install or refresh happens at all.
 
 ```ts ! package-manager.ts
 			const installMissing = async (): Promise<boolean> => {
 				if (isOfflineModeEnabled()) return false;
-				if (!onMissing) {
+				if (onMissing) {
+					const action = await onMissing(resolvedSource);
+					if (action === "skip") return false;
+					if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
+				}
+				// A source that cannot be installed (no network, missing package, failing git prepare step)
+				// must not abort startup. Skip its resources, like offline mode does, and report the failure.
+				try {
 					await this.installParsedSource(parsed, resolvedScope);
 					return true;
+				} catch (error) {
+					installFailures.push({
+						source: resolvedSource,
+						scope: resolvedScope,
+						message: error instanceof Error ? error.message : String(error),
+					});
+					return false;
 				}
-				const action = await onMissing(resolvedSource);
-				if (action === "skip") return false;
-				if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
-				await this.installParsedSource(parsed, resolvedScope);
-				return true;
 			};
+```
+
+## !!steps Refreshing temporary sources
+
+Temporary sources come from `-e` on the command line and have no `pi update` path, so they are refreshed on every resolve instead. For npm, an unpinned temporary package is reinstalled when the registry has a newer version in range. An unversioned spec is installed as `name@latest`, because a bare `npm install name` would keep the range already saved in the temporary `package.json`.
+
+Temporary git sources are pulled on each resolve too, including ones with a ref, since a ref may name a moving branch. The network call is skipped only when the ref looks like a commit hash and that commit is already checked out. In both cases a failed refresh keeps the cached copy.
+
+```ts ! package-manager.ts
+				if (
+					!needsInstall &&
+					resolvedScope === "temporary" &&
+					!parsed.pinned &&
+					(await this.npmHasAvailableUpdate(parsed, installedPath))
+				) {
+					// Temporary (-e) sources have no `pi update` path, so refresh unpinned ones on load like
+					// temporary git sources. Like `pi update`, install `name@latest` for unversioned specs because a bare
+					// `npm install name` keeps the range already saved in the temporary package.json.
+					const spec = parsed.version ? parsed.spec : `${parsed.name}@latest`;
+					try {
+						await this.installNpm({ ...parsed, spec }, resolvedScope, true);
+					} catch {
+						// Keep the cached install if the refresh fails.
+					}
+				}
+// ...
+			// A ref can name a moving branch, so refresh refs too. Skip the network call only when the
+			// ref is a commit hash that is already checked out.
+			if (source.ref && /^[0-9a-f]{7,64}$/i.test(source.ref)) {
+				const head = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
+					cwd: installedPath,
+					timeoutMs: NETWORK_TIMEOUT_MS,
+				});
+				if (head.trim().toLowerCase().startsWith(source.ref.toLowerCase())) {
+					return;
+				}
+			}
 ```
 
 ## !!steps Filters, manifests and conventions inside a package
 
 Once a package directory exists, `collectPackageResources` decides what it provides. If the settings entry has a filter object, each resource type is handled by `applyPackageFilter` (patterns applied to everything the package offers; an empty array disables that type), by the delta filter when `autoload` is false, or by the package defaults.
 
-Without a filter, a `pi` manifest in `package.json` lists the resources. Without either, conventional `extensions`, `skills`, `prompts` and `themes` directories are scanned. The boolean result tells local-directory callers whether the folder looked like a package at all.
+Without a filter, a `pi` manifest in `package.json` lists the resources, but only if it actually names at least one resource type. A `pi` object that holds only metadata (a changelog path, gallery media) falls back to scanning the conventional `extensions`, `skills`, `prompts` and `themes` directories, as does a package with no manifest. The boolean result tells local-directory callers whether the folder looked like a package at all.
 
 ```ts ! package-manager.ts
 		if (filter) {
@@ -308,11 +366,39 @@ Without a filter, a `pi` manifest in `package.json` lists the resources. Without
 			}
 			return true;
 		}
+
+		if (manifest && hasManifestResourceFields(manifest)) {
+```
+
+## !!steps Finding a package changelog
+
+Before any of that, `collectPackageResources` looks for the package's changelog and stores it in the metadata, so interactive mode can show what changed in an extension since the version the user last saw (see [changelog.ts](/docs/src/utils/changelog.ts)). The path comes from `pi.changelogPath` in the manifest, defaulting to `CHANGELOG.md`; an empty string opts out.
+
+The resolved path must exist, be a regular file, and stay inside the package root after symlinks are resolved. That stops a package from pointing pi at an arbitrary file elsewhere on disk.
+
+```ts ! package-manager.ts
+function resolvePackageChangelogPath(packageRoot: string, manifest: PiManifest | null): string | undefined {
+	const changelogPath = manifest?.changelogPath ?? "CHANGELOG.md";
+	if (!changelogPath) return undefined;
+
+	const resolvedPath = resolve(packageRoot, changelogPath);
+	if (!existsSync(resolvedPath)) return undefined;
+
+	const canonicalPackageRoot = canonicalizePath(packageRoot);
+	const canonicalChangelogPath = canonicalizePath(resolvedPath);
+	if (!isPathInside(canonicalPackageRoot, canonicalChangelogPath)) return undefined;
+
+	try {
+		return statSync(resolvedPath).isFile() ? resolvedPath : undefined;
+	} catch {
+		return undefined;
+	}
+}
 ```
 
 ## !!steps Auto-discovery and the trust gate
 
-`addAutoDiscoveredResources` scans `.pi` (project) and the agent directory (user) for the four resource directories, and applies each settings list as overrides through `isEnabledByOverrides`. Project scanning, including `.agents/skills` directories found by walking up from the cwd to the git root, happens only when `isProjectTrusted()` is true, since project files can run code. User-level `~/.agents/skills` is always scanned.
+`addAutoDiscoveredResources` scans `.pi` (project) and the agent directory (user) for the four resource directories, and applies each settings list as overrides through `isEnabledByOverrides`. Project scanning, including `.agents/skills` directories found by walking up from the cwd to the git root, happens only when `isProjectTrusted()` is true, since project files can run code. User-level `~/.agents/skills` is always scanned, and is dropped from the project list with `pathsEqual`, which compares case-insensitively on Windows, so a cwd under the home directory does not scan it twice.
 
 The same trust rule guards installs: `assertProjectTrustedForScope` throws before touching project package storage.
 
@@ -320,7 +406,7 @@ The same trust rule guards installs: `assertProjectTrustedForScope` throws befor
 		const userAgentsSkillsDir = join(getHomeDir(), ".agents", "skills");
 		const projectTrusted = this.settingsManager.isProjectTrusted();
 		const projectAgentsSkillDirs = projectTrusted
-			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))
+			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => !pathsEqual(dir, userAgentsSkillsDir))
 			: [];
 ```
 
@@ -328,7 +414,7 @@ The same trust rule guards installs: `assertProjectTrustedForScope` throws befor
 
 A git install clones into a path under `git/host/path`, checks out the ref if there is one, and installs dependencies with the detected package manager, removing the half-built directory if anything fails. `resolveManagedPath` refuses any path that escapes the install root.
 
-Updating uses `ensureGitRef`: it fetches only the target ref and, if the head moved, writes a `.pi-update-incomplete` marker, runs `git reset --hard`, then `git clean -fdx` and reinstalls dependencies, deleting the marker last. If the marker is found on a later run, the clean and install is repeated, so an interrupted update self-heals.
+Updating uses `ensureGitRef`: it fetches only the target ref and, if the head moved, writes a `.pi-update-incomplete` marker, runs `git reset --hard`, then `git clean -fdx` and reinstalls dependencies, deleting the marker last if the clean succeeded. If the marker is found on a later run, the clean and install is repeated, so an interrupted update self-heals.
 
 ```ts ! package-manager.ts
 		const markerPath = this.getGitUpdateMarkerPath(targetDir);
@@ -346,13 +432,48 @@ Updating uses `ensureGitRef`: it fetches only the target ref and, if the head mo
 		await this.cleanAndInstallGitDependencies(targetDir, markerPath);
 ```
 
+## !!steps When git clean fails
+
+On Windows, files that another process has loaded (for example a native module of this extension in another pi session) cannot be deleted, so `git clean` fails. Earlier this aborted the update. Now the failure is reported as a `progress` warning and dependencies for the new commit are still installed, so the extension matches its code.
+
+The marker is removed only after a successful clean. Leaving it in place means the next update retries the clean, because `ensureGitRef` repeats the clean and install whenever it finds the marker, even if the head did not move.
+
+```ts ! package-manager.ts
+		let cleaned = true;
+		try {
+			await this.runCommand("git", ["clean", "-fdx"], { cwd: targetDir });
+		} catch (error) {
+			cleaned = false;
+			const reason = error instanceof Error ? error.message : String(error);
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: targetDir,
+				message: `Could not remove all untracked files in ${targetDir} (${reason}). Files may be in use by another pi session; close it and run the update again.`,
+			});
+		}
+
+		const packageJsonPath = join(targetDir, "package.json");
+		if (existsSync(packageJsonPath)) {
+			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
+		}
+		if (cleaned) {
+			rmSync(markerPath, { force: true });
+		}
+```
+
 ## !!steps Supporting npm, pnpm and bun
 
 The npm command is configurable in settings (`getNpmCommand`), and `getPackageManagerName` infers whether it is really npm, pnpm or bun, including wrapper commands. `getNpmInstallArgs` then builds matching flags for each. All three disable peer dependency resolution, because extension packages get pi's own packages from the host through loader aliases and a stale auto-installed peer could block updates.
 
+npm installs also pass `--no-audit` and `--no-fund`. Besides hiding noise, this keeps npm from suggesting `npm audit fix`, which would run without `--legacy-peer-deps` and pull pi's peers back in. The install root is passed through `realpathSync` first, because npm writes broken nested `package-lock.json` paths when `--prefix` goes through a symlink, as it does when the agent directory is a symlink.
+
 npm packages are installed into a private `npm` project directory with a generated `package.json`, not globally. For user scope, an older global install is still found as a legacy fallback.
 
 ```ts ! package-manager.ts
+		// npm writes broken nested package-lock.json paths when --prefix goes through a symlink.
+		const installRoot = existsSync(root) ? realpathSync(root) : root;
+// ...
 		if (packageManagerName === "bun") {
 			return ["install", ...specs, "--cwd", installRoot, "--omit=peer"];
 		}
@@ -367,7 +488,62 @@ npm packages are installed into a private `npm` project directory with a generat
 				"--config.strict-dep-builds=false",
 			];
 		}
-		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps"];
+		// npm audit fix would run without --legacy-peer-deps and install pi peers, so skip audit advice.
+		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps", "--no-audit", "--no-fund"];
+```
+
+## !!steps Reporting what an update changed
+
+`update` used to finish silently. It now records the state before and after: for npm, the installed version from the update check; for git, `git rev-parse HEAD` around `updateGit`. Each package whose version or commit changed is announced as one `result` progress event, such as `npm:foo 1.2.0 -> 1.3.0`, with git commits shortened to seven characters. Git results are emitted in configured order even though the clones update in parallel.
+
+`result` is a new event type outside the usual pairing, where every `start` gets exactly one `complete` or `error`. [package-manager-cli.ts](/docs/src/package-manager-cli.ts) collects these lines for its summary.
+
+```ts ! package-manager.ts
+	/**
+	 * `start` is followed by exactly one `complete` or `error` for the same source.
+	 * `progress` carries an intermediate message or warning.
+	 * `result` reports an outcome outside that pairing, e.g. one changed package
+	 * after update(): `npm:foo 1.2.0 -> 1.3.0`.
+	 */
+	type: "start" | "progress" | "complete" | "error" | "result";
+// ...
+		// Report each changed package, e.g. "npm:foo 1.2.0 -> 1.3.0".
+		for (const pkg of updated) {
+			const format = (value: string | undefined) =>
+				value === undefined ? "(none)" : pkg.type === "git" ? value.slice(0, 7) : value;
+			const scope = pkg.scope === "project" ? " (project)" : "";
+			this.emitProgress({
+				type: "result",
+				action: "update",
+				source: pkg.source,
+				message: `${pkg.source}${scope} ${format(pkg.from)} -> ${format(pkg.to)}`,
+			});
+		}
+```
+
+## !!steps Warning when npm did not move
+
+Shortly after a publish, npm can resolve stale registry metadata and reinstall the old version without an error. After each npm batch, `reportUnchangedNpmUpdates` compares the installed version with the one recorded before the update. If the registry had announced a newer version and nothing changed, it emits a `progress` warning suggesting to try again in a few minutes, instead of letting the CLI claim success.
+
+```ts ! package-manager.ts
+	private reportUnchangedNpmUpdates(sources: NpmUpdateTarget[], scope: InstalledSourceScope): void {
+		for (const entry of sources) {
+			if (!entry.installedVersion || !entry.targetVersion) {
+				continue;
+			}
+			const installedPath = this.getManagedNpmInstallPath(entry.parsed, scope);
+			const versionAfter = this.getInstalledNpmVersion(installedPath);
+			if (versionAfter !== entry.installedVersion) {
+				continue;
+			}
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: entry.source,
+				message: `${entry.source} is still ${versionAfter} (registry reports ${entry.targetVersion}); npm registry metadata may be stale, try again in a few minutes`,
+			});
+		}
+	}
 ```
 
 ## !!steps Bounded concurrency for update checks

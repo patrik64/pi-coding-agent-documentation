@@ -11,10 +11,14 @@ When the user switches branches in the session tree, the abandoned path can be s
 
 ## !!steps Class setup
 
-The component extends pi-tui's `Box` with one cell of padding and the shared
-custom-message background, so it looks like other injected messages such as
+The component extends pi-tui's `Box` with the shared custom-message
+background, so it looks like other injected messages such as
 [custom-message.ts](/docs/src/modes/interactive/components/custom-message.ts).
-It is collapsed by default and renders immediately in the constructor.
+The horizontal padding is the user's `outputPad` setting, like every other
+transcript block. The host also passes the extension Markdown transformers and,
+when the message was loaded from the session file, its entry id and timestamp,
+which are handed on to the transformers. It is collapsed by default and renders
+immediately in the constructor.
 
 ```ts ! branch-summary-message.ts
 /**
@@ -25,24 +29,43 @@ export class BranchSummaryMessageComponent extends Box {
 	private expanded = false;
 	private message: BranchSummaryMessage;
 	private markdownTheme: MarkdownTheme;
+	private markdownTransformers: readonly MarkdownTransformer[];
+	private messageId?: string;
+	private timestamp?: string;
 
-	constructor(message: BranchSummaryMessage, markdownTheme: MarkdownTheme = getMarkdownTheme()) {
-		super(1, 1, (t) => theme.bg("customMessageBg", t));
+	constructor(
+		message: BranchSummaryMessage,
+		markdownTheme: MarkdownTheme = getMarkdownTheme(),
+		outputPad = 1,
+		markdownTransformers: readonly MarkdownTransformer[] = [],
+		messageId?: string,
+		timestamp?: string,
+	) {
+		super(outputPad, 1, (t) => theme.bg("customMessageBg", t));
 		this.message = message;
 		this.markdownTheme = markdownTheme;
+		this.markdownTransformers = markdownTransformers;
+		this.messageId = messageId;
+		this.timestamp = timestamp;
 		this.updateDisplay();
 	}
 ```
 
 ## !!steps Expanding and re-rendering
 
-`setExpanded` flips the flag and rebuilds. `invalidate` also rebuilds, so a
-theme change picks up new colors. Rebuilding always starts with `clear()`.
+`setExpanded` flips the flag and rebuilds. `setOutputPad` only changes the
+box padding, which is enough when the user changes the setting. `invalidate`
+rebuilds, so a theme change picks up new colors. Rebuilding always starts with
+`clear()`.
 
 ```ts ! branch-summary-message.ts
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
 		this.updateDisplay();
+	}
+
+	setOutputPad(outputPad: number): void {
+		this.setPaddingX(outputPad);
 	}
 
 	override invalidate(): void {
@@ -55,6 +78,8 @@ theme change picks up new colors. Rebuilding always starts with `clear()`.
 
 Collapsed it shows one line telling the user which key expands it. Expanded it renders the summary as markdown under a bold heading, in the custom message text color. The label `[branch]` is always bold.
 
+Extension transformers run on the summary as the `summary` surface. The heading is added after the transform, so a transformer never sees or rewrites pi's own header. Summaries are never streamed, so `isStreaming` is always false.
+
 ```ts ! branch-summary-message.ts
 	private updateDisplay(): void {
 		this.clear();
@@ -66,10 +91,23 @@ Collapsed it shows one line telling the user which key expands it. Expanded it r
 
 		if (this.expanded) {
 			const header = "**Branch Summary**\n\n";
+			const transform = createMarkdownTransform(
+				"summary",
+				() => false,
+				this.markdownTransformers,
+				this.messageId,
+				this.timestamp,
+			);
 			content.addChild(
-				new Markdown(header + this.message.summary, 0, 0, this.markdownTheme, {
-					color: (text: string) => theme.fg("customMessageText", text),
-				}),
+				new Markdown(
+					this.message.summary,
+					0,
+					0,
+					this.markdownTheme,
+					{ color: (text: string) => theme.fg("customMessageText", text) },
+					// Transformers see only the summary content, not Pi's header.
+					{ transform: (markdown, width) => header + transform(markdown, width) },
+				),
 			);
 		} else {
 			content.addChild(

@@ -13,7 +13,9 @@ Consumers are [bash-executor.ts](/docs/src/core/bash-executor.ts), [bash.ts](/do
 
 ## !!steps Shell configuration and legacy WSL bash
 
-`ShellConfig` is the shell binary plus the args that precede the command. The legacy `C:\Windows\System32\bash.exe` (the old WSL launcher) cannot take `-c` reliably, so it gets `-s` and the command is sent on stdin via `commandTransport: "stdin"`. Everything else uses `-c`.
+`ShellConfig` is the shell binary plus the args that precede the command. The legacy WSL launcher `bash.exe` in the Windows system directory cannot take `-c` reliably, so it gets `-s` and the command is sent on stdin via `commandTransport: "stdin"`. Everything else uses `-c`.
+
+The launcher is recognized by comparing against `System32\bash.exe` and `Sysnative\bash.exe` under `SystemRoot`, so Windows installed on another drive or in another folder is handled; a `SystemRoot` that is not an absolute drive path matches nothing. The conventional `C:\Windows` pattern is only a fallback for when `SystemRoot` is unset. A comment notes that the same logic lives in the durable package and must be kept in sync.
 
 ```ts ! shell.ts
 export interface ShellConfig {
@@ -22,11 +24,17 @@ export interface ShellConfig {
 	commandTransport?: "argv" | "stdin";
 }
 
-/**
- * Find bash executable on PATH (cross-platform)
- */
+// Keep in sync with packages/durable/src/env/node.ts.
 function isLegacyWslBashPath(path: string): boolean {
-	const normalized = path.replace(/\//g, "\\").toLowerCase();
+	const normalized = win32.normalize(path).toLowerCase();
+	const systemRoot = process.env.SystemRoot;
+	if (systemRoot) {
+		if (!/^[a-z]:[\\/]/i.test(systemRoot)) return false;
+		return ["System32", "Sysnative"].some(
+			(directory) => normalized === win32.join(systemRoot, directory, "bash.exe").toLowerCase(),
+		);
+	}
+	// Fall back to conventional launcher paths only when the Windows directory is unknown.
 	return /^[a-z]:\\windows\\(?:system32|sysnative)\\bash\.exe$/.test(normalized);
 }
 
@@ -35,16 +43,33 @@ function getBashShellConfig(shell: string): ShellConfig {
 }
 ```
 
+## !!steps Checking that a shell exists
+
+Every existence check in this file goes through `shellPathExists`, a plain `access(F_OK)`. On Unix that is exactly what `existsSync` does. On Windows, `existsSync` adds a stat call that fails with `EACCES` for Windows Store app aliases, so a runnable Store-installed shell used to be rejected as missing.
+
+```ts ! shell.ts
+// Matches harness-v2's pathExists (packages/durable/src/env/node.ts).
+// On Unix this is identical to existsSync() (both are access(F_OK)), just
+// spelled with try/catch. On Windows we explicitly avoid existsSync(): its
+// extra stat check rejects runnable Store aliases (nodejs/node#36790).
+function shellPathExists(path: string): boolean {
+	try {
+		accessSync(path, constants.F_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+```
+
 ## !!steps Looking up an executable
 
-On Windows it runs `where` and then checks the first hit exists, since `where` can report stale paths. On Unix it trusts `which` without an existence check, so Termux and unusual filesystems work. Both have a 5 second timeout and swallow errors.
-
-The doc comment above `isLegacyWslBashPath` ("Find bash executable on PATH") belongs to `findExecutableOnPath`, not to the function it sits on.
+On Windows it runs `where` and then checks the first hit with `shellPathExists`. On Unix it trusts `which` without an existence check, so Termux and unusual filesystems work. Both have a 5 second timeout and swallow errors.
 
 ```ts ! shell.ts
 function findExecutableOnPath(executable: string): string | null {
 	if (process.platform === "win32") {
-		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
+		// Windows: use 'where' and check the returned path.
 		try {
 			const result = spawnSync("where", [executable], {
 				encoding: "utf-8",
@@ -53,7 +78,7 @@ function findExecutableOnPath(executable: string): string | null {
 			});
 			if (result.status === 0 && result.stdout) {
 				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
+				if (firstMatch && shellPathExists(firstMatch)) {
 					return firstMatch;
 				}
 			}
@@ -72,7 +97,7 @@ An explicit path wins and throws if missing, with no silent fallback. On Windows
 export function getShellConfig(customShellPath?: string): ShellConfig {
 	// 1. Check user-specified shell path
 	if (customShellPath) {
-		if (existsSync(customShellPath)) {
+		if (shellPathExists(customShellPath)) {
 			return getBashShellConfig(customShellPath);
 		}
 		throw new Error(`Custom shell path not found: ${customShellPath}`);
@@ -87,13 +112,13 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		}
 ```
 
-## !!steps Unix fallback and PowerShell
+## !!steps Unix fallback
 
-On Unix the order is `/bin/bash`, `bash` on PATH, then plain `sh -c`, so a minimal container still works. PowerShell is Windows-only and prefers `pwsh.exe` (PowerShell 7) over `powershell.exe`. The fixed args skip profiles, disable prompts and bypass execution policy.
+On Unix the order is `/bin/bash`, `bash` on PATH, then plain `sh -c`, so a minimal container still works.
 
 ```ts ! shell.ts
 	// Unix: try /bin/bash, then bash on PATH, then fallback to sh
-	if (existsSync("/bin/bash")) {
+	if (shellPathExists("/bin/bash")) {
 		return getBashShellConfig("/bin/bash");
 	}
 
@@ -104,8 +129,29 @@ On Unix the order is `/bin/bash`, `bash` on PATH, then plain `sh -c`, so a minim
 
 	return { shell: "sh", args: ["-c"] };
 }
+```
 
+## !!steps Finding PowerShell
+
+PowerShell is Windows-only. The lookup prefers PowerShell 7 and checks each candidate on `PATH` first, then in its installation directory, because those directories can be on any drive and need not be on `PATH`: `pwsh.exe`, then `ProgramFiles\PowerShell\7\pwsh.exe`, then `powershell.exe`, then Windows PowerShell under `SystemRoot`. The fixed args skip profiles, disable prompts and bypass execution policy.
+
+```ts ! shell.ts
 export const POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] as const;
+// ...
+	let shell = findExecutableOnPath("pwsh.exe");
+	// Installation directories may be on any drive and need not be on PATH.
+	const programFiles = process.env.ProgramFiles;
+	if (!shell && programFiles) {
+		const pwsh7 = win32.join(programFiles, "PowerShell", "7", "pwsh.exe");
+		if (shellPathExists(pwsh7)) shell = pwsh7;
+	}
+
+	shell ??= findExecutableOnPath("powershell.exe");
+	const systemRoot = process.env.SystemRoot;
+	if (!shell && systemRoot) {
+		const windowsPowerShell = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+		if (shellPathExists(windowsPowerShell)) shell = windowsPowerShell;
+	}
 ```
 
 ## !!steps Environment with the managed bin directory
@@ -156,9 +202,9 @@ export function killTrackedDetachedChildren(): void {
 }
 ```
 
-## !!steps Killing a whole tree
+## !!steps Killing a whole tree on Windows
 
-On Windows it runs `taskkill /F /T` from the System32 directory so a poisoned `PATH` cannot substitute it, and consumes the async `error` event. On Unix it sends `SIGKILL` to the negative pid, which targets the whole process group, and falls back to the single pid if that throws. Both are best-effort.
+On Windows it runs `taskkill /F /T` from the System32 directory so a poisoned `PATH` cannot substitute it, and consumes the async `error` event. The directory falls back to `C:\Windows` when `SystemRoot` is unset or empty; the `||` replaced a `??`, which let an empty value through.
 
 ```ts ! shell.ts
 export function killProcessTree(pid: number): void {
@@ -166,7 +212,7 @@ export function killProcessTree(pid: number): void {
 		// Use the trusted System32 executable so cleanup does not depend on PATH.
 		try {
 			const child = spawn(
-				join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+				join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"),
 				["/F", "/T", "/PID", String(pid)],
 				{
 					stdio: "ignore",
@@ -180,6 +226,37 @@ export function killProcessTree(pid: number): void {
 			// Ignore errors if taskkill fails.
 		}
 	} else {
+```
+
+## !!steps Killing a process group on Unix
+
+On Unix it sends `SIGKILL` to the negative pid, which targets the whole process group, and falls back to the single pid if that throws. On macOS the group is stopped with `SIGSTOP` first. macOS delivers a group signal to members one by one, so a killed child can wake its waiting shell before the shell itself is signalled, and in `a; b` the shell could start `b` during cancellation. Stopping the group first narrows that window; as the comment says, it is best-effort rather than an atomic freeze, and a failed stop never prevents the kill. Linux signals the whole group under one lock, so it needs no such step.
+
+```ts ! shell.ts
+		if (process.platform === "darwin") {
+			// macOS signals group members individually after releasing the group lock. A killed
+			// child can wake its waiting shell before that shell is signalled, letting `a; b`
+			// start b during cancellation (#11252). Stop the group first to reduce this race;
+			// this is best-effort, not an atomic freeze. SIGKILL also kills stopped processes.
+			// Linux holds tasklist_lock across group signalling; child exit notification needs
+			// its write lock, so the shell is signalled before observing the killed child's exit.
+			try {
+				process.kill(-pid, "SIGSTOP");
+			} catch {
+				// A failed stop must not prevent the kill attempt or its single-process fallback.
+			}
+		}
+		// Use SIGKILL on Unix/Linux/Mac
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch {
+			// Fallback to killing just the child if process group kill fails
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Process already dead
+			}
+		}
 ```
 
 </Scrollycoding>

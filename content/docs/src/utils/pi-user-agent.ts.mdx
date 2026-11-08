@@ -1,35 +1,32 @@
 ---
 title: "pi-user-agent.ts"
-description: "Builds the User-Agent string pi sends on its own HTTP requests"
+description: "Builds the User-Agent string pi sends on its own HTTP requests, in the same detailed form pi-ai sends to providers"
 source: "src/utils/pi-user-agent.ts"
 full: true
 ---
 
-A four-line helper that formats a consistent `User-Agent` header. It lets servers such as the pi.dev version endpoint see which pi version, platform, runtime and CPU architecture is calling.
+A one-function helper that gives pi's own network requests a consistent `User-Agent` header. It lets servers such as the pi.dev version endpoint see which pi version, platform, runtime and CPU architecture is calling.
 
-Its caller in this folder is [version-check.ts](/docs/src/utils/version-check.ts), which passes the current version into it. HTTP retry and timeout behavior live in [management-http.ts](/docs/src/utils/management-http.ts).
+It used to format that string itself. When client identity moved into pi-ai, the formatting moved with it: provider requests get their `User-Agent` from the identity built in [client-identity.ts](/docs/src/core/client-identity.ts), and this helper now asks pi-ai for the same detailed form, so pi identifies itself the same way to providers and to its own services.
+
+Callers include [version-check.ts](/docs/src/utils/version-check.ts), the GitHub release lookup in [tools-manager.ts](/docs/src/utils/tools-manager.ts), the remote model catalog in [remote-catalog-provider.ts](/docs/src/core/remote-catalog-provider.ts), [bug-report.ts](/docs/src/core/bug-report.ts) and [package-manager-cli.ts](/docs/src/package-manager-cli.ts). HTTP retry and timeout behavior live in [management-http.ts](/docs/src/utils/management-http.ts).
 
 <Scrollycoding>
 
-## !!steps Detect the runtime
+## !!steps Delegating to pi-ai
 
-pi runs under both Node and Bun (compiled binaries). `process.versions.bun` exists only under Bun, so its presence selects the `bun/` label; otherwise `process.version` supplies the Node version.
+`formatUserAgent` takes a client identity. With `userAgent: "detailed"` and a version it returns something like `pi/1.2.3 (darwin; node/v22.0.0; arm64)`, choosing a `bun/` label under Bun (compiled binaries) and `node/` otherwise, which is exactly what this file used to build by hand. The version is still passed in rather than read here, so this file has no dependency on package metadata.
 
 ```ts ! pi-user-agent.ts
+import { formatUserAgent } from "@earendil-works/pi-ai";
+
+/** pi's `User-Agent` for its own network requests; the same detailed form pi-ai sends to providers. */
 export function getPiUserAgent(version: string): string {
 	// !mark
-	const runtime = process.versions.bun ? `bun/${process.versions.bun}` : `node/${process.version}`;
-```
-
-## !!steps Assemble the string
-
-The result looks like `pi/1.2.3 (darwin; node/v22.0.0; arm64)`. The version is passed in rather than read here, so this file has no dependency on package metadata.
-
-```ts ! pi-user-agent.ts
-	return `pi/${version} (${process.platform}; ${runtime}; ${process.arch})`;
+	return formatUserAgent({ userAgent: "detailed", version });
 }
 ```
 
 </Scrollycoding>
 
-The string reveals OS and architecture but nothing user-specific. It is also used implicitly as the version-check client identity; the GitHub release lookup in [tools-manager.ts](/docs/src/utils/tools-manager.ts) uses a simpler agent built from the app name instead.
+The string reveals OS and architecture but nothing user-specific. Unlike provider requests, these calls carry no attribution header; that part of the identity applies only to model providers.

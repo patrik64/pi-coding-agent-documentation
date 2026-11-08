@@ -5,38 +5,40 @@ source: "src/core/settings-manager.ts"
 full: true
 ---
 
-pi reads configuration from two JSON files: a global one in the agent directory and a project one under the working directory's config folder. This file defines the `Settings` shape, merges the two layers, and offers around a hundred typed getters and setters over them.
+pi reads configuration from two JSON files: a global one in the agent directory and a project one under the working directory's config folder. This file merges the two layers and offers around a hundred typed getters and setters over them. The `Settings` shape it works with is derived from the schema in [settings-schema.ts](/docs/src/core/settings-schema.ts), and the defaults its getters fall back to come from [settings-defaults.ts](/docs/src/core/settings-defaults.ts).
 
 Most of the code is repetitive accessors. The part worth studying is how writes work: a setter changes only the in-memory global layer and records which keys it touched, and a queued background write then merges just those keys into whatever is currently on disk. That way two running pi instances, or a hand edit of the file, are not clobbered by stale in-memory state.
 
 <Scrollycoding>
 
-## !!steps One interface describes every setting
+## !!steps Types and defaults come from the schema
 
-`Settings` is a flat bag of optional fields, with defaults described in trailing comments. Nested groups such as `compaction`, `retry`, `terminal` and `images` have their own interfaces. Getters apply those defaults at read time, so an absent key and a default value are indistinguishable on disk.
+The `Settings` type and its nested groups such as `CompactionSettings` and `RetrySettings` are no longer declared here. They are derived from the TypeBox schema in [settings-schema.ts](/docs/src/core/settings-schema.ts), which also produces the published `settings.schema.json`, and re-exported so existing imports keep working. Default values come from `SETTINGS_DEFAULTS`, the same constants the schema publishes as `default`. The getters, the types and the editor hints therefore agree.
 
-Two fields carry notes about scope. `defaultProjectTrust` and `deviceId` are marked global-only, and `cacheWarming` is global-only because each refresh costs money.
+The schema is not used to validate the file when it loads. Values are read as they are. Each getter applies its default at read time, and many also check the stored value before using it, so an absent key and a default value are indistinguishable on disk. `CACHE_WARMING_MODES` stays as a runtime list for one of those guards; the `satisfies` clause checks that each entry is a valid mode, though not that the list is complete.
 
 ```ts ! settings-manager.ts
-export interface Settings {
-	lastChangelogVersion?: string;
-	defaultProvider?: string;
-	defaultModel?: string;
-	defaultThinkingLevel?: ThinkingLevel;
-	modelThinkingLevels?: Record<string, ThinkingLevel>; // per-model default thinking level overrides keyed by "provider/modelId"
-	transport?: TransportSetting; // default: "auto"
-	steeringMode?: "all" | "one-at-a-time";
-	followUpMode?: "all" | "one-at-a-time";
-	theme?: string;
-	compaction?: CompactionSettings;
-	branchSummary?: BranchSummarySettings;
-	retry?: RetrySettings;
+import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import type {
+	CacheWarmingMode,
+	CompactionModelOverride,
 // ...
-	defaultProjectTrust?: DefaultProjectTrust; // default: "ask"; global setting only
+} from "./settings-schema.ts";
+
+export type {
+	BranchSummarySettings,
+	CacheWarmingMode,
 // ...
-	deviceId?: string; // stable UUID of this installation, created when a login first needs it; global setting only
-// ...
-	cacheWarming?: CacheWarmingMode; // default: "streaming"; global only because each refresh costs money
+	WarningSettings,
+} from "./settings-schema.ts";
+/** Cache-warming profile. "idle" also warms between agent runs. */
+// !mark
+export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
+
+const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
+	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
+	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
+};
 ```
 
 ## !!steps Deep merge with project on top
@@ -72,11 +74,23 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 
 ## !!steps defaultTools is the exception
 
-Tool lists need to be extendable, so `defaultTools` bypasses the generic merge. A list of plain names replaces the inherited one. A list made only of `+name` and `-name` entries is appended to the inherited list instead, and `resolveDefaultTools` later applies the modifiers in order on top of the built-in read, bash, edit and write set.
+Tool lists need to be extendable, so `defaultTools` bypasses the generic merge. A list of plain names replaces the inherited one. A list made only of `+name` and `-name` entries is appended to the inherited list instead, and `resolveDefaultTools` later applies the modifiers in order. If the entries contain no plain names, the built-in read, bash, edit and write set is the starting point; an empty list yields no tools at all.
 
-If the entries contain no plain names, the built-in defaults are the starting point; an empty list yields no tools at all.
+`applyToolModifiers` is exported because the same grammar applies to `--tools` and the SDK `tools` option, which [sdk.ts](/docs/src/core/sdk.ts) and [agent-session.ts](/docs/src/core/agent-session.ts) apply on top of the default selection. Those lists are stricter than a settings layer: the exported `getToolListError` rejects a list that mixes plain names with modifiers, or a modifier that contains a `*` pattern.
 
 ```ts ! settings-manager.ts
+export function applyToolModifiers(base: readonly string[], entries: readonly string[]): string[] {
+	const tools = [...base];
+	for (const entry of entries) {
+		if (!isToolModifier(entry)) continue;
+		const name = entry.slice(1);
+		const index = tools.indexOf(name);
+		if (entry.startsWith("+") && index === -1 && name) tools.push(name);
+		else if (entry.startsWith("-") && index !== -1) tools.splice(index, 1);
+	}
+	return tools;
+}
+
 /**
  * Merge `defaultTools` of two settings layers. A list with plain tool names replaces the inherited
  * one; a list of only `+name`/`-name` entries is appended, so it modifies the inherited selection.
@@ -94,15 +108,8 @@ function mergeDefaultTools(base: string[] | undefined, overrides: string[] | und
  */
 function resolveDefaultTools(entries: string[]): string[] {
 	const plain = entries.filter((entry) => !isToolModifier(entry));
-	const tools = plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES];
-	for (const entry of entries) {
-		if (!isToolModifier(entry)) continue;
-		const name = entry.slice(1);
-		const index = tools.indexOf(name);
-		if (entry.startsWith("+") && index === -1 && name) tools.push(name);
-		else if (entry.startsWith("-") && index !== -1) tools.splice(index, 1);
-	}
-	return tools;
+	// !mark
+	return applyToolModifiers(plain.length > 0 || entries.length === 0 ? plain : DEFAULT_TOOL_NAMES, entries);
 }
 ```
 
@@ -255,7 +262,7 @@ The file on disk is only rewritten when some later setter happens to persist tha
 
 A setter writes to `globalSettings`, calls `markModified` with the field (and, for nested groups, the nested key), then calls `save`. Tracking the nested key means that changing `compaction.enabled` does not take ownership of the user's other compaction fields on disk.
 
-Note that setters always target the global layer. Only a handful of path-list setters have project counterparts, covered below.
+Note that setters always target the global layer. Only a handful of path-list setters have project counterparts, covered below. Newer setters follow the same pattern: `setSessionShareDestination` stores where `/share` uploads, and `setExtensionChangelogVersion` records the last changelog version seen for each extension package, with the package as the nested key, so two instances that update different packages do not overwrite each other.
 
 ```ts ! settings-manager.ts
 	setCompactionEnabled(enabled: boolean): void {
@@ -465,7 +472,7 @@ The compaction logic that consumes it is in [compaction.ts](/docs/src/core/compa
 
 ## !!steps Settings that ignore the project layer
 
-A few getters read `globalSettings` directly instead of the merged view: `getCacheWarmingMode`, `getDefaultProjectTrust` and `getOrCreateDeviceId`. The reasons are cost and safety. A checked-in project file should not be able to turn on paid cache refreshes, loosen trust policy, or give every clone the same device id.
+A few getters read `globalSettings` directly instead of the merged view: `getCacheWarmingMode`, `getDefaultProjectTrust` and `getOrCreateDeviceId`. The reasons are cost and safety. A checked-in project file should not be able to turn on paid cache refreshes, loosen trust policy, or give every clone the same device id. The schema can only say so in each field's description, since both files share one schema. `selfUpdateCommand` is global-only in the same way, but it is read by the update command through `getGlobalSettings` rather than by a getter here.
 
 `getOrCreateDeviceId` creates and persists its UUID lazily on first use.
 
@@ -473,12 +480,12 @@ A few getters read `globalSettings` directly instead of the merged view: `getCac
 	/** Read from global settings only because warming costs money. */
 	getCacheWarmingMode(): CacheWarmingMode {
 		const mode = this.globalSettings.cacheWarming;
-		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : "streaming";
+		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : SETTINGS_DEFAULTS.cacheWarming;
 	}
 // ...
 	getDefaultProjectTrust(): DefaultProjectTrust {
 		const value = this.globalSettings.defaultProjectTrust;
-		return value === "always" || value === "never" ? value : "ask";
+		return value === "always" || value === "never" ? value : SETTINGS_DEFAULTS.defaultProjectTrust;
 	}
 // ...
 	/**
@@ -498,4 +505,4 @@ A few getters read `globalSettings` directly instead of the merged view: `getCac
 
 </Scrollycoding>
 
-The manager is built early at startup and shared. [agent-session.ts](/docs/src/core/agent-session.ts) reads retry, compaction and steering settings from it, [resource-loader.ts](/docs/src/core/resource-loader.ts) reads the path lists, and [settings-diagnostics.ts](/docs/src/core/settings-diagnostics.ts) surfaces the errors drained from it. Structurally the file is types and merge helpers first, then storage classes, then one large class whose second half is accessors in no particular order.
+The manager is built early at startup and shared. [agent-session.ts](/docs/src/core/agent-session.ts) reads retry, compaction and steering settings from it, [resource-loader.ts](/docs/src/core/resource-loader.ts) reads the path lists, and [settings-diagnostics.ts](/docs/src/core/settings-diagnostics.ts) surfaces the errors drained from it. Structurally the file is type re-exports and merge helpers first, then storage classes, then one large class whose second half is accessors in no particular order.

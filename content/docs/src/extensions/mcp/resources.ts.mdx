@@ -7,9 +7,9 @@ full: true
 
 MCP servers can offer resources: files, schemas and other context that is read by URI rather than called like a tool. This file turns them into three ordinary pi tools: `list_mcp_resources`, `list_mcp_resource_templates` and `read_mcp_resource`. The names and the JSON listing shape copy Codex and opencode on purpose, so models trained on those tools use them without instruction.
 
-The tools take a `server` argument and span every connected server that has resources, instead of one tool per server. Results are post-processed by helpers from [tools.ts](/docs/src/extensions/mcp/tools.ts): the same output limit and the same content conversion as normal MCP tool calls.
+The tools take a `server` argument and span every connected server that has resources, instead of one tool per server. Results are post-processed the same way as normal MCP tool calls: content conversion and the temp-file saver come from [tools.ts](/docs/src/extensions/mcp/tools.ts), and the output limit is `limitMcpContent` from the `@earendil-works/pi-mcp` package.
 
-The tool names are defined in [mcp-servers.ts](/docs/src/core/mcp-servers.ts), the definitions use the `ToolDefinition` type from [types.ts](/docs/src/core/extensions/types.ts), and [runtime.ts](/docs/src/extensions/mcp/runtime.ts) decides when to register them and supplies the connected servers.
+The tool names are defined in [mcp-servers.ts](/docs/src/core/mcp-servers.ts) and the definitions use the `ToolDefinition` type from [types.ts](/docs/src/core/extensions/types.ts). [index.ts](/docs/src/extensions/mcp/index.ts) registers them with the widest exposure among the servers that have resources (hidden when none do), and the connections in [runtime.ts](/docs/src/extensions/mcp/runtime.ts) implement the server interface below. Nothing is listed when a server connects; every listing here is fetched when the model asks.
 
 <Scrollycoding>
 
@@ -28,27 +28,15 @@ export interface McpResourceServer {
 	allResourceTemplates(options: McpRequestOptions): Promise<ResourceTemplate[]>;
 	readResource(uri: string, options: McpRequestOptions): Promise<ReadResourceResult>;
 }
-
-/** MCP App user interfaces, which only hosts that render them can use. */
-export function isMcpAppResource(item: { uri?: string; uriTemplate?: string; mimeType?: string }): boolean {
-	const uri = item.uri ?? item.uriTemplate ?? "";
-	return uri.startsWith("ui://") || /;\s*profile\s*=\s*"?mcp-app"?/i.test(item.mimeType ?? "");
-}
-
-/** A listed resource or template without `_meta` and icons, tagged with its server. */
-function listed<T extends { _meta?: unknown }>(server: string, item: T): Record<string, unknown> {
-	const { _meta, icons: _icons, ...rest } = item as T & { icons?: unknown };
-	return { server, ...rest };
-}
 ```
 
 ## !!steps Hiding MCP App interfaces
 
-Resources with a `ui://` URI or a `profile=mcp-app` MIME type are user interfaces for hosts that can render them. A text-only model cannot use them, so `isMcpAppResource` lets every listing filter them out. `listed` also drops `_meta` and icons and tags each item with its server name.
+Resources with a `ui://` URI or a `profile=mcp-app` MIME type are user interfaces for hosts that can render them. A text-only model cannot use them, so `isMcpAppResource` lets every listing filter them out. It is private now: the connection no longer lists resources up front, so this file is the only place that filters them. `listed` also drops `_meta` and icons and tags each item with its server name.
 
 ```ts ! resources.ts
 /** MCP App user interfaces, which only hosts that render them can use. */
-export function isMcpAppResource(item: { uri?: string; uriTemplate?: string; mimeType?: string }): boolean {
+function isMcpAppResource(item: { uri?: string; uriTemplate?: string; mimeType?: string }): boolean {
 	const uri = item.uri ?? item.uriTemplate ?? "";
 	// !mark
 	return uri.startsWith("ui://") || /;\s*profile\s*=\s*"?mcp-app"?/i.test(item.mimeType ?? "");
@@ -91,7 +79,7 @@ const READ_PARAMETERS = {
 
 ## !!steps Argument handling and the result wrapper
 
-`stringArgument` treats missing and null as absent, rejects non-strings, and trims. `jsonResult` sends the JSON text through `limitMcpContent`, so a huge listing is truncated for the model and the full text is saved to a temp file, while `structuredContent` keeps the whole payload for scripts.
+`stringArgument` treats missing and null as absent, rejects non-strings, and trims. `jsonResult` sends the JSON text through pi-mcp's `limitMcpContent` with `saveToTempFile` as the saver, so a huge listing is truncated for the model and the full text is saved to a temp file, while `structuredContent` keeps the whole payload for scripts.
 
 ```ts ! resources.ts
 function stringArgument(params: unknown, key: string): string | undefined {
@@ -111,8 +99,11 @@ async function jsonResult(
 	server: string | undefined,
 	payload: Record<string, unknown>,
 ): Promise<{ content: (TextContent | ImageContent)[]; details: McpToolDetails; structuredContent: JsonValue }> {
-	// !mark
-	const { content, fullOutputPath } = await limitMcpContent([{ type: "text", text: JSON.stringify(payload) }]);
+	// !mark(1:4)
+	const { content, fullOutputPath } = await limitMcpContent(
+		[{ type: "text", text: JSON.stringify(payload) }],
+		saveToTempFile,
+	);
 	return {
 		content,
 		details: { server: server ?? "", tool, ...(fullOutputPath ? { fullOutputPath } : {}) },
@@ -211,6 +202,7 @@ The two listing tools differ only in which methods they call and which key they 
 			const { content, fullOutputPath } = await limitMcpContent(
 				// !mark
 				converted.length > 0 ? converted : [{ type: "text", text: `Resource ${uri} is empty.` }],
+				saveToTempFile,
 			);
 			const contents = result.contents.map(({ _meta: _ignored, ...rest }) => rest);
 ```

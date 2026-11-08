@@ -1,13 +1,13 @@
 ---
 title: "source-resolver.ts"
-description: "A Node module-resolution hook that maps the workspace's tsconfig path aliases to TypeScript source, so experimental processes never load stale dist builds"
+description: "A Node module-resolution hook that maps the workspace's tsconfig path aliases to TypeScript source, so scripts, tests and pi-test run from source never load stale dist builds"
 source: "src/experimental/source-resolver.ts"
 full: true
 ---
 
 Node can run TypeScript directly by stripping types, but it ignores the `paths` aliases in `tsconfig.json`. In this monorepo the `@earendil-works/*` packages are imported by those aliases, so without help Node would resolve them through `node_modules` to built `dist` files, which may be out of date relative to the source being edited.
 
-This file is a preload module: it has no exports, and importing it with `node --import` installs a resolve hook as a side effect. It is experimental tooling. [process.ts](/docs/src/experimental/process.ts) adds `--import` for it whenever it spawns an internal process (such as [session-worker.ts](/docs/src/experimental/session-worker.ts)) from `.ts` source, several tests preload it, and the [vacation demo](/docs/src/experimental/vacation/README.md) documents the flag for running without a build.
+This file is a preload module: it has no exports, and importing it with `node --import` installs a resolve hook as a side effect. It is the last file left in `src/experimental` after the experimental server stack was removed, and it survives because it is build tooling rather than a feature. The package's `generate:schemas` and `generate:references` scripts run [generate-schemas.ts](/docs/scripts/generate-schemas.ts) and [generate-references.ts](/docs/scripts/generate-references.ts) with `--import` pointing at it, the tests that spawn a child Node process from `.ts` source preload it, and the monorepo's `pi-test.sh` and `pi-test.ps1` use it to run pi straight from source without a build.
 
 <Scrollycoding>
 
@@ -128,4 +128,4 @@ function resolveSourcePath(replacement: string): string | undefined {
 
 </Scrollycoding>
 
-The whole file is a side effect: nothing imports a function from it. Its consumers are [process.ts](/docs/src/experimental/process.ts), the tests, and people running the demos by hand. One structural note: the `.replace("*", wildcard)` call substitutes only the first `*` in a replacement, which matches the single-wildcard restriction enforced earlier.
+The whole file is a side effect: nothing imports a function from it. Its consumers are the schema and reference generators, the tests, and the `pi-test` launchers. One structural note: the `.replace("*", wildcard)` call substitutes only the first `*` in a replacement, which matches the single-wildcard restriction enforced earlier.

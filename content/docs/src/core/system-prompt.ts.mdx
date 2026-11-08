@@ -122,6 +122,8 @@ Because of the dedupe set, two tools that contribute the same sentence yield one
 
 Hidden tools are removed from `declaredTools` first, so they appear in neither the tool list nor the rule logic.
 
+The default wording was tightened: the persona is a single plain sentence, the note under the tool list says only that additional tools may be available, and the docs section is to be read only when the user asks about the harness itself, with one instruction to read the relevant docs in full before implementing harness changes.
+
 ```ts ! system-prompt.ts
 	for (const name of Object.keys(customSections)) {
 		if (!SYSTEM_PROMPT_SECTION_NAME.test(name) || name === "preamble") {
@@ -135,11 +137,11 @@ Hidden tools are removed from `declaredTools` first, so they appear in neither t
 		promptSections.preamble = customPrompt;
 	} else {
 		promptSections.preamble =
-			"You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+			"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
-		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
+		promptSections.tools = `${tools}\n\nAdditional tools may be available.`;
 		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
 ```
 

@@ -11,18 +11,23 @@ It is the largest utility here because it must cope with three archive layouts, 
 
 <Scrollycoding>
 
-## !!steps Tool table
+## !!steps Release targets and the tool table
 
-Each tool is described by its GitHub repo, binary name, tag prefix and a function that maps version, platform and architecture to the exact release asset name. The two tools differ in tag format (`v10.3.0` versus `14.1.0`) and in asset naming. `fd` also lists `fdfind`, the Debian package name, as an alternative system command.
+fd and ripgrep publish the same target suffixes, so `getReleaseTarget` maps Node's platform and architecture to one suffix for both. Only `x64` and `arm64` are mapped. Other architectures, such as 32-bit ARM or `ia32`, used to fall through to the x86-64 archive, which then could not run; now they get no target at all.
+
+Each tool is then described by its GitHub repo, binary name, tag prefix and a one-line function that joins version and target into the release asset name. The two tools differ in tag format (`v10.3.0` versus `14.1.0`) and in asset naming. `fd` also lists `fdfind`, the Debian package name, as an alternative system command.
 
 ```ts ! tools-manager.ts
-interface ToolConfig {
-	name: string;
-	repo: string; // GitHub repo (e.g., "sharkdp/fd")
-	binaryName: string; // Name of the binary inside the archive
-	systemBinaryNames?: string[]; // Alternative system command names to try before downloading
-	tagPrefix: string; // Prefix for tags (e.g., "v" for v1.0.0, "" for 1.0.0)
-	getAssetName: (version: string, plat: string, architecture: string) => string | null;
+// Map Node's platform/arch to the release target suffix shared by fd and ripgrep.
+// Only x64 and arm64 are mapped. Other architectures (e.g. ARM32 `arm`, `ia32`)
+// must not fall back to x86-64 binaries (#11209).
+function getReleaseTarget(plat: string, architecture: string): string | undefined {
+	const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : undefined;
+	if (!archStr) return undefined;
+	if (plat === "darwin") return `${archStr}-apple-darwin.tar.gz`;
+	if (plat === "linux") return `${archStr}-unknown-linux-musl.tar.gz`;
+	if (plat === "win32") return `${archStr}-pc-windows-msvc.zip`;
+	return undefined;
 }
 
 const TOOLS: Record<string, ToolConfig> = {
@@ -32,6 +37,16 @@ const TOOLS: Record<string, ToolConfig> = {
 		binaryName: "fd",
 		systemBinaryNames: ["fd", "fdfind"],
 		tagPrefix: "v",
+		getAssetName: (version, target) => `fd-v${version}-${target}`,
+	},
+	rg: {
+		name: "ripgrep",
+		repo: "BurntSushi/ripgrep",
+		binaryName: "rg",
+		tagPrefix: "",
+		getAssetName: (version, target) => `ripgrep-${version}-${target}`,
+	},
+};
 ```
 
 ## !!steps Finding an existing binary
@@ -63,7 +78,7 @@ export function getToolPath(tool: "fd" | "rg"): string | null {
 
 ## !!steps Resolving the latest version without the API
 
-Instead of the rate-limited GitHub API, it requests the `releases/latest` web page with `redirect: "manual"` and reads the `Location` header, which points at the tagged release. The comment explains why: anonymous API quota is exhausted behind shared proxies and CI runners. The body is cancelled so the connection can be reused.
+Instead of the rate-limited GitHub API, it requests the `releases/latest` web page with `redirect: "manual"` and reads the `Location` header, which points at the tagged release. The comment explains why: anonymous API quota is exhausted behind shared proxies and CI runners. The request identifies itself with the shared pi user agent from [pi-user-agent.ts](/docs/src/utils/pi-user-agent.ts). The body is cancelled so the connection can be reused.
 
 ```ts ! tools-manager.ts
 	const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
@@ -115,23 +130,22 @@ function extractZipArchive(archivePath: string, extractDir: string, assetName: s
 		failures.push(tarFailure);
 ```
 
-## !!steps Choosing a version and asset
+## !!steps Choosing a target, version and asset
 
-`fd` on macOS Intel is pinned to 10.3.0, skipping the network lookup, presumably because later releases dropped a prebuilt x64 macOS asset. If `getAssetName` returns null the platform is unsupported.
+The release target is resolved first, so an unsupported platform fails before any network request. `fd` on macOS Intel is pinned to 10.3.0, skipping the version lookup, presumably because later releases dropped a prebuilt x64 macOS asset. Since every mapped target exists for both tools, building the asset name can no longer fail.
 
 ```ts ! tools-manager.ts
 	const plat = platform();
 	const architecture = arch();
+	const target = getReleaseTarget(plat, architecture);
+	if (!target) {
+		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
+	}
 
 	// fd is pinned on darwin/x64, so skip the version lookup there.
 	const version =
 		tool === "fd" && plat === "darwin" && architecture === "x64" ? "10.3.0" : await getLatestVersion(config.repo);
-
-	// Get asset name for this platform
-	const assetName = config.getAssetName(version, plat, architecture);
-	if (!assetName) {
-		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
-	}
+	const assetName = config.getAssetName(version, target);
 ```
 
 ## !!steps Unique extraction directory
@@ -171,7 +185,7 @@ Archives differ: some nest under a folder named after the asset, some put the bi
 
 ## !!steps ensureTool and its guards
 
-`ensureTool` is the public entry point. If the tool exists it returns immediately. Otherwise it stops with a warning in offline mode, and on Android prints a `pkg install` hint because Linux binaries do not run against Bionic libc. Only then does it download. All outcomes are reported through the optional `onStatus` callback.
+`ensureTool` is the public entry point. If the tool exists it returns immediately. Otherwise it stops with a warning in offline mode, and on Android prints a `pkg install` hint because Linux binaries do not run against Bionic libc. On any other platform without a release target it warns that automatic download is unsupported and points to the system package manager, instead of downloading a binary that cannot run. Only then does it download. All outcomes are reported through the optional `onStatus` callback.
 
 ```ts ! tools-manager.ts
 	const existingPath = getToolPath(tool);
@@ -192,6 +206,15 @@ Archives differ: some nest under a folder named after the asset, some put the bi
 	if (platform() === "android") {
 		const pkgName = TERMUX_PACKAGES[tool] ?? tool;
 		onStatus?.({ type: "warning", message: `${config.name} not found. Install with: pkg install ${pkgName}` });
+		return undefined;
+	}
+
+	// Prebuilt downloads only exist for the targets mapped in getReleaseTarget.
+	if (!getReleaseTarget(platform(), arch())) {
+		onStatus?.({
+			type: "warning",
+			message: `${config.name} not found. Automatic download is not supported on ${platform()}/${arch()}. Install ${config.name} with your system package manager.`,
+		});
 		return undefined;
 	}
 ```
@@ -218,4 +241,4 @@ Node's `fetch` often fails with a bare "fetch failed" and keeps the useful reaso
 
 </Scrollycoding>
 
-Failure never throws out of `ensureTool`; it returns `undefined` and the tool code must degrade. Offline mode here is parsed locally (`1`, `true`, `yes`) while [version-check.ts](/docs/src/utils/version-check.ts) treats any non-empty `PI_OFFLINE` as offline, so the two disagree about values like `0` or `false`. No checksum or signature of the downloaded archive is verified.
+Failure never throws out of `ensureTool`; it returns `undefined` and the tool code must degrade. Offline mode here is parsed locally (`1`, `true`, `yes`), as in [package-manager.ts](/docs/src/core/package-manager.ts), while [version-check.ts](/docs/src/utils/version-check.ts) treats any non-empty `PI_OFFLINE` as offline and [model-runtime.ts](/docs/src/core/model-runtime.ts) any defined one, so they disagree about values like `0` or `false`. No checksum or signature of the downloaded archive is verified.

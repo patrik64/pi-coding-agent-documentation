@@ -45,9 +45,11 @@ export function isInstallTelemetryEnabled(
 
 </Scrollycoding>
 
-Within this package nothing else calls `isInstallTelemetryEnabled`; the
-install-telemetry sending code is not in this tree. The function appears to be
-unused here, though the setting it reads is defined by
-[settings-manager.ts](/docs/src/core/settings-manager.ts) and the session that
-holds the manager is [agent-session.ts](/docs/src/core/agent-session.ts). Its
-opt-out rule keeps the environment override in one place.
+Two callers consult it. `reportInstallTelemetry` in
+[interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) sends the
+one install ping to `pi.dev` only when it returns true (and `PI_OFFLINE` is
+unset). [client-identity.ts](/docs/src/core/client-identity.ts) uses the same
+answer to decide whether provider requests carry pi's attribution. The setting
+it reads is defined by
+[settings-manager.ts](/docs/src/core/settings-manager.ts). Keeping the opt-out
+rule here means `PI_TELEMETRY` switches off both the ping and the attribution.

@@ -1,0 +1,92 @@
+---
+title: "client-identity.ts"
+description: "Tells pi-ai how pi's provider requests identify themselves: a detailed User-Agent with pi's version, and attribution to pi only while install telemetry is on"
+source: "src/core/client-identity.ts"
+full: true
+---
+
+Several hosted providers want to know which client is calling, for app
+rankings, billing origin or request grouping. The coding agent used to build
+those headers itself, matching each model's provider and base URL. That logic
+now lives in pi-ai, which takes a `ClientIdentity` request option and turns it
+into a `User-Agent` plus per-provider attribution headers. What is left here is
+the coding agent's one decision: which identity to send.
+
+[sdk.ts](/docs/src/core/sdk.ts) calls `getClientIdentity` while building the
+options of every request, so the answer follows the current settings without
+rebuilding the session. The telemetry decision comes from
+[telemetry.ts](/docs/src/core/telemetry.ts), read through
+[settings-manager.ts](/docs/src/core/settings-manager.ts).
+
+<Scrollycoding>
+
+## !!steps A detailed User-Agent with pi's version
+
+`"detailed"` makes pi-ai send a `User-Agent` of the form
+`pi/VERSION (platform; runtime/version; arch)` to every provider. Without the
+`version` field pi-ai would fill in its own package version; passing `VERSION`
+from [config.ts](/docs/src/config.ts) makes the header name the coding agent
+release the user actually runs.
+
+The User-Agent is sent regardless of telemetry. It replaces the old
+per-provider special case that gave Cloudflare a fixed `pi-coding-agent`
+User-Agent.
+
+```ts ! client-identity.ts
+import { type ClientIdentity, PI_ATTRIBUTION } from "@earendil-works/pi-ai";
+import { VERSION } from "../config.ts";
+// ...
+export function getClientIdentity(settingsManager: SettingsManager): ClientIdentity {
+	return {
+		// !mark(1:2)
+		userAgent: "detailed",
+		version: VERSION,
+// ...
+	};
+}
+```
+
+## !!steps Attribution only while install telemetry is on
+
+`PI_ATTRIBUTION` is pi-ai's constant for pi: name `pi`, URL `https://pi.dev`
+and the category `cli-agent`. pi-ai maps it to each provider's headers:
+OpenRouter gets `HTTP-Referer`, `X-OpenRouter-Title` and
+`X-OpenRouter-Categories`, NVIDIA NIM gets `X-BILLING-INVOKE-ORIGIN: Pi`, and
+OpenCode gets `x-opencode-client: pi`. Providers are recognized by id or base
+URL, so a custom provider pointed at one of these endpoints is attributed too.
+Other providers get nothing.
+
+The value is `null`, not an absent field, when telemetry is off. pi-ai merges
+identities field by field and skips undefined fields, and pi-agent-core's
+default identity attributes requests to pi, so only an explicit `null` turns
+attribution off. The `PI_TELEMETRY` environment variable overrides the saved
+setting, as described in [telemetry.ts](/docs/src/core/telemetry.ts).
+
+OpenCode's `x-opencode-session` header is not attribution and is not gated
+here; [model-runtime.ts](/docs/src/core/model-runtime.ts) adds it to OpenCode
+requests that carry a session id. Headers configured on a model or provider,
+and anything a `before_provider_headers` extension handler returns, still win
+over the identity's defaults.
+
+```ts ! client-identity.ts
+import { isInstallTelemetryEnabled } from "./telemetry.ts";
+
+/**
+ * How pi's requests identify it to providers: a detailed `User-Agent` with pi's version, and attribution to pi as a
+ * CLI agent while install telemetry is enabled.
+ */
+export function getClientIdentity(settingsManager: SettingsManager): ClientIdentity {
+	return {
+		userAgent: "detailed",
+		version: VERSION,
+		// !mark
+		attribution: isInstallTelemetryEnabled(settingsManager) ? PI_ATTRIBUTION : null,
+	};
+}
+```
+
+</Scrollycoding>
+
+The returned object is plain JSON with no provider knowledge, so adding or
+changing an attributed provider is now a pi-ai change; this file only changes
+if pi's policy for when to identify itself does.

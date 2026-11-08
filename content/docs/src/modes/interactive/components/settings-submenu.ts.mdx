@@ -134,7 +134,7 @@ The list shows at most 10 rows. Preselection and the optional selection-change c
 
 ## !!steps Filter and input routing
 
-Filtering matches against label plus description and builds a fresh list with no preselection. In search mode, navigation keys go to the list, everything else to the input.
+Filtering matches against label plus description and builds a fresh list with no preselection. In search mode, navigation keys (including the selection page keys, which the list now handles) go to the list, everything else to the input.
 
 ```ts ! settings-submenu.ts
 	private applyFilter(query: string): void {
@@ -156,6 +156,8 @@ Filtering matches against label plus description and builds a fresh list with no
 			const isNav =
 				kb.matches(data, "tui.select.up") ||
 				kb.matches(data, "tui.select.down") ||
+				kb.matches(data, "tui.select.pageUp") ||
+				kb.matches(data, "tui.select.pageDown") ||
 				kb.matches(data, "tui.select.confirm") ||
 				kb.matches(data, "tui.select.cancel");
 			if (isNav) {

@@ -7,7 +7,7 @@ full: true
 
 `clipboard.ts` provides `copyToClipboard`, `readClipboardText` and `readClipboardFilePaths`. Clipboards differ wildly between macOS, Windows, Linux with Wayland or X11, Termux, WSL, containers and SSH sessions, so the file is mostly an ordered list of strategies.
 
-Process execution goes through [clipboard-command.ts](/docs/src/utils/clipboard-command.ts) and WSL detection through [wsl.ts](/docs/src/utils/wsl.ts). Images are handled separately by [clipboard-image.ts](/docs/src/utils/clipboard-image.ts). The TUI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) consumes all three functions.
+Process execution goes through [clipboard-command.ts](/docs/src/utils/clipboard-command.ts), which also keeps helpers such as `wl-copy` out of pi's process group, and WSL detection through [wsl.ts](/docs/src/utils/wsl.ts). Images are handled separately by [clipboard-image.ts](/docs/src/utils/clipboard-image.ts). The TUI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) consumes all three functions.
 
 <Scrollycoding>
 
@@ -15,12 +15,19 @@ Process execution goes through [clipboard-command.ts](/docs/src/utils/clipboard-
 
 OSC 52 is a terminal escape that asks the terminal emulator to set its own clipboard, which works across SSH. `emitOsc52` base64-encodes the text and refuses anything over 100,000 encoded characters. `isRemoteSession` looks for SSH or mosh environment variables.
 
+Some remote setups leave no such marker, for example attaching to a tmux or screen session started elsewhere, or a terminal inside an IDE's remote daemon. For those, `PI_CLIPBOARD_OSC52=1` makes pi treat the session as remote, so every copy also goes out as OSC 52.
+
 ```ts ! clipboard.ts
 const MAX_OSC52_ENCODED_LENGTH = 100_000;
 
+/**
+ * Remote sessions also emit OSC 52 so the client terminal receives the copy. PI_CLIPBOARD_OSC52=1
+ * covers remote clients that leave no SSH markers, such as multiplexer attaches (#10114, #10835)
+ * or IDE daemons (#10826).
+ */
 // !mark(1:3)
 function isRemoteSession(env: NodeJS.ProcessEnv): boolean {
-	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION);
+	return Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.MOSH_CONNECTION || env.PI_CLIPBOARD_OSC52 === "1");
 }
 
 function emitOsc52(text: string): boolean {
@@ -75,23 +82,24 @@ Any failure returns false. The `finally` block always tries to delete the file, 
 
 ## !!steps Reading text
 
-On Linux the function tries tools in order: Termux, `wl-paste` under Wayland, then `xclip` and `xsel` under X11. A tool that runs returns its result (or null if empty); only a failed tool moves on. Everything else falls back to the native clipboard from `pi-tui`.
+The function builds a list of tools and tries them in order: `termux-clipboard-get` whenever `TERMUX_VERSION` is set, then on Linux `wl-paste` under Wayland and `xclip` and `xsel` under X11. The Termux check used to sit inside the Linux branch, but Node on Termux reports the platform as `android`, so it never ran; it is now checked on any platform. A tool that runs returns its result (or null if empty); only a failed tool moves on. If none ran, the native clipboard from `pi-tui` is the fallback.
 
 ```ts ! clipboard.ts
 export async function readClipboardText(): Promise<string | null> {
+	const commands: [string, string[]][] = [];
+	// Termux reports platform "android", not "linux" (#10391).
+	// !mark
+	if (process.env.TERMUX_VERSION) commands.push(["termux-clipboard-get", []]);
 	if (platform() === "linux") {
-		const commands: [string, string[]][] = [];
-		// !mark(1:3)
-		if (process.env.TERMUX_VERSION) commands.push(["termux-clipboard-get", []]);
 		if (process.env.WAYLAND_DISPLAY) commands.push(["wl-paste", ["--no-newline", "--type", "text"]]);
 		if (process.env.DISPLAY) {
 			commands.push(["xclip", ["-selection", "clipboard", "-out"]], ["xsel", ["--clipboard", "--output"]]);
 		}
-		for (const [command, args] of commands) {
-			const bytes = await runClipboardCommand(command, args, { timeoutMs: 5000 });
-			// !mark
-			if (bytes !== undefined) return bytes.toString("utf8") || null;
-		}
+	}
+	for (const [command, args] of commands) {
+		const bytes = await runClipboardCommand(command, args, { timeoutMs: 5000 });
+		// !mark
+		if (bytes !== undefined) return bytes.toString("utf8") || null;
 	}
 	try {
 		return (await getNativeClipboard()?.getText()) || null;
@@ -115,7 +123,7 @@ export async function readClipboardFilePaths(): Promise<string[] | null> {
 
 ## !!steps Direct writes first
 
-`copyToClipboard` starts with the native writer on every platform except Linux, where tools keep ownership of the selection after returning. If that is unavailable it runs a platform command such as `pbcopy`, `clip`, `wl-copy`, `xclip` or `xsel`, feeding the text on stdin.
+`copyToClipboard` starts with the native writer on every platform except Linux, where tools keep ownership of the selection after returning. If that is unavailable it runs a platform command such as `pbcopy`, `clip`, `wl-copy`, `xclip` or `xsel`, feeding the text on stdin. The final `else` covers every other platform, so Termux on `android` reaches `termux-clipboard-set` here.
 
 ```ts ! clipboard.ts
 export async function copyToClipboard(text: string): Promise<void> {
@@ -185,17 +193,17 @@ Under WSL, Windows Terminal sessions prefer OSC 52, otherwise PowerShell is used
 
 ## !!steps Error messages
 
-If nothing worked, an oversized message gets a specific error. On Linux the message names the package to install based on the session type; otherwise a generic error is thrown.
+If nothing worked, an oversized message gets a specific error. Termux gets its install hint on any platform, for the same `android` reason as above. On Linux the message names the package to install based on the session type; otherwise a generic error is thrown.
 
 ```ts ! clipboard.ts
 	if (copied) return;
 	// !mark
 	if (oversized) throw new Error("Clipboard unavailable: text exceeds the OSC 52 size limit");
+	// !mark(1:3)
+	if (env.TERMUX_VERSION) {
+		throw new Error("Clipboard unavailable: install the Termux:API app and `termux-api` package");
+	}
 	if (p === "linux") {
-		// !mark(1:3)
-		if (env.TERMUX_VERSION) {
-			throw new Error("Clipboard unavailable: install the Termux:API app and `termux-api` package");
-		}
 		if (env.WAYLAND_DISPLAY) {
 			throw new Error("Clipboard unavailable: install `wl-clipboard` (`wl-copy`) or check Wayland access");
 		}

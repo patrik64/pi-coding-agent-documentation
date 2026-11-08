@@ -1,6 +1,6 @@
 ---
 title: "edit.ts"
-description: "The edit tool: applies several exact-text replacements to one file, with tolerant argument parsing, BOM and line-ending preservation, and a diff in the result"
+description: "The edit tool: applies several exact-text replacements to one file, with tolerant argument parsing, BOM and per-line line-ending preservation, and a diff computed before the write"
 source: "src/core/tools/edit.ts"
 full: true
 ---
@@ -41,16 +41,14 @@ const editSchema = Type.Object(
 
 ## !!steps Guidelines for the system prompt
 
-These four strings are merged into the system prompt along with the other tools. They encourage one call with several `edits[]` entries over several calls, and small unique `oldText` over padded context. See [system-prompt.ts](/docs/src/core/system-prompt.ts).
+These two strings are merged into the system prompt along with the other tools. They ask for one call per file with several `edits[]` entries rather than several calls, and for short, unique, non-overlapping `oldText` without padded context. See [system-prompt.ts](/docs/src/core/system-prompt.ts).
 
 ```ts ! edit.ts
 export const editToolSystemPromptContribution = {
 	snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
 	guidelines: [
-		"Use edit for precise changes (edits[].oldText must match exactly)",
-		"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+		"Use edit for targeted changes. Batch changes to one file in a single call.",
+		"Each edits[].oldText must exactly and uniquely match the original file. Keep matches short and non-overlapping; merge nearby changes without including large unchanged regions.",
 	],
 } as const;
 ```
@@ -156,11 +154,11 @@ The access failure is rewritten into a short message with the error code, such a
 				throwIfAborted();
 ```
 
-## !!steps BOM, line endings and applying the edits
+## !!steps BOM, matching and diffing before the write
 
-The file is read as UTF-8, and a leading BOM is split off with `splitBom` from [text.ts](/docs/src/utils/text.ts), because the model will never include an invisible BOM in `oldText`. The dominant line ending is detected, the text is normalized to LF, and the edits are applied to that normalized text.
+The file is read as UTF-8, and a leading BOM is split off with `splitBom` from [text.ts](/docs/src/utils/text.ts), because the model will never include an invisible BOM in `oldText`. The text is normalized to LF and the edits are applied to that normalized text, which also returns the list of replacements made.
 
-On the way out the line endings are restored and the BOM is put back, so editing a CRLF file with a BOM does not rewrite its encoding conventions.
+The diff is computed next, before anything is written. `generateEditDiff` diffs only a window around each replacement, so a two-line edit of a huge file no longer needs memory proportional to the file, and if diffing does fail the file is still unchanged. Earlier versions wrote first and diffed the whole file afterwards, which could crash after the edit was already on disk.
 
 ```ts ! edit.ts
 				// Read the file.
@@ -170,23 +168,35 @@ On the way out the line endings are restored and the BOM is put back, so editing
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = splitBom(rawContent);
-				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
+					normalizedContent,
+					edits,
+					path,
+				);
+				// Diff before writing, so diff computation cannot fail after the write.
+				const editDiff = generateEditDiff(path, baseContent, newContent, replacements);
 				throwIfAborted();
+```
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+## !!steps Writing with the original line endings
+
+When the file contains no CR at all, the normalized result is already the final text. Otherwise the replacements are spliced into the original text with `applyReplacementsToOriginal`, so every untouched line keeps its own line ending and only the new lines take the ending of the line they replace. The tool used to detect one line ending from the first line break and rewrite the whole file with it, which converted the other lines of mixed-ending files. The BOM is put back in front either way.
+
+```ts ! edit.ts
+				// Splice into the original text, so untouched lines keep their line endings. Without any CR
+				// the original is the normalized text, and the normalized result is already final.
+				const finalContent =
+					bom + (content === normalizedContent ? newContent : applyReplacementsToOriginal(content, replacements));
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 ```
 
 ## !!steps The result: message, diff and patch
 
-Two representations of the change are produced. `generateDiffString` is the display diff with line numbers and limited context, and `generateUnifiedPatch` is a standard patch. `firstChangedLine` lets an editor-like UI jump to the change. The message to the model only reports how many blocks were replaced; it does not echo the diff.
+The `EditDiff` from the earlier step becomes `details` as is: a display diff with line numbers and limited context, a standard unified patch, and `firstChangedLine` so an editor-like UI can jump to the change. The message to the model only reports how many blocks were replaced; it does not echo the diff.
 
 ```ts ! edit.ts
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				return {
 					content: [
 						{
@@ -194,7 +204,7 @@ Two representations of the change are produced. `generateDiffString` is the disp
 							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
 						},
 					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					details: editDiff,
 				};
 			});
 		},
@@ -208,3 +218,5 @@ Two representations of the change are produced. `generateDiffString` is the disp
 The tool is registered by [index.ts](/docs/src/core/tools/index.ts) and displayed by the edit renderer in [edit.ts](/docs/src/core/tools/renderers/edit.ts), which also uses the diff helpers to preview changes before execution. The model-facing contract is deliberately strict: no match, several matches, overlapping edits and no-op edits are all errors raised in edit-diff.ts.
 
 Structurally, `validateEditInput` only checks that `edits` is a non-empty array; the types of each entry are trusted from the schema. The constant `EditToolDetails` documents `diff` as display-oriented and `patch` as standard, which is the split the renderers rely on.
+
+The final `throwIfAborted()` runs after `writeFile` has succeeded, so an abort that lands during the write reports `Operation aborted` even though the edit is on disk.

@@ -1,0 +1,157 @@
+---
+title: "generate-schemas.ts"
+description: "Build script that serializes the TypeBox schemas for models.json, settings.json, keybindings.json and theme files into the published JSON Schema files, sharing repeated subschemas through $defs"
+source: "scripts/generate-schemas.ts"
+full: true
+---
+
+pi publishes JSON Schemas for its four user-edited configuration files: `models.json`, `settings.json`, `keybindings.json` and theme files. They live in the package's `schemas/` directory and are served from `https://pi.dev/schemas/`, so a file can name its schema in `$schema` and get completion and validation in an editor. The schemas are not written by hand. This script imports the schemas pi itself uses, from [model-config.ts](/docs/src/core/model-config.ts), [settings-schema.ts](/docs/src/core/settings-schema.ts), [keybindings-schema.ts](/docs/src/core/keybindings-schema.ts) and [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts), plus a few of pi-ai's model and compatibility schemas, and writes each one out as JSON.
+
+It runs through `npm run generate:schemas`. `test/config-schemas.test.ts` calls `renderConfigSchemas` and fails when a committed file differs from what the code would generate, so a schema change cannot ship without regenerating the files. Its sibling [generate-references.ts](/docs/scripts/generate-references.ts) renders Markdown reference pages from the same schemas.
+
+<Scrollycoding>
+
+## !!steps Four artifacts
+
+Each artifact names its output file, its root schema and, optionally, a set of definitions. A definition is a subschema that appears many times once the root is expanded. A color value appears under each of the 57 theme tokens, the key id union under each of about ninety keybinding actions, and pi-ai's cost, input limit, prompt cache and compatibility schemas wherever `models.json` uses them. Without definitions, each of those subtrees would be repeated in full at every use.
+
+```ts ! generate-schemas.ts
+const packageDirectory = fileURLToPath(new URL("..", import.meta.url));
+const schemaBaseUrl = "https://pi.dev/schemas";
+const schemaDraft = "https://json-schema.org/draft/2020-12/schema";
+const generatedComment =
+	"This file is generated from TypeScript source. Do not edit it manually; run npm run generate:schemas.";
+
+interface SchemaArtifact {
+	filename: `${string}.schema.json`;
+	schema: TSchema;
+	definitions?: Readonly<Record<string, TSchema>>;
+}
+
+const schemaArtifacts: readonly SchemaArtifact[] = [
+	{
+		filename: "models.schema.json",
+		schema: ModelsConfigSchema,
+		definitions: {
+			ModelCost: ModelCostSchema,
+			ModelInputLimits: ModelInputLimitsSchema,
+			ModelPromptCache: ModelPromptCacheSchema,
+			ProviderCompat: ProviderCompatSchema,
+			ThinkingLevelMap: ThinkingLevelMapSchema,
+		},
+	},
+// ...
+	{
+		filename: "theme.schema.json",
+		schema: ThemeJsonSchema,
+		// !mark
+		definitions: { ColorValue: ColorValueSchema },
+	},
+];
+```
+
+## !!steps Annotations versus shape
+
+Some JSON Schema keywords only describe a value and do not change what validates: `description`, `default`, `title`, `examples`, `deprecated` and the read and write flags. `splitAnnotations` separates those from the rest of a schema object. The remaining shape is what decides whether two subschemas are the same schema, even when each use carries a different description.
+
+```ts ! generate-schemas.ts
+const schemaAnnotationKeys = new Set([
+	"default",
+	"deprecated",
+	"description",
+	"examples",
+	"readOnly",
+	"title",
+	"writeOnly",
+]);
+
+function splitAnnotations(schema: object): {
+	shape: Record<string, unknown>;
+	annotations: Record<string, unknown>;
+} {
+	const shape: Record<string, unknown> = {};
+	const annotations: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema)) {
+		// !mark
+		(schemaAnnotationKeys.has(key) ? annotations : shape)[key] = value;
+	}
+	return { shape, annotations };
+}
+```
+
+## !!steps Replacing repeats with references
+
+`addDefinitions` walks the whole schema. Wherever an object's shape serializes to the same JSON as a definition's shape, it is replaced by a `$ref` to that definition plus the object's own annotations. Each theme token therefore keeps its description while pointing at one shared `ColorValue`. The comparison uses `JSON.stringify`, so key order counts, which works because both sides come from the same builder function.
+
+Definitions are compacted too, excluding themselves so a definition does not turn into a reference to itself. Two mistakes fail loudly: a definition name that is not a valid identifier, and a definition that nothing referenced. The second catches a schema change that altered a shape so it no longer matches, which would otherwise quietly inline every copy again.
+
+```ts ! generate-schemas.ts
+	const referencedDefinitions = new Set<string>();
+	const replaceDefinitions = (value: unknown, excludedName?: string): unknown => {
+		if (Array.isArray(value)) return value.map((item) => replaceDefinitions(item, excludedName));
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+
+		const { shape, annotations } = splitAnnotations(value);
+		const shapeKey = JSON.stringify(shape);
+		const match = preparedDefinitions.find(
+			(definition) => definition.name !== excludedName && definition.shapeKey === shapeKey,
+		);
+		// !mark(1:4)
+		if (match) {
+			referencedDefinitions.add(match.name);
+			return { $ref: `#/$defs/${match.name}`, ...annotations };
+		}
+
+		return Object.fromEntries(
+			Object.entries(value).map(([key, child]) => [
+				key,
+				schemaAnnotationKeys.has(key) ? child : replaceDefinitions(child, excludedName),
+			]),
+		);
+	};
+// ...
+	if (unusedDefinitions.length > 0) {
+		throw new Error(`Unused schema definitions: ${unusedDefinitions.join(", ")}`);
+	}
+	return { ...compactSchema, $defs: compactDefinitions };
+```
+
+## !!steps Serializing and writing
+
+Each file gets three keys in front of the schema: `$schema` names JSON Schema draft 2020-12, `$id` is the public pi.dev URL, and `$comment` says the file is generated. The public URL is a constant separate from the output path, so where the files are served does not depend on where they are written.
+
+Rendering returns a map of paths to file contents and does not touch the disk, which lets the test compare in memory. Writing happens only when the file is run directly, as the final guard checks.
+
+```ts ! generate-schemas.ts
+function serializeSchema(artifact: SchemaArtifact): string {
+	const schema = artifact.definitions ? addDefinitions(artifact.schema, artifact.definitions) : artifact.schema;
+	return `${JSON.stringify(
+		{
+			$schema: schemaDraft,
+			$id: `${schemaBaseUrl}/${artifact.filename}`,
+			$comment: generatedComment,
+			...schema,
+		},
+		null,
+		2,
+	)}\n`;
+}
+
+// !mark(1:8)
+export function renderConfigSchemas(): ReadonlyMap<string, string> {
+	const rendered = new Map<string, string>();
+	for (const artifact of schemaArtifacts) {
+		const content = serializeSchema(artifact);
+		rendered.set(`schemas/${artifact.filename}`, content);
+	}
+	return rendered;
+}
+// ...
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	generateSchemas();
+}
+```
+
+</Scrollycoding>
+
+The script relies on the source schemas being plain JSON Schema objects. pi's own schemas are built with TypeBox and pi-ai's with pi-schema, and both are serialized directly with `JSON.stringify`, so anything a schema expresses outside JSON Schema would not survive. The npm script preloads the package's source resolver, which maps the workspace `@earendil-works/*` imports to their TypeScript sources, so the script reads current schemas rather than stale build output.

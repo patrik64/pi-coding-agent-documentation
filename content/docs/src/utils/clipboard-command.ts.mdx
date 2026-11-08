@@ -1,6 +1,6 @@
 ---
 title: "clipboard-command.ts"
-description: "Runs a clipboard helper process with timeout, size limit and no retained pipes"
+description: "Runs a clipboard helper process with timeout, size limit, no retained pipes, and outside pi's process group and directory"
 source: "src/utils/clipboard-command.ts"
 full: true
 ---
@@ -15,6 +15,8 @@ It is shared by [clipboard.ts](/docs/src/utils/clipboard.ts) for text and [clipb
 
 The doc comment states the contract: `undefined` means failure. The child is spawned with stdin as a pipe, stdout piped only when no input is being written, and stderr ignored. Clipboard writers such as `xclip` can daemonize, so giving them output pipes would keep the parent waiting on them.
 
+Two more options came from bug reports. On POSIX the child is `detached`, which puts it in its own process group: a daemonized clipboard owner left in pi's group was stopped along with pi when the user pressed Ctrl+Z, and the clipboard stopped answering. And the child runs from `/` (the drive root on Windows). Clipboard tools ignore the working directory, and under WSL `powershell.exe` cannot start at all when it is a `\\wsl.localhost\...` path longer than the Windows path limit; it also stops a long-lived daemon from pinning pi's directory.
+
 ```ts ! clipboard-command.ts
 /** Undefined means the command failed; an empty buffer is a successful result. */
 export function runClipboardCommand(
@@ -24,9 +26,16 @@ export function runClipboardCommand(
 ): Promise<Buffer | undefined> {
 	return new Promise((resolve) => {
 		// Clipboard writers can daemonize. Do not give them output pipes to retain.
+		// Detach on POSIX so the daemon leaves pi's process group and Ctrl+Z suspend
+		// (SIGTSTP to the group) does not stop the clipboard owner (#11179).
+		// Run from / (the current drive root on Windows): clipboard tools ignore the cwd, and WSL cannot start
+		// Windows executables (powershell.exe) when the cwd's \\wsl.localhost\... path
+		// exceeds MAX_PATH (#11592). This also keeps daemons from pinning pi's cwd.
 		const child = spawn(command, args, {
-			// !mark
+			// !mark(1:3)
 			stdio: ["pipe", options?.input === undefined ? "pipe" : "ignore", "ignore"],
+			cwd: "/",
+			detached: process.platform !== "win32",
 			windowsHide: true,
 		});
 ```

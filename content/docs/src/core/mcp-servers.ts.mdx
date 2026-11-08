@@ -1,13 +1,15 @@
 ---
 title: "mcp-servers.ts"
-description: "MCP server config types, validation, tool-exposure rules and the registry of servers that extensions register"
+description: "pi's fields on top of the shared mcpServers config shape from pi-mcp, their validation, tool-exposure rules and the registry of servers that extensions register"
 source: "src/core/mcp-servers.ts"
 full: true
 ---
 
 pi supports MCP servers either from `mcp.json` or registered at runtime by extensions through `pi.registerMcpServer()`. The core deliberately does very little with them: this file defines the config shapes, validates raw entries, answers questions about tool names and exposure, and stores registrations. Actually connecting is left to the MCP extension under [extensions/mcp](/docs/src/extensions/mcp/index.ts) or any extension that listens for `mcp_servers_change`.
 
-The part worth reading carefully is the exposure model, which decides whether a server's tools are shown to the model directly, deferred behind a search tool, hidden, or reachable only from codemode scripts. The registry connects to the extension runner in [runner.ts](/docs/src/core/extensions/runner.ts).
+The standard `mcpServers` shape (stdio and HTTP fields, `oauth`, `enabled`, `description`, `timeout`) and its validation moved into the `@earendil-works/pi-mcp` package, together with the namespace and tool-name helpers. What stays here is what only pi has: the exposure model, which decides whether a server's tools are shown to the model directly, deferred behind a search tool, hidden, or reachable only from codemode scripts; the `auth.provider` field; and the rule for which OAuth callbacks pi's Client ID Metadata Documents cover.
+
+Validation is used by [config.ts](/docs/src/extensions/mcp/config.ts), [cli.ts](/docs/src/extensions/mcp/cli.ts) and the extension [loader.ts](/docs/src/core/extensions/loader.ts); the tool-name helpers by [agent-session.ts](/docs/src/core/agent-session.ts) and [sdk.ts](/docs/src/core/sdk.ts); and [radius-mcp.ts](/docs/src/core/radius-mcp.ts) builds an `McpHttpServerConfig`. The registry connects to the extension runner in [runner.ts](/docs/src/core/extensions/runner.ts).
 
 <Scrollycoding>
 
@@ -85,13 +87,24 @@ const MCP_EXPOSURES: readonly string[] = ["codemode", "deferred", "direct", "hid
 const MCP_EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = { "codemode-deferred": "codemode" };
 ```
 
-## !!steps The shared config fields
+## !!steps pi's fields on top of pi-mcp's
 
-Fields common to every server: exposure, a one-sentence description used in the system prompt and tool ranking, per-tool overrides, an `enabled` switch, and a request timeout in seconds with a default of 60.
+The `mcpServers` shape itself now belongs to the `@earendil-works/pi-mcp` package, so other applications read the same entries the same way. pi imports its types and validator under `...Fields` aliases and adds only what is pi-specific.
 
-`toolExposure` resolution is documented in the comment: an exact name beats patterns, and among patterns the first in object order wins. Setting the server to `hidden` and then overriding a few tools is the way to expose only those.
+`McpServerConfigBase` holds those additions: the exposure, per-tool overrides, and two shared fields (`description`, `timeout`) declared again so pi's generated documentation can describe how pi uses them. `toolExposure` resolution is documented in the comment: an exact name beats patterns, and among patterns the first in object order wins. Setting the server to `hidden` and then overriding a few tools is the way to expose only those. `enabled` is no longer listed here because it is one of pi-mcp's shared fields.
 
 ```ts ! mcp-servers.ts
+import {
+	type McpHttpServerConfig as McpHttpServerFields,
+	type McpOAuthConfig as McpOAuthFields,
+	type McpStdioServerConfig as McpStdioServerFields,
+	validateMcpServerConfig as validateMcpServerFields,
+} from "@earendil-works/pi-mcp";
+// ...
+/**
+ * pi's fields of every server entry, beside the shared `mcpServers` fields of pi-mcp. `description`
+ * and `timeout` are shared fields, declared again for pi's documentation.
+ */
 interface McpServerConfigBase {
 	/** Default: `codemode`. */
 	// !mark
@@ -109,9 +122,6 @@ interface McpServerConfigBase {
 	 */
 	// !mark
 	toolExposure?: Record<string, McpExposure>;
-	/** Set to false to keep the entry without connecting. Default: true. */
-	enabled?: boolean;
-	// !mark
 	/** Per-request timeout in seconds. Progress notifications from the server reset it. Default: 60. */
 	timeout?: number;
 }
@@ -119,25 +129,23 @@ interface McpServerConfigBase {
 
 ## !!steps Stdio and HTTP server shapes
 
-A stdio server needs a `command`, with optional args, an `env` whose values may be `${NAME}` references or `!cmd` commands, and a working directory. An HTTP server needs a `url` plus headers, optional OAuth and an optional `auth` that reuses a pi provider login.
+Each server type extends both pi-mcp's fields (`command` and `args`, or `url`) and pi's base. The redeclared `env`, `cwd` and `headers` fields add pi's notes: values may be `${NAME}` references or `!cmd` commands, and a relative `cwd` resolves against the session directory. `oauth` is narrowed to pi's documented `McpOAuthConfig`.
 
-The `auth` comment is a security rule: it sends a credential to the URL, so it is forbidden in project `mcp.json` files and requires https unless the host is loopback.
+`auth` is pi's own field and a security rule: it sends a pi provider's credential to the URL, so it is forbidden in project `mcp.json` files and requires https unless the host is loopback.
 
 ```ts ! mcp-servers.ts
-export interface McpStdioServerConfig extends McpServerConfigBase {
-	// !mark(1:2)
-	type?: "stdio";
-	command: string;
-	args?: string[];
+// !mark
+export interface McpStdioServerConfig extends McpStdioServerFields, McpServerConfigBase {
+	// Shared fields, declared again for pi's documentation.
 	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
 	env?: Record<string, string>;
 	/** Relative paths resolve against the session working directory. */
 	cwd?: string;
 }
 // ...
-export interface McpHttpServerConfig extends McpServerConfigBase {
-	type?: "http";
-	url: string;
+// !mark
+export interface McpHttpServerConfig extends McpHttpServerFields, McpServerConfigBase {
+	// `headers` is shared, declared again for pi's documentation; `oauth` narrows to pi's documented type.
 	/** Values may reference environment variables (`${NAME}`) or commands (`!cmd`). */
 	headers?: Record<string, string>;
 	oauth?: McpOAuthConfig;
@@ -152,110 +160,46 @@ export interface McpHttpServerConfig extends McpServerConfigBase {
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
 ```
 
-## !!steps OAuth client settings
+## !!steps OAuth client settings and pi's metadata documents
 
-`McpOAuthConfig` covers servers that do not support dynamic client registration. Without `clientId`, pi registers itself. `callbackPort` and `callbackUrl` control the loopback redirect, and `clientRegistration` can switch from dynamic registration to a client ID metadata document. `authServerMetadataUrl` overrides discovery when a server advertises the wrong authorization server.
+`McpOAuthConfig` keeps the shared fields from pi-mcp (`clientId`, `callbackPort`, `callbackUrl`, `scope`, `authServerMetadataUrl`) and redeclares the three whose documentation is pi-specific.
+
+`clientRegistration` now defaults to `auto`: pi identifies itself with its Client ID Metadata Document on pi.dev when the authorization server supports that for public clients, and falls back to dynamic client registration otherwise. A custom `clientName` or a callback the documents do not list forces dynamic registration.
+
+`isClientMetadataDocumentCallback` encodes which callbacks the documents on pi.dev list: path `/callback` on localhost or 127.0.0.1, on any port. Validation below uses it, and [oauth.ts](/docs/src/extensions/mcp/oauth.ts) hands it to pi-mcp as the documents' `listsRedirectUrl` check.
 
 ```ts ! mcp-servers.ts
 /** OAuth client settings for servers that do not support dynamic client registration. */
-export interface McpOAuthConfig {
-	/** Pre-registered client id. Without it, pi registers a client with the authorization server. */
-	clientId?: string;
+export interface McpOAuthConfig extends McpOAuthFields {
+	// Shared fields, declared again for pi's documentation.
 	/** May reference environment variables (`${NAME}`) or commands (`!cmd`). */
 	clientSecret?: string;
-	/**
-	 * Port of the loopback callback server, for clients registered with a fixed redirect URI. Without
-	 * `callbackUrl`, the redirect URI is `http://127.0.0.1:<port>/callback`.
-	// !mark(1:2)
-	 */
-	callbackPort?: number;
-	/**
-	 * Redirect URI registered for `clientId`, for example `http://localhost:8080/oauth/callback`. It must
-	 * be an `http` URI on `localhost`, `127.0.0.1`, or `[::1]`. Without a port, the callback server
-	 * listens on `callbackPort` or a free port, which is added to the URI (RFC 8252).
-	 */
-	// !mark
-	callbackUrl?: string;
-	/** Scopes to request, separated by spaces. Default: the scopes the server advertises. */
-	scope?: string;
 	/**
 	 * `client_name` sent with dynamic client registration, for servers that only accept known clients.
 	 * Default: `pi`.
 	 */
 	clientName?: string;
 	/**
-	 * How pi identifies itself without `clientId`. `dcr` (default): dynamic client registration. `cimd`:
-	 * pi's Client ID Metadata Document on pi.dev, for authorization servers that allow pi by that URL. The
-	 * server must support it for public clients, and the callback must use the default path `/callback`.
+	 * How pi identifies itself without `clientId`. `auto` (default): pi's Client ID Metadata Document on
+	 * pi.dev when the authorization server supports it for public clients, otherwise dynamic client
+	 * registration; with `clientName` or a `callbackUrl` other than `/callback` on localhost or 127.0.0.1,
+	 * always dynamic client registration. `cimd`: always the document, and sign-in fails without support.
+	 * `dcr`: always dynamic client registration.
 	 */
 	// !mark
-	clientRegistration?: "dcr" | "cimd";
-	/**
-	 * Authorization server metadata document (RFC 8414 or OpenID Connect discovery) to use instead of
-	 * discovery through the server, for servers that advertise a wrong authorization server or none.
-	 * The document is trusted as configured. Must use https, except on loopback hosts.
-	 */
-	authServerMetadataUrl?: string;
+	clientRegistration?: "auto" | "dcr" | "cimd";
 }
-```
 
-## !!steps Loopback checks and namespaces
-
-`isLoopbackRedirectUri` accepts only `http` on localhost, 127.0.0.1 or `[::1]`, with no query or fragment. `mcpNamespace` builds the `mcp__server` prefix and replaces dashes with underscores, matching how tool names are produced, so a server named `my-server` has namespace `mcp__my_server`.
-
-```ts ! mcp-servers.ts
-const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
-
-/** Whether a redirect URI can be served by pi's loopback callback server. */
-export function isLoopbackRedirectUri(value: string): boolean {
-	if (!URL.canParse(value)) return false;
-	const url = new URL(value);
+/**
+ * Whether pi's Client ID Metadata Documents list a redirect URI for the loopback `callbackUrl`: they list
+ * `/callback` on localhost and 127.0.0.1, on any port. Without `callbackUrl`, pi uses such a URI.
+ */
+export function isClientMetadataDocumentCallback(callbackUrl: string | undefined): boolean {
+	if (callbackUrl === undefined) return true;
+	const url = new URL(callbackUrl);
 	// !mark
-	return url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname) && url.search === "" && url.hash === "";
+	return url.hostname !== "[::1]" && url.pathname === "/callback";
 }
-// ...
-const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
-
-/** Namespace of a server's tools: `mcp__<server>` with `-` replaced by `_`, like the tool names. */
-export function mcpNamespace(server: string): string {
-	// !mark
-	return `mcp__${server.replace(/-/g, "_")}`;
-}
-```
-
-## !!steps Validating OAuth
-
-Each rule returns an error string, or `undefined` when valid. Ports must be integers from 1 to 65535. A callback URL must be loopback, and if it carries a port that differs from `callbackPort` the config is rejected as contradictory.
-
-The `cimd` mode cannot combine with `clientId` or `clientName`, and needs a callback on localhost or 127.0.0.1 with path `/callback`, as the config comment on `clientRegistration` requires.
-
-```ts ! mcp-servers.ts
-	const port = value.callbackPort;
-	if (port !== undefined && (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)) {
-		return "oauth.callbackPort must be a port number";
-	}
-	// !mark(1:4)
-	if (value.callbackUrl !== undefined) {
-		if (typeof value.callbackUrl !== "string" || !isLoopbackRedirectUri(value.callbackUrl)) {
-			return "oauth.callbackUrl must be an http URI on localhost, 127.0.0.1, or [::1] without query or fragment";
-		}
-		const urlPort = new URL(value.callbackUrl).port;
-		if (urlPort && port !== undefined && Number(urlPort) !== port) {
-			return "oauth.callbackUrl and oauth.callbackPort name different ports";
-		}
-	}
-// ...
-	if (value.clientRegistration !== undefined && value.clientRegistration !== "dcr") {
-		if (value.clientRegistration !== "cimd") return 'oauth.clientRegistration must be "dcr" or "cimd"';
-		// !mark(1:3)
-		if (value.clientId !== undefined || value.clientName !== undefined) {
-			return 'oauth.clientRegistration "cimd" cannot be combined with oauth.clientId or oauth.clientName';
-		}
-		const callback = typeof value.callbackUrl === "string" ? new URL(value.callbackUrl) : undefined;
-		if (callback && (callback.hostname === "[::1]" || callback.pathname !== "/callback")) {
-			return 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback';
-		}
-	}
 ```
 
 ## !!steps Resolving the effective exposure
@@ -278,46 +222,57 @@ export function getMcpToolExposure(config: McpServerConfig, toolName: string): M
 
 ## !!steps Validating a server entry
 
-`validateMcpServerConfig` returns either a config or an error string, never throwing. It checks the name against `^[A-Za-z0-9_-]+$` and then the common fields. A `type` of `sse` is rejected with a pointer to streamable HTTP.
+`validateMcpServerConfig` returns either a config or an error string, never throwing. It first resolves exposure aliases on a copy, then hands the entry to pi-mcp, which checks the server name, the shared fields, the stdio or HTTP shape and the `oauth` block, and tags the result with its kind. pi-mcp refuses `clientRegistration: "cimd"` unless the application supplies `checkMetadataDocumentCallback`, so pi passes one built on `isClientMetadataDocumentCallback`.
 
-A `url` makes it an HTTP server and a `command` makes it stdio. Neither yields an error naming both options. The returned value is a copy with aliases resolved, cast to the specific config type.
+pi-mcp keeps fields it does not know, so pi then checks its own: `checkExposures` validates `exposure` and every `toolExposure` value, and for HTTP servers `checkAuth` enforces the https-or-loopback rule for `auth`. The final cast is safe because those checks just ran.
 
 ```ts ! mcp-servers.ts
-export function validateMcpServerConfig(name: string, raw: unknown): McpServerConfig | string {
-	// !mark
-	if (!SERVER_NAME.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
-	if (!isRecord(raw)) return `server "${name}" must be an object`;
-	const value = resolveExposureAliases(raw);
-	const { type, exposure, enabled, timeout, toolExposure, description } = value;
+/** Checks `exposure` and `toolExposure`, after aliases were resolved. Returns an error message. */
+function checkExposures(entry: Record<string, unknown>): string | undefined {
+	const { exposure, toolExposure } = entry;
 	const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
-	if (exposure !== undefined && !isExposure(exposure)) {
-		return `server "${name}": exposure must be one of ${exposures}`;
+	if (exposure !== undefined && !isExposure(exposure)) return `exposure must be one of ${exposures}`;
+	if (toolExposure !== undefined) {
+		if (!isRecord(toolExposure)) return "toolExposure must map tool names to exposures";
+		for (const [tool, value] of Object.entries(toolExposure)) {
+			if (!isExposure(value)) return `toolExposure "${tool}" must be one of ${exposures}`;
+		}
 	}
-// ...
-	// !mark
-	if (type === "sse") return `server "${name}": legacy SSE transport is not supported; use the streamable HTTP URL`;
+	return undefined;
+}
 
-	// !mark(1:3)
-	if (typeof value.url === "string" && (type === undefined || type === "http" || type === "streamable-http")) {
-		if (!URL.canParse(value.url) || !/^https?:$/.test(new URL(value.url).protocol)) {
-			return `server "${name}": url must be an http or https URL`;
-		}
-		if (value.headers !== undefined && !isStringRecord(value.headers)) {
-			return `server "${name}": headers must map names to strings`;
-		}
-		const oauthError = validateOAuth(value.oauth);
-		if (oauthError) return `server "${name}": ${oauthError}`;
-		if (value.auth !== undefined) {
-			if (!isRecord(value.auth) || typeof value.auth.provider !== "string" || !value.auth.provider) {
-				return `server "${name}": auth.provider must be a provider name`;
-			}
-			const url = new URL(value.url);
-			if (url.protocol !== "https:" && !LOOPBACK_HOSTS.includes(url.hostname)) {
-				return `server "${name}": auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]`;
-			}
-		}
-		return value as unknown as McpHttpServerConfig;
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
+/** Checks `auth` of an HTTP server, which sends a provider's credential to `url`. Returns an error message. */
+function checkAuth(auth: unknown, url: string): string | undefined {
+	if (auth === undefined) return undefined;
+	if (!isRecord(auth) || typeof auth.provider !== "string" || !auth.provider) {
+		return "auth.provider must be a provider name";
 	}
+	const parsed = new URL(url);
+	// !mark(1:3)
+	if (parsed.protocol !== "https:" && !LOOPBACK_HOSTS.includes(parsed.hostname)) {
+		return "auth requires an https URL, or http on localhost, 127.0.0.1, or [::1]";
+	}
+	return undefined;
+}
+// ...
+export function validateMcpServerConfig(name: string, raw: unknown): McpServerConfig | string {
+	// !mark(1:6)
+	const result = validateMcpServerFields(name, isRecord(raw) ? resolveExposureAliases(raw) : raw, {
+		checkMetadataDocumentCallback: (callbackUrl) =>
+			isClientMetadataDocumentCallback(callbackUrl)
+				? undefined
+				: 'oauth.clientRegistration "cimd" requires oauth.callbackUrl on localhost or 127.0.0.1 with path /callback',
+	});
+	if (result.kind === "invalid") return result.error;
+	const error =
+		checkExposures(result.config) ??
+		(result.kind === "http" ? checkAuth(result.config.auth, result.config.url) : undefined);
+	if (error) return `server "${name}": ${error}`;
+	// The cast holds because pi's fields were checked above, which the types cannot express.
+	return result.config as McpServerConfig;
+}
 ```
 
 ## !!steps The registry for extension-registered servers
@@ -366,4 +321,4 @@ export class McpServerRegistry {
 
 </Scrollycoding>
 
-Config files and extension registrations both pass through the validation function, so the same rules apply to either source. One structural note: exposure aliases are resolved only inside validation, so code that reads a raw config without validating it can still see the old spelling.
+Config files and extension registrations both pass through the validation function, so the same rules apply to either source, and the shared part of those rules is the same in every application built on pi-mcp. One structural note: exposure aliases are resolved only inside validation, so code that reads a raw config without validating it can still see the old spelling.

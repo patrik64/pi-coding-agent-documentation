@@ -7,7 +7,7 @@ full: true
 
 `changelog.ts` powers the "what's new" display. It reads the project changelog, turns each `## [x.y.z]` section into an entry, filters entries newer than the last version the user saw, and rewrites relative markdown links so they point at the matching git tag on GitHub.
 
-The interactive UI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) calls these functions, and `getChangelogPath` is re-exported from [config.ts](/docs/src/config.ts).
+The interactive UI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) calls these functions, both for pi's own changelog and for the changelogs of extension packages, and `getChangelogPath` is re-exported from [config.ts](/docs/src/config.ts).
 
 <Scrollycoding>
 
@@ -210,7 +210,11 @@ export function parseChangelog(changelogPath: string): ChangelogEntry[] {
 
 ## !!steps Comparing and filtering
 
-Versions compare numerically field by field. `getNewEntries` parses the last-seen version string, defaulting missing or non-numeric parts to 0, and keeps strictly newer entries. Pre-release suffixes are not understood by the header regex, so only the numeric part is read.
+Versions compare numerically field by field. `getNewEntries` reads only the leading `major.minor.patch` of the last-seen version, with an optional `v` prefix, the same way the heading regex reads changelog sections, and keeps strictly newer entries.
+
+This used to split on dots and turn each part into a number. A prerelease such as `0.1.5-20261020.7` then parsed its patch as `NaN`, which fell back to 0, so the `[0.1.5]` notes counted as new and were shown again on every launch. The comment lists the alternatives that were rejected: string comparison puts 0.10.0 before 0.9.0, and strict semver orders `0.1.5-x` before `0.1.5`, which repeats the notes forever.
+
+When the saved version has no readable `major.minor.patch` at all, the function now returns `undefined` instead of comparing against 0.0.0. Both callers in interactive mode treat that as "show nothing and record the current version", so a corrupt setting heals itself instead of dumping the whole changelog.
 
 ```ts ! changelog.ts
 export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number {
@@ -220,16 +224,22 @@ export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number 
 }
 
 /**
- * Get entries newer than lastVersion
+ * Get entries newer than lastVersion, or undefined when lastVersion has no major.minor.patch to compare against
  */
 // !mark
-export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] {
-	// Parse lastVersion
-	const parts = lastVersion.split(".").map(Number);
+export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] | undefined {
+	// Read only the leading major.minor.patch, like the changelog headings, so a prerelease such as
+	// 0.1.5-20261020.7 counts as 0.1.5 and its notes are not shown again on every launch (#11703).
+	// Alternatives considered: plain string comparison orders 0.10.0 before 0.9.0; numeric localeCompare
+	// works by accident and is locale-dependent; strict semver orders 0.1.5-x before 0.1.5, which repeats
+	// the [0.1.5] notes forever.
+	// !mark(1:2)
+	const parts = lastVersion.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+	if (!parts) return undefined;
 	const last: ChangelogEntry = {
-		major: parts[0] || 0,
-		minor: parts[1] || 0,
-		patch: parts[2] || 0,
+		major: Number(parts[1]),
+		minor: Number(parts[2]),
+		patch: Number(parts[3]),
 		content: "",
 	};
 
@@ -243,4 +253,4 @@ export { getChangelogPath } from "../config.ts";
 
 </Scrollycoding>
 
-The file has no state. Quirks worth knowing: `compareVersions` ignores pre-release tags, and parse failures are logged with `console.error` and treated as an empty changelog rather than raised.
+The file has no state. Quirks worth knowing: `compareVersions` ignores pre-release tags on purpose, so a prerelease and its release count as the same version, and parse failures are logged with `console.error` and treated as an empty changelog rather than raised.

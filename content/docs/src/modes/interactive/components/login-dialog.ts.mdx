@@ -7,7 +7,9 @@ full: true
 
 `LoginDialogComponent` is the visible half of every login flow. The auth backend in pi-ai calls a set of callbacks (`onAuth`, `onDeviceCode`, `onPrompt`, `onProgress`), and each one maps to a `show...` method here that mutates a content area between two borders.
 
-It also owns cancellation. An `AbortController` exposes a `signal` the login flow can pass along, and pending input promises are rejected when the user presses cancel. The provider list that leads here is [oauth-selector.ts](/docs/src/modes/interactive/components/oauth-selector.ts), and [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) wires the two together.
+It also owns cancellation. An `AbortController` exposes a `signal` the login flow can pass along, and pending input promises are rejected when the user presses cancel. The provider list that leads here is [oauth-selector.ts](/docs/src/modes/interactive/components/oauth-selector.ts), and [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) wires the two together. The shell command `pi auth login` in [auth-login.ts](/docs/src/cli/auth-login.ts) runs the same provider flows without this dialog.
+
+URLs come from providers, including extension-registered ones, so the dialog treats them as untrusted. Only `http:` and `https:` URLs from [web-url.ts](/docs/src/utils/web-url.ts) are opened or turned into terminal hyperlinks; anything else is shown with its control characters replaced, so it cannot end a hyperlink early or send escape sequences of its own.
 
 <Scrollycoding>
 
@@ -15,7 +17,7 @@ It also owns cancellation. An `AbortController` exposes a `signal` the login flo
 
 The constructor lays out a top [dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts), a title, an empty `contentContainer`, and a bottom border. Everything the login flow shows later goes into `contentContainer`.
 
-The `Input` is created up front but not attached. It is added only when a prompt needs it. Its submit handler resolves the pending promise and swaps itself for a plain `> value` line, so the typed text stays on screen after submission. Escape cancels the whole login.
+The `Input` is created up front but not attached. It is added only when a prompt needs it. Its submit handler resolves the pending promise and swaps itself for a plain `> value` line, so the typed text stays on screen after submission. Escape cancels the whole login. The two device-code fields hold the pending Enter action of a device-code login and the row that shows its hint.
 
 ```ts ! login-dialog.ts
 export class LoginDialogComponent extends Container implements Focusable {
@@ -27,6 +29,8 @@ export class LoginDialogComponent extends Container implements Focusable {
 	private abortController = new AbortController();
 	private inputResolver?: (value: string) => void;
 	private inputRejecter?: (error: Error) => void;
+	private deviceCodeAction?: { info: OAuthDeviceCodeInfo; hint: Container };
+	private deviceCodeHint?: Container;
 	private onComplete: (success: boolean, message?: string) => void;
 
 // ...
@@ -64,7 +68,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 `focused` is a getter and setter that forwards the flag to the inner `Input`. This matters for IME: the terminal cursor must sit in the input to position composition popups.
 
-`cancel` aborts the controller, rejects any waiting prompt with `Login cancelled`, and reports failure through `onComplete`. The dialog never closes itself; the owner decides what to do with the `onComplete` result.
+`clearDeviceCodeAction` removes the device-code hint row and forgets its pending action. Every method that moves the flow to another step calls it first, and so does `cancel`, which then aborts the controller, rejects any waiting prompt with `Login cancelled`, and reports failure through `onComplete`. The dialog never closes itself; the owner decides what to do with the `onComplete` result.
 
 ```ts ! login-dialog.ts
 	// Focusable implementation - propagate to input for IME cursor positioning
@@ -87,7 +91,16 @@ export class LoginDialogComponent extends Container implements Focusable {
 		);
 	}
 
+	private clearDeviceCodeAction(): void {
+		if (this.deviceCodeHint) {
+			this.contentContainer.removeChild(this.deviceCodeHint);
+		}
+		this.deviceCodeHint = undefined;
+		this.deviceCodeAction = undefined;
+	}
+
 	private cancel(): void {
+		this.clearDeviceCodeAction();
 		this.abortController.abort();
 		if (this.inputRejecter) {
 			this.inputRejecter(new Error("Login cancelled"));
@@ -100,18 +113,26 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 ## !!steps Showing the sign-in URL
 
-`showAuth` clears the body and shows an [auth-url.ts](/docs/src/modes/interactive/components/auth-url.ts) component, plus optional instructions in the warning color. It then calls `openBrowser` from [open-browser.ts](/docs/src/utils/open-browser.ts) so the browser opens without the user copying anything.
+`webLink` makes text a terminal hyperlink only when its target is a web URL. `showAuth` clears the body and shows an [auth-url.ts](/docs/src/modes/interactive/components/auth-url.ts) component with the normalized URL, or with a sanitized copy if the value is not a web URL, plus optional instructions in the warning color. It then calls `openBrowser` from [open-browser.ts](/docs/src/utils/open-browser.ts), but only for a web URL: the shared launcher would also open files and custom protocols.
 
 The component is kept in `authUrl` so that the copy keybinding can reach it later.
 
 ```ts ! login-dialog.ts
+/** `text` as a terminal hyperlink to `url` when that is a web URL, else plain `text`. */
+function webLink(text: string, url: string): string {
+	const target = webUrl(url);
+	return target === undefined ? text : hyperlink(text, target);
+}
+// ...
 	/**
 	 * Called by onAuth callback - show URL and optional instructions
 	 */
 	showAuth(url: string, instructions?: string): void {
+		this.clearDeviceCodeAction();
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
-		this.authUrl = new AuthUrlComponent(this.tui, url);
+		const target = webUrl(url);
+		this.authUrl = new AuthUrlComponent(this.tui, target ?? replaceControlCharacters(url));
 		this.contentContainer.addChild(this.authUrl);
 
 		if (instructions) {
@@ -119,14 +140,16 @@ The component is kept in `authUrl` so that the copy keybinding can reach it late
 			this.contentContainer.addChild(new Text(theme.fg("warning", instructions), 1, 0));
 		}
 
-		openBrowser(url);
+		if (target !== undefined) openBrowser(target);
 		this.tui.requestRender();
 	}
 ```
 
 ## !!steps Device code flow
 
-For device-code logins the user must open a page and type a code. The URL is wrapped in an OSC 8 escape sequence so supporting terminals make it clickable, and a second dim line gives the platform-specific click hint. `authUrl` is cleared, so the copy shortcut does nothing in this mode.
+For device-code logins the user must open a page and type a code. The URL is shown as a hyperlink, and a second dim line gives the platform-specific click hint. `authUrl` is cleared, so the copy shortcut does nothing in this mode.
+
+Opening the browser and copying the code are offered, not done automatically: a hint row asks the user to press Enter first. Both actions default to on, and a provider can opt out of either through `openBrowserOnConfirm` and `copyCodeOnConfirm` on the device-code info. The hint is a `Container` holding one `TruncatedText`, so the same single row can later show progress even in a narrow terminal.
 
 ```ts ! login-dialog.ts
 	/**
@@ -134,18 +157,68 @@ For device-code logins the user must open a page and type a code. The URL is wra
 	 */
 	showDeviceCode(info: OAuthDeviceCodeInfo): void {
 		this.authUrl = undefined;
+		info = {
+			...info,
+			openBrowserOnConfirm: info.openBrowserOnConfirm ?? true,
+			copyCodeOnConfirm: info.copyCodeOnConfirm ?? true,
+		};
+		this.clearDeviceCodeAction();
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
-		const linkedUrl = `\x1b]8;;${info.verificationUri}\x07${info.verificationUri}\x1b]8;;\x07`;
-		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
+		const shownUrl = displayUrl(info.verificationUri);
+		this.contentContainer.addChild(new Text(theme.fg("accent", webLink(shownUrl, shownUrl)), 1, 0));
 
 		const clickHint = process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
-		const hyperlink = `\x1b]8;;${info.verificationUri}\x07${clickHint}\x1b]8;;\x07`;
-		this.contentContainer.addChild(new Text(theme.fg("dim", hyperlink), 1, 0));
+		this.contentContainer.addChild(new Text(theme.fg("dim", webLink(clickHint, info.verificationUri)), 1, 0));
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("warning", `Enter code: ${info.userCode}`), 1, 0));
 
+		if (!this.signal.aborted && (info.openBrowserOnConfirm || info.copyCodeOnConfirm)) {
+			const actionLabel = info.openBrowserOnConfirm
+				? info.copyCodeOnConfirm
+					? "to open browser and copy code"
+					: "to open browser"
+				: "to copy code";
+			// Reuse this single row for progress/result text, including in narrow terminals.
+			const hint = new Container();
+			hint.addChild(new TruncatedText(`(${keyHint("tui.select.confirm", actionLabel)})`, 1, 0));
+			this.contentContainer.addChild(hint);
+			this.deviceCodeHint = hint;
+			this.deviceCodeAction = { info, hint };
+		}
 		this.tui.requestRender();
+	}
+```
+
+## !!steps Running the confirmed action
+
+`activateDeviceCode` replaces the hint with a status line and starts both actions. The clipboard copy is not awaited, so slow clipboard tools never delay the browser or the provider's polling; its result updates the row when it arrives. A failing browser launcher is swallowed, since the user can still open the link by hand.
+
+`setDeviceCodeStatus` drops updates once the login is aborted, the dialog lost focus, or the row is no longer in the body. A copy that finishes after the flow has moved on therefore cannot write into a later step.
+
+```ts ! login-dialog.ts
+	private setDeviceCodeStatus(hint: Container, message: string): void {
+		if (this.signal.aborted || !this.focused || !this.contentContainer.children.includes(hint)) return;
+		hint.children = [new TruncatedText(theme.fg("dim", message), 1, 0)];
+		this.tui.requestRender();
+	}
+
+	private activateDeviceCode(info: OAuthDeviceCodeInfo, hint: Container): void {
+		this.setDeviceCodeStatus(hint, info.copyCodeOnConfirm ? "Copying code..." : "Browser open requested");
+		if (info.copyCodeOnConfirm) {
+			// Do not delay polling or browser opening while clipboard tools are running.
+			void copyToClipboard(info.userCode)
+				.then(() => this.setDeviceCodeStatus(hint, "Code copied to clipboard"))
+				.catch(() => this.setDeviceCodeStatus(hint, "Copy code manually"));
+		}
+		if (info.openBrowserOnConfirm) {
+			try {
+				const target = webUrl(info.verificationUri);
+				if (target !== undefined) openBrowser(target);
+			} catch {
+				// Launcher failures must not interrupt login.
+			}
+		}
 	}
 ```
 
@@ -153,13 +226,14 @@ For device-code logins the user must open a page and type a code. The URL is wra
 
 `showManualInput` and `showPrompt` attach the shared `Input` and return a promise whose `resolve` and `reject` are stored as fields. The submit handler from the constructor settles them.
 
-Note the difference in clearing: `showPrompt` appends to the existing body so a URL from `showAuth` stays visible, while `showManualInput` does the same without clearing but also resets the value first. Only one input is pending at a time, since the resolver fields are single slots.
+Neither clears the body, so a URL from `showAuth` stays visible above the input; both only drop a pending device-code hint and reset the input value. Only one input is pending at a time, since the resolver fields are single slots.
 
 ```ts ! login-dialog.ts
 	/**
 	 * Show input for manual code/URL entry (for callback server providers)
 	 */
 	showManualInput(prompt: string): Promise<string> {
+		this.clearDeviceCodeAction();
 		this.input.setValue("");
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("dim", prompt), 1, 0));
@@ -178,6 +252,7 @@ Note the difference in clearing: `showPrompt` appends to the existing body so a 
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(message: string, placeholder?: string): Promise<string> {
+		this.clearDeviceCodeAction();
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("text", message), 1, 0));
 		if (placeholder) {
@@ -204,12 +279,13 @@ Note the difference in clearing: `showPrompt` appends to the existing body so a 
 
 ## !!steps Informational and progress output
 
-`showDetails` replaces the body with plain lines. `showInfo` appends a message and OSC 8 links, with an optional close hint for provider-owned screens that have no callback flow. `showWaiting` and `showProgress` append dim status text for polling flows such as GitHub Copilot.
+`showDetails` replaces the body with plain lines. `showInfo` appends a message and links, with an optional close hint for provider-owned screens that have no callback flow. Each link URL is normalized or sanitized for display and is only clickable when it is a web URL. `showWaiting` and `showProgress` append dim status text for polling flows such as GitHub Copilot.
 
 ```ts ! login-dialog.ts
 	/** Show informational text before another login step. */
 	showDetails(lines: string[]): void {
 		this.authUrl = undefined;
+		this.clearDeviceCodeAction();
 		this.contentContainer.clear();
 		this.contentContainer.addChild(new Spacer(1));
 		for (const line of lines) {
@@ -223,9 +299,9 @@ Note the difference in clearing: `showPrompt` appends to the existing body so a 
 		this.contentContainer.addChild(new Spacer(1));
 		this.contentContainer.addChild(new Text(theme.fg("text", message), 1, 0));
 		for (const link of links) {
-			const text = link.label ? `${link.label}: ${link.url}` : link.url;
-			const hyperlink = `\x1b]8;;${link.url}\x07${text}\x1b]8;;\x07`;
-			this.contentContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
+			const url = displayUrl(link.url);
+			const text = link.label ? `${link.label}: ${url}` : url;
+			this.contentContainer.addChild(new Text(theme.fg("accent", webLink(text, url)), 1, 0));
 		}
 		if (showCloseHint) {
 			this.contentContainer.addChild(new Spacer(1));
@@ -255,7 +331,7 @@ Note the difference in clearing: `showPrompt` appends to the existing body so a 
 
 ## !!steps Key handling
 
-Cancel is checked first, then the copy shortcut, which only fires when a URL is showing. Everything else goes to the input. Because the `Input` is not a child unless a prompt is active, typing at other times is harmless.
+Cancel is checked first, then the copy shortcut, which only fires when a URL is showing. Next comes the device-code confirm key, accepted only while no prompt is waiting for input and the dialog is focused and not aborted. The action is cleared before it runs, so pressing Enter twice cannot open two browsers or start two clipboard writes. Everything else goes to the input. Because the `Input` is not a child unless a prompt is active, typing at other times is harmless.
 
 ```ts ! login-dialog.ts
 	handleInput(data: string): void {
@@ -270,6 +346,21 @@ Cancel is checked first, then the copy shortcut, which only fires when a URL is 
 			return;
 		}
 
+		if (
+			this.deviceCodeAction &&
+			!this.inputResolver &&
+			!this.signal.aborted &&
+			this.focused &&
+			kb.matches(data, "tui.select.confirm")
+		) {
+			const action = this.deviceCodeAction;
+			// Consume once so a repeated Enter cannot launch multiple browsers or clipboard writes.
+			this.deviceCodeAction = undefined;
+			this.activateDeviceCode(action.info, action.hint);
+			this.tui.requestRender();
+			return;
+		}
+
 		// Pass to input
 		this.input.handleInput(data);
 	}
@@ -277,4 +368,4 @@ Cancel is checked first, then the copy shortcut, which only fires when a URL is 
 
 </Scrollycoding>
 
-The dialog is a passive view: the login orchestration lives elsewhere and calls into it. It leans on [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for hint text. A structural note: appending methods never remove old lines, so long flows accumulate content until a method that clears is called.
+The dialog is a passive view: the login orchestration lives elsewhere and calls into it. It leans on [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts) for hint text. A structural note: apart from the device-code hint row, appending methods never remove old lines, so long flows accumulate content until a method that clears is called.

@@ -218,7 +218,10 @@ Skills with `disableModelInvocation` are filtered out first, and an empty list
 produces an empty string so no heading is added. The wording of the instruction
 line depends on how the model can read files: with the `read` tool, with `bash`,
 or neither. The skill entries use the XML layout of the Agent Skills standard,
-with names, descriptions and locations escaped by `escapeXml`.
+with names, descriptions and locations escaped by `escapeXml`. A fixed line
+tells the model to resolve relative paths against the skill's directory and to
+use absolute paths in tool calls, since the working directory is usually not
+the skill's.
 
 ```ts ! skills.ts
 export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" | "indirect" = "read"): string {
@@ -235,7 +238,7 @@ export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "b
 			: fileReadTool === "bash"
 				? "Use bash to load a skill's file when the task matches its description."
 				: "Load a skill's file when the task matches its description.",
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
 		"",
 		"<available_skills>",
 	];
@@ -246,15 +249,16 @@ export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "b
 `loadSkills` builds one map keyed by name. Defaults are loaded first, user before
 project, then explicit paths, so on a name clash the earlier skill wins and the
 later one produces a `collision` diagnostic naming both paths. Before checking
-names, `canonicalizePath` resolves symlinks, so the same real file reached by two
-routes is skipped silently rather than reported as a collision.
+names, `getResourcePathKey` from [source-info.ts](/docs/src/core/source-info.ts)
+resolves symlinks (and folds case on Windows), so the same real file reached by
+two routes is skipped silently rather than reported as a collision.
 
 ```ts ! skills.ts
 	function addSkills(result: LoadSkillsResult) {
 		allDiagnostics.push(...result.diagnostics);
 		for (const skill of result.skills) {
 			// Resolve symlinks to detect duplicate files
-			const realPath = canonicalizePath(skill.filePath);
+			const realPath = getResourcePathKey(skill.filePath);
 
 			// Skip silently if we've already loaded this exact file (via symlink)
 			if (realPathSet.has(realPath)) {
@@ -288,7 +292,9 @@ With `includeDefaults` the user skills directory is loaded, then the project's.
 Each configured path must exist and be either a directory, scanned as above, or a
 `.md` file, loaded directly. Anything else yields a warning. When defaults are
 off, a configured path that lies under one of the default directories is still
-labeled `user` or `project`, so its source label is the same either way.
+labeled `user` or `project`, so its source label is the same either way. That
+containment test is `isPathWithin` from [paths.ts](/docs/src/utils/paths.ts),
+which replaced a local prefix check and ignores case on Windows.
 Collision diagnostics are placed after all other diagnostics in the result.
 
 ```ts ! skills.ts

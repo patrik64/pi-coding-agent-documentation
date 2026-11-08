@@ -50,18 +50,22 @@ The session is passed as a `ReadonlySessionManager` from [session-manager.ts](/d
 
 `getMessageFromEntry` maps each session entry to at most one message. Tool results are dropped on purpose: the assistant's tool call already records what happened, and the result bodies are often large. Custom messages, branch summaries and compaction entries become their message equivalents using the factories in [messages.ts](/docs/src/core/messages.ts).
 
-Bookkeeping entries such as model changes, labels and session info yield nothing. The switch has no default, so a new entry type added to the union would make the function's return type incomplete and be flagged by the compiler.
+A message or custom message can also come with a `context_edit` that targets it. In that case the entry goes through `projectContextEntry` from [session-manager.ts](/docs/src/core/session-manager.ts), the same function that builds live model context, so the summarizer sees the replacement content instead of the original, or nothing at all when the edit hid the entry. Without this, a branch summary could resurrect text the model never actually saw.
+
+Bookkeeping entries such as model changes, labels and session info yield nothing. The switch has no default, and `usage` and `context_edit` entries have no case at all: they fall off the end and return `undefined` implicitly, which the declared return type allows. So the compiler does not force a decision when a new entry type is added.
 
 ```ts ! branch-summarization.ts
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
+function getMessageFromEntry(entry: SessionEntry, edit?: ContextEditEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
 			// Skip tool results - context is in assistant's tool call
 			// !mark
 			if (entry.message.role === "toolResult") return undefined;
-			return entry.message;
+			// !mark
+			return edit ? projectContextEntry(entry, edit)[0] : entry.message;
 
 		case "custom_message":
+			if (edit) return projectContextEntry(entry, edit)[0];
 			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
 
 		case "branch_summary":
@@ -75,7 +79,7 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 
 `prepareBranchEntries` makes two passes. The first scans every entry for earlier `branch_summary` entries that pi itself produced (not ones flagged `fromHook`) and merges their `readFiles` and `modifiedFiles`. It does this before any budget applies, so cumulative file tracking survives even when old content gets dropped.
 
-The second pass goes newest to oldest and prepends messages until the budget is hit. Recent context therefore wins over old context. A budget of zero means no limit.
+Between the two passes it indexes `context_edit` entries by `targetId`. Later edits overwrite earlier ones in the map, so only the latest edit per target applies, matching how the live context is projected. The second pass goes newest to oldest, looks up each entry's edit, and prepends messages until the budget is hit. Recent context therefore wins over old context. A budget of zero means no limit.
 
 ```ts ! branch-summarization.ts
 	for (const entry of entries) {
@@ -92,6 +96,12 @@ The second pass goes newest to oldest and prepends messages until the budget is 
 				}
 			}
 		}
+	}
+
+	// Context edits hide or replace earlier entries in model context; honor the latest edit per target.
+	const edits = new Map<string, ContextEditEntry>();
+	for (const entry of entries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
 ```
 
@@ -149,7 +159,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
 ## !!steps Budget, instructions and the model call
 
-`generateBranchSummary` derives the history budget as the context window (128000 when the model reports none) minus `reserveTokens`, which defaults to 16384. The output is capped at 4096 tokens, or the model's own limit if smaller.
+`generateBranchSummary` derives the history budget as the context window (128000 when the model reports none) minus `reserveTokens`, which defaults to 16384. The request itself sets no output cap. A fixed 4096-token limit used to apply, but with reasoning sharing the output budget a high thinking level could exhaust it, so the provider layer now sizes output from the request as it does for compaction. The caller passes the session's `thinkingLevel`, which becomes the request's `reasoning` option on models that support it.
 
 Custom instructions can either be appended as "Additional focus" or, with `replaceInstructions`, replace the whole prompt. The conversation is serialized to text and wrapped in tags, like in compaction, before the call goes through `completeSummarization` with the caller's `streamFn` and retry policy.
 

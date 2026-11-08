@@ -57,6 +57,34 @@ export function llamaInferenceUrl(serverUrl: string): string {
 }
 ```
 
+## !!steps Naming the server when it cannot be reached
+
+Every request, including the `/models/sse` watch, goes through `fetchServer`. When `fetch` fails at the network level, Node throws a bare `fetch failed` and keeps the real reason (a refused connection, a wrong port, `https://` against a plain-HTTP server) in `error.cause`. Before this helper, that reason was dropped and a failed `/login llama.cpp` said only that the API key could not be saved.
+
+Now the error names the server URL and the cause's message or its `code`, and keeps the original as `cause`. A request whose signal was aborted, by the caller or by the timeout below, is rethrown unchanged, so cancellation still looks like cancellation.
+
+```ts ! client.ts
+function connectionErrorDetail(error: unknown): string {
+	const cause = error instanceof Error ? error.cause : undefined;
+	if (cause instanceof Error && cause.message) return cause.message;
+	if (cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string") return cause.code;
+	return error instanceof Error ? error.message : String(error);
+}
+// ...
+	/** Fetches from the server, naming the server and the network-level cause when the connection fails. */
+	private async fetchServer(path: string, init: RequestInit): Promise<Response> {
+		try {
+			return await fetch(`${this.serverUrl}${path}`, init);
+		} catch (error) {
+			// !mark
+			if (init.signal?.aborted) throw error;
+			throw new Error(`Could not reach llama.cpp server at ${this.serverUrl}: ${connectionErrorDetail(error)}`, {
+				cause: error,
+			});
+		}
+	}
+```
+
 ## !!steps The request helper
 
 Every request adds JSON content type when there is a body and a bearer token when an API key is configured. A 15 second timeout is combined with the caller's signal using `AbortSignal.any`, so either can cancel the call.
@@ -70,7 +98,7 @@ Error bodies are parsed leniently: the JSON error message is used if present, ot
 		if (this.apiKey) headers.set("Authorization", `Bearer ${this.apiKey}`);
 		const timeout = AbortSignal.timeout(15_000);
 		const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
-		const response = await fetch(`${this.serverUrl}${path}`, { ...init, headers, signal });
+		const response = await this.fetchServer(path, { ...init, headers, signal });
 		let payload: unknown;
 		try {
 			payload = await response.json();

@@ -11,20 +11,23 @@ The algorithm is in [image-resize-core.ts](/docs/src/utils/image-resize-core.ts)
 
 <Scrollycoding>
 
-## !!steps Copying the input for transfer
+## !!steps Copying the input and recognizing replies
 
 Transferring an ArrayBuffer to a worker detaches it from the sender. To keep the caller's bytes usable, a copy is made and that copy is transferred.
 
+The reply type now lives in [image-resize-core.ts](/docs/src/utils/image-resize-core.ts), shared with the worker, and every reply carries a fixed `type` tag. `isResizeImageWorkerResponse` checks that tag rather than accepting any object, because Node itself can post messages on the same channel: under `node --watch` the worker sends a `watch:require` message that the old check took for the answer.
+
 ```ts ! image-resize.ts
 import { Worker } from "node:worker_threads";
-import { type ImageResizeOptions, type ResizedImage, resizeImageInProcess } from "./image-resize-core.ts";
+import {
+	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
+	type ImageResizeOptions,
+	type ResizedImage,
+	type ResizeImageWorkerResponse,
+	resizeImageInProcess,
+} from "./image-resize-core.ts";
 
 export type { ImageResizeOptions, ResizedImage } from "./image-resize-core.ts";
-
-interface ResizeImageWorkerResponse {
-	result?: ResizedImage | null;
-	error?: string;
-}
 
 function toTransferableBytes(input: Uint8Array): Uint8Array<ArrayBuffer> {
 	// Transfer detaches the buffer, so transfer a worker-owned copy and leave the
@@ -33,7 +36,10 @@ function toTransferableBytes(input: Uint8Array): Uint8Array<ArrayBuffer> {
 }
 
 function isResizeImageWorkerResponse(value: unknown): value is ResizeImageWorkerResponse {
-	return value !== null && typeof value === "object";
+	// !mark(1:3)
+	return (
+		value !== null && typeof value === "object" && "type" in value && value.type === IMAGE_RESIZE_WORKER_RESPONSE_TYPE
+	);
 }
 
 function createResizeWorker(workerSpecifier: string | URL): Worker {
@@ -43,7 +49,7 @@ function createResizeWorker(workerSpecifier: string | URL): Worker {
 
 ## !!steps Settling exactly once
 
-`resizeImageInWorker` wraps the worker in a promise with `settled` guards, because message, error and exit events can all fire. An error string in the response becomes a rejection, a null result resolves as null, and an exit before any answer is an error.
+`resizeImageInWorker` wraps the worker in a promise with `settled` guards, because message, error and exit events can all fire. The listener uses `on` rather than `once` and skips messages without the tag, so a stray Node message no longer consumes the only listener or fails the resize. A reply with `error` becomes a rejection, a null result resolves as null, and an exit before any answer is an error.
 
 ```ts ! image-resize.ts
 async function resizeImageInWorker(
@@ -68,16 +74,13 @@ async function resizeImageInWorker(
 				reject(error);
 			};
 
-			worker.once("message", (message: unknown) => {
-				if (!isResizeImageWorkerResponse(message)) {
-					fail(new Error("Invalid image resize worker response"));
-					return;
-				}
-				if (message.error) {
-					fail(new Error(message.error));
-					return;
-				}
-				settle(message.result ?? null);
+			// !mark(1:7)
+			worker.on("message", (message: unknown) => {
+				// Ignore messages Node posts on the worker channel itself, such as
+				// `{ "watch:require": [...] }` under `node --watch` (nodejs/node#65044).
+				if (!isResizeImageWorkerResponse(message)) return;
+				if ("error" in message) fail(new Error(message.error));
+				else settle(message.result);
 			});
 			worker.once("error", fail);
 			worker.once("exit", (code) => {
@@ -89,7 +92,7 @@ async function resizeImageInWorker(
 
 ## !!steps Posting the job and terminating
 
-The request is posted with the buffer listed as transferable. The `finally` always terminates the worker, ignoring termination errors.
+The request is posted with the buffer listed as transferable. The `finally` always terminates the worker, ignoring termination errors, and now awaits the termination. Previously it fired and forgot, so a caller resizing several images in a row could start the next worker while the last one was still shutting down, and that overlap aborted the whole process on macOS with Node 24.
 
 ```ts ! image-resize.ts
 			worker.postMessage(
@@ -102,7 +105,10 @@ The request is posted with the buffer listed as transferable. The `finally` alwa
 			);
 		});
 	} finally {
-		void worker.terminate().catch(() => undefined);
+		// Await termination so a serial resize never starts a worker while this one is
+		// still shutting down; that overlap aborted the process on macOS with Node 24 (#10695).
+		// !mark
+		await worker.terminate().catch(() => undefined);
 	}
 }
 ```

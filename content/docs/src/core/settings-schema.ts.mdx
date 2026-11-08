@@ -1,0 +1,184 @@
+---
+title: "settings-schema.ts"
+description: "TypeBox schema for settings.json, the source of both the published settings.schema.json and the Settings types the settings manager uses"
+source: "src/core/settings-schema.ts"
+full: true
+---
+
+`settings.json` has about sixty top-level keys. This file describes all of them in one TypeBox schema, and the schema is used in two ways. [generate-schemas.ts](/docs/scripts/generate-schemas.ts) serializes it to `schemas/settings.schema.json`, published at `https://pi.dev/schemas/settings.schema.json`, so editors can complete keys and show descriptions and defaults. And the TypeScript types that [settings-manager.ts](/docs/src/core/settings-manager.ts) works with, `Settings`, `CompactionSettings` and the rest, are derived from it with `Static`. Before this file existed, the `Settings` interface carried its defaults and descriptions as trailing comments. Now they are schema annotations that cannot drift from the types.
+
+Defaults are not written here as literals. They come from [settings-defaults.ts](/docs/src/core/settings-defaults.ts), the same object the getters fall back to. The schema is not used to validate settings files at load time. The settings manager reads JSON as it is, and its getters check values one field at a time. `test/config-schemas.test.ts` keeps the two in line by checking that the schema rejects values the getters would reject.
+
+<Scrollycoding>
+
+## !!steps Constraints shared with the accessors
+
+Some fields carry constraints that match what the settings manager enforces. Compaction token counts must be non-negative safe integers, because `getCompactionTokenSetting` throws on anything else. Per-model compaction overrides are keyed by exact `provider/modelId` strings.
+
+Timeouts accept a non-negative number or the word `disabled`. The runtime parser also accepts a numeric string such as `"30000"`, which the schema rejects, so the published schema describes only the documented forms.
+
+```ts ! settings-schema.ts
+function nonNegativeSafeInteger(options: { default?: number } = {}) {
+	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
+}
+
+function timeoutSetting(options?: TSchemaOptions) {
+	return Type.Union([Type.Number({ minimum: 0 }), Type.Literal("disabled")], options);
+}
+
+const CompactionModelOverrideSchema = Type.Object({
+	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
+	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+});
+
+const CompactionSettingsSchema = Type.Object({
+	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
+	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
+	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	modelOverrides: Type.Optional(
+		Type.Record(Type.String(), CompactionModelOverrideSchema, {
+			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
+		}),
+	),
+});
+```
+
+## !!steps Defaults, descriptions and deprecated keys
+
+Every field with a default takes it from `SETTINGS_DEFAULTS`, and the descriptions replace the comments the old interface had. Keys that only exist for migration are marked `deprecated: true`, which editors that understand the keyword can flag.
+
+`retry.maxDelayMs` is one of them. The settings manager moves its value to `retry.provider.maxRetryDelayMs` when it loads the file, and the description points users there.
+
+```ts ! settings-schema.ts
+const RetrySettingsSchema = Type.Object({
+	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.retry.enabled })),
+	maxRetries: Type.Optional(Type.Number({ default: SETTINGS_DEFAULTS.retry.maxRetries })),
+	baseDelayMs: Type.Optional(
+		Type.Number({
+			description: "Exponential backoff base delay in milliseconds: 2s, 4s, 8s.",
+			default: SETTINGS_DEFAULTS.retry.baseDelayMs,
+		}),
+	),
+	maxAgentDelayMs: Type.Optional(Type.Number({ default: SETTINGS_DEFAULTS.retry.maxAgentDelayMs })),
+	provider: Type.Optional(ProviderRetrySettingsSchema),
+	// !mark(1:6)
+	maxDelayMs: Type.Optional(
+		Type.Number({
+			description: "Legacy retry delay setting. Use provider.maxRetryDelayMs instead.",
+			deprecated: true,
+		}),
+	),
+});
+```
+
+## !!steps Package sources and the old skills form
+
+A package source is either a string, which loads every resource in the package, or an object that filters resources by kind. With `autoload: false`, the object form starts empty and loads only what its patterns name.
+
+`skills` accepts two shapes because older files used an object with `enableSkillCommands` and `customDirectories`. The settings manager converts that object to the array form on load, so the object branch is marked deprecated.
+
+```ts ! settings-schema.ts
+const PackageSourceSchema = Type.Union(
+	[
+		Type.String({ description: "Load all resources from the package." }),
+		Type.Object({
+			source: Type.String(),
+			autoload: Type.Optional(
+				Type.Boolean({ description: "When false, start empty and only apply explicit resource patterns." }),
+			),
+			extensions: Type.Optional(Type.Array(Type.String())),
+			skills: Type.Optional(Type.Array(Type.String())),
+			prompts: Type.Optional(Type.Array(Type.String())),
+			themes: Type.Optional(Type.Array(Type.String())),
+		}),
+	],
+// ...
+const StringArraySchema = Type.Array(Type.String());
+const SkillsInputSchema = Type.Union(
+	[
+		StringArraySchema,
+		Type.Object(
+			{
+				enableSkillCommands: Type.Optional(Type.Boolean()),
+				customDirectories: Type.Optional(StringArraySchema),
+			},
+			// !mark
+			{ deprecated: true },
+		),
+	],
+	{ description: "Local skill file paths or directories." },
+);
+```
+
+## !!steps The top-level object
+
+`SettingsSchema` lists every key. The thinking level reuses pi-ai's schema through [pi-ai-schemas.ts](/docs/src/core/pi-ai-schemas.ts), which wraps pi-ai's schemas so they type-check in TypeBox. The global and project files share this one schema, so scope can only be stated in prose: `defaultProjectTrust`, `selfUpdateCommand`, `deviceId` and `cacheWarming` say "global only" in their descriptions, and the code that reads them is what actually ignores the project file.
+
+The object is open, with `additionalProperties: true`. Extensions keep their own keys in the same file, and the settings manager preserves keys it does not know, so a strict schema would flag valid files. The legacy `queueMode` and `websockets` keys are still listed, as deprecated, because the settings manager migrates them to `steeringMode` and `transport`.
+
+```ts ! settings-schema.ts
+export const SettingsSchema = Type.Object(
+	{
+		$schema: Type.Optional(Type.String({ description: "JSON Schema reference." })),
+		lastChangelogVersion: Type.Optional(Type.String()),
+		extensionChangelogVersions: Type.Optional(
+			Type.Record(Type.String(), Type.String(), {
+				description: "Last seen changelog version per extension package.",
+			}),
+		),
+		defaultProvider: Type.Optional(Type.String()),
+		defaultModel: Type.Optional(Type.String()),
+		// !mark
+		defaultThinkingLevel: Type.Optional(ModelThinkingLevelSchema),
+// ...
+		cacheWarming: Type.Optional(
+			Type.Union([Type.Literal("off"), Type.Literal("streaming"), Type.Literal("idle")], {
+				description:
+					'Cache-warming profile. "idle" also warms between agent runs. Global only because each refresh costs money.',
+				default: SETTINGS_DEFAULTS.cacheWarming,
+			}),
+		),
+// ...
+		queueMode: Type.Optional(
+			Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")], {
+				description: "Legacy setting migrated to steeringMode.",
+				deprecated: true,
+			}),
+		),
+		websockets: Type.Optional(
+			Type.Boolean({ description: "Legacy setting migrated to transport.", deprecated: true }),
+		),
+	},
+	// !mark
+	{ additionalProperties: true },
+);
+```
+
+## !!steps Types derived from the schema
+
+The exported types are `Static` views of the schemas above, declared as interfaces where possible. The enum-like types such as `TransportSetting` and `CacheWarmingMode` are read off the top-level object, with `NonNullable` removing the `undefined` of an optional key.
+
+`Settings` is not quite the input shape. It drops `queueMode` and `websockets` and narrows `retry` and `skills`, because the settings manager's migration rewrites those keys before any getter sees them. The schema describes what a file may contain, and `Settings` describes what the code reads after migration. `RetrySettings` drops `maxDelayMs` for the same reason.
+
+```ts ! settings-schema.ts
+type SettingsInput = Static<typeof SettingsSchema>;
+
+export interface CompactionModelOverride extends Static<typeof CompactionModelOverrideSchema> {}
+export interface CompactionSettings extends Static<typeof CompactionSettingsSchema> {}
+// ...
+// !mark
+export interface RetrySettings extends Omit<Static<typeof RetrySettingsSchema>, "maxDelayMs"> {}
+// ...
+export type TransportSetting = NonNullable<SettingsInput["transport"]>;
+// ...
+export type CacheWarmingMode = NonNullable<SettingsInput["cacheWarming"]>;
+// !mark(1:4)
+export interface Settings extends Omit<SettingsInput, "queueMode" | "retry" | "skills" | "websockets"> {
+	retry?: RetrySettings;
+	skills?: string[];
+}
+```
+
+</Scrollycoding>
+
+Because the types come from the schema, adding a setting means adding a property here, with its default in settings-defaults.ts if it has one, and then a getter in the settings manager. The committed `settings.schema.json` must then be regenerated, and a test fails until it is.

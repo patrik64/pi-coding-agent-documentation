@@ -34,13 +34,15 @@ type HighlightJsLanguageFactory = (hljs: HighlightJsApi) => HighlightJsLanguageD
 
 ## !!steps The hljs object
 
-`HighlightJsApi` lists the four methods used: `highlight`, `highlightAuto`, `getLanguage` and `registerLanguage`.
+`HighlightJsApi` lists the five methods used: `highlight`, `highlightAuto`, `getLanguage`, `listLanguages` and `registerLanguage`. `listLanguages` was added so [syntax-highlight.ts](/docs/src/utils/syntax-highlight.ts) can report how many grammars are registered, which highlighting caches use to notice the background grammar load.
 
 ```ts ! highlight-js.d.ts
 interface HighlightJsApi {
 	highlight(code: string, options: HighlightJsOptions): HighlightJsResult;
 	highlightAuto(code: string, languageSubset?: string[]): HighlightJsResult;
 	getLanguage(name: string): HighlightJsLanguageDefinition | undefined;
+	// !mark
+	listLanguages(): string[];
 	registerLanguage(name: string, language: HighlightJsLanguageFactory): void;
 }
 ```

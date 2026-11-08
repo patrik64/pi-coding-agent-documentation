@@ -17,7 +17,7 @@ The two implementations of this contract are [loader.ts](/docs/src/core/extensio
 
 `ExtensionUIContext` is how an extension talks to a person. It covers dialogs (`select`, `confirm`, `input`, `editor`), passive output (`notify`, `setStatus`, widgets, footer, header, title) and raw hooks such as `onTerminalInput` and custom components with keyboard focus.
 
-Each mode implements it differently. The interactive TUI does everything, while RPC and print modes supply cut-down versions. When no UI exists, the runner substitutes a no-op object. Dialogs accept an `AbortSignal` and a timeout through `ExtensionUIDialogOptions`.
+Each mode implements it differently. The interactive TUI does everything, while RPC and print modes supply cut-down versions. When no UI exists, the runner substitutes a no-op object. Dialogs accept an `AbortSignal` and a timeout through `ExtensionUIDialogOptions`. A `custom()` component can pass `blocked` to report pi as waiting on user input through the terminal's program status (OSC 7501): inline components report it while visible, overlays until `done()` is called.
 
 The theme type comes from [theme.ts](/docs/src/modes/interactive/theme/theme.ts).
 
@@ -92,6 +92,8 @@ export type ToolExposure = "direct" | "model-only" | "codemode" | "deferred" | "
 
 `ToolDefinition` is what `registerTool` takes. Beyond the usual name, label, description and TypeBox `parameters`, it carries prompt text for the default system prompt, an optional `prepareArguments` shim that runs before schema validation, an `outputSchema`, an `executionMode` override and custom `renderCall` and `renderResult` functions.
 
+Tools that reach other tools, such as `codemode` (which calls them) and `tool_search` (which loads them), can declare `reachesTools`: given a call's input it returns `"all"` or the words that may name the tools involved. Extensions that register tools late, such as MCP servers still connecting, read it from their `tool_call` handler to finish registering those tools before the call runs. A tool's `namespace` may also carry `aliases`, alternative names under which codemode and tool search look the group up.
+
 `defineTool` is an identity function whose purpose is purely typing. It preserves parameter inference when a tool is stored in a variable or array, where contextual typing would otherwise widen `params` to `unknown`.
 
 ```ts ! types.ts
@@ -128,7 +130,7 @@ export interface SessionBeforeCompactEvent {
 
 Several events sit right at the model call. `context` sees only the conversation and Pi puts the prompt and tool state back afterwards. `context_with_system` sees everything and owns the result. `before_provider_request` can replace the raw payload. `before_provider_headers` mutates headers in place, and a `null` value deletes a header.
 
-`before_agent_start` runs after the user submits a prompt. Its `systemPrompt` is read-only and rendered on demand, while `systemPromptOptions` is the mutable source that later handlers also see.
+`before_agent_start` runs before every run, whether it was started by a prompt or by an idle `pi.sendMessage(..., { triggerTurn: true })`. The event is a union on `messageType`: the `user` variant carries the prompt text and images, the `custom` variant the starting custom message. Its `systemPrompt` is read-only and rendered on demand, while `systemPromptOptions` is the mutable source that later handlers also see.
 
 ```ts ! types.ts
 /**
@@ -142,6 +144,9 @@ export interface ContextEvent {
 	type: "context";
 	messages: AgentMessage[];
 }
+// ...
+/** Fired before a run starts from a user message or an idle custom message with `triggerTurn`. */
+export type BeforeAgentStartEvent = BeforeAgentStartUserEvent | BeforeAgentStartCustomEvent;
 ```
 
 ## !!steps Boundary events and drafted entries
@@ -205,6 +210,28 @@ export interface ToolResultEventResult {
 	structuredContent?: JsonValue;
 	isError?: boolean;
 	usage?: Usage;
+}
+```
+
+## !!steps Rendering hooks
+
+Renderer contexts (`ToolRenderContext`, `MessageRenderOptions`, `EntryRenderOptions`) extend `KeybindingHints`, which formats the host's configured keybindings. Extensions are told to use it instead of importing `keyText` or `keyHint`, because an import may resolve to another copy of the coding-agent package that does not see the host's keybindings. Tool renderers also receive the tool's `durationMs` and the `outputPad` setting.
+
+Markdown transformers now choose their surfaces. `MarkdownMessageType` adds custom messages, expanded summaries and the changelog to the three transcript types; a transformer registered without options still runs on user, assistant and thinking Markdown only. Transform contexts rendered from persisted entries also carry the entry's `messageId` and `timestamp`.
+
+```ts ! types.ts
+export type MarkdownMessageType = "user" | "assistant" | "assistant-thinking" | "custom" | "summary" | "changelog";
+
+export interface MarkdownTransformContext {
+	messageType: MarkdownMessageType;
+	isStreaming: boolean;
+	availableWidth: number;
+// ...
+}
+// ...
+export interface MarkdownTransformerOptions {
+	/** Surfaces the transformer runs on. Default: `["user", "assistant", "assistant-thinking"]`. */
+	messageTypes?: readonly MarkdownMessageType[];
 }
 ```
 

@@ -104,7 +104,7 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 
 ## !!steps Truncating tool results
 
-Tool output can be enormous, and a summarizer does not need all of it. Results are cut to 2000 characters, keeping the beginning and noting how many characters were dropped.
+Tool output can be enormous, and a summarizer does not need all of it. Results are cut to 2000 characters, keeping the beginning and noting how many characters were dropped. The cut goes through `sliceHead` from [truncate.ts](/docs/src/core/tools/truncate.ts) rather than a plain `slice`, so an emoji or other character outside the Basic Multilingual Plane that straddles the limit is dropped whole instead of leaving half a surrogate pair, which would be invalid UTF-16 in the request body.
 
 ```ts ! utils.ts
 /** Maximum characters for a tool result in serialized summaries. */
@@ -114,13 +114,15 @@ const TOOL_RESULT_MAX_CHARS = 2000;
 function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	return `${sliceHead(text, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
 }
 ```
 
 ## !!steps Serializing the conversation
 
-Messages become tagged plain text such as `[User]:` and `[Assistant]:`. The docstring explains why: sending real chat turns would make the model continue the dialogue, whereas a transcript reads as material to summarize. Thinking, text and tool calls from one assistant message are emitted as separate parts, and tool calls are rendered as `name(key=json, ...)`.
+Messages become tagged plain text such as `[User]:` and `[Assistant]:`. The docstring explains why: sending real chat turns would make the model continue the dialogue, whereas a transcript reads as material to summarize. Text and tool calls from one assistant message are emitted as separate parts, and tool calls are rendered as `name(key=json, ...)`.
+
+Thinking blocks are left out entirely. Providers hand back only a summary of the real reasoning, and replayed thinking is often not in the model's live context anyway (for example, a block that does not match its request is dropped), so including it could make the summarization request larger than the context being summarized. Visible text, tool calls and tool results are enough to record what happened.
 
 ```ts ! utils.ts
 export function serializeConversation(messages: Message[]): string {
@@ -131,13 +133,25 @@ export function serializeConversation(messages: Message[]): string {
 			const content = contentText(msg.content, "");
 			if (content) parts.push(`[User]: ${content}`);
 		} else if (msg.role === "assistant") {
-			const thinkingParts: string[] = [];
 			const toolCalls: string[] = [];
 
 			for (const block of msg.content) {
-				if (block.type === "thinking") {
-					thinkingParts.push(block.thinking);
-				} else if (block.type === "toolCall") {
+				if (block.type === "toolCall") {
+					const args = block.arguments as Record<string, unknown>;
+					const argsStr = Object.entries(args)
+						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+						.join(", ");
+					toolCalls.push(`${block.name}(${argsStr})`);
+				}
+			}
+
+			if (msg.content.some((block) => block.type === "text")) {
+				parts.push(`[Assistant]: ${contentText(msg.content)}`);
+			}
+			if (toolCalls.length > 0) {
+				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+			}
+// ...
 ```
 
 ## !!steps The system prompt

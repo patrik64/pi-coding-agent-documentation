@@ -7,7 +7,7 @@ full: true
 
 This is the light counterpart of [dark.json](/docs/src/modes/interactive/theme/dark.json). The structure is identical: a `vars` palette, a `colors` table covering every token, and an `export` block. What changes is the numbers. Where the dark theme uses about 67% lightness for foregrounds and about 24% for surfaces, the light theme uses about 47% for foregrounds and about 91% for surfaces, with saturation raised to keep colors from washing out.
 
-The file is read by [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and has to satisfy [theme-json.ts](/docs/src/modes/interactive/theme/theme-json.ts). When the user's setting is a light/dark pair or the `system` theme, [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) decides when this one is chosen.
+The file is read by [theme.ts](/docs/src/modes/interactive/theme/theme.ts) and follows the schema in [theme-schema.ts](/docs/src/modes/interactive/theme/theme-schema.ts). When the user's setting is a light/dark pair or the `system` theme, [theme-controller.ts](/docs/src/modes/interactive/theme/theme-controller.ts) decides when this one is chosen.
 
 <Scrollycoding>
 
@@ -17,7 +17,7 @@ Same variable names as the dark theme. Foreground families sit at roughly 46 to 
 
 ```json ! light.json
 {
-	"$schema": "https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+	"$schema": "https://pi.dev/schemas/theme.schema.json",
 	"name": "light",
 	"appearance": "light",
 	"vars": {
@@ -91,4 +91,4 @@ The thinking ramp is light here: pale greys and pastels (70 to 80% lightness) ra
 
 </Scrollycoding>
 
-The two built-in files must stay in key-for-key sync because both are validated against the same schema. The generated `system` theme in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) derives its own colors from the terminal and aims for the same roles.
+The two built-in files must stay in key-for-key sync because both have to satisfy the same schema. pi does not validate built-in themes at runtime, so a missing required key would only show up as an "Unknown theme color" error the first time a component paints with that token. The generated `system` theme in [system-theme.ts](/docs/src/modes/interactive/theme/system-theme.ts) derives its own colors from the terminal and aims for the same roles.

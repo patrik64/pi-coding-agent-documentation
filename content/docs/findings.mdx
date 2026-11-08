@@ -9,6 +9,10 @@ None of this is a judgement of the code overall; it is the ordinary residue of
 a fast-moving codebase. Only the files with walkthroughs have been read this
 closely.
 
+The list was re-checked when the pages were brought up to date with pi-mono
+`ccbb224c2` (2026-11-08). Entries fixed upstream since the first pass are
+collected under [Fixed since the first pass](#fixed-since-the-first-pass).
+
 ## Behavior that looks wrong
 
 - **CLI overrides are dropped by later saves.** `applyOverrides` only touches
@@ -26,8 +30,10 @@ closely.
   [model-runtime.ts](/docs/src/core/model-runtime.ts), while
   [package-manager.ts](/docs/src/core/package-manager.ts) accepts only `1`,
   `true` or `yes`.
-- **A mistyped flag can eat the prompt.** A value flag with no value, or an
-  unknown flag followed by a word, is stored silently. See
+- **A mistyped flag can eat the prompt.** A value flag with no value is
+  dropped silently, and an unknown `--flag` takes the next word as its value.
+  An unregistered flag is reported later, but a registered boolean extension
+  flag swallows that word without a sound. See
   [args.ts](/docs/src/cli/args.ts).
 - **A failed session swap can leave a disposed session.** A factory failure
   after teardown leaves the runtime holding it. See
@@ -35,12 +41,25 @@ closely.
 - **Aborts after completion still report errors** in
   [write.ts](/docs/src/core/tools/write.ts) and
   [edit.ts](/docs/src/core/tools/edit.ts).
+- **A shutdown requested during a failing RPC command waits.** The `catch` in
+  `handleInputLine` never calls `checkShutdownRequested`, so a `ctx.shutdown()`
+  made while a command throws is only noticed after the next command or when
+  the agent settles. See [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts).
+- **The settings schema rejects timeouts pi accepts.** `timeoutSetting` allows
+  a number or `"disabled"`, so editors flag `"30000"`, which
+  `parseHttpIdleTimeoutMs` in
+  [http-dispatcher.ts](/docs/src/core/http-dispatcher.ts) parses happily. See
+  [settings-schema.ts](/docs/src/core/settings-schema.ts).
+- **One path check is still case-sensitive on Windows.** `isUnderPath` uses
+  `startsWith`, while the code around it moved to the case-insensitive
+  `isPathWithin`. See [resource-loader.ts](/docs/src/core/resource-loader.ts).
+- **`pi mcp list` sends provider-backed servers to `/login`.** Its hint still
+  reads "sign in with: /login provider", while `pi mcp login` and `logout` for
+  the same servers now point at `pi auth login`. See
+  [cli.ts](/docs/src/extensions/mcp/cli.ts).
 
 ## Comments that contradict the code
 
-- `findInitialModel` lists "restored from session" as a source it does not
-  implement, and `parseModelPattern` mentions "off" where it returns
-  `undefined`: [model-resolver.ts](/docs/src/core/model-resolver.ts).
 - `detectExtensionConflicts` mentions commands but checks tools and flags only:
   [resource-loader.ts](/docs/src/core/resource-loader.ts).
 - The `createAgentSession` example uses a `continueSession` option that does
@@ -49,9 +68,25 @@ closely.
   does not check: [agent-session.ts](/docs/src/core/agent-session.ts).
 - Several doc comments sit above the wrong declaration, in
   [session-manager.ts](/docs/src/core/session-manager.ts),
-  [types.ts](/docs/src/core/extensions/types.ts),
-  [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) and
-  [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts).
+  [tree-selector.ts](/docs/src/modes/interactive/components/tree-selector.ts),
+  [loader.ts](/docs/src/core/extensions/loader.ts), where the
+  `createExtensionAPI` comment now sits on `DEFAULT_MARKDOWN_MESSAGE_TYPES`,
+  and [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts),
+  where the "Startup details" comment now sits on `getModelScopeNotice`
+  instead of `shouldShowStartupDetails`.
+- `prompt()` refuses with "compaction is in progress" even when a branch
+  summary is what is running:
+  [agent-session.ts](/docs/src/core/agent-session.ts).
+- `appendOutput` says binary data is sanitized by `executeBashCommand` in
+  `tui-renderer.ts`, which no longer exists; `sanitizeBinaryOutput` runs in
+  [bash-executor.ts](/docs/src/core/bash-executor.ts). See
+  [bash-execution.ts](/docs/src/modes/interactive/components/bash-execution.ts).
+- `lowerQualityJpegs` is not lower: with the default quality of 80 the next
+  candidate is 85. See
+  [image-resize-core.ts](/docs/src/utils/image-resize-core.ts).
+- The `-l` help text says it picks `.pi/mcp.json` over the global file, but
+  for `login` and `logout` it only rejects servers the project does not
+  define: [cli.ts](/docs/src/extensions/mcp/cli.ts).
 
 ## Dead or duplicated code
 
@@ -68,6 +103,10 @@ closely.
   [session-selector.ts](/docs/src/modes/interactive/components/session-selector.ts).
 - `loadThemes` is always called with `includeDefaults` false, so that branch is
   dead: [resource-loader.ts](/docs/src/core/resource-loader.ts).
+- `restoreModelFromSession` is exported but has no callers anywhere in the
+  monorepo: [model-resolver.ts](/docs/src/core/model-resolver.ts).
+- `ExecOptions.cwd` is declared but never read; `execCommand` takes the
+  working directory as a separate argument: [exec.ts](/docs/src/core/exec.ts).
 
 ## Found while documenting the rest
 
@@ -87,8 +126,6 @@ closely.
   [footer.ts](/docs/src/modes/interactive/components/footer.ts).
 - **A rejected terminal-color query disables the easter egg for good.**
   See [easter-egg-3d.ts](/docs/src/modes/interactive/components/easter-egg-3d.ts).
-- **Bash header color is lost after the first update** for `!!` commands. See
-  [bash-execution.ts](/docs/src/modes/interactive/components/bash-execution.ts).
 - **A failed Photon load is cached forever.** See
   [photon.ts](/docs/src/utils/photon.ts).
 - **`PI_OFFLINE` is parsed three ways** across
@@ -96,12 +133,27 @@ closely.
   [version-check.ts](/docs/src/utils/version-check.ts) and the two files in
   the first list.
 - **Dead exports:** `warnDeprecation`
-  ([deprecation.ts](/docs/src/utils/deprecation.ts)), `wrapToolDefinitions`
+  ([deprecation.ts](/docs/src/utils/deprecation.ts)) and `wrapToolDefinitions`
   ([tool-definition-wrapper.ts](/docs/src/core/tools/tool-definition-wrapper.ts))
-  and `isInstallTelemetryEnabled`
-  ([telemetry.ts](/docs/src/core/telemetry.ts)) have no callers in `src`.
-- **`vacation/` is a near-copy of `durable/`**, including an identical
-  `main.ts`. See [main.ts](/docs/src/experimental/vacation/main.ts).
+  have no callers in `src`.
 - **Abort handling gaps in `grep` and `ls`:** an abort during tool download is
   missed in [grep.ts](/docs/src/core/tools/grep.ts), and
   [ls.ts](/docs/src/core/tools/ls.ts) leaks its listener on early rejects.
+
+## Fixed since the first pass
+
+- The bash header color for `!!` commands now survives updates: the color key
+  is a field that `updateDisplay` reads. See
+  [bash-execution.ts](/docs/src/modes/interactive/components/bash-execution.ts).
+- `findInitialModel` now implements every source its comment lists, and
+  `parseModelPattern`, whose comment mentioned "off", is gone:
+  [model-resolver.ts](/docs/src/core/model-resolver.ts).
+- The stray "Check if shutdown was requested" comment in
+  [rpc-mode.ts](/docs/src/modes/rpc/rpc-mode.ts) was removed.
+- `vacation/`, the near-copy of `durable/`, went with the rest of the
+  experimental server stack.
+- One entry was simply wrong: `isInstallTelemetryEnabled` always had callers.
+  See [telemetry.ts](/docs/src/core/telemetry.ts).
+- The misplaced doc comment once listed for
+  [types.ts](/docs/src/core/extensions/types.ts) could not be found on
+  re-check, so it was dropped from that entry.

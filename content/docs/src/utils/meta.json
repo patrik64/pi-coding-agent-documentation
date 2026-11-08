@@ -31,10 +31,12 @@
     "shell.ts",
     "sleep.ts",
     "syntax-highlight.ts",
+    "terminal-question.ts",
     "text.ts",
     "tool-result-images.ts",
     "tools-manager.ts",
     "version-check.ts",
+    "web-url.ts",
     "windows-self-update.ts",
     "wsl.ts",
     "zip.ts"

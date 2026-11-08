@@ -1,28 +1,33 @@
 ---
 title: "tool.ts"
-description: "Tool discovery: a BM25 ranker over tool names, descriptions and schemas, shared by the tool_search tool and codemode's searchTools"
+description: "Tool discovery: a field-weighted BM25 ranker over tool names, descriptions, schemas and namespaces, shared by the tool_search tool and codemode's searchTools"
 source: "src/extensions/tool-search/tool.ts"
 full: true
 ---
 
-When a session has many tools, declaring all of them to the model on every call wastes context. Tools with `deferred` or `codemode` exposure are therefore left out, and this file lets the model find them again by describing what it needs. It contains the search engine itself (tokenizer, document builder, BM25 ranker) and the `tool_search` tool that uses it to activate matches.
+When a session has many tools, declaring all of them to the model on every call wastes context. Tools with `deferred` or `codemode` exposure are therefore left out, and this file lets the model find them again by describing what it needs. It contains the search engine itself (tokenizer, document builder, ranker) and the `tool_search` tool that uses it to activate matches.
 
-The ranker is shared: [execute.ts](/docs/src/extensions/codemode/execute.ts) imports `Bm25Ranker` and `createToolSearchDocument` for its script-side `searchTools()`. The tool is registered by [index.ts](/docs/src/extensions/tool-search/index.ts), and the tool and namespace types come from [types.ts](/docs/src/core/extensions/types.ts). MCP tools reach this path through the exposure mapping in [tools.ts](/docs/src/extensions/mcp/tools.ts).
+The ranker is shared: [execute.ts](/docs/src/extensions/codemode/execute.ts) imports `Bm25Ranker` and `createToolSearchDocument` for its script-side `searchTools()`. The tool is registered by [index.ts](/docs/src/extensions/tool-search/index.ts), and the tool and namespace types come from [types.ts](/docs/src/core/extensions/types.ts). MCP tools reach this path through the exposure mapping in [tools.ts](/docs/src/extensions/mcp/tools.ts), and the MCP extension in [index.ts](/docs/src/extensions/mcp/index.ts) uses the tool's `reachesTools` to connect servers before a search runs.
+
+The ranker started as plain BM25 over one blob of text. It now treats a tool's name, its description and schema, and its namespace as separate fields with different weights, and it orders results by how many query terms they match before it looks at scores, because models usually search with a couple of words that name the tool they want.
 
 <Scrollycoding>
 
 ## !!steps A pluggable ranker
 
-`ToolRanker` is the seam: given a query and documents, return scored names. BM25 is the only implementation today, and the comment says a hybrid ranker with embeddings could replace it without touching callers. A document is just a name and a text blob.
+`ToolRanker` is the seam: given a query and documents, return scored names. BM25 is the only implementation today, and the comment says a hybrid ranker with embeddings could replace it without touching callers. A document carries the name, the text of the tool itself, and the text of its namespace separately, so the ranker can weigh them differently.
 
 ```ts ! tool.ts
 export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 export const DEFAULT_TOOL_SEARCH_LIMIT = 8;
 
-/** A tool as the ranker sees it: its name and the text built by {@link createToolSearchDocument}. */
+/** A tool as the ranker sees it: its name and the texts built by {@link createToolSearchDocument}. */
 export interface ToolSearchDocument {
 	name: string;
+	/** Description, schema descriptions, and property names. */
 	text: string;
+	/** Name, description, and instructions of the tool's namespace. */
+	namespaceText?: string;
 }
 
 export interface ToolSearchMatch {
@@ -38,114 +43,231 @@ export interface ToolRanker {
 
 ## !!steps Tokenizing and stemming
 
-`tokenize` splits camelCase, lowercases, splits on anything that is not a letter or digit, drops stop words, and applies a naive stemmer. The stemmer only handles plurals (`ies`, `ches`, trailing `s`), enough for `issues` to match `issue`. Because queries and documents use the same function, mismatches in the stemmer cancel out.
+`tokenize` normalizes to NFC, splits camelCase, lowercases, and turns every run of characters that is not a letter, mark or digit in any script into a space. Plain ASCII text is then split at spaces. Anything else goes through `Intl.Segmenter`, which finds word boundaries in scripts written without spaces, such as Chinese; the comment explains the fast path: the segmenter is about 15 times slower than a split and gives the same words for ASCII.
+
+Stop words are dropped, and the naive stemmer is applied only to ASCII words. It handles plurals (`ies`, `ches`, trailing `s`), enough for `issues` to match `issue`. Because queries and documents use the same function, mismatches in the stemmer cancel out.
 
 ```ts ! tool.ts
+const wordSegmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+// ...
 /** Naive singular form, so `issues` matches `issue` and `searches` matches `search`. */
 function stem(term: string): string {
-	// !mark(1:3)
 	if (term.length > 4 && term.endsWith("ies")) return `${term.slice(0, -3)}y`;
 	if (term.length > 4 && /(ches|shes|sses|xes|zes)$/.test(term)) return term.slice(0, -2);
 	if (term.length > 3 && term.endsWith("s") && !term.endsWith("ss")) return term.slice(0, -1);
 	return term;
 }
 
-/** Lowercase terms, split at camelCase boundaries and non-alphanumerics, without stop words. */
+/** Unicode word segmentation with identifier boundaries and English stop words/singular forms. */
 export function tokenize(text: string): string[] {
-	return text
+	const normalized = text
+		.normalize("NFC")
 		// !mark(1:2)
 		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
 		.replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
 		.toLowerCase()
-		.split(/[^a-z0-9]+/)
-		.filter((term) => term.length > 0 && !STOP_WORDS.has(term))
-		.map(stem);
+		.replace(/[^\p{L}\p{M}\p{N}]+/gu, " ");
+	// The segmenter costs about 15 times a split. Plain ASCII splits into the same words at spaces, so only other
+	// text, such as Chinese written without spaces, goes through it.
+	// !mark(1:3)
+	const words = /^[a-z0-9 ]*$/.test(normalized)
+		? normalized.split(" ")
+		: Array.from(wordSegmenter.segment(normalized), (segment) => (segment.isWordLike ? segment.segment : ""));
+	return words
+		.filter((word) => word.length > 0 && !STOP_WORDS.has(word))
+		.map((word) => (/^[a-z0-9]+$/.test(word) ? stem(word) : word));
 }
 ```
 
 ## !!steps What a tool's searchable text contains
 
-`createToolSearchDocument` concatenates the tool name (also with underscores turned into spaces), its description, every description and property name found recursively in the parameter schema (including `items` and `anyOf`, `oneOf`, `allOf` branches), and the namespace's name, description and instructions. A namespace match therefore lifts all the tools inside it.
+`createToolSearchDocument` builds the tool's own text from its description plus every description and property name found recursively in the parameter schema, including `items` and the `anyOf`, `oneOf`, `allOf` branches. Schemas from MCP servers often keep their structure in `$defs` and point at it with `$ref`, so `schemaText` follows local references through `resolveSchemaRef` from pi-codemode. The `seen` set stops recursive definitions from looping and reads a shared definition once; definitions that nothing references are never read.
+
+The namespace's name, description and instructions go into a separate `namespaceText`. The tool name is no longer copied into the text at all: the ranker reads it from `name` and scores it as its own field.
 
 ```ts ! tool.ts
-/** Schema descriptions and property names, recursively. */
-function schemaText(schema: unknown, parts: string[]): void {
+/**
+ * Schema descriptions and property names, recursively, following local `$ref`s into `root`. `seen` holds the
+ * subschemas already reached through a reference, so recursive and shared definitions are read once, and
+ * definitions no property references are not read.
+ */
+function schemaText(schema: unknown, root: unknown, parts: string[], seen: Set<unknown>): void {
 	if (!isObject(schema)) return;
+	// !mark(1:7)
+	if (typeof schema.$ref === "string") {
+		const target = resolveSchemaRef(schema.$ref, root);
+		if (isObject(target) && !seen.has(target)) {
+			seen.add(target);
+			schemaText(target, root, parts, seen);
+		}
+	}
 	if (typeof schema.description === "string") parts.push(schema.description);
 	if (isObject(schema.properties)) {
 		for (const [name, property] of Object.entries(schema.properties)) {
 			parts.push(name);
-			schemaText(property, parts);
+			schemaText(property, root, parts, seen);
 		}
 	}
-	schemaText(schema.items, parts);
+	schemaText(schema.items, root, parts, seen);
 	for (const key of ["anyOf", "oneOf", "allOf"]) {
 		const variants = schema[key];
-		if (Array.isArray(variants)) for (const variant of variants) schemaText(variant, parts);
+		if (Array.isArray(variants)) for (const variant of variants) schemaText(variant, root, parts, seen);
 	}
 }
 
 /**
- * Search text of a tool: the name, the name with `_`
- * as spaces, the description, schema descriptions and property names, and the namespace with its
- * description and instructions.
+ * Search text of a tool: the description and the schema descriptions and property names, and
+ * separately the namespace name, description, and instructions. The ranker reads the name from `name`.
  */
 export function createToolSearchDocument(
 	tool: Pick<ToolInfo, "name" | "description" | "parameters">,
 	namespace?: ToolNamespace,
 ): ToolSearchDocument {
+	const parts = [tool.description];
+	schemaText(tool.parameters, tool.parameters, parts, new Set([tool.parameters]));
 	// !mark(1:3)
-	const parts = [tool.name, tool.name.replaceAll("_", " "), tool.description];
-	schemaText(tool.parameters, parts);
-	if (namespace) parts.push(namespace.name, namespace.description ?? "", namespace.instructions ?? "");
-	return { name: tool.name, text: parts.filter((part) => part.trim()).join(" ") };
+	const namespaceText = namespace
+		? [namespace.name, namespace.description ?? "", namespace.instructions ?? ""].join(" ")
+		: "";
+	return { name: tool.name, text: parts.filter((part) => part.trim()).join(" "), namespaceText };
 }
 ```
 
-## !!steps BM25 scoring
+## !!steps Names as their own field
 
-The ranker counts terms per document, computes average document length, and scores each query term with an inverse document frequency times a length-normalized term frequency, using the usual `k1` of 1.2 and `b` of 0.75. Only positive scores are returned, sorted descending and cut at the limit. Because the sort is stable, ties keep document order.
+Before ranking, each document is split into fields. `nameTerms` are all terms of the full name, so `mcp__app__thread_read` contributes `mcp`, `app`, `thread` and `read`. `localNameTerms` are only the terms after the last `__`, the part a model is likely to say. The description text keeps term counts for BM25.
+
+Exact-name queries are compared after `normalizeName`, which lowercases and replaces anything that is not valid in a script identifier with `_`. A query matches when it equals the whole name or a suffix after a `__` separator, so `thread_read` and `app__thread_read` both name `mcp__app__thread_read`, and `dev-radius` matches `dev_radius`.
+
+```ts ! tool.ts
+/** Lowercase with characters invalid in script identifiers as `_`, so `dev-radius` matches `dev_radius`. */
+function normalizeName(name: string): string {
+	return name
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9_$]/g, "_");
+}
+
+/**
+ * Whether the whole query is the tool's name: its full name or a suffix after a `__` separator, so
+ * `thread_read` and `app__thread_read` both name `mcp__app__thread_read`.
+ */
+function isExactNameQuery(query: string, name: string): boolean {
+	const normalized = normalizeName(name);
+	return normalized === query || normalized.endsWith(`__${query}`);
+}
+// ...
+function indexDocument(document: ToolSearchDocument): IndexedDocument {
+	const textCounts = new Map<string, number>();
+	for (const term of tokenize(document.text)) textCounts.set(term, (textCounts.get(term) ?? 0) + 1);
+	const segments = document.name.split("__");
+	return {
+		name: document.name,
+		// !mark(1:2)
+		nameTerms: new Set(tokenize(document.name)),
+		localNameTerms: [...new Set(tokenize(segments[segments.length - 1]))],
+		textCounts,
+		textLength: [...textCounts.values()].reduce((sum, count) => sum + count, 0),
+		namespaceTerms: new Set(tokenize(document.namespaceText ?? "")),
+	};
+}
+```
+
+## !!steps Field weights and ordering rules
+
+The two constants set how much each field is worth, in multiples of a term's IDF. A single mention in the description is worth about 1 and the BM25 term-frequency part can never exceed `k1 + 1`, so a name weight of 3 means a query term in the name beats any number of mentions in the description. Namespace text is shared by every tool of an MCP server, so it gets only half a mention: it helps find the server but not the tool within it.
+
+The class comment states the full ordering: an exact name query wins outright, then tools matching more distinct query terms rank above those matching fewer regardless of score, then score decides. A tool whose whole local name appears in the query gets a bonus. Only the description is length-normalized, so long names or long namespace instructions do not drag a tool down.
+
+```ts ! tool.ts
+/**
+ * A query term in the name counts this many times its IDF. The text part of a term is at most
+ * `k1 + 1` (2.2) times its IDF and about 1 for a single mention, so a name match beats any number of
+ * mentions in the description.
+ */
+// !mark
+const NAME_WEIGHT = 3;
+
+/**
+ * A query term in the namespace name, description, or instructions counts this many times its IDF. They
+ * are shared by every tool of the server, so they help find the server but not the tool in it.
+ */
+// !mark
+const NAMESPACE_WEIGHT = 0.5;
+
+/**
+ * Okapi BM25 over the description, with the name and the namespace as separate fields:
+ * - a tool that matches more of the query's terms, in any field, ranks above one that matches
+ *   fewer, whatever their scores: for `screenshot window`, a tool whose description has both words
+ *   beats `window`, whose name has one;
+ * - a query term in the name scores more than any number of mentions in the description;
+ * - a tool whose whole local name is in the query (`app` in `peekaboo app` for
+ *   `mcp__peekaboo__app`) gets a bonus worth one more match of every query term, so among tools
+ *   matching as many terms it mostly wins over tools that only mention the words;
+ * - a query that is exactly a tool's name ranks that tool first, before coverage.
+ *
+ * The description alone is length-normalized, so a long name or long namespace instructions do
+ * not lower a tool's score. Ties keep document order.
+ */
+export class Bm25Ranker implements ToolRanker {
+```
+
+## !!steps Scoring
+
+IDF counts a document as containing a term if any of its three fields does. For each document, every query term contributes its IDF times the sum of the field weights: `NAME_WEIGHT` if the name has it, `NAMESPACE_WEIGHT` if the namespace has it, and the usual length-normalized BM25 term frequency (`k1` 1.2, `b` 0.75) for the description. `covered` counts the terms with any positive weight.
+
+The full-name bonus is the sum of all query-term IDFs. The final sort is three keys deep: exact name first, then coverage, then score. Because the sort is stable, ties keep document order. The internal `covered` and `exact` fields are stripped before returning.
 
 ```ts ! tool.ts
 	rank(query: string, documents: readonly ToolSearchDocument[], limit: number): ToolSearchMatch[] {
-		// !mark(1:2)
-		const queryTerms = [...new Set(tokenize(query))];
-		if (queryTerms.length === 0 || documents.length === 0 || limit <= 0) return [];
-		const termCounts = documents.map((document) => {
-			const counts = new Map<string, number>();
-			for (const term of tokenize(document.text)) counts.set(term, (counts.get(term) ?? 0) + 1);
-			return counts;
-		});
-		const lengths = termCounts.map((counts) => [...counts.values()].reduce((sum, count) => sum + count, 0));
-		const averageLength = lengths.reduce((sum, length) => sum + length, 0) / documents.length || 1;
-		// !mark(1:5)
+		const queryTerms = new Set(tokenize(query));
+		if (queryTerms.size === 0 || documents.length === 0 || limit <= 0) return [];
+		const indexed = documents.map(indexDocument);
+		const averageLength = indexed.reduce((sum, document) => sum + document.textLength, 0) / indexed.length || 1;
 		const idf = new Map(
-			queryTerms.map((term) => {
-				const frequency = termCounts.filter((counts) => counts.has(term)).length;
-				return [term, Math.log(1 + (documents.length - frequency + 0.5) / (frequency + 0.5))] as const;
+			[...queryTerms].map((term) => {
+				const frequency = indexed.filter(
+					(document) =>
+						document.nameTerms.has(term) || document.textCounts.has(term) || document.namespaceTerms.has(term),
+				).length;
+				return [term, Math.log(1 + (indexed.length - frequency + 0.5) / (frequency + 0.5))] as const;
 			}),
 		);
-		const matches: ToolSearchMatch[] = [];
-		documents.forEach((document, index) => {
+		const fullNameBonus = [...idf.values()].reduce((sum, value) => sum + value, 0);
+		const exactQuery = normalizeName(query);
+		const matches: (ToolSearchMatch & { covered: number; exact: boolean })[] = [];
+		for (const document of indexed) {
+			const norm = this.k1 * (1 - this.b + (this.b * document.textLength) / averageLength);
 			let score = 0;
+			let covered = 0;
 			for (const term of queryTerms) {
-				const count = termCounts[index].get(term);
-				if (!count) continue;
-				// !mark(1:2)
-				const norm = this.k1 * (1 - this.b + (this.b * lengths[index]) / averageLength);
-				score += (idf.get(term) ?? 0) * ((count * (this.k1 + 1)) / (count + norm));
+				const count = document.textCounts.get(term) ?? 0;
+				// !mark(1:4)
+				const weight =
+					(document.nameTerms.has(term) ? NAME_WEIGHT : 0) +
+					(document.namespaceTerms.has(term) ? NAMESPACE_WEIGHT : 0) +
+					(count * (this.k1 + 1)) / (count + norm);
+				if (weight > 0) covered++;
+				score += (idf.get(term) ?? 0) * weight;
 			}
-			if (score > 0) matches.push({ name: document.name, score });
-		});
-		// !mark
-		return matches.sort((a, b) => b.score - a.score).slice(0, limit);
+			if (score === 0) continue;
+			const local = document.localNameTerms;
+			// !mark
+			if (local.length > 0 && local.every((term) => queryTerms.has(term))) score += fullNameBonus;
+			matches.push({ name: document.name, score, covered, exact: isExactNameQuery(exactQuery, document.name) });
+		}
+		return matches
+			// !mark
+			.sort((a, b) => Number(b.exact) - Number(a.exact) || b.covered - a.covered || b.score - a.score)
+			.slice(0, limit)
+			.map(({ name, score }) => ({ name, score }));
 	}
 }
 ```
 
-## !!steps The tool schema and identity check
+## !!steps The tool schema
 
-The tool takes a query and an optional limit. `isToolSearchTool` compares the schema object by reference as well as the name, so another extension that registers a tool with the same name is not mistaken for this one.
+The tool takes a query and an optional limit. There used to be an `isToolSearchTool` check that compared this schema object by reference, so the MCP extension could tell this tool apart from another extension's tool of the same name. It is gone: the MCP extension now activates a `tool_search` only if it declares `reachesTools`, which the definition below does.
 
 ```ts ! tool.ts
 export const toolSearchSchema = Type.Object({
@@ -156,12 +278,6 @@ export const toolSearchSchema = Type.Object({
 });
 
 export type ToolSearchInput = Static<typeof toolSearchSchema>;
-
-/** Whether the tool is this `tool_search`, not another extension's tool of the same name. */
-export function isToolSearchTool(tool: Pick<ToolInfo, "name" | "parameters">): boolean {
-	// !mark
-	return tool.name === TOOL_SEARCH_TOOL_NAME && tool.parameters === toolSearchSchema;
-}
 ```
 
 ## !!steps Searching and activating
@@ -200,7 +316,9 @@ function searchAndLoad(
 
 ## !!steps The tool definition
 
-The description deliberately does not list the searchable tools, so it stays constant while tools register, for example as MCP servers connect; a changing description would break prompt caching. The tool is `model-only` because scripts have their own `searchTools()`. `execute` validates the query and limit, then reports the loaded tools with the first line of each description.
+The description deliberately does not list the searchable tools, so it stays constant while tools register, for example as MCP servers connect; a changing description would break prompt caching. The tool is `model-only` because scripts have their own `searchTools()`.
+
+`reachesTools: () => "all"` tells other extensions that any call may load any not-yet-declared tool. The MCP extension reads it in its `tool_call` handler and waits for every server that is still connecting, so a search issued right after startup can still find their tools. `execute` validates the query and limit, then reports the loaded tools with the first line of each description.
 
 ```ts ! tool.ts
 export function createToolSearchToolDefinition(
@@ -213,8 +331,10 @@ export function createToolSearchToolDefinition(
 		promptSnippet: "Search for tools that are not loaded yet and load the matches",
 		parameters: toolSearchSchema,
 		// Searching is not something scripts need; it changes what the model sees.
-		// !mark(1:6)
 		exposure: "model-only",
+		// A query can match any tool that is not declared yet.
+		// !mark
+		reachesTools: () => "all",
 		async execute(_toolCallId, { query, limit }) {
 			if (query.trim() === "") throw new Error("query must not be empty");
 			const max = limit ?? DEFAULT_TOOL_SEARCH_LIMIT;
@@ -234,4 +354,4 @@ export function createToolSearchToolDefinition(
 
 </Scrollycoding>
 
-Only `tokenize`, `Bm25Ranker`, `createToolSearchDocument`, the constants and the tool factory are needed from outside. The result of a search is a side effect (the active tool set changes) plus a short text, which is why the model is told the loaded tools are available from its next call, not the current one.
+From the rest of the package, only `Bm25Ranker`, `createToolSearchDocument`, the constants and the tool factory are used; `tokenize` is exported for the tests. The result of a search is a side effect (the active tool set changes) plus a short text, which is why the model is told the loaded tools are available from its next call, not the current one.

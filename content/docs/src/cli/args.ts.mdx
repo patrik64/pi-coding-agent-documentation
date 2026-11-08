@@ -143,6 +143,13 @@ empty entries. Repeatable flags such as `--append-system-prompt` and
 `--extension` accumulate into arrays. An invalid `--thinking` value is only a
 warning, so a typo does not abort the run; the level is simply left unset.
 
+`--tools` is also checked with `getToolListError` from
+[settings-manager.ts](/docs/src/core/settings-manager.ts). The list is either
+an allowlist of names and patterns, or only `+name` and `-name` entries that
+add to or remove from the default tools, as in `--tools +codemode`. Mixing the
+two forms, or using a `*` pattern in a `+`/`-` entry, is an error diagnostic and
+the flag is ignored.
+
 ```ts ! args.ts
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i]
@@ -153,6 +160,17 @@ warning, so a typo does not abort the run; the level is simply left unset.
 			result.noTools = true;
 		} else if (arg === "--no-builtin-tools" || arg === "-nbt") {
 			result.noBuiltinTools = true;
+		} else if ((arg === "--tools" || arg === "-t") && i + 1 < args.length) {
+			const tools = args[++i]
+				.split(",")
+				.map((s) => s.trim())
+				.filter((name) => name.length > 0);
+			const error = getToolListError(tools);
+			if (error) {
+				result.diagnostics.push({ type: "error", message: `${arg}: ${error}` });
+			} else {
+				result.tools = tools;
+			}
 // ...
 		} else if (arg === "--thinking" && i + 1 < args.length) {
 			const level = args[++i];

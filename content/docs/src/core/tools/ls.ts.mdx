@@ -71,7 +71,9 @@ const defaultLsOperations: LsOperations = {
 `execute` wraps the work in a manual promise so that an abort signal can reject
 immediately. It checks the signal up front, then registers a one-shot listener.
 The path is resolved against `ctx.cwd` when the extension context provides one,
-otherwise the cwd given to the factory.
+otherwise the cwd given to the factory. The limit is floored and clamped to at
+least 1: `limit: 0` used to list nothing and report an empty directory, and a
+fractional limit produced notices such as `Use limit=3` for `1.5`.
 
 ```ts ! ls.ts
 			return new Promise((resolve, reject) => {
@@ -86,7 +88,8 @@ otherwise the cwd given to the factory.
 				(async () => {
 					try {
 						const dirPath = resolveToCwd(path || ".", ctx?.cwd || cwd);
-						const effectiveLimit = limit ?? DEFAULT_LIMIT;
+						// A limit of 0 would list nothing and report "(empty directory)", so it means 1.
+						const effectiveLimit = Math.max(1, Math.floor(limit ?? DEFAULT_LIMIT));
 ```
 
 An abort only rejects the outer promise; the async body keeps running and

@@ -1,23 +1,23 @@
 ---
 title: "tools.ts"
-description: "Adapts MCP tools to pi tool definitions: name sanitizing, result conversion, output truncation, binary handling and TUI renderers"
+description: "Adapts MCP tools to pi tool definitions: result conversion for the model and for scripts, binary handling, a self-describing result schema and TUI renderers"
 source: "src/extensions/mcp/tools.ts"
 full: true
 ---
 
-Every tool an MCP server exposes becomes a pi `ToolDefinition` through this file. The work is mostly translation in both directions: a provider-safe tool name, an input schema that every provider will accept, annotations carried across, and the server's `CallToolResult` converted into the text and images the model can see.
+Every tool an MCP server exposes becomes a pi `ToolDefinition` through this file. The work is mostly translation in both directions: an input schema every provider will accept, annotations carried across, a declared output schema, and the server's `CallToolResult` converted into the text and images the model can see.
 
-Two audiences read each result. The model gets bounded, readable content. Codemode scripts get the whole `CallToolResult` as `structuredContent`, never truncated. The resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) reuse the same conversion and limiting helpers, and [runtime.ts](/docs/src/extensions/mcp/runtime.ts) calls `createMcpToolDefinition` for each discovered tool.
+Two audiences read each result. The model gets bounded, readable content. Codemode scripts get the whole `CallToolResult` as `structuredContent`, never truncated. The parts every MCP client needs the same way (the `mcp__server__tool` naming, input-schema normalization and the 20 KB middle-cut output limit) moved into the `@earendil-works/pi-mcp` package, so other applications name and limit MCP tools exactly like pi; this file imports them. The result schema also became self-contained when codemode stopped knowing about MCP.
 
-The file leans on [truncate.ts](/docs/src/core/tools/truncate.ts) for the middle-cut, [output-files.ts](/docs/src/utils/output-files.ts) for temp files, [render-utils.ts](/docs/src/core/tools/render-utils.ts) and [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts) for the TUI, and the types in [types.ts](/docs/src/core/extensions/types.ts).
+The MCP extension in [index.ts](/docs/src/extensions/mcp/index.ts) calls `createMcpToolDefinition` for each discovered tool and `createMcpToolRenderers` for calls shown before a server connects. The resource tools in [resources.ts](/docs/src/extensions/mcp/resources.ts) reuse `toModelContent` and `saveToTempFile`. The file leans on [output-files.ts](/docs/src/utils/output-files.ts) for temp files, [truncate.ts](/docs/src/core/tools/truncate.ts) for size formatting, [render-utils.ts](/docs/src/core/tools/render-utils.ts) and [visual-truncate.ts](/docs/src/modes/interactive/components/visual-truncate.ts) for the TUI, and the types in [types.ts](/docs/src/core/extensions/types.ts).
 
 <Scrollycoding>
 
-## !!steps Exposure and the output limits
+## !!steps Exposure and where saved output goes
 
 MCP exposure has a `codemode` value that the core tool exposure type lacks. `toToolExposure` maps it to `deferred`: both keep the tool out of the codemode description, and they differ only in which tool the MCP extension activates to reach them.
 
-The constants set the policy: names up to 64 characters, model-facing text up to 20 KB, and 5 visual lines in the collapsed TUI view.
+The collapsed TUI view shows 5 visual lines. The model-facing size limit is no longer defined here: it is pi-mcp's `MCP_OUTPUT_MAX_BYTES`. pi-mcp's limiter only saves the full text when the caller hands it a saver, and `saveToTempFile` is pi's: it writes under a `pi-mcp` prefix with the shared output-file helper.
 
 ```ts ! tools.ts
 export function toToolExposure(exposure: McpExposure): ToolExposure {
@@ -25,12 +25,6 @@ export function toToolExposure(exposure: McpExposure): ToolExposure {
 	return exposure === "codemode" ? "deferred" : exposure;
 }
 
-/** Provider tool names are limited to 64 characters of `[A-Za-z0-9_-]`. */
-// !mark
-const MAX_TOOL_NAME_LENGTH = 64;
-/** Model-facing text of an MCP result beyond this is cut in the middle. */
-// !mark
-export const MCP_OUTPUT_MAX_BYTES = 20 * 1024;
 /** Visual (wrapped) result lines shown before the output is expanded. */
 // !mark
 const OUTPUT_PREVIEW_LINES = 5;
@@ -43,55 +37,11 @@ export interface McpToolDetails {
 	/** Temp file with the full text output, when the model-facing text was truncated. */
 	fullOutputPath?: string;
 }
-```
 
-## !!steps Provider-safe tool names
-
-Names follow `mcp__server__tool`, with everything outside `[A-Za-z0-9_]` replaced by an underscore, as Codex does. That makes the name usable as a script identifier too. Sanitizing can make distinct tools collide (`a-b` and `a_b`), and long names exceed provider limits; in both cases the name is cut and gets an 8-character hash of the original server and tool names.
-
-```ts ! tools.ts
-export function createMcpToolName(
-	server: string,
-	tool: string,
-	isTaken: (name: string) => boolean = () => false,
-): string {
-	// !mark(1:4)
-	const name = `mcp__${server}__${tool}`.replace(/[^A-Za-z0-9_]/g, "_");
-	if (name.length <= MAX_TOOL_NAME_LENGTH && !isTaken(name)) return name;
-	const hash = createHash("sha256").update(`${server}\0${tool}`).digest("hex").slice(0, 8);
-	return `${name.slice(0, MAX_TOOL_NAME_LENGTH - hash.length - 1)}_${hash}`;
-}
-```
-
-## !!steps Cutting the middle of long output
-
-`limitMcpContent` joins all text blocks and asks `truncateMiddle` to fit the byte limit. If it did not fit, the model sees one text block in Codex's truncation format (a warning, line count and the kept start and end) followed by the path of a temp file with the full text. If saving fails, the model is told that instead of the path. Images are kept after the text block.
-
-```ts ! tools.ts
-export async function limitMcpContent(
-	content: (TextContent | ImageContent)[],
-	saveOutput: McpOutputSaver = saveToTempFile,
-): Promise<{ content: (TextContent | ImageContent)[]; fullOutputPath?: string }> {
-	const combined = textOf(content);
-	// !mark(1:2)
-	const truncation = truncateMiddle(combined, MCP_OUTPUT_MAX_BYTES);
-	if (!truncation.truncated) return { content };
-	let fullOutputPath: string | undefined;
-	let where: string;
-	try {
-		// !mark
-		fullOutputPath = await saveOutput(combined, ".txt");
-		where = `[Full output: ${fullOutputPath} (read it with offset/limit)]`;
-	} catch (error) {
-		where = `[Could not save the full output: ${error instanceof Error ? error.message : String(error)}]`;
-	}
-	const tokens = Math.ceil(truncation.totalBytes / 4);
-	const text = `Warning: truncated output (original token count: ${tokens})\nTotal output lines: ${truncation.totalLines}\n\n${truncation.content}\n\n${where}`;
-	return {
-		// !mark
-		content: [{ type: "text", text }, ...content.filter((block) => block.type === "image")],
-		...(fullOutputPath ? { fullOutputPath } : {}),
-	};
+/** Saves the full text of a truncated result, or a binary resource, to a temp file and returns its path. */
+// !mark(1:3)
+export function saveToTempFile(data: string | Uint8Array, extension: string): Promise<string> {
+	return writeOutputFile("pi-mcp", extension, data);
 }
 ```
 
@@ -140,7 +90,11 @@ async function blockToContent(
 
 ## !!steps The whole result
 
-`convertMcpResult` converts all blocks in parallel, falls back to the structured content when there are no blocks, and guarantees an error result is never empty. The script-facing `structuredContent` is the original result minus `_meta`, so truncation never affects scripts, and `isError` is carried onto the result so the agent marks it as an error.
+`convertMcpResult` converts all blocks in parallel, falls back to the structured content when there are no blocks, and guarantees an error result is never empty.
+
+The output limit is pi-mcp's `limitMcpContent`: text over 20 KB keeps its start and end with the middle cut out, in Codex's truncation format, followed by the path of the saved full text; images come after it. pi always passes a saver (the caller's, or `saveToTempFile`), so the model can read the full text with offset and limit.
+
+The script-facing `structuredContent` is the original result minus `_meta`, so truncation never affects scripts, and `isError` is carried onto the result so the agent marks it as an error.
 
 ```ts ! tools.ts
 export async function convertMcpResult(
@@ -156,7 +110,8 @@ export async function convertMcpResult(
 	if (result.isError && textOf(converted) === "") {
 		converted.push({ type: "text", text: `MCP tool ${server}/${tool} returned an error` });
 	}
-	const { content, fullOutputPath } = await limitMcpContent(converted, options.saveOutput);
+	// !mark
+	const { content, fullOutputPath } = await limitMcpContent(converted, options.saveOutput ?? saveToTempFile);
 	// !mark
 	const { _meta: _ignored, ...scriptResult } = result;
 	return {
@@ -169,36 +124,93 @@ export async function convertMcpResult(
 }
 ```
 
-## !!steps Schemas and annotations
+## !!steps A result schema that describes itself
 
-MCP servers may omit `type` in an input schema, and some providers reject an object schema without `properties`; `toParameters` fixes both. Only the four boolean annotation hints survive. Every tool gets an output schema that describes the `CallToolResult` shape, with the server's own output schema nested as `structuredContent`, which codemode uses to generate types.
+Every tool declares an output schema for the `CallToolResult` scripts receive, and codemode renders it into the tool's TypeScript declaration. Codemode used to recognise this shape and fill in MCP types itself; now the schema carries everything.
+
+Content blocks get one compact type with the fields scripts read most (`text`, `data`, `mimeType`), open to the rest. `structuredContent` is the server's own output schema when it declares one, and otherwise the empty schema `{}`, since MCP now allows any JSON value there, arrays and null included. `_meta` is no longer declared because conversion drops it, and `additionalProperties` leaves room for fields newer protocol versions add.
 
 ```ts ! tools.ts
-/**
- * Output schema of every MCP tool: the `CallToolResult` scripts receive, with the tool's own output
- * schema as `structuredContent`. Codemode detects this shape to render `CallToolResult<T>`
- * declarations.
- */
-// !mark(1:2)
+const CONTENT_BLOCK_SCHEMA = {
+	type: "object",
+	properties: {
+		type: { enum: ["text", "image", "audio", "resource_link", "resource"] },
+		text: { type: "string" },
+		data: { type: "string" },
+		mimeType: { type: "string" },
+	},
+	required: ["type"],
+	additionalProperties: true,
+};
+// ...
 export function createMcpResultSchema(structuredContentSchema: Record<string, unknown> | undefined): TSchema {
 	return {
 		type: "object",
 		properties: {
-			content: { type: "array", items: { type: "object" } },
 			// !mark
-			...(structuredContentSchema ? { structuredContent: structuredContentSchema } : {}),
+			content: { type: "array", items: CONTENT_BLOCK_SCHEMA },
+			// Servers may send structured content without declaring a schema for it, and it may be any JSON value.
+			// !mark(1:3)
+			structuredContent: structuredContentSchema
+				? relocateSchema(structuredContentSchema, "#/properties/structuredContent")
+				: {},
 			isError: { type: "boolean" },
-			_meta: { type: "object" },
 		},
-		// !mark
 		required: ["content"],
+		// Fields newer protocol versions add.
+		additionalProperties: true,
 	} as unknown as TSchema;
+}
+```
+
+## !!steps Relocating the server's references
+
+Nesting the server's schema under `structuredContent` would break its local references: `#/$defs/Item` would now point at the root of the result schema. `relocateSchema` rewrites every local `$ref` to sit below the new pointer, so `#/$defs/Item` becomes `#/properties/structuredContent/$defs/Item` and resolves to the same subschema.
+
+The walk has to know a little JSON Schema to avoid false rewrites. Under data keywords such as `const` or `enum`, a `$ref` key is a value, not a reference, so the value is copied unchanged. Under map keywords such as `properties` or `$defs`, the keys are names (a property may well be called `$ref`), so only their values are walked.
+
+```ts ! tools.ts
+/** Keywords whose values are data, so a `$ref` key in them is not a reference. */
+const SCHEMA_DATA_KEYWORDS: ReadonlySet<string> = new Set(["const", "enum", "default", "examples"]);
+/** Keywords whose values map names to schemas, so their keys are names, not keywords. */
+const SCHEMA_MAP_KEYWORDS: ReadonlySet<string> = new Set([
+	"properties",
+	"patternProperties",
+	"dependentSchemas",
+	"dependencies",
+	"$defs",
+	"definitions",
+]);
+// ...
+function relocateSchema(schema: unknown, pointer: string): unknown {
+	if (Array.isArray(schema)) return schema.map((item) => relocateSchema(item, pointer));
+	if (typeof schema !== "object" || schema === null) return schema;
+	const relocated: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(schema)) {
+		// !mark(1:2)
+		if (key === "$ref" && typeof value === "string" && (value === "#" || value.startsWith("#/"))) {
+			relocated[key] = `${pointer}${value.slice(1)}`;
+		// !mark(1:2)
+		} else if (SCHEMA_DATA_KEYWORDS.has(key)) {
+			relocated[key] = value;
+		// !mark
+		} else if (SCHEMA_MAP_KEYWORDS.has(key) && typeof value === "object" && value !== null && !Array.isArray(value)) {
+			relocated[key] = Object.fromEntries(
+				Object.entries(value).map(([name, subschema]) => [name, relocateSchema(subschema, pointer)]),
+			);
+		} else {
+			relocated[key] = relocateSchema(value, pointer);
+		}
+	}
+	return relocated;
 }
 ```
 
 ## !!steps Building the tool definition
 
-The definition carries the label `server/tool`, a description that falls back from description to title to a generated sentence, and the exposure and namespace. `execute` obtains the client lazily through `getClient`, forwards progress notifications as tool updates, and finishes with `convertMcpResult`.
+The definition carries the label `server/tool`, a description that falls back from description to title to a generated sentence, and the exposure and namespace. Only the four boolean annotation hints survive. The input schema goes through pi-mcp's `normalizeMcpInputSchema`, which adds a missing `type: "object"` and an empty `properties`, since some providers reject object schemas without them.
+
+`execute` obtains the client lazily through `getClient`, forwards progress notifications as tool updates, and finishes with `convertMcpResult`.
 
 ```ts ! tools.ts
 export function createMcpToolDefinition(options: {
@@ -221,7 +233,9 @@ export function createMcpToolDefinition(options: {
 		label,
 		// !mark
 		description: tool.description?.trim() || title || `MCP tool ${tool.name} from server ${server}`,
-		parameters: toParameters(tool.inputSchema),
+		// An object schema, which is what TypeBox schemas are at runtime.
+		// !mark
+		parameters: normalizeMcpInputSchema(tool.inputSchema) as unknown as TSchema,
 		outputSchema: createMcpResultSchema(tool.outputSchema),
 		exposure: toToolExposure(options.exposure),
 		namespace: options.namespace,
@@ -294,4 +308,4 @@ export function createMcpToolRenderers(label: string): ToolRenderers {
 
 </Scrollycoding>
 
-The key invariant of the file is that conversion for the model (bounded, human-readable, with files saved on the side) and conversion for scripts (complete) are produced together in one result object. Other modules only need `createMcpToolName`, `createMcpToolDefinition`, `limitMcpContent` and `toModelContent`.
+The key invariant of the file is that conversion for the model (bounded, human-readable, with files saved on the side) and conversion for scripts (complete) are produced together in one result object. Other modules only need `createMcpToolDefinition`, `createMcpToolRenderers`, `toModelContent` and `saveToTempFile`; naming and limiting come straight from pi-mcp.

@@ -1,13 +1,13 @@
 ---
 title: "paths.ts"
-description: "Path normalization, resolution and cwd-relative helpers shared by tools, config loading and the CLI"
+description: "Path normalization, resolution, case-aware path comparison and cwd-relative helpers shared by tools, config loading and the CLI"
 source: "src/utils/paths.ts"
 full: true
 ---
 
 Every place that accepts a path from a user or a model has the same small problems: a leading `~`, an `@file` prefix from the CLI, exotic unicode spaces pasted from chat, `file://` URLs, and Git Bash style drive paths on Windows. This file collects those rules in one place so the rest of the code can call `resolvePath` and trust the result.
 
-It also holds a few unrelated filesystem helpers: symlink-aware canonicalization, a cheap file revision fingerprint, a check for whether a string is a local path versus a package source, and a macOS/Linux call that tells cloud sync clients to ignore a directory. Tool code such as [path-utils.ts](/docs/src/core/tools/path-utils.ts), [package-manager.ts](/docs/src/core/package-manager.ts) and [windows-self-update.ts](/docs/src/utils/windows-self-update.ts) builds on these.
+It also decides when two paths are the same place, which on Windows means ignoring letter case, and holds a few unrelated filesystem helpers: symlink-aware canonicalization, a cheap file revision fingerprint, a check for whether a string is a local path versus a package source, and a macOS/Linux call that tells cloud sync clients to ignore a directory. Tool code such as [path-utils.ts](/docs/src/core/tools/path-utils.ts), [package-manager.ts](/docs/src/core/package-manager.ts) and [windows-self-update.ts](/docs/src/utils/windows-self-update.ts) builds on these.
 
 <Scrollycoding>
 
@@ -52,6 +52,49 @@ export function getFileRevision(path: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+```
+
+## !!steps Comparing paths
+
+On Windows `c:\Users\me` and `C:\Users\me` are the same directory, but pi used to compare paths as exact strings, and `realpathSync` keeps whatever casing it was given. With a lower-case drive letter in the cwd, global skills loaded twice and collided, saved trust decisions were not found, and with a custom session directory, sessions recorded under another casing disappeared from the list.
+
+`getPathComparisonKey` is the fix: the resolved absolute path, lower-cased on Windows. It does no filesystem access, so callers that also need symlinks to compare equal canonicalize first, and the key is only for comparing, never for display. `pathsEqual` and `isPathWithin` build on it, and are now used across the session manager, trust manager, resource and skill loading, the package manager and the selectors. `isPathWithin` takes care that a root such as `/` or `C:\` already ends in a separator, and `shortenHomePath` uses it to show paths under the home directory as `~`. The platform is read at call time so tests can simulate Windows.
+
+```ts ! paths.ts
+export function getPathComparisonKey(path: string): string {
+	const pathApi = getPlatformPathApi();
+	const resolvedPath = pathApi.resolve(path);
+	// !mark
+	return pathApi === win32 ? resolvedPath.toLowerCase() : resolvedPath;
+}
+
+/** `node:path` rules for the current platform, read at call time so tests can simulate Windows. */
+function getPlatformPathApi(): typeof win32 {
+	return process.platform === "win32" ? win32 : posix;
+}
+
+/** True when both paths name the same location (see `getPathComparisonKey`). */
+export function pathsEqual(left: string, right: string): boolean {
+	return getPathComparisonKey(left) === getPathComparisonKey(right);
+}
+
+/** True when `child` is `parent` or inside it (see `getPathComparisonKey`). */
+export function isPathWithin(parent: string, child: string): boolean {
+	const parentKey = getPathComparisonKey(parent);
+	const childKey = getPathComparisonKey(child);
+	if (childKey === parentKey) return true;
+	// Filesystem roots (`/`, `C:\`) already end with a separator.
+	const pathSep = getPlatformPathApi().sep;
+	return childKey.startsWith(parentKey.endsWith(pathSep) ? parentKey : `${parentKey}${pathSep}`);
+}
+
+/** Replace a leading home directory with `~` for display. Relative paths are returned unchanged. */
+export function shortenHomePath(path: string, homeDir: string = homedir()): string {
+	const pathApi = getPlatformPathApi();
+	if (!homeDir || !pathApi.isAbsolute(path) || !isPathWithin(homeDir, path)) return path;
+	const relativePath = pathApi.relative(homeDir, path);
+	return relativePath ? `~${pathApi.sep}${relativePath}` : "~";
 }
 ```
 

@@ -1,9 +1,0 @@
-{
-  "title": "experimental",
-  "pages": [
-    "commands",
-    "cli.ts",
-    "command-options.ts",
-    "command.ts"
-  ]
-}

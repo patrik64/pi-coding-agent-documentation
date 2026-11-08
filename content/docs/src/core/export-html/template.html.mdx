@@ -62,13 +62,14 @@ The main element has two empty containers: one for the header with session stats
 
 ## !!steps Data and scripts, in dependency order
 
-The session is embedded as a JSON script element, but the token holds base64 text, not raw JSON, which avoids any escaping problems with `</script>` inside conversation text. The vendored marked and highlight.js bundles come before the main script because it uses both as globals. The vendor files are read from disk by the generator in [index.ts](/docs/src/core/export-html/index.ts).
+The session is embedded as a JSON script element, but the token holds base64 text, not raw JSON, which avoids any escaping problems with `</script>` inside conversation text. The vendored marked bundle, its CJK-friendly emphasis extension and highlight.js come before the main script because it uses them as globals; the extension follows marked, which it plugs into. The vendor files are read from disk by the generator in [index.ts](/docs/src/core/export-html/index.ts).
 
 ```html ! template.html
   <script id="session-data" type="application/json">{{SESSION_DATA}}</script>
 
   <!-- Vendored libraries -->
   <script>{{MARKED_JS}}</script>
+  <script>{{MARKED_CJK_FRIENDLY_JS}}</script>
 
   <!-- highlight.js -->
   <script>{{HIGHLIGHT_JS}}</script>

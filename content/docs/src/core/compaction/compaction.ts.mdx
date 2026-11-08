@@ -17,7 +17,7 @@ The flow has three phases. Estimate how big the context is. Pick a cut point and
 
 Compaction is governed by three numbers. `reserveTokens` is headroom kept free for the next prompt and answer, and `keepRecentTokens` is how much recent conversation survives verbatim. `enabled` is the master switch.
 
-`shouldCompact` is a one-line comparison: compact when the context exceeds the window minus the reserve. Note that it is a threshold on the whole window, not a percentage. Reserve also feeds the summarizer's own output budget later, so one setting governs both headroom and summary size.
+`shouldCompact` is a one-line comparison: compact when the context exceeds the window minus the reserve. Note that it is a threshold on the whole window, not a percentage. The reserve now controls only when compaction starts. It used to cap the summarizer's output as well, but summary requests no longer set an output limit at all (see below).
 
 ```ts ! compaction.ts
 export interface CompactionSettings {
@@ -255,16 +255,18 @@ It then calls either the supplied `streamFn` or `completeSimple`, wrapped in `re
 
 ## !!steps Building the summary request
 
-`generateSummaryWithUsage` caps output at 80 percent of `reserveTokens` and at the model's own `maxTokens` when that is positive. If a previous summary exists it switches to the update prompt, which instructs the model to preserve everything and move finished items from In Progress to Done. That is how a summary stays cumulative across several compactions.
+`generateSummaryWithUsage` sets no `maxTokens`. Output used to be capped at 80 percent of `reserveTokens`, but on providers where reasoning shares the output limit a high thinking level could spend most of that cap and the summary failed with a token-cap error. The summary request is also usually far smaller than the full context (the kept tail, tool definitions and the normal system prompt are not sent), so the provider layer now sizes output from the actual request, as it does for normal turns. The `_reserveTokens` parameter is kept only so existing callers still compile. `createSummarizationOptions` adds the session's thinking level as `reasoning` when the model supports it.
 
-The conversation is serialized to plain text inside `conversation` tags rather than sent as real messages. The comment gives the reason: the model should summarize the transcript, not try to continue it. `generateSummary` above it is a thin wrapper that returns only the text.
+If a previous summary exists the function switches to the update prompt, which instructs the model to preserve everything and move finished items from In Progress to Done. That is how a summary stays cumulative across several compactions. The conversation is serialized to plain text inside `conversation` tags rather than sent as real messages. The comment gives the reason: the model should summarize the transcript, not try to continue it. `generateSummary` above it is a thin wrapper that returns only the text.
 
 ```ts ! compaction.ts
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
-
+export async function generateSummaryWithUsage(
+	currentMessages: AgentMessage[],
+	model: Model<any>,
+	// Unused. Kept for existing callers; summaries use the model's output limit (#9512).
+	_reserveTokens: number | undefined,
+// ...
+): Promise<{ text: string; usage: Usage }> {
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
@@ -332,7 +334,7 @@ It returns `undefined` when the branch already ends in a compaction, when no kep
 
 ## !!steps Compacting a split turn
 
-In the split case `compact` makes two requests: one for the history, which reuses the previous summary, and a smaller one for the turn prefix with its own prompt and half the reserve as output budget. If there is no history to summarize, the prior summary text or the literal "No prior history." stands in.
+In the split case `compact` makes two requests: one for the history, which reuses the previous summary, and one for the turn prefix with its own prompt. Custom `/compact` instructions are appended to both, so a requested focus is not lost on the turn prefix. If there is no history to summarize, the prior summary text or the literal "No prior history." stands in.
 
 The two parts are joined under a `Turn Context (split turn)` heading into one summary string, and their usage is combined with `combineUsage` from [usage-totals.ts](/docs/src/core/usage-totals.ts), so the session can account for the cost of both calls.
 

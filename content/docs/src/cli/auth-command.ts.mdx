@@ -5,7 +5,7 @@ source: "src/cli/auth-command.ts"
 full: true
 ---
 
-The `pi auth` family has three commands: `check`, `print-api-key` and `print-bearer-token`. This file owns everything about their command line: the typed `AuthCommand`, the help text, a hand-written parser for the extra flags, validation of the shared `--provider` and `--model` options, and a small function that pulls a credential string out of an auth result.
+The `pi auth` family has five commands. `login` and `logout` parse their own arguments in [auth-login.ts](/docs/src/cli/auth-login.ts) and [auth-logout.ts](/docs/src/cli/auth-logout.ts), and [main.ts](/docs/src/main.ts) routes them there before this parser runs. This file owns the command line of the other three, `check`, `print-api-key` and `print-bearer-token`: the typed `AuthCommand`, a hand-written parser for the extra flags, validation of the shared `--provider` and `--model` options, and a small function that pulls a credential string out of an auth result. The help text and the unknown-command error cover all five.
 
 The general-purpose option parser in [args.ts](/docs/src/cli/args.ts) produces the `Args` object validated here. The commands themselves are implemented in [auth-check.ts](/docs/src/cli/auth-check.ts) and [credential-print.ts](/docs/src/cli/credential-print.ts), and dispatch happens from [main.ts](/docs/src/main.ts).
 
@@ -32,7 +32,7 @@ export class AuthCommandError extends Error {}
 
 ## !!steps Usage strings and help detection
 
-Usage lines are keyed by kind and built from `APP_NAME` in [config.ts](/docs/src/config.ts). Help is triggered by `auth` alone, `auth help`, or any `--help` or `-h` in the arguments.
+Usage lines are keyed by kind and built from `APP_NAME` in [config.ts](/docs/src/config.ts). Help is triggered by `auth` alone, `auth help`, or any `--help` or `-h` in the arguments. Because main checks for help first, `pi auth login --help` also prints the shared help, which lists the login options.
 
 ```ts ! auth-command.ts
 export function getAuthCommandUsage(kind: AuthCommandKind): string {

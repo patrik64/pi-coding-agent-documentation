@@ -1,6 +1,8 @@
 {
   "title": "scripts",
   "pages": [
+    "generate-references.ts",
+    "generate-schemas.ts",
     "migrate-sessions.sh"
   ]
 }

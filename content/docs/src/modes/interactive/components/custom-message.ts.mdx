@@ -13,7 +13,7 @@ It has two paths. A registered renderer gets first chance and controls its own s
 
 ## !!steps Fields and the default box
 
-The constructor stores the message, optional renderer, markdown theme (defaulting to the theme module's) and an `outputPad` that is passed through to renderers. It adds a spacer and creates the default `Box` once with the `customMessageBg` background; `rebuild` later attaches or detaches that box.
+The constructor stores the message, optional renderer, markdown theme (defaulting to the theme module's), an `outputPad` that is passed through to renderers, and the extension Markdown transformers used by the default view. `messageId` and `timestamp` are set when the message is replayed from the session file, so transformers can tell which entry they are rewriting. It adds a spacer and creates the default `Box` once with the `customMessageBg` background; `rebuild` later attaches or detaches that box.
 
 ```ts ! custom-message.ts
 	constructor(
@@ -21,12 +21,18 @@ The constructor stores the message, optional renderer, markdown theme (defaultin
 		customRenderer?: MessageRenderer,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		outputPad = 1,
+		markdownTransformers: readonly MarkdownTransformer[] = [],
+		messageId?: string,
+		timestamp?: string,
 	) {
 		super();
 		this.message = message;
 		this.customRenderer = customRenderer;
 		this.markdownTheme = markdownTheme;
 		this.outputPad = outputPad;
+		this.markdownTransformers = markdownTransformers;
+		this.messageId = messageId;
+		this.timestamp = timestamp;
 
 		this.addChild(new Spacer(1));
 
@@ -59,7 +65,7 @@ Both `setExpanded` and `setOutputPad` rebuild only on an actual change, and `inv
 
 ## !!steps Trying the custom renderer
 
-`rebuild` first removes the previous content and the default box. If a renderer exists it is called with the message, the expanded and padding options, and the theme. A returned component is added and the method returns early. The catch block is deliberately empty, so a failing renderer silently degrades to the default view.
+`rebuild` first removes the previous content and the default box. If a renderer exists it is called with the message, the expanded and padding options, the host's `keyText` and `keyHint` functions, and the theme. The key helpers are passed in rather than imported by the extension because an extension may load its own copy of the package, whose keybindings the host never configured, and its hints would then render without a key. A returned component is added and the method returns early. The catch block is deliberately empty, so a failing renderer silently degrades to the default view.
 
 ```ts ! custom-message.ts
 		// Try custom renderer first - it handles its own styling
@@ -67,7 +73,7 @@ Both `setExpanded` and `setOutputPad` rebuild only on an actual change, and `inv
 			try {
 				const component = this.customRenderer(
 					this.message,
-					{ expanded: this._expanded, outputPad: this.outputPad },
+					{ expanded: this._expanded, outputPad: this.outputPad, keyText, keyHint },
 					theme,
 				);
 				if (component) {
@@ -85,12 +91,13 @@ Both `setExpanded` and `setOutputPad` rebuild only on an actual change, and `inv
 
 ## !!steps Default rendering
 
-The default box begins with a bold label such as the message `customType`, using raw ANSI bold codes inside the themed label color, then a spacer.
+The box is created with one cell of padding, so its horizontal padding is reset to `outputPad` on every rebuild. It begins with a bold label such as the message `customType`, using raw ANSI bold codes inside the themed label color, then a spacer.
 
 ```ts ! custom-message.ts
 		// Default rendering uses our box
 		this.addChild(this.box);
 		this.box.clear();
+		this.box.setPaddingX(this.outputPad);
 
 		// Default rendering: label + content
 		const label = theme.fg("customMessageLabel", `\x1b[1m[${this.message.customType}]\x1b[22m`);
@@ -100,7 +107,7 @@ The default box begins with a bold label such as the message `customType`, using
 
 ## !!steps Extracting the text
 
-Message content is either a string or an array of content blocks. Only text blocks are kept and joined with newlines, so images or other block types in a custom message are not shown by the default view. The text goes through the `Markdown` component with the custom message text color.
+Message content is either a string or an array of content blocks. Only text blocks are kept and joined with newlines, so images or other block types in a custom message are not shown by the default view. The text goes through the `Markdown` component with the custom message text color, and extension transformers see it as the `custom` surface (see [markdown-transform.ts](/docs/src/modes/interactive/components/markdown-transform.ts)). Custom messages are never streamed, so `isStreaming` is always false.
 
 ```ts ! custom-message.ts
 		let text: string;
@@ -114,9 +121,22 @@ Message content is either a string or an array of content blocks. Only text bloc
 		}
 
 		this.box.addChild(
-			new Markdown(text, 0, 0, this.markdownTheme, {
-				color: (text: string) => theme.fg("customMessageText", text),
-			}),
+			new Markdown(
+				text,
+				0,
+				0,
+				this.markdownTheme,
+				{ color: (text: string) => theme.fg("customMessageText", text) },
+				{
+					transform: createMarkdownTransform(
+						"custom",
+						() => false,
+						this.markdownTransformers,
+						this.messageId,
+						this.timestamp,
+					),
+				},
+			),
 		);
 ```
 

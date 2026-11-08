@@ -7,7 +7,7 @@ full: true
 
 MCP servers are configured in an `mcp.json` file using the `mcpServers` shape shared with other MCP clients. This file reads that configuration from two places, the agent directory (global) and the project's config directory (project, only when the project is trusted), and merges them into a list of server entries plus a list of human-readable errors.
 
-It also holds the write side: adding, removing, and patching servers while preserving the file's other content and indentation. Validation of an individual server lives in [mcp-servers.ts](/docs/src/core/mcp-servers.ts); trust is decided by [trust-manager.ts](/docs/src/core/trust-manager.ts). Consumers are the offline command in [cli.ts](/docs/src/extensions/mcp/cli.ts), the in-session UI in [ui.ts](/docs/src/extensions/mcp/ui.ts), and [index.ts](/docs/src/extensions/mcp/index.ts).
+It also holds the write side: adding, removing, and patching servers while preserving the file's other content and indentation. Validation of an individual server lives in [mcp-servers.ts](/docs/src/core/mcp-servers.ts), which builds on the shared validator in the `@earendil-works/pi-mcp` package; the override test and the namespace helper also come from pi-mcp now. Trust is decided by [trust-manager.ts](/docs/src/core/trust-manager.ts). Consumers are the offline command in [cli.ts](/docs/src/extensions/mcp/cli.ts) and the extension in [index.ts](/docs/src/extensions/mcp/index.ts), whose `/mcp` manager saves its changes here; the other MCP modules import only the re-exported types.
 
 <Scrollycoding>
 
@@ -67,7 +67,7 @@ export interface LoadedMcpConfig {
 
 ## !!steps Reading one file
 
-`readConfigFile` is tolerant. A missing file is skipped, invalid JSON or a wrong top-level shape becomes an error string prefixed with the path, and `autoEnableCodemode` must be a boolean. Because the state object is shared, reading the project file after the global file lets the project value win.
+`readConfigFile` is tolerant. A missing file is skipped, a leading UTF-8 byte order mark (which some Windows editors write) is removed with `stripBom` from [text.ts](/docs/src/utils/text.ts) before parsing, invalid JSON or a wrong top-level shape becomes an error string prefixed with the path, and `autoEnableCodemode` must be a boolean. Because the state object is shared, reading the project file after the global file lets the project value win.
 
 ```ts ! config.ts
 function readConfigFile(path: string, scope: "global" | "project", state: McpConfigState): void {
@@ -75,7 +75,8 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
 	if (!existsSync(path)) return;
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(readFileSync(path, "utf8"));
+		// !mark
+		parsed = JSON.parse(stripBom(readFileSync(path, "utf8")));
 	} catch (error) {
 		errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
 		return;
@@ -91,10 +92,10 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
 
 ## !!steps Applying a project override
 
-In the project file, an entry that is an override looks up the base server. No base means an error, extra keys mean an error, and otherwise the base config and the override are merged and re-validated before the entry replaces the base. The `override` field remembers the file so the UI can show it.
+In the project file, an entry that is an override (pi-mcp's `isMcpServerOverride`: no `command`, `url` or `type`) looks up the base server. pi-mcp leaves the choice of overridable fields to the application, and pi allows only `OVERRIDE_KEYS`. No base means an error, extra keys mean an error, and otherwise the base config and the override are merged and re-validated before the entry replaces the base. The `override` field remembers the file so the UI can show it.
 
 ```ts ! config.ts
-		if (scope === "project" && isRecord(value) && isOverride(value)) {
+		if (scope === "project" && isRecord(value) && isMcpServerOverride(value)) {
 			const base = servers.get(name);
 			const extra = Object.keys(value).filter((key) => !OVERRIDE_KEYS.includes(key));
 			if (!base) {
@@ -113,7 +114,7 @@ In the project file, an entry that is an override looks up the base server. No b
 
 ## !!steps Name clashes and project restrictions
 
-For a full definition, the config is validated, then checked for a namespace clash: names that differ only in `-` versus `_` map to the same tool namespace through `mcpNamespace`, so the second is rejected. Project HTTP servers with `auth` are rejected as well.
+For a full definition, the config is validated, then checked for a namespace clash: names that differ only in `-` versus `_` map to the same tool namespace through pi-mcp's `mcpNamespace`, so the second is rejected. Project HTTP servers with `auth` are rejected as well.
 
 Note the clash test compares against all servers loaded so far, including ones from the same file.
 
@@ -172,7 +173,7 @@ With the `override` option, a missing entry is created as an empty override.
 		}
 		if (!isRecord(server)) throw new Error(`${path} does not define MCP server "${name}"`);
 		// !mark
-		const keepDefaults = isOverride(server);
+		const keepDefaults = isMcpServerOverride(server);
 		if (patch.enabled !== undefined) {
 			if (patch.enabled && !keepDefaults) delete server.enabled;
 			else server.enabled = patch.enabled;
@@ -210,14 +211,15 @@ export function removeMcpServerConfig(path: string, name: string): boolean {
 
 ## !!steps The shared editor
 
-All writes go through `editMcpServers`. It parses the file (or starts from an empty object), checks the shape, lets the callback mutate it, and writes back only if the callback returned true. The indentation of the first indented line is detected and reused, falling back to two spaces, so editing does not reformat the user's file. Unlike the loader, this function throws on bad content, and callers such as [cli.ts](/docs/src/extensions/mcp/cli.ts) turn that into an error message.
+All writes go through `editMcpServers`. It parses the file (or starts from an empty object), stripping a byte order mark like the loader does, checks the shape, lets the callback mutate it, and writes back only if the callback returned true. The indentation of the first indented line is detected and reused, falling back to two spaces, so editing does not reformat the user's file. Unlike the loader, this function throws on bad content, and callers such as [cli.ts](/docs/src/extensions/mcp/cli.ts) turn that into an error message.
 
 ```ts ! config.ts
 function editMcpServers(
 	path: string,
 	edit: (servers: Record<string, unknown> | undefined, parsed: Record<string, unknown>) => boolean,
 ): void {
-	const text = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+	// !mark
+	const text = existsSync(path) ? stripBom(readFileSync(path, "utf8")) : undefined;
 	const parsed: unknown = text === undefined ? {} : JSON.parse(text);
 	if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
 		throw new Error(`${path}: expected an object with an "mcpServers" object`);

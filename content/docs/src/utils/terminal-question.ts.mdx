@@ -1,0 +1,68 @@
+---
+title: "terminal-question.ts"
+description: "Reads one line from stdin for shell commands, rejecting on abort, Ctrl+C or EOF and always closing readline"
+source: "src/utils/terminal-question.ts"
+full: true
+---
+
+Some commands run from the shell without the TUI and still need to ask the user for a line of text. `pi auth login` asks for a pasted code or a choice through [auth-terminal.ts](/docs/src/cli/auth-terminal.ts), and `pi mcp login` in [cli.ts](/docs/src/extensions/mcp/cli.ts) offers to take a pasted redirect URL when the browser cannot reach the machine. `questionTerminal` is the one prompt both use.
+
+Node's `readline/promises` already has `question()` with an abort signal, but two of its behaviours make a bare call hang. When stdin reaches EOF (the user presses Ctrl+D, or input is piped and runs out), readline closes but the pending question never settles. And Ctrl+C on a readline interface only pauses it by default, so the process neither exits nor gets an answer. The helper was extracted from the MCP CLI when `pi auth login` arrived, and turns both cases into a rejection.
+
+<Scrollycoding>
+
+## !!steps The contract
+
+The caller supplies where the prompt goes (`output`, so the MCP CLI can prompt on stderr while stdout stays clean) and a `signal` that cancels just this prompt, for example when the browser callback wins the race. `onInterrupt` is separate on purpose: it runs only for Ctrl+C or EOF, which mean the user wants out. `pi auth login` passes a callback that aborts the whole login, as a SIGINT to the process would, while a caller-side abort of one prompt is routine and cancels nothing else.
+
+```ts ! terminal-question.ts
+/** Read one line from stdin, rejecting on abort, Ctrl+C, or EOF and always closing readline. */
+export async function questionTerminal(
+	message: string,
+	options: {
+		output: NodeJS.WritableStream;
+		signal: AbortSignal;
+		/** Called on Ctrl+C or EOF, not when the caller aborts just this prompt. */
+		onInterrupt?: () => void;
+	},
+): Promise<string> {
+```
+
+## !!steps Turning Ctrl+C and EOF into an abort
+
+A second `AbortController` represents the interrupt. Both the `SIGINT` and the `close` event of the readline interface abort it, and the question listens to the caller's signal and the interrupt signal together through `AbortSignal.any`. Either one rejects the pending question.
+
+```ts ! terminal-question.ts
+	const readline = createInterface({ input: process.stdin, output: options.output });
+	const interrupted = new AbortController();
+	// EOF closes readline without settling its pending question; Ctrl+C normally only pauses it.
+	// !mark(1:3)
+	const onInterrupt = () => interrupted.abort();
+	readline.on("SIGINT", onInterrupt);
+	readline.on("close", onInterrupt);
+	try {
+		// !mark
+		return await readline.question(message, { signal: AbortSignal.any([options.signal, interrupted.signal]) });
+```
+
+## !!steps Reporting the interrupt and cleaning up
+
+On rejection, `onInterrupt` is called only if the interrupt signal fired, then the error is rethrown so the caller still sees a failed prompt. The `finally` removes both listeners before it calls `readline.close()`. The order matters: closing the interface emits `close`, and with the listener still attached every normal answer would also count as an interrupt.
+
+```ts ! terminal-question.ts
+	} catch (error) {
+		// !mark
+		if (interrupted.signal.aborted) options.onInterrupt?.();
+		throw error;
+	} finally {
+		// !mark(1:3)
+		readline.off("close", onInterrupt);
+		readline.off("SIGINT", onInterrupt);
+		readline.close();
+	}
+}
+```
+
+</Scrollycoding>
+
+A new readline interface is created for every question and closed afterwards, so no interface stays attached to stdin between prompts. Reading a secret without echo is a different job and lives in [auth-terminal.ts](/docs/src/cli/auth-terminal.ts), which reads raw keystrokes instead.

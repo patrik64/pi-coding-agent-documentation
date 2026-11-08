@@ -9,7 +9,7 @@ import type { Graph, Node } from '@/components/graph-view';
 export const KINDS = {
   core: 'Core engine (src/core)',
   ui: 'CLI, modes and TUI',
-  ext: 'Extensions, utils, experimental',
+  ext: 'Extensions, utils, scripts',
 } as const;
 
 export type Kind = keyof typeof KINDS;

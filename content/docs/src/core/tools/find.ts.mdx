@@ -90,12 +90,22 @@ running and then rejects.
 
 ## !!steps The custom glob path
 
-With a custom backend, the tool checks that the root exists, calls `glob` with
-ignores for `node_modules` and `.git` and the limit, and checks for abort after
-each await because the backend cannot be interrupted. The results are
-relativized and assembled like the fd results.
+The limit is floored and clamped to at least 1, because fd treats
+`--max-results 0` as no limit and used to return every match. With a custom
+backend, the tool checks that the root exists, calls `glob` with ignores for
+`node_modules` and `.git`, and checks for abort after each await because the
+backend cannot be interrupted. It asks for one result more than the limit: that
+extra result is how the tool tells exactly N matches apart from more than N, so
+the limit notice appears only when something was really left out. At most
+`limit` results are shown, even if a backend ignores the option and returns
+more.
 
 ```ts ! find.ts
+						// fd treats --max-results 0 as unlimited, so a limit below 1 means 1.
+						const effectiveLimit = Math.max(1, Math.floor(limit ?? DEFAULT_LIMIT));
+						const ops = customOps ?? defaultFindOperations;
+
+						// If custom operations provide glob(), use that instead of fd.
 						if (customOps?.glob) {
 							if (!(await ops.exists(searchPath))) {
 								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
@@ -105,10 +115,17 @@ relativized and assembled like the fd results.
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
+							// One result past the limit tells "exactly N matches" apart from "more than N".
 							const results = await ops.glob(pattern, searchPath, {
 								ignore: ["**/node_modules/**", "**/.git/**"],
-								limit: effectiveLimit,
+								limit: effectiveLimit + 1,
 							});
+// ...
+							const resultLimitReached = results.length > effectiveLimit;
+							// Relativize paths against the search root for stable output.
+							const relativized = results
+								.slice(0, effectiveLimit)
+								.map((p) => relativizeFindResultPath(p, searchPath));
 ```
 
 ## !!steps Choosing fd flags: git awareness
@@ -118,7 +135,8 @@ fd always gets `--glob`, `--hidden` and no color. Whether to add
 a `.git`: outside a repository, fd would otherwise ignore `.gitignore` files, so
 the flag forces it to honor them. Inside a repository the flag is omitted so
 that a parent repo's rules stop at nested repo boundaries, as the comment
-explains with a link to the issue.
+explains with a link to the issue. fd is asked for one result past the limit,
+for the same reason as the custom path.
 
 ```ts ! find.ts
 						const args: string[] = ["--glob", "--color=never", "--hidden"];
@@ -138,7 +156,8 @@ explains with a link to the issue.
 							current = parent;
 						}
 						if (!insideGitRepo) args.push("--no-require-git");
-						args.push("--max-results", String(effectiveLimit));
+						// One result past the limit tells "exactly N matches" apart from "more than N" (#7121).
+						args.push("--max-results", String(effectiveLimit + 1));
 ```
 
 ## !!steps Making path patterns work with fd
@@ -163,73 +182,93 @@ Windows the slashes become a character class matching either separator.
 						args.push("--", effectivePattern, searchPath);
 ```
 
-## !!steps Running the process and reading lines
+## !!steps Running the process and handling lines
 
 The child is spawned with stdin ignored and its stdout wrapped in a readline
-interface that collects lines. stderr is collected separately for error
-messages. `stopChild` is assigned here, which is what lets an abort kill the
-process. A spawn failure becomes a `Failed to run fd` error.
+interface. stderr is collected separately for error messages. `stopChild` is
+assigned here, which is what lets an abort kill the process.
+
+Each line is cleaned and relativized as it arrives instead of being collected
+first. The extra line past the limit only sets `resultLimitReached`. Results are
+stored up to the first one past the 50KB cap and only counted after that, since
+byte truncation would drop them anyway; this keeps memory bounded by the output
+cap rather than by the number of matches.
 
 ```ts ! find.ts
 						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
-						const lines: string[] = [];
+						// Results within the limit, stored only up to the first one past the byte cap:
+						// truncateHead drops the rest anyway, so they are counted but not kept.
+						const storedResults: string[] = [];
+						let resultCount = 0;
+						// Byte size of all results within the limit, each counted with a trailing newline.
+						let outputBytes = 0;
+						let resultLimitReached = false;
 
 						stopChild = () => {
 							if (!child.killed) {
 								child.kill();
 							}
 						};
-
-						const cleanup = () => {
-							rl.close();
-						};
-
-						child.stderr?.on("data", (chunk) => {
-							stderr += chunk.toString();
-						});
-
-						rl.on("line", (line) => {
-							lines.push(line);
+// ...
+						rl.on("line", (rawLine) => {
+							const line = rawLine.replace(/\r$/, "").trim();
+							if (!line) return;
+							if (resultCount === effectiveLimit) {
+								resultLimitReached = true;
+								return;
+							}
+							const result = relativizeFindResultPath(line, searchPath);
+							resultCount++;
+							if (outputBytes - 1 <= DEFAULT_MAX_BYTES) storedResults.push(result);
+							outputBytes += Buffer.byteLength(result, "utf-8") + 1;
 						});
 ```
 
 ## !!steps Interpreting the exit
 
-On close, an abort wins first. A nonzero exit code only becomes an error when
-there is no output at all, so a partial result with a warning on stderr is
-still returned. Empty output returns the text `No files found matching pattern`.
+A spawn failure becomes a `Failed to run fd` error. On close, an abort wins
+first. A nonzero exit code only becomes an error when there were no results at
+all, so a partial result with a warning on stderr is still returned. Zero
+results return the text `No files found matching pattern`.
 
 ```ts ! find.ts
+						child.on("error", (error) => {
+							cleanup();
+							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
+						});
+
 						child.on("close", (code) => {
 							cleanup();
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
-							const output = lines.join("\n");
-							if (code !== 0) {
+							if (code !== 0 && resultCount === 0) {
 								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
-								if (!output) {
-									settle(() => reject(new Error(errorMsg)));
-									return;
-								}
+								settle(() => reject(new Error(errorMsg)));
+								return;
 							}
 ```
 
-## !!steps Notices for limits
+## !!steps Truncation totals and notices
 
-Lines are cleaned of trailing carriage returns and relativized. The result
-limit is considered reached when the count is at least the limit, which also
-fires when there are exactly that many matches. The fd path adds a hint to double
+Because the stored results run one past the byte cap whenever more exist,
+`truncateHead` makes the same truncation decision it would make on the full
+output; only its totals are replaced with the counted ones. The limit notice
+fires only when fd sent the extra result. The fd path adds a hint to double
 `limit` or refine the pattern; the custom path in the same file uses a shorter
 notice without the hint.
 
 ```ts ! find.ts
-							const resultLimitReached = relativized.length >= effectiveLimit;
-							const rawOutput = relativized.join("\n");
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+							// Stored results extend past the byte cap when more exist, so truncateHead decides
+							// truncation as for the full output; only the totals need the unstored rest.
+							const truncation = {
+								...truncateHead(storedResults.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER }),
+								totalLines: resultCount,
+								totalBytes: outputBytes - 1,
+							};
 							let resultOutput = truncation.content;
 							const details: FindToolDetails = {};
 							const notices: string[] = [];

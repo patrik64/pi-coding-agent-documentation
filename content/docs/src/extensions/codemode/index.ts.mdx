@@ -42,11 +42,11 @@ export interface CodemodeExtensionOptions {
 
 ## !!steps Reading settings defensively
 
-Settings are read when needed, not at registration, so a changed setting takes effect. `readMode` maps anything other than `only` to `on`. `readInlineBudget` accepts only a finite number that is zero or more, and otherwise returns undefined so the default budget in tool.ts applies.
+Settings are read when needed, not at registration, so a changed setting takes effect. `readMode` maps anything other than `only` to the default mode from [settings-defaults.ts](/docs/src/core/settings-defaults.ts), which is `on`; the defaults now live in that one table instead of being repeated as literals. `readInlineBudget` accepts only a finite number that is zero or more, and otherwise returns undefined so the default budget in tool.ts applies.
 
 ```ts ! index.ts
 function readMode(pi: ExtensionAPI): CodemodeMode {
-	return pi.getSettings().codemode?.mode === "only" ? "only" : "on";
+	return pi.getSettings().codemode?.mode === "only" ? "only" : SETTINGS_DEFAULTS.codemode.mode;
 }
 
 function readInlineBudget(pi: ExtensionAPI): number | undefined {

@@ -1,0 +1,54 @@
+---
+title: "keybindings-schema.ts"
+description: "Builds the published JSON Schema for keybindings.json from the live keybinding table, with one described property per action"
+source: "src/core/keybindings-schema.ts"
+full: true
+---
+
+This file builds the schema behind `https://pi.dev/schemas/keybindings.schema.json`, which lets an editor complete action names in `keybindings.json`, show what each action does, and flag malformed key ids. The schema is not written by hand. It walks the `KEYBINDINGS` table in [keybindings.ts](/docs/src/core/keybindings.ts), so a new action shows up in the schema as soon as it is added there. The value syntax comes from [key-id-schema.ts](/docs/src/core/key-id-schema.ts).
+
+Only [generate-schemas.ts](/docs/scripts/generate-schemas.ts) imports this file. At runtime, keybindings.ts checks values with the small key id schema directly and never builds the full object schema.
+
+<Scrollycoding>
+
+## !!steps One property per action
+
+Every id in `KEYBINDINGS`, the `tui.*` editor and selector bindings as well as the `app.*` actions, becomes an optional property with that binding's description. `$schema` is allowed as well, so a file can point at the published schema without being invalid.
+
+Defaults are not written into the schema. Several `defaultKeys` in the table depend on the platform the module was loaded on (Windows and WSL get different chords), so writing them out would make the generated file depend on the machine that ran the generator. Descriptions are the same everywhere.
+
+```ts ! keybindings-schema.ts
+import { type TSchema, Type } from "typebox";
+import { KeybindingValueSchema, keybindingValueSchema } from "./key-id-schema.ts";
+import { KEYBINDINGS } from "./keybindings.ts";
+
+export { KeybindingValueSchema } from "./key-id-schema.ts";
+
+const properties: Record<string, TSchema> = {
+	$schema: Type.Optional(Type.String()),
+};
+
+// !mark(1:7)
+for (const [id, definition] of Object.entries(KEYBINDINGS)) {
+	properties[id] = Type.Optional(
+		keybindingValueSchema({
+			description: definition.description,
+		}),
+	);
+}
+```
+
+## !!steps Unknown ids are still checked
+
+A keybindings file can contain ids this table does not define, such as one written for a newer pi version or one that other code reads for itself. The schema test uses `extension.action` as its example. So `additionalProperties` is not `false` but the value schema itself. An unknown id is accepted, but its value must still be a valid key id or array of key ids. keybindings.ts applies the same rule when it loads the file: it keeps such entries if their values are valid, and the TUI manager simply never looks them up.
+
+```ts ! keybindings-schema.ts
+export const KeybindingsSchema = Type.Object(properties, {
+	// !mark
+	additionalProperties: KeybindingValueSchema,
+});
+```
+
+</Scrollycoding>
+
+The generated file has a property for each of the roughly ninety ids, and each one points at a single shared `$defs/KeybindingValue`. The value schema, with its long key id pattern, is written once instead of under every action.

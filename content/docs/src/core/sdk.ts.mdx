@@ -24,9 +24,13 @@ users call it directly.
 ## !!steps Options and the default stream function
 
 `CreateAgentSessionOptions` is almost entirely optional. The notable pair is
-`tools` (an allowlist of names or `*` patterns) and `noTools` (`"all"` or
-`"builtin"`), plus the `excludeTools` denylist that applies afterward and
-reaches MCP tools too.
+`tools` and `noTools` (`"all"` or `"builtin"`), plus the `excludeTools`
+denylist that applies afterward and reaches MCP tools too.
+
+`tools` has two shapes. Plain entries form an allowlist of names or `*`
+patterns. A list made only of `+name` and `-name` entries instead edits the
+default selection, the same way the `defaultTools` setting does; such entries
+take exact names, and mixing the two shapes is an error.
 
 At import time the module also calls `setDefaultStreamFn(streamSimple)`, a
 side effect that keeps extensions constructing bare `Agent` instances working
@@ -168,27 +172,41 @@ Finally the result is clamped to what the chosen model supports, and forced to
 
 ## !!steps Initial tool selection
 
-Three inputs combine here. `allowedToolNames` is the explicit allowlist (an
-empty list when `noTools` is `"all"`). `excludedToolNames` is compiled into a
-matcher by `createToolNameMatcher` from
-[mcp-servers.ts](/docs/src/core/mcp-servers.ts). The initially active set is
-`tools`, or nothing if `noTools` is set, or the `defaultTools` setting, or
-`DEFAULT_TOOL_NAMES`, with excluded names filtered out.
+The `tools` list is validated first with `getToolListError` from
+[settings-manager.ts](/docs/src/core/settings-manager.ts), which rejects
+mixed lists and patterns in `+name`/`-name` entries; the SDK throws rather
+than guessing.
 
-Note that `noTools: "builtin"` and `"all"` both produce an empty initial
-active list here; the difference is carried to the session through
-`allowedToolNames` and `usesDefaultTools` later.
+`defaultToolNames` is the base selection: nothing if `noTools` is set,
+otherwise the `defaultTools` setting or `DEFAULT_TOOL_NAMES`. A modifier list
+is applied to that base with `applyToolModifiers`; a plain list replaces it.
+The allowlist follows the same split. Modifiers do not restrict which tools
+may exist, so they produce no allowlist unless `noTools` is `"all"`, in which
+case the edited selection becomes the allowlist. A plain list is the
+allowlist itself, and `noTools: "all"` alone gives an empty one.
+
+`excludedToolNames` is compiled into a matcher by `createToolNameMatcher` from
+[mcp-servers.ts](/docs/src/core/mcp-servers.ts) and filters the initial active
+set last.
 
 ```ts ! sdk.ts
-	const configuredDefaultToolNames = settingsManager.getDefaultTools();
-	// !mark
-	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
+	// !mark(1:2)
+	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
+	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
+	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
+	// replacing it, like the `defaultTools` setting.
+	// !mark(1:2)
+	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
+	const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
+	const allowedToolNames = toolModifiers
+		? options.noTools === "all"
+			? selectedToolNames
+			: undefined
+		: (options.tools ?? (options.noTools === "all" ? [] : undefined));
 	const excludedToolNames = options.excludeTools;
 	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
-	// !mark(1:3)
-	const initialActiveToolNames = (
-		options.tools ?? (options.noTools ? [] : (configuredDefaultToolNames ?? DEFAULT_TOOL_NAMES))
-	).filter((name) => !isExcludedTool?.(name));
+	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
 ```
 
 ## !!steps Blocking images, checked on every request
@@ -232,10 +250,19 @@ session creates later (and replaces on reload). Every hook reads
 `extensionRunnerRef.current` at call time, so it always sees the live runner.
 
 `buildRequestOptions` merges per-request options with settings: provider retry
-settings, an HTTP idle timeout where `0` means effectively unlimited
-(`2147483647` ms), and a `transformHeaders` callback that adds attribution
-headers via [provider-attribution.ts](/docs/src/core/provider-attribution.ts)
-and then lets `before_provider_headers` extension handlers rewrite them.
+settings and an HTTP idle timeout where `0` means effectively unlimited
+(`2147483647` ms).
+
+It also sets the request's `identity` from
+[client-identity.ts](/docs/src/core/client-identity.ts). pi-ai turns that
+identity into the `User-Agent` and the provider attribution headers, so this
+file no longer needs to know the request's model; it used to merge those
+headers itself. The identity replaces pi-agent-core's default and is computed
+on every request, so turning install telemetry off stops attribution on the
+next call. The remaining `transformHeaders` callback hands the request
+headers to `before_provider_headers` extension handlers. pi-ai adds the
+identity's headers later, beneath the request headers, so handlers no longer
+see the attribution headers but can still override or remove them.
 
 ```ts ! sdk.ts
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
@@ -245,10 +272,7 @@ and then lets `before_provider_headers` extension handlers rewrite them.
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
-	const buildRequestOptions = (
-		requestModel: Model<any>,
-		options: ModelsSimpleStreamOptions = {},
-	): ModelsSimpleStreamOptions => {
+	const buildRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 		// !mark
@@ -257,6 +281,16 @@ and then lets `before_provider_headers` extension handlers rewrite them.
 		return {
 			...options,
 			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+// ...
+			// Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+			// !mark
+			identity: getClientIdentity(settingsManager),
+			transformHeaders: async (headers) =>
+				headerRunner?.hasHandlers("before_provider_headers")
+					? headerRunner.emitBeforeProviderHeaders(headers)
+					: headers,
+		};
+	};
 ```
 
 ## !!steps Cache warming only for stable requests
@@ -328,6 +362,14 @@ summary calls use their own IDs and must not reset warming), and delegates to
 Steering and follow-up modes, transport, thinking budgets and retry delay come
 from settings.
 
+Right after construction, `markRuntimeStreamFunction` registers this stream
+function with [agent-session.ts](/docs/src/core/agent-session.ts) as one that
+resolves auth through `modelRuntime`. Compaction and other summaries check that
+mark and leave credential resolution to the runtime instead of passing a
+pre-resolved token as an explicit API key, which some providers treat
+differently from stored OAuth. A caller that swaps `agent.streamFunction` loses
+the mark and gets the old pre-resolving behavior.
+
 ```ts ! sdk.ts
 	const agent = new Agent({
 		initialState: {
@@ -339,7 +381,7 @@ from settings.
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
+			const requestOptions = buildRequestOptions(options);
 // ...
 			// !mark(1:3)
 			if (options?.sessionId === sessionManager.getSessionId()) {
@@ -348,6 +390,10 @@ from settings.
 			return modelRuntime.streamSimple(model, context, requestOptions);
 		},
 		onPayload: transformProviderPayload,
+// ...
+	// This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
+	// !mark
+	markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
 ```
 
 ## !!steps Persisting metadata and creating the session
@@ -357,10 +403,13 @@ session, the initial model and thinking level are written to the transcript so
 a later resume restores them. Then the `AgentSession` is constructed with all
 the resolved pieces.
 
-`usesDefaultTools` is true only when neither `tools` nor `noTools` was passed,
-which tells the session that a settings reload may activate newly added
-default tools. The result carries the extensions result for UI setup and the
-fallback message.
+`usesDefaultTools` is true when `noTools` was not passed and `tools` was
+either omitted or a modifier list. It tells the session that the initial tools
+came from the defaults, so a resumed session may replace them with the loadout
+its transcript records and a settings reload may activate newly added default
+tools. `defaultToolModifiers` hands over the modifier list so both paths apply
+it again, keeping a `-name` tool removed. The result carries the extensions
+result for UI setup and the fallback message.
 
 ```ts ! sdk.ts
 	// Restore missing settings metadata for older sessions.
@@ -383,8 +432,9 @@ fallback message.
 		settingsManager,
 		cwd,
 // ...
-		// !mark
-		usesDefaultTools: options.tools === undefined && !options.noTools,
+		// !mark(1:2)
+		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+		defaultToolModifiers: toolModifiers,
 		allowedToolNames,
 ```
 

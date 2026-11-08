@@ -7,7 +7,7 @@ full: true
 
 Radius is a gateway that the built-in provider of the same name signs in to. This file centralizes its identity: the provider id, the environment variable that overrides the gateway origin, the default MCP endpoint, and a function returning the effective gateway URL.
 
-The URL normalization and default come from the pi-ai package. The consumers are the experimental relay in [radius-auth.ts](/docs/src/experimental/radius-auth.ts), the bug report flow in [bug-report-upload.ts](/docs/src/core/bug-report-upload.ts), and the UI in [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts).
+The URL normalization and default come from the pi-ai package. The bug report flow in [bug-report.ts](/docs/src/modes/interactive/bug-report.ts) and [bug-report-upload.ts](/docs/src/core/bug-report-upload.ts) uploads to the gateway URL; [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts) and `pi auth login` in [auth-login.ts](/docs/src/cli/auth-login.ts) recognise a Radius login by the provider id; and [radius-mcp.ts](/docs/src/core/radius-mcp.ts) uses the MCP endpoint to point the Radius MCP server at that login.
 
 <Scrollycoding>
 
@@ -39,4 +39,4 @@ export function getRadiusGatewayUrl(): string {
 
 </Scrollycoding>
 
-Worth noting the asymmetry: the MCP URL is fixed at module load while the gateway URL is dynamic, so a custom gateway does not change the MCP endpoint.
+Worth noting the asymmetry: the MCP URL is fixed at module load while the gateway URL is dynamic, so a custom gateway does not change the MCP endpoint that [radius-mcp.ts](/docs/src/core/radius-mcp.ts) writes into `mcp.json`. In this package the override only redirects bug report uploads.

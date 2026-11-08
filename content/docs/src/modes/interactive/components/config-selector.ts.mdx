@@ -490,4 +490,4 @@ For top-level resources the project file receives entries that name the inherite
 
 </Scrollycoding>
 
-The pattern helpers at the bottom of `ResourceList` (relative paths against a base directory, canonical keys for matching inherited items) are what let the same file be recognized across the global and project views. Be aware that the toggling logic is duplicated in a few forms (top-level versus package, global versus project), so a change to the pattern format must touch all of them.
+The pattern helpers at the bottom of `ResourceList` (relative paths against a base directory, and item keys built with `getResourcePathKey` from [source-info.ts](/docs/src/core/source-info.ts), which resolves symlinks and ignores case on Windows) are what let the same file be recognized across the global and project views. Be aware that the toggling logic is duplicated in a few forms (top-level versus package, global versus project), so a change to the pattern format must touch all of them.

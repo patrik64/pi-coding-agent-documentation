@@ -10,10 +10,14 @@ the prompt (`!cmd`, or `!!cmd` to exclude it from model context). It shows the
 command, streams output into a bordered box with a spinner, then settles into a
 collapsed preview with exit status and truncation info.
 
-The process itself is run by the interactive mode ([tui-renderer.ts](/docs/src/modes/interactive/tui-renderer.ts)
-sanitizes binary output before calling `appendOutput`). The truncation limits
-come from [truncate.ts](/docs/src/core/tools/truncate.ts), the same ones the
-bash tool uses, so what is shown matches what the model would see.
+The process itself is started by [interactive-mode.ts](/docs/src/modes/interactive/interactive-mode.ts)
+through the session, and [bash-executor.ts](/docs/src/core/bash-executor.ts)
+sanitizes binary output before chunks reach `appendOutput`. While the agent is
+streaming, the component sits in the pending-messages area until the run ends.
+The interactive mode creates it with the current tool-output expansion state and
+the user's `outputPad` setting. The truncation limits come from
+[truncate.ts](/docs/src/core/tools/truncate.ts), the same ones the bash tool
+uses, so what is shown matches what the model would see.
 
 <Scrollycoding>
 
@@ -21,7 +25,9 @@ bash tool uses, so what is shown matches what the model would see.
 
 The component tracks the command, accumulated lines, a four-state status,
 the exit code, and an expanded flag. `PREVIEW_LINES` of 20 matches the tool
-execution preview.
+execution preview. The color key is decided once and kept as a field, so every
+rebuild of the display uses the same color. `outputPad` is the horizontal
+padding shared by all transcript blocks.
 
 ```ts ! bash-execution.ts
 // Preview line limit when not expanded (matches tool execution behavior)
@@ -37,24 +43,28 @@ export class BashExecutionComponent extends Container {
 	private fullOutputPath?: string;
 	private expanded = false;
 	private contentContainer: Container;
-
+	/** `dim` marks `!!` commands, whose output is excluded from the model context. */
+	private readonly colorKey: "dim" | "bashMode";
+	private outputPad: number;
 ```
 
 ## !!steps Header, loader and borders
 
-Commands run with `!!` get a dim border color instead of the `bashMode` one. The
+Commands run with `!!` get a dim color instead of the `bashMode` one. The
 constructor builds spacer, top border ([dynamic-border.ts](/docs/src/modes/interactive/components/dynamic-border.ts)),
-a content container, and bottom border. The loader text names the cancel key
-from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
+a content container, and bottom border. The header and loader are not added
+here: the constructor ends by calling `updateDisplay`, the same method that
+redraws on every change, so the initial view and later ones cannot drift apart.
+The loader text names the cancel key from
+[keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hints.ts).
 
 ```ts ! bash-execution.ts
-	constructor(command: string, ui: TUI, excludeFromContext = false) {
+	constructor(command: string, ui: TUI, excludeFromContext = false, outputPad = 1) {
 		super();
 		this.command = command;
-
-		// Use dim border for excluded-from-context commands (!! prefix)
-		const colorKey = excludeFromContext ? "dim" : "bashMode";
-		const borderColor = (str: string) => theme.fg(colorKey, str);
+		this.colorKey = excludeFromContext ? "dim" : "bashMode";
+		this.outputPad = outputPad;
+		const borderColor = (str: string) => theme.fg(this.colorKey, str);
 
 		// Add spacer
 		this.addChild(new Spacer(1));
@@ -66,30 +76,38 @@ from [keybinding-hints.ts](/docs/src/modes/interactive/components/keybinding-hin
 		this.contentContainer = new Container();
 		this.addChild(this.contentContainer);
 
-		// Command header
-		const header = new Text(theme.fg(colorKey, theme.bold(`$ ${command}`)), 1, 0);
-		this.contentContainer.addChild(header);
-
-		// Loader
 		this.loader = new Loader(
 			ui,
-			(spinner) => theme.fg(colorKey, spinner),
+			(spinner) => theme.fg(this.colorKey, spinner),
 			(text) => theme.fg("muted", text),
 			`Running... (${keyText("tui.select.cancel")} to cancel)`, // Plain text for loader
 		);
-		this.contentContainer.addChild(this.loader);
 
 		// Bottom border
 		this.addChild(new DynamicBorder(borderColor));
+
+		this.updateDisplay();
+	}
+
+	// ...
+	setOutputPad(outputPad: number): void {
+		this.outputPad = outputPad;
+		this.updateDisplay();
 	}
 ```
+
+When the user changes the padding in settings, the interactive mode calls
+`setOutputPad` on every transcript child that has it, so existing blocks
+reflow without a rebuild.
 
 ## !!steps Appending streamed chunks
 
 Chunks are stripped of ANSI codes and carriage returns are normalized to
 newlines. Since a chunk can end mid-line, the first piece of a new chunk is
 appended to the last existing line rather than starting a new one. Every chunk
-triggers a full `updateDisplay`.
+triggers a full `updateDisplay`. The inline comment still points at
+`tui-renderer.ts`, but the binary sanitizing it refers to happens in
+[bash-executor.ts](/docs/src/core/bash-executor.ts).
 
 ```ts ! bash-execution.ts
 	appendOutput(chunk: string): void {
@@ -144,7 +162,8 @@ truncation result and the path of a full-output file.
 
 `updateDisplay` first applies the same tail truncation as the bash tool
 (`truncateTail`, keeping the end of the output). Then the collapsed view keeps
-only the last 20 logical lines and counts the hidden ones.
+only the last 20 logical lines and counts the hidden ones. The header is
+rebuilt here with the stored color key and padding.
 
 ```ts ! bash-execution.ts
 	private updateDisplay(): void {
@@ -166,7 +185,7 @@ only the last 20 logical lines and counts the hidden ones.
 		this.contentContainer.clear();
 
 		// Command header
-		const header = new Text(theme.fg("bashMode", theme.bold(`$ ${this.command}`)), 1, 0);
+		const header = new Text(theme.fg(this.colorKey, theme.bold(`$ ${this.command}`)), this.outputPad, 0);
 		this.contentContainer.addChild(header);
 ```
 
@@ -183,7 +202,7 @@ Expanded mode simply prints everything.
 			if (this.expanded) {
 				// Show all lines
 				const displayText = availableLines.map((line) => theme.fg("muted", line)).join("\n");
-				this.contentContainer.addChild(new Text(`\n${displayText}`, 1, 0));
+				this.contentContainer.addChild(new Text(`\n${displayText}`, this.outputPad, 0));
 			} else {
 				// Use shared visual truncation utility with width-aware caching
 				const styledOutput = previewLogicalLines.map((line) => theme.fg("muted", line)).join("\n");
@@ -193,7 +212,7 @@ Expanded mode simply prints everything.
 				this.contentContainer.addChild({
 					render: (width: number) => {
 						if (cachedLines === undefined || cachedWidth !== width) {
-							const result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, 1);
+							const result = truncateToVisualLines(styledInput, PREVIEW_LINES, width, this.outputPad);
 							cachedLines = result.visualLines;
 							cachedWidth = width;
 						}
@@ -247,7 +266,7 @@ truncation warning with the path to the full output.
 			}
 
 			if (statusParts.length > 0) {
-				this.contentContainer.addChild(new Text(`\n${statusParts.join("\n")}`, 1, 0));
+				this.contentContainer.addChild(new Text(`\n${statusParts.join("\n")}`, this.outputPad, 0));
 			}
 		}
 ```

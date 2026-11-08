@@ -7,7 +7,7 @@ full: true
 
 A single function, `openBrowser`, used when pi needs to send the user to a URL (for example an OAuth login page or a docs link) or open a file. It picks the right launcher per operating system and spawns it detached.
 
-The file is small but security-sensitive. URLs can come from remote sources, so the design rule is to never route them through a shell. It is called from the login dialog and the MCP CLI. Related process-spawning helpers live in [child-process.ts](/docs/src/utils/child-process.ts), and the other Windows-aware path handling is in [paths.ts](/docs/src/utils/paths.ts).
+The file is small but security-sensitive. URLs can come from remote sources, so the design rule is to never route them through a shell. It is called from the login dialog, the terminal sign-in flow of `pi auth login` in [auth-terminal.ts](/docs/src/cli/auth-terminal.ts), the MCP extension and CLI, and the TUI renderer. Related process-spawning helpers live in [child-process.ts](/docs/src/utils/child-process.ts), and the other Windows-aware path handling is in [paths.ts](/docs/src/utils/paths.ts).
 
 <Scrollycoding>
 
@@ -44,14 +44,19 @@ The doc comment explains the choice of `rundll32`. `cmd /c start` would make cmd
 
 The child is spawned with ignored stdio and `detached: true`, then `unref()` so it cannot keep pi's event loop alive. A missing launcher (no `xdg-open` on a headless box) surfaces as an asynchronous `error` event; an empty handler swallows it so it cannot crash the process.
 
+It also runs from `/` rather than pi's working directory. On WSL, `xdg-open` hands off to `explorer.exe`, a Windows program, and Windows cannot start it when the current directory is a `\\wsl.localhost\...` path longer than the Windows path limit. The target is a URL, so no launcher needs pi's directory. [clipboard-command.ts](/docs/src/utils/clipboard-command.ts) does the same for `powershell.exe`.
+
 Callers are expected to also print the target, which is why failing silently is acceptable.
 
 ```ts ! open-browser.ts
 	// spawn reports launcher failures (for example, missing xdg-open) via an
 	// error event. Browser launch is best-effort: callers still present the target
 	// to the user, so keep the launcher failure from becoming a process crash.
-	// !mark(1:3)
-	spawn(cmd, args, { stdio: "ignore", detached: true })
+	// !mark(4:6)
+	// On WSL, xdg-open launches explorer.exe, which fails when the cwd's
+	// \\wsl.localhost\... path exceeds MAX_PATH (#11592). The target is a URL,
+	// so no launcher needs pi's cwd.
+	spawn(cmd, args, { stdio: "ignore", detached: true, cwd: "/" })
 		.on("error", () => {})
 		.unref();
 }

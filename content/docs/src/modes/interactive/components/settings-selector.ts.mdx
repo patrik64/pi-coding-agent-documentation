@@ -13,7 +13,7 @@ Most entries are simple value cycles. A few open submenus built from [settings-s
 
 ## !!steps Config and callbacks contract
 
-Every setting appears twice: a field in `SettingsConfig` and an `onXChange` callback. The dialog never touches the settings file itself.
+Every setting appears twice: a field in `SettingsConfig` and an `onXChange` callback. The dialog never touches the settings file itself. The newest entry is the session share destination, which picks where `/share` uploads: `auto`, `gist` or `radius` (see [session-share.ts](/docs/src/modes/interactive/session-share.ts)).
 
 ```ts ! settings-selector.ts
 export interface SettingsConfig {
@@ -30,6 +30,7 @@ export interface SettingsConfig {
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
+	sessionShareDestination: SessionShareDestination;
 	httpIdleTimeoutMs: number;
 	cacheWarmingMode: CacheWarmingMode;
 	thinkingLevel: ThinkingLevel;
@@ -55,6 +56,7 @@ export interface SettingsCallbacks {
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
+	onSessionShareDestinationChange: (destination: SessionShareDestination) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
 	onCacheWarmingModeChange: (mode: CacheWarmingMode) => void;
 	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
@@ -78,7 +80,7 @@ export interface SettingsCallbacks {
 
 ## !!steps A small submenu for warnings
 
-`WarningSettingsSubmenu` wraps a nested `SettingsList` holding one toggle, anthropic extra usage. It keeps a local copy of the warnings object and reports a fresh copy on each change. A missing value counts as enabled.
+`WarningSettingsSubmenu` wraps a nested `SettingsList` holding one toggle, anthropic extra usage. It keeps a local copy of the warnings object and reports a fresh copy on each change. A missing value falls back to the shipped default from [settings-defaults.ts](/docs/src/core/settings-defaults.ts), which is enabled.
 
 ```ts ! settings-selector.ts
 class WarningSettingsSubmenu extends Container {
@@ -96,7 +98,8 @@ class WarningSettingsSubmenu extends Container {
 				label: "Anthropic extra usage",
 				description: "Warn when Anthropic subscription auth may use paid extra usage",
 				// !mark
-				currentValue: (this.state.anthropicExtraUsage ?? true) ? "true" : "false",
+				currentValue:
+					(this.state.anthropicExtraUsage ?? SETTINGS_DEFAULTS.warnings.anthropicExtraUsage) ? "true" : "false",
 				values: ["true", "false"],
 			},
 		];

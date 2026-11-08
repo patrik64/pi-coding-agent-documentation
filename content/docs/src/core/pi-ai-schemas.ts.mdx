@@ -1,0 +1,95 @@
+---
+title: "pi-ai-schemas.ts"
+description: "Re-types pi-ai's pi-schema configuration schemas as TypeBox schemas so the coding agent's TypeBox-built models.json and settings.json schemas can embed them"
+source: "src/core/pi-ai-schemas.ts"
+full: true
+---
+
+The coding agent defines its configuration schemas with TypeBox:
+[model-config.ts](/docs/src/core/model-config.ts) for `models.json` and
+[settings-schema.ts](/docs/src/core/settings-schema.ts) for `settings.json`.
+Parts of those files describe things pi-ai owns, such as model costs, input
+modalities, thinking levels and provider compat flags, and pi-ai publishes
+schemas for them. Those used to be TypeBox schemas that could be dropped into a
+`Type.Object` directly. pi-ai now builds them with pi-schema, which produces
+the same JSON Schema but carries pi-schema's static types, not TypeBox's.
+
+This file bridges the two. It imports each pi-ai schema and wraps it so that
+TypeBox treats it as one of its own, without changing a byte of the JSON. Both
+config modules import from here instead of from pi-ai.
+
+<Scrollycoding>
+
+## !!steps Importing the JSON schemas under new names
+
+Each schema comes in with both its pi-ai type and the schema value, renamed
+with a `JsonSchema` suffix so the TypeBox-typed export below can keep the
+original name. Callers keep writing `ModelCostSchema` as before.
+
+```ts ! pi-ai-schemas.ts
+import {
+	type ProviderCompat,
+	ProviderCompatSchema as ProviderCompatJsonSchema,
+} from "@earendil-works/pi-ai/providers/compat-schema";
+import {
+	// !mark(1:2)
+	type ModelCost,
+	ModelCostSchema as ModelCostJsonSchema,
+	type ModelInputLimits,
+	ModelInputLimitsSchema as ModelInputLimitsJsonSchema,
+// ...
+} from "@earendil-works/pi-ai/providers/model-schema";
+import { Type } from "typebox";
+```
+
+## !!steps Type.Unsafe keeps the JSON and adds the type
+
+`Type.Unsafe` takes an arbitrary JSON Schema and returns it as a TypeBox schema
+whose `Static` is the given type argument. The JSON is what TypeBox's compiled
+validator checks, so `models.json` validates exactly as it does against pi-ai's
+schema, and `Static` of the enclosing object yields pi-ai's own types.
+
+The "unsafe" part is that nothing checks the type argument against the JSON.
+Using pi-ai's exported type for each schema keeps the two in step.
+
+```ts ! pi-ai-schemas.ts
+// !mark
+export const ProviderCompatSchema = Type.Unsafe<ProviderCompat>(ProviderCompatJsonSchema);
+export const ModelCostSchema = Type.Unsafe<ModelCost>(ModelCostJsonSchema);
+export const ModelInputLimitsSchema = Type.Unsafe<ModelInputLimits>(ModelInputLimitsJsonSchema);
+export const ModelInputModalitySchema = Type.Unsafe<ModelInputModality>(ModelInputModalityJsonSchema);
+export const ModelPromptCacheSchema = Type.Unsafe<ModelPromptCache>(ModelPromptCacheJsonSchema);
+export const ModelThinkingLevelSchema = Type.Unsafe<ModelThinkingLevel>(ModelThinkingLevelJsonSchema);
+export const ThinkingLevelMapSchema = Type.Unsafe<ThinkingLevelMap>(ThinkingLevelMapJsonSchema);
+```
+
+## !!steps A partial cost schema without Type.Partial
+
+Model overrides in `models.json` may change only some of a model's rates.
+`model-config.ts` used to express that as `Type.Partial(ModelCostSchema)`, but
+`Type.Partial` only knows how to transform TypeBox's own object schemas, not an
+opaque `Type.Unsafe` wrapper.
+
+`withoutRequired` does the equivalent on the JSON: it drops the object's
+`required` list and keeps everything else. It is shallow, like `Type.Partial`,
+so an override that supplies `tiers` must still give each tier all of its
+fields.
+
+```ts ! pi-ai-schemas.ts
+/** `ModelCostSchema` with every field optional, for model overrides that change some of the rates. */
+export const PartialModelCostSchema = Type.Unsafe<Partial<ModelCost>>(withoutRequired(ModelCostJsonSchema));
+
+// !mark(1:4)
+function withoutRequired(schema: object): object {
+	const { required: _required, ...rest } = schema as { required?: unknown };
+	return rest;
+}
+```
+
+</Scrollycoding>
+
+pi-ai's schemas are open objects (`additionalProperties` allowed), the same
+shape the TypeBox versions had, so the wrap changes types only. Extensions
+hit the same gap from the other side, since pi-ai no longer hands them TypeBox
+either; [pi-ai-extension-view.ts](/docs/src/core/extensions/pi-ai-extension-view.ts)
+covers that.

@@ -39,19 +39,26 @@ export interface CreateModelRuntimeOptions {
 
 ## !!steps Building the runtime in create
 
-`create` is the only public constructor. It wraps credentials in [runtime-credentials.ts](/docs/src/core/runtime-credentials.ts), loads [model-config.ts](/docs/src/core/model-config.ts) from `models.json`, picks a file-backed or in-memory models store from [models-store.ts](/docs/src/core/models-store.ts), and decorates every built-in provider (except radius) with [remote-catalog-provider.ts](/docs/src/core/remote-catalog-provider.ts).
+`create` is the only public constructor. It wraps credentials in [runtime-credentials.ts](/docs/src/core/runtime-credentials.ts), loads [model-config.ts](/docs/src/core/model-config.ts) from `models.json`, picks a file-backed or in-memory models store from [models-store.ts](/docs/src/core/models-store.ts), and decorates every built-in provider (except radius) with [remote-catalog-provider.ts](/docs/src/core/remote-catalog-provider.ts). Most get the pi.dev overlay from `withRemoteCatalog`. OpenRouter gets `withPersonalizedCatalog` with pi-ai's `personalizeOpenRouterCatalog`, so its model list shrinks to the models, limits and prices the user's key is allowed.
 
 Network access is further gated by `PI_OFFLINE`: it is allowed only when that variable is undefined. A refresh timeout is built by combining the caller's signal with a timer-driven controller via `AbortSignal.any`.
 
 ```ts ! model-runtime.ts
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog
-			.builtinProviders()
-			.map((provider) =>
-				provider.id === "radius"
-					? provider
-					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
-			);
+		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
+			if (provider.id === "radius") return provider;
+			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
+			// !mark(1:8)
+			if (provider.id === "openrouter") {
+				return withPersonalizedCatalog(
+					provider,
+					personalizeOpenRouterCatalog,
+					options.catalogBaseUrl,
+					builtinModelDataGeneratedAt,
+				);
+			}
+			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
+		});
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -179,6 +186,8 @@ Login, logout and runtime key changes for the same provider are queued through `
 
 After each change `synchronizeCredentialState` recomposes the provider, refreshes its models without network, and updates availability. If that local synchronization fails, it throws `CredentialSynchronizationError`, which carries the credential: the change itself was already committed, and callers need to know.
 
+Some credential writes happen outside this queue, most importantly an OAuth refresh triggered by a background catalog refresh. `settleCredentialWrites` waits for every write that [runtime-credentials.ts](/docs/src/core/runtime-credentials.ts) has started. [agent-session-runtime.ts](/docs/src/core/agent-session-runtime.ts) awaits it on dispose, because an OAuth refresh may already have spent the single-use refresh token; exiting before the new token is saved would leave only the spent one in `auth.json`.
+
 ```ts ! model-runtime.ts
 	private enqueueCredentialOperation<T>(providerId: string, signal: AbortSignal, task: () => Promise<T>): Promise<T> {
 		const previous = this.credentialOperations.get(providerId) ?? Promise.resolve();
@@ -194,13 +203,22 @@ After each change `synchronizeCredentialState` recomposes the provider, refreshe
 		})();
 		const tail = operation.catch(() => {});
 		this.credentialOperations.set(providerId, tail);
+// ...
+	/**
+	 * Wait until credential writes already in progress finish, such as an OAuth refresh started by a
+	 * background catalog refresh. Call before the process exits so a rotated token is not lost.
+	 */
+	// !mark(1:3)
+	settleCredentialWrites(): Promise<void> {
+		return this.credentials.settled();
+	}
 ```
 
 ## !!steps Preparing a request
 
-Every request path (`stream`, `streamSimple`, `streamDeferred`, `generateImages`, `classify`) goes through `prepareRequest`. It looks up the provider, resolves auth through `getAuth`, and merges headers in a fixed order: auth headers, then caller headers, then an optional `transformHeaders` hook.
+Every request path (`stream`, `streamSimple`, `streamDeferred`, `generateImages`, `classify`) goes through `prepareRequest`. It looks up the provider, resolves auth through `getAuth`, and merges headers in a fixed order: OpenCode's session header, then auth headers, then caller headers, then an optional `transformHeaders` hook.
 
-A caller-supplied `apiKey` beats the resolved one, and a resolved `baseUrl` is applied by cloning the model. Missing auth throws `ModelsError` with kind `auth`.
+A caller-supplied `apiKey` beats the resolved one, and a resolved `baseUrl` is applied by cloning the model. That clone is built before the headers because pi-ai's `getOpenCodeSessionHeaders` recognizes OpenCode by provider id or by the request's base URL, so a custom provider pointed at OpenCode also gets `x-opencode-session` when the request carries a session id. The `User-Agent` and attribution headers are not added here; pi-ai adds them from the request's identity, beneath these headers (see [client-identity.ts](/docs/src/core/client-identity.ts)). Missing auth throws `ModelsError` with kind `auth`.
 
 ```ts ! model-runtime.ts
 		const provider = this.models.getProvider(model.provider);
@@ -214,13 +232,22 @@ A caller-supplied `apiKey` beats the resolved one, and a resolved `baseUrl` is a
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+		// !mark(1:9)
+		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		const sessionId =
+			"sessionId" in providerOptions && typeof providerOptions.sessionId === "string"
+				? providerOptions.sessionId
+				: undefined;
+		let headers = mergeHeaders(
+			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), resolution.auth.headers),
+			providerOptions.headers,
+		);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
 ```
 
 ## !!steps Lazy streams and routed virtual models
 
-Streams are built with `lazyStream`, so a stream object is returned synchronously and auth resolution happens when it is first consumed. Callers like [agent-session.ts](/docs/src/core/agent-session.ts) can therefore treat failures as ordinary stream errors.
+Streams are built with `lazyStream`, so a stream object is returned synchronously while auth resolution and provider setup run behind it. Callers like [agent-session.ts](/docs/src/core/agent-session.ts) can therefore treat setup failures as ordinary stream errors. Each call also passes the request's abort signal: if setup fails after the signal fired, the stream ends with stop reason `aborted` rather than `error`, so cancelling during auth setup is not reported as a provider failure.
 
 For a virtual model, `streamSimple` first calls `resolveModel` to route the request, then recurses with the real model. The output budget is capped to the routed model's limit, and caller credentials are forwarded only when the routed model shares the virtual model's provider, so keys are not sent to the wrong vendor.
 
@@ -228,19 +255,30 @@ For a virtual model, `streamSimple` first calls `resolveModel` to route the requ
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
 			// cap the output budget to the routed model.
-			return lazyStream(model, async () => {
-				const route = await this.resolveModel(model, transcript.messages, {
-					reason: "direct",
-					thinkingLevel: options?.reasoning ?? "off",
-					signal: options?.signal,
-				});
-				const { maxTokens: limit } = route.model;
-				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
-				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
-				// Caller credentials were resolved for the virtual model's provider. Another provider
-				// resolves its own, so they are not sent to the wrong vendor.
-				const { apiKey, headers, env, ...rest } = options ?? {};
-				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+			return lazyStream(
+				model,
+				async () => {
+					const route = await this.resolveModel(model, transcript.messages, {
+						reason: "direct",
+						thinkingLevel: options?.reasoning ?? "off",
+						signal: options?.signal,
+					});
+					const { maxTokens: limit } = route.model;
+					// !mark(1:2)
+					const maxTokens =
+						options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+					const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+					// Caller credentials were resolved for the virtual model's provider. Another provider
+					// resolves its own, so they are not sent to the wrong vendor.
+					const { apiKey, headers, env, ...rest } = options ?? {};
+					// !mark
+					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+				},
+				undefined,
+				// !mark
+				options?.signal,
+			);
 ```
 
 ## !!steps Registering providers at runtime

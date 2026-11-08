@@ -9,7 +9,9 @@ This file is the integration layer between MCP servers and pi's extension API. I
 
 Actual protocol work is delegated. [runtime.ts](/docs/src/extensions/mcp/runtime.ts) holds the connections and is loaded lazily, [config.ts](/docs/src/extensions/mcp/config.ts) parses and edits `mcp.json`, [tools.ts](/docs/src/extensions/mcp/tools.ts) builds tool definitions, [resources.ts](/docs/src/extensions/mcp/resources.ts) the resource tools, and [ui.ts](/docs/src/extensions/mcp/ui.ts) the manager screens.
 
-The key design idea is exposure. By default MCP tools are not declared to the model at all: they are reachable only from [codemode](/docs/src/extensions/codemode/tool.ts) scripts or through [tool_search](/docs/src/extensions/tool-search/tool.ts), so large tool catalogs do not bloat every request. The rest of the file keeps that promise: waiting for servers only when something needs them, and telling the model that the servers exist.
+The key design idea is exposure. By default MCP tools are not declared to the model at all: they are reachable only from [codemode](/docs/src/extensions/codemode/tool.ts) scripts or through [tool_search](/docs/src/extensions/tool-search/tool.ts), so large tool catalogs do not bloat every request. The rest of the file keeps that promise: waiting for servers only when something needs them, and telling the model that the servers exist. It no longer knows how codemode scripts are written: both tools declare `reachesTools`, a hook from [types.ts](/docs/src/core/extensions/types.ts) that says which tools a call may reach, and this file waits on that.
+
+The second theme is lifetime. Connections, sign-ins and `/mcp` actions all run in the background and can outlive the session or the action that started them, so each piece of work checks a per-session abort signal and its own connection attempt before acting on a late result.
 
 <Scrollycoding>
 
@@ -75,7 +77,7 @@ Because codemode and tool_search tools are not in the tool declarations, nothing
 
 The section has a hard budget of 4096 characters. It first drops trailing servers until the bare lines fit, adding a closing "N more servers" line, then splits the leftover space evenly as a per-server description limit capped at 250 characters, minus two for the `: ` separator.
 
-Servers are sorted by name, so the section is stable across runs and does not needlessly change the prompt.
+Servers are sorted by name, so the section is stable across runs and does not needlessly change the prompt. Descriptions are cut with `sliceHead` from [truncate.ts](/docs/src/core/tools/truncate.ts), which never splits a surrogate pair.
 
 ```ts ! index.ts
 export function renderServersSection(servers: readonly McpServerListing[]): string | undefined {
@@ -101,7 +103,9 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 
 Everything lives in the closure of the factory, not in module scope, so each extension instance is independent. The main list is `servers`, each entry being an `McpServer` with its config entry, an optional connection (absent when disabled), and a `ready` promise that settles when its connection attempt ends.
 
-Two fields guard against stale async work. `generation` is bumped on every session start and shutdown, and any late continuation compares it before acting. `waitedForStartup` makes the bounded startup wait happen at most once per session.
+`session` replaced the old generation counter. It is an `AbortController` that `session_start` replaces and `session_shutdown` aborts; it starts out aborted so nothing runs before the first session. Work captures `session.signal` when it begins and drops its result once the signal has fired, for example a runtime load that resolves after shutdown.
+
+Work that outlives the command that started it, such as a sign-in or a manager action that opens a connection, is wrapped in `track`. Shutdown then waits for those tasks to clean up, not just for the connections to close.
 
 ```ts ! index.ts
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
@@ -114,18 +118,40 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		/** Whether a prompt already waited for the startup connections since the session started. */
 		let waitedForStartup = false;
 		const startupWaitMs = options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS;
-		/** Bumped on every session start and shutdown so a runtime load that resolves late is dropped. */
+		// ...
+		// !mark(1:2)
+		let session = new AbortController();
+		session.abort();
+		/** Work registered with `track`: manager actions opening or closing connections, and sign-ins. */
+		const backgroundActions = new Set<Promise<void>>();
 		// !mark
-		let generation = 0;
+		const track = <T>(work: Promise<T>): Promise<T> => {
+			const task = work.then(
+				() => undefined,
+				() => undefined,
+			);
+			backgroundActions.add(task);
+			void task.finally(() => backgroundActions.delete(task));
+			return work;
+		};
 ```
 
 ## !!steps Registering tools under stable unique names
 
-`registerTools` is the `onTools` callback each connection calls after connecting or after a `list_changed` notification. It builds a namespace (name, description, instructions) and then a pi tool name for every server tool.
+`registerTools` is the `onTools` callback each connection calls after connecting or after a `list_changed` notification. It builds a namespace (name, description, instructions) and then a pi tool name for every server tool. The namespace gets the bare server name as an alias, so a script's `describeNamespace("docs")` finds `mcp__docs`; that replaced a special rule codemode used to have for MCP. Names come from pi-mcp's `createMcpToolName`.
 
 Name assignment must be stable and collision free. A candidate is rejected if another owner already has it, if it was already taken in this pass, or if two tools of this server sanitize to the same plain name. In that last case all of them get the hash suffix, so the result does not depend on list order. The `toolOwners` map remembers who owns which name across reconnects.
 
 ```ts ! index.ts
+			const namespace = {
+				name: mcpNamespace(server),
+				// `describeNamespace("docs")` finds `mcp__docs`.
+				// !mark
+				aliases: [server],
+				...(description ? { description } : {}),
+				...(connection.instructions ? { instructions: connection.instructions } : {}),
+			};
+			// ...
 			// Like Codex, all tools whose names sanitize to the same name get the hash suffix, so which
 			// one would keep the plain name does not depend on the order of the list.
 			const plain = [...new Set(connection.tools.map((tool) => tool.name))].map((tool) =>
@@ -145,6 +171,32 @@ Name assignment must be stable and collision free. A candidate is rejected if an
 				current.add(name);
 				return name;
 			};
+```
+
+## !!steps A tool call finds the current connection
+
+A tool definition used to hold on to the connection it was registered from. That breaks when a call is prepared, then waits in the `tool_call` hook while the user disables and re-enables the server: the old connection is closed by the time the call runs. `getClient` now looks the server up again when the call executes.
+
+It fails with a clear message when the server is disabled or gone, when it is still starting, or when the tool was hidden or the server stopped offering it. `readableResources` is resolved by server name for the same reason.
+
+```ts ! index.ts
+					getClient: async () => {
+						// A prepared call can outlive this definition's connection while the readiness
+						// hook waits for a disable/re-enable. Resolve the replacement at execution time.
+						// !mark(1:4)
+						const current = findServer(server);
+						if (!current || !isEnabled(current)) throw new Error(`MCP server "${server}" is disabled.`);
+						const client = current.connection;
+						if (!client) throw new Error(`MCP server "${server}" is still starting.`);
+						if (
+							getMcpToolExposure(current.entry.config, tool.name) === "hidden" ||
+							(client.state === "connected" && !client.tools.some((offered) => offered.name === tool.name))
+						) {
+							throw new Error(`MCP tool "${server}/${tool.name}" is no longer available.`);
+						}
+						return client;
+					},
+					readableResources: () => resourceServers().some((current) => current.name === server),
 ```
 
 ## !!steps Tools cannot be unregistered, so they are hidden
@@ -177,13 +229,16 @@ This is why the file keeps a `definitions` map of the last definition per name. 
 
 `ensureDiscoveryActive` is the safety net for the exposure model. From the enabled servers' configured exposures it works out whether codemode, tool_search or both are needed, then activates them if they exist and are not already active. Codemode activation respects `autoEnableCodemode`.
 
-It only activates tools recognised by `isCodemodeTool` and `isToolSearchTool`, because another extension's tool with the same name cannot reach MCP tools. If neither route ends up active, it warns once per session that the MCP tools cannot be called.
+It only activates a tool of those names that declares `reachesTools`. Another extension can register a tool called `codemode` or `tool_search`, but without that hook it cannot reach MCP tools, so activating it would be useless. If neither route ends up active, it warns once per session that the MCP tools cannot be called.
 
 ```ts ! index.ts
-			// Other extensions' tools of the same names cannot reach MCP tools, so never activate them.
+			// Only a tool of these names that declares `reachesTools` can reach MCP tools; another
+			// extension's tool of the same name without it is never activated.
 			const tools = pi.getAllTools();
-			const hasCodemode = tools.some(isCodemodeTool);
-			const hasToolSearch = tools.some(isToolSearchTool);
+			// !mark(1:3)
+			const hasReachingTool = (name: string) => tools.some((tool) => tool.name === name && tool.reachesTools);
+			const hasCodemode = hasReachingTool(CODEMODE_TOOL_NAME);
+			const hasToolSearch = hasReachingTool(TOOL_SEARCH_TOOL_NAME);
 			const active = pi.getActiveTools();
 			const activate: string[] = [];
 			// !mark(1:6)
@@ -225,35 +280,43 @@ On every `turn_start`, `reconnectSignedIn` compares the current stored tokens wi
 			await Promise.allSettled(signedIn.map(([connection]) => connection.reconnect()));
 ```
 
-## !!steps Background connections that respect session lifetime
+## !!steps Background connections that respect their lifetime
 
 `startConnection` runs the connect in the background and stores a swallowed-error version in `server.ready`, so waiters never throw, while the returned promise still rejects if the runtime cannot load. Failures of the connection itself are not errors here: they show up as state on the connection.
 
-It takes an `isCurrent` check and an optional `after` promise. After each await it checks `isCurrent()`, so a session that ended mid-connect does nothing further. `createConnection` is where the lazy [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts) import happens, wiring `onTools` to `registerTools`.
+Each call stamps the server with a fresh `attempt` symbol. `isCurrent` is true only while the session is alive, this is still the server's latest attempt, the server is enabled, and it is still in the list. Disabling or replacing a server therefore invalidates an attempt that is still loading. `createConnection` is where the lazy [runtime.lazy.ts](/docs/src/extensions/mcp/runtime.lazy.ts) import happens, and it uses the same check to ignore `onTools` and `onChange` callbacks from a connection that is no longer current.
 
 ```ts ! index.ts
+		const startConnection = (server: McpServer, after?: Promise<unknown>): Promise<void> => {
+			const { signal } = session;
+			// !mark(1:4)
+			const attempt = Symbol();
+			server.attempt = attempt;
+			const isCurrent = () =>
+				!signal.aborted && server.attempt === attempt && isEnabled(server) && servers.includes(server);
 			const ready = (async () => {
 				await after;
-				// !mark
 				if (!isCurrent()) return;
-				const connection = await createConnection(server);
-				if (!isCurrent()) return;
+				const connection = await createConnection(server, isCurrent);
+				if (!connection || !isCurrent()) return;
 				await connection.getClient().catch(() => undefined);
 			})();
 			// !mark
 			server.ready = ready.catch(() => undefined);
 			return ready;
+		};
 ```
 
 ## !!steps Session start
 
-`session_start` loads config, resets the per-session flags, increments `generation`, and builds the server list: servers from `mcp.json` first, then extension-registered servers that no configured server overrides, matched by namespace.
+`session_start` loads config, resets the per-session flags, starts a new `session` controller, and builds the server list: servers from `mcp.json` first, then extension-registered servers that no configured server overrides, matched by namespace.
 
 Discovery tools are activated from config straight away, before any server connects. With no enabled servers it only reports config problems. Otherwise it waits one `setImmediate` turn before loading the runtime, a deliberate delay so the first render is not blocked by importing the MCP client. Problems are reported once, after all connections settle.
 
 ```ts ! index.ts
-			const current = ++generation;
-			sessionActive = true;
+			// !mark(1:2)
+			session = new AbortController();
+			const { signal } = session;
 			configuredEntries = loaded.servers;
 			const registered = registeredServers();
 			overridden = registered.overridden;
@@ -277,22 +340,33 @@ Discovery tools are activated from config straight away, before any server conne
 
 Three event hooks decide who waits. The first prompt waits, at most `startupWaitMs` and only once, for servers with direct tools, and notifies if the timeout wins. `before_agent_start` also writes or removes the `mcp_servers` section of the system prompt on every prompt.
 
-The `tool_call` hook covers indirect servers. A codemode script waits only for servers whose namespace its source mentions, or for all pending servers if it calls `searchTools`, `describeNamespace`, `describeTool` or `ALL_TOOLS`. tool_search and the resource tools wait for everything, since they can reach any server. The wait is tied to `ctx.signal`, so cancelling the turn stops it.
+The `tool_call` hook covers everything else. A tool with `reachesTools` reports what a call may reach: `"all"`, or the words of its input. Codemode returns the words of the script (or `"all"` when it searches or enumerates tools) and tool_search always returns `"all"`. `reachesServer` matches a server when any word contains its namespace, which may over-match but never misses. The resource tools wait for every server, and a direct MCP call waits only for its own server, found through `toolOwners`.
+
+It considers every enabled server with a `ready` promise, not only ones that look disconnected: a reconnect shows `connected` while it is still closing the old transport. The wait is tied to `ctx.signal`, so cancelling the turn stops it, and `waitForServers` loops when a newer attempt replaced one it was waiting on.
 
 ```ts ! index.ts
-			const pendingServers = servers.filter(
-				(server) => isEnabled(server) && server.connection?.state !== "connected" && server.ready,
-			);
-			if (pendingServers.length === 0) return;
+function reachesServer(reach: "all" | readonly string[], server: string): boolean {
+	if (reach === "all") return true;
+	const namespace = mcpNamespace(server);
+	// !mark
+	return reach.some((word) => word.includes(namespace));
+}
+// ...
+			// Readiness can be pending while the display state is still connected: reconnect first
+			// closes the old transport, then opens a new one. Settled promises return immediately.
+			const readyServers = servers.filter((server) => isEnabled(server) && server.ready);
+			if (readyServers.length === 0) return;
 			let waiting: McpServer[] = [];
-			if (isCodemodeTool(tool)) {
-				const { code } = event.input as { code?: unknown };
-				const source = typeof code === "string" ? code : "";
-				// !mark
-				waiting = pendingServers.filter((server) => scriptNeedsServer(source, server.entry.name));
-			} else if (isToolSearchTool(tool) || RESOURCE_TOOL_NAMES.has(tool.name)) {
-				// !mark
-				waiting = pendingServers;
+			// !mark
+			const reach = tool.reachesTools?.(event.input);
+			if (reach !== undefined) {
+				waiting = readyServers.filter((server) => reachesServer(reach, server.entry.name));
+			} else if (RESOURCE_TOOL_NAMES.has(tool.name)) {
+				waiting = readyServers;
+			} else {
+				// !mark(1:2)
+				const owner = toolOwners.get(event.toolName)?.split("\0", 1)[0];
+				waiting = readyServers.filter((server) => server.entry.name === owner);
 			}
 			await waitForServers(waiting, ctx.signal);
 ```
@@ -301,7 +375,7 @@ The `tool_call` hook covers indirect servers. A codemode script waits only for s
 
 Extensions can register or remove MCP servers mid-session. `mcp_servers_change` diffs by `registeredConfig`, a JSON snapshot of the config: a server whose registration vanished or changed is dropped (its tools hidden, its connection closed), and a changed one comes back as a new server and connects right away.
 
-After connecting it re-checks `generation`. If the session ended while it waited, the connections it just made are closed rather than leaked. `session_shutdown` bumps `generation`, empties the list and closes every connection.
+After connecting it re-checks the session signal it captured. If the session ended while it waited, the connections it just made are closed rather than leaked. `session_shutdown` aborts the session, which also cancels running sign-ins, empties the list, and waits for every tracked background action as well as every connection to close.
 
 ```ts ! index.ts
 			const removed = servers.filter(
@@ -318,36 +392,86 @@ After connecting it re-checks `generation`. If the session ended while it waited
 			ensureDiscoveryActive(ctx);
 			await Promise.all(removed.map((server) => server.connection?.close()));
 			const connecting = added.filter(isEnabled);
-			if (current !== generation || connecting.length === 0) return;
+			if (signal.aborted || connecting.length === 0) return;
 			try {
-				await Promise.all(connecting.map((server) => startConnection(server, () => current === generation)));
-				if (current !== generation) {
+				await Promise.all(connecting.map((server) => startConnection(server)));
+				if (signal.aborted) {
 					// !mark
 					await Promise.all(connecting.map((server) => server.connection?.close()));
 					return;
 				}
+// ...
+		pi.on("session_shutdown", async () => {
+			session.abort();
+			const closing = connections();
+			servers = [];
+			emitChange();
+			// !mark
+			await Promise.all([...backgroundActions, ...closing.map((connection) => connection.close())]);
+		});
+```
+
+## !!steps A manager that stays responsive
+
+Opening or closing a connection can take a while, and the manager used to sit on a status screen until it finished. Reconnect, enable and disable now go through `runInBackground`: the menu stays usable and, because it is subscribed to changes, shows the server's state as it moves. When the operation ends, its message is stored only if the session is still alive and no newer attempt replaced this one.
+
+Sign-in still uses the full screen, but every status message on it offers a cancel key that aborts the sign-in's own controller. `signIn` combines that signal with the session's, so Esc and session shutdown both stop the OAuth flow, and it runs the flow under `track`.
+
+```ts ! index.ts
+		const signInWithUi = (ui: McpUi, server: McpServer): Promise<string | undefined> => {
+			const title = `Sign in to ${server.entry.name}`;
+			// !mark(1:2)
+			const cancel = new AbortController();
+			const status = (message: string) => ui.status(title, message, () => cancel.abort());
+			let authorizationUrl = "";
+			status("Contacting the authorization server…");
+			return signIn(
+// ...
+		/** Keep the subscribed menu usable while a connection opens or closes. */
+		const runInBackground = (
+			ctx: ExtensionContext,
+			server: McpServer,
+			operation: () => Promise<string | undefined>,
+		) => {
+			const ready = operation();
+			const attempt = server.attempt;
+			const { signal } = session;
+			const finish = (message: string | undefined) => {
+				// !mark
+				if (signal.aborted || server.attempt !== attempt || !servers.includes(server)) return;
+				server.message = message;
+				ensureDiscoveryActive(ctx);
+				emitChange();
+			};
+			// !mark
+			void track(ready.then(finish, (error: unknown) => finish(errorMessage(error))));
+		};
 ```
 
 ## !!steps The /mcp command in two modes
 
-With no arguments, `/mcp` opens the interactive manager in the TUI and prints a plain status text elsewhere. The handler first awaits `pending`, so it never shows a half-started state. The subcommands `login`, `logout` and `reconnect` take an optional server name. More than one argument prints the usage line.
+With no arguments, `/mcp` opens the interactive manager in the TUI and prints a plain status text elsewhere. The manager opens at once, even while startup connections are still running, and shows them as connecting; only the plain status text and the subcommands await `pending`, since they need settled states. The subcommands `login`, `logout` and `reconnect` take an optional server name. More than one argument prints the usage line.
 
 When the name is omitted, `pickServer` narrows to eligible servers and then to preferred ones (for login, those needing sign-in), and only prompts the user when the choice is still ambiguous. The manager itself is a pair of nested menu loops in `manage`, driven by the pure builders `serversMenu` and `serverMenu`, which list only the actions valid for the server's current state.
 
 ```ts ! index.ts
 			handler: async (args, ctx) => {
-				// !mark
-				await pending;
 				const [action, name, ...extra] = args.trim().split(/\s+/).filter(Boolean);
 				if (action === undefined) {
+					// !mark
 					if (ctx.mode === "tui") await showMcpManager(ctx, (ui) => manage(ui, ctx));
-					else ctx.ui.notify(formatStatus(), "info");
+					else {
+						await pending;
+						ctx.ui.notify(formatStatus(), "info");
+					}
 					return;
 				}
 				if (extra.length > 0) {
 					ctx.ui.notify(MCP_USAGE, "warning");
 					return;
 				}
+				// !mark
+				await pending;
 				switch (action) {
 					case "login": {
 						// !mark
@@ -359,6 +483,6 @@ When the name is omitted, `pickServer` narrows to eligible servers and then to p
 
 </Scrollycoding>
 
-The pieces connect through one loop: config produces `servers`, `startConnection` produces connections, each connection calls `registerTools` and `onChange`, and everything user-visible, from the manager menu to the `mcp_servers` prompt section, is derived from that same `servers` array. The extension API it targets is described in [types.ts](/docs/src/core/extensions/types.ts), and namespace handling comes from [mcp-servers.ts](/docs/src/core/mcp-servers.ts).
+The pieces connect through one loop: config produces `servers`, `startConnection` produces connections, each connection calls `registerTools` and `onChange`, and everything user-visible, from the manager menu to the `mcp_servers` prompt section, is derived from that same `servers` array. The extension API it targets is described in [types.ts](/docs/src/core/extensions/types.ts), exposure handling comes from [mcp-servers.ts](/docs/src/core/mcp-servers.ts), and namespace and tool naming from the pi-mcp package.
 
-One structural note: the file is one large closure. Most helpers capture mutable state such as `servers`, `generation` and `credentials`, so they cannot be unit tested on their own. Only the pure functions, `renderServersSection` among them, are exported for tests.
+One structural note: the file is one large closure. Most helpers capture mutable state such as `servers`, `session` and `credentials`, so they cannot be unit tested on their own. Only the pure functions, `renderServersSection` among them, are exported for tests.

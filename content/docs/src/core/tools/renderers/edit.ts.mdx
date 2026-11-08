@@ -98,7 +98,7 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 
 The background of the box is derived from state. A preview with an error is red, a preview with a diff is green, and with no preview yet the box is the pending color. If the tool already failed without any preview (`settledError`), it turns red too.
 
-`buildEditCallComponent` then redraws: set the background, clear children, add the header line, and if a preview exists add a spacer and either the error text or the rendered diff.
+`buildEditCallComponent` then redraws: set the background and the horizontal padding, clear children, add the header line, and if a preview exists add a spacer and either the error text or the rendered diff. The edit tool declares `renderShell: "self"`, so it draws its own box, and the padding comes from `context.outputPad` (the user's `outputPad` setting) rather than a fixed value; the result text uses the same padding, so both parts line up with every other transcript block.
 
 ```ts ! edit.ts
 function getEditHeaderBg(
@@ -181,7 +181,13 @@ export const editRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 			});
 		}
 
-		return buildEditCallComponent(component, args as RenderableEditArgs | undefined, theme, context.cwd);
+		return buildEditCallComponent(
+			component,
+			args as RenderableEditArgs | undefined,
+			theme,
+			context.cwd,
+			context.outputPad,
+		);
 	},
 ```
 

@@ -7,7 +7,7 @@ full: true
 
 This is an experimental-feature switch, not experimental code itself. It is one function that reads `PI_EXPERIMENTAL` from the environment so that features still under development can be hidden by default and enabled with a single flag.
 
-Callers such as the experimental commands module, the startup UI in [startup-ui.ts](/docs/src/cli/startup-ui.ts) and the [footer.ts](/docs/src/modes/interactive/components/footer.ts) component call it instead of reading the variable directly, so the rule lives in one place.
+Its callers, the startup UI in [startup-ui.ts](/docs/src/cli/startup-ui.ts) and the [footer.ts](/docs/src/modes/interactive/components/footer.ts) component, call it instead of reading the variable directly, so the rule lives in one place. It is also re-exported from [core/index.ts](/docs/src/core/index.ts) for SDK users.
 
 <Scrollycoding>
 
